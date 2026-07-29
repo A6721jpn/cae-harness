@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "febio-gmsh-launcher"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+  "gmsh==4.15.2",
+  "numpy==2.5.1",
+]
+
+[project.scripts]
+febio-gmsh-launcher = "febio_gmsh_launcher.cli:main"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
