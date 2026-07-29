@@ -31,6 +31,7 @@ Place `<job-name>.gmsh-run.json` beside the exported FEB, or in one of its first
   "gmsh": {
     "target_size_mm": 2.0,
     "min_size_mm": 0.2,
+    "mapping_tolerance_mm": 0.002,
     "algorithm3d": 10,
     "curvature_elements_per_2pi": 20
   },
