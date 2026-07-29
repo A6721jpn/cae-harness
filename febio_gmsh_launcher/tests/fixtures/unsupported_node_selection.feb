@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<febio_spec version="4.0">
+  <Mesh>
+    <Nodes name="Part1"><node id="1">0,0,0</node></Nodes>
+    <NodeSet name="picked-node"><node id="1"/></NodeSet>
+  </Mesh>
+  <Boundary><bc name="node-fix" node_set="picked-node" type="zero displacement"/></Boundary>
+</febio_spec>
