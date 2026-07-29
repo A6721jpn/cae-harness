@@ -2,7 +2,8 @@ from pathlib import Path
 
 import pytest
 
-from febio_gmsh_launcher.cli import parse_febio_args
+import febio_gmsh_launcher.cli as cli
+from febio_gmsh_launcher.cli import main, parse_febio_args
 from febio_gmsh_launcher.errors import ExitCode, LauncherError
 
 
@@ -36,3 +37,15 @@ def test_missing_input_has_stable_config_exit_code() -> None:
         parse_febio_args([])
 
     assert caught.value.exit_code == ExitCode.CONFIG_ERROR
+
+
+def test_main_returns_stable_code_for_missing_input() -> None:
+    assert main([]) == ExitCode.CONFIG_ERROR
+
+
+def test_main_dispatches_valid_request_to_pipeline(monkeypatch) -> None:
+    captured = []
+    monkeypatch.setattr(cli, "run_pipeline", lambda request: captured.append(request) or 0)
+
+    assert main(["-i", "model.feb", "--non-interactive"]) == 0
+    assert captured[0].input_feb == Path("model.feb")

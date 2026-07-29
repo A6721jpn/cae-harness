@@ -46,6 +46,13 @@ class RunArtifacts:
     def final_log(self) -> Path:
         return self.job_feb.with_suffix(".log")
 
+    def archive_existing_outputs(self) -> None:
+        previous = self.run_dir / "previous"
+        for target in (self.final_xplt, self.final_log):
+            if target.exists():
+                previous.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(target), previous / target.name)
+
     def promote_success(self) -> None:
         for source, target in (
             (self.solver_xplt, self.final_xplt),

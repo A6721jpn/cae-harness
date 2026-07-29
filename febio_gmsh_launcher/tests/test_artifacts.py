@@ -29,3 +29,16 @@ def test_success_promotion_is_atomic_and_deferred(tmp_path: Path) -> None:
 
     assert final_xplt.read_bytes() == b"new-result"
     assert final_log.read_text(encoding="utf-8") == "new-log"
+
+
+def test_existing_studio_outputs_are_archived_before_run(tmp_path: Path) -> None:
+    job = tmp_path / "model.feb"
+    job.with_suffix(".xplt").write_bytes(b"previous")
+    job.with_suffix(".log").write_text("previous-log", encoding="utf-8")
+    artifacts = RunArtifacts.create(job)
+
+    artifacts.archive_existing_outputs()
+
+    assert not job.with_suffix(".xplt").exists()
+    assert not job.with_suffix(".log").exists()
+    assert (artifacts.run_dir / "previous" / "model.xplt").read_bytes() == b"previous"

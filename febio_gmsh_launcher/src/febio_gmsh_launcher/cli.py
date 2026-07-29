@@ -36,13 +36,22 @@ def parse_febio_args(argv: Sequence[str]) -> LaunchRequest:
     )
 
 
+def run_pipeline(request: LaunchRequest) -> int:
+    from .orchestrator import run_pipeline as orchestrate
+
+    return int(orchestrate(request))
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     try:
-        parse_febio_args(sys.argv[1:] if argv is None else argv)
+        request = parse_febio_args(sys.argv[1:] if argv is None else argv)
+        return run_pipeline(request)
     except LauncherError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return int(exc.exit_code)
-    return int(ExitCode.SUCCESS)
+    except Exception as exc:
+        print(f"INTERNAL ERROR: {exc}", file=sys.stderr)
+        return int(ExitCode.INTERNAL_ERROR)
 
 
 if __name__ == "__main__":
