@@ -43,8 +43,10 @@ the provisional 46.17 MPa basis.
 
 ## Persistence
 
-Save the configured result as a separate FEBio Studio post project beside the
-completed result files. Do not overwrite the `.feb`, `.log`, or `.xplt`.
+Save the configured result as
+`C:\dev\FEBio\jobs\jobs\02_Bottom_Frame,0729_CAE_VM_FOS.fsps`, a FEBio Studio
+post-session file beside the completed result files. Do not overwrite the
+`.feb`, `.log`, or `.xplt`.
 
 Use explicit field names containing `46p17MPa` so the provisional basis cannot
 be mistaken for a material-qualified allowable.
