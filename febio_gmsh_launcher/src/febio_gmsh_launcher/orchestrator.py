@@ -101,9 +101,7 @@ def run_pipeline(
                 required_domains,
                 config.gmsh,
                 config.quality,
-                mapping_tolerance=max(
-                    1e-7, config.gmsh.min_size_mm * 1e-4
-                ),
+                mapping_tolerance=config.gmsh.mapping_tolerance_mm,
             )
         with stage("FEBio model translation", log.emit):
             selected.translator(input_feb, mesh, artifacts.translated_feb)

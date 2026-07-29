@@ -12,6 +12,7 @@ from .errors import ExitCode, LauncherError
 class GmshConfig:
     target_size_mm: float
     min_size_mm: float
+    mapping_tolerance_mm: float = 1e-5
     algorithm3d: int = 10
     curvature_elements_per_2pi: int = 20
     heal: bool = False
@@ -101,6 +102,12 @@ def load_run_config(path: Path, expected_model_stem: str) -> RunConfig:
         gmsh = GmshConfig(
             target_size_mm=float(gmsh_raw["target_size_mm"]),
             min_size_mm=float(gmsh_raw["min_size_mm"]),
+            mapping_tolerance_mm=float(
+                gmsh_raw.get(
+                    "mapping_tolerance_mm",
+                    max(1e-7, float(gmsh_raw["min_size_mm"]) * 1e-4),
+                )
+            ),
             algorithm3d=int(gmsh_raw.get("algorithm3d", 10)),
             curvature_elements_per_2pi=int(
                 gmsh_raw.get("curvature_elements_per_2pi", 20)
@@ -121,7 +128,11 @@ def load_run_config(path: Path, expected_model_stem: str) -> RunConfig:
         febio_exe = Path(str(raw["febio_exe"])).expanduser()
     except (KeyError, TypeError, ValueError) as exc:
         raise _config_error(f"Invalid configuration value: {exc}") from exc
-    if gmsh.target_size_mm <= 0 or gmsh.min_size_mm <= 0:
+    if (
+        gmsh.target_size_mm <= 0
+        or gmsh.min_size_mm <= 0
+        or gmsh.mapping_tolerance_mm <= 0
+    ):
         raise _config_error("Mesh sizes must be positive")
     return RunConfig(
         path=resolved,

@@ -16,7 +16,11 @@ def _write_config(path: Path, step: Path, model_stem: str = "model") -> Path:
                 "model_stem": model_stem,
                 "step_path": str(step),
                 "step_sha256": hashlib.sha256(step.read_bytes()).hexdigest(),
-                "gmsh": {"target_size_mm": 2.0, "min_size_mm": 0.2},
+                "gmsh": {
+                    "target_size_mm": 2.0,
+                    "min_size_mm": 0.2,
+                    "mapping_tolerance_mm": 0.002,
+                },
                 "quality": {"min_det_j": 0.0},
                 "febio_exe": r"C:\Program Files\FEBioStudio\bin\febio4.exe",
             }
@@ -32,6 +36,14 @@ def test_explicit_config_wins(tmp_path: Path) -> None:
     explicit = _write_config(tmp_path / "explicit.json", step)
 
     assert resolve_config(tmp_path / "model.feb", explicit) == explicit.resolve()
+
+
+def test_loads_explicit_surface_mapping_tolerance(tmp_path: Path) -> None:
+    step = tmp_path / "part.step"
+    step.write_bytes(b"step")
+    path = _write_config(tmp_path / "model.gmsh-run.json", step)
+
+    assert load_run_config(path, "model").gmsh.mapping_tolerance_mm == 0.002
 
 
 def test_config_is_found_up_to_three_parents(tmp_path: Path) -> None:
