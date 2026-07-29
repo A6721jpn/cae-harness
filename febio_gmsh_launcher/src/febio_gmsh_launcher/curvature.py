@@ -37,13 +37,42 @@ def relax_invalid_midnodes(
             ExitCode.QUALITY_ERROR,
         )
     targets: dict[int, list[np.ndarray]] = {}
-    for element_index in initial.invalid_indices:
-        element = elements[element_index]
-        for offset, (left, right) in enumerate(_EDGE_CORNERS, start=4):
-            targets.setdefault(int(element[offset]), []).append(
-                (original[element[left]] + original[element[right]]) / 2.0
+
+    def include_elements(element_indices: np.ndarray) -> int:
+        before = len(targets)
+        for element_index in element_indices:
+            element = elements[element_index]
+            for offset, (left, right) in enumerate(_EDGE_CORNERS, start=4):
+                midpoint_node = int(element[offset])
+                midpoint = (
+                    original[element[left]] + original[element[right]]
+                ) / 2.0
+                values = targets.setdefault(midpoint_node, [])
+                if not any(np.array_equal(midpoint, value) for value in values):
+                    values.append(midpoint)
+        return len(targets) - before
+
+    include_elements(initial.invalid_indices)
+    while True:
+        node_ids = np.array(sorted(targets), dtype=np.int64)
+        straight = np.stack(
+            [np.mean(targets[int(node)], axis=0) for node in node_ids], axis=0
+        )
+        fully_straight = original.copy()
+        fully_straight[node_ids] = straight
+        straight_report = evaluate_tet10_quality(
+            fully_straight, elements, min_det_j=config.min_det_j
+        )
+        if straight_report.invalid_count == 0:
+            break
+        if np.any(straight_report.corner_volumes[straight_report.invalid_indices] <= 0):
+            raise LauncherError(
+                "Curvature repair exposed an invalid corner Tet4",
+                ExitCode.QUALITY_ERROR,
             )
-    node_ids = np.array(sorted(targets), dtype=np.int64)
+        if include_elements(straight_report.invalid_indices) == 0:
+            assert_quality_gate(straight_report)
+
     fraction = len(node_ids) / max(len(original), 1)
     if fraction > config.max_corrected_fraction:
         raise LauncherError(
@@ -51,9 +80,6 @@ def relax_invalid_midnodes(
             f"{config.max_corrected_fraction:.6g}",
             ExitCode.QUALITY_ERROR,
         )
-    straight = np.stack(
-        [np.mean(targets[int(node)], axis=0) for node in node_ids], axis=0
-    )
     displacement = np.linalg.norm(original[node_ids] - straight, axis=1)
     maximum = float(displacement.max(initial=0.0))
     if maximum > config.max_displacement_mm:
@@ -68,11 +94,6 @@ def relax_invalid_midnodes(
         result[node_ids] = straight + alpha * (original[node_ids] - straight)
         return result
 
-    fully_straight = candidate(0.0)
-    straight_report = evaluate_tet10_quality(
-        fully_straight, elements, min_det_j=config.min_det_j
-    )
-    assert_quality_gate(straight_report)
     low, high = 0.0, 1.0
     for _ in range(45):
         middle = (low + high) / 2.0
