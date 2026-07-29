@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<febio_spec version="4.0">
+  <Module type="solid"/>
+  <Material><material id="1" name="mat" type="neo-Hookean"/></Material>
+  <Mesh>
+    <Nodes name="Part1">
+      <node id="1">0,0,0</node><node id="2">1,0,0</node>
+      <node id="3">0,1,0</node><node id="4">0,0,1</node>
+    </Nodes>
+    <Elements type="tet4" name="Part1"><elem id="1">1,2,3,4</elem></Elements>
+    <Surface name="Fixed"><tri3 id="1">1,3,2</tri3></Surface>
+    <Surface name="Loaded"><tri3 id="1">1,2,4</tri3></Surface>
+  </Mesh>
+  <MeshDomains><SolidDomain name="Part1" mat="mat"/></MeshDomains>
+  <Boundary><bc name="fix" node_set="@surface:Fixed" type="zero displacement"/></Boundary>
+  <Step><step id="1" name="Step1"><Boundary>
+    <bc name="push" surface="Loaded" type="normal displacement"/>
+  </Boundary></step></Step>
+</febio_spec>

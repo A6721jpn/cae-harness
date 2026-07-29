@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "model_stem": "02_Bottom_Frame_FEBio_Tet10",
+  "step_path": "C:\\Users\\backo\\Downloads\\02_Bottom Frame_v1.0,0728_C.step",
+  "step_sha256": "2c6ba30347d859e1306767137d8d51aa4f23200e864319d8e45e46bf873dabb6",
+  "gmsh": {
+    "target_size_mm": 2.0,
+    "min_size_mm": 0.1,
+    "mapping_tolerance_mm": 0.002,
+    "algorithm3d": 10,
+    "curvature_elements_per_2pi": 20
+  },
+  "quality": {
+    "min_det_j": 0.0,
+    "min_alpha": 0.0,
+    "max_corrected_fraction": 0.02,
+    "max_displacement_mm": 1.0
+  },
+  "febio_exe": "C:\\Program Files\\FEBioStudio\\bin\\febio4.exe"
+}
