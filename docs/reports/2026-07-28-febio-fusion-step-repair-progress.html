@@ -1,0 +1,888 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>FEBio ABS解析・STEP修復・Fusion監視アドイン 進捗レポート</title>
+  <style>
+    :root {
+      --ink: #172033;
+      --muted: #5d687a;
+      --line: #d8e0ea;
+      --paper: #fff;
+      --canvas: #edf2f6;
+      --navy: #12355b;
+      --blue: #1769aa;
+      --teal: #087f8c;
+      --amber: #9a5b00;
+      --red: #a9362b;
+      --green: #2e6b46;
+      --soft-blue: #edf6ff;
+      --soft-teal: #ebf8f7;
+      --soft-amber: #fff6e5;
+      --soft-red: #fff0ee;
+      --soft-green: #edf7f0;
+      --radius: 14px;
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; background: var(--canvas); }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background: linear-gradient(180deg, #e9f0f7 0, var(--canvas) 420px);
+      font-family: "Yu Gothic UI", "Yu Gothic", "Hiragino Kaku Gothic ProN",
+        "Noto Sans JP", system-ui, sans-serif;
+      font-size: 15px;
+      line-height: 1.75;
+    }
+    a { color: var(--blue); text-underline-offset: 3px; overflow-wrap: anywhere; }
+    a:focus-visible, summary:focus-visible {
+      outline: 3px solid #ffbf47;
+      outline-offset: 3px;
+      border-radius: 3px;
+    }
+    .page {
+      width: min(1160px, calc(100% - 32px));
+      margin: 30px auto 72px;
+      background: var(--paper);
+      border: 1px solid var(--line);
+      border-radius: 20px;
+      box-shadow: 0 18px 50px rgba(18, 53, 91, .10);
+      overflow: hidden;
+    }
+    .hero {
+      padding: 52px 58px 42px;
+      color: #fff;
+      background:
+        radial-gradient(circle at 90% 5%, rgba(255,255,255,.18), transparent 32%),
+        linear-gradient(135deg, var(--navy), #164c7e 68%, var(--teal));
+    }
+    .eyebrow {
+      margin: 0 0 10px;
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: .12em;
+      text-transform: uppercase;
+      opacity: .84;
+    }
+    h1, h2, h3 { line-height: 1.42; letter-spacing: .01em; }
+    h1 { max-width: 900px; margin: 0; font-size: clamp(28px, 4.6vw, 46px); }
+    .subtitle { max-width: 880px; margin: 15px 0 0; font-size: 17px; opacity: .92; }
+    .meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 18px;
+      margin-top: 26px;
+      padding-top: 18px;
+      border-top: 1px solid rgba(255,255,255,.28);
+      font-size: 13px;
+    }
+    .layout { display: grid; grid-template-columns: 240px minmax(0, 1fr); }
+    nav {
+      align-self: start;
+      position: sticky;
+      top: 16px;
+      max-height: calc(100vh - 32px);
+      overflow: auto;
+      padding: 30px 22px;
+      border-right: 1px solid var(--line);
+      background: #f7f9fc;
+    }
+    nav strong {
+      display: block;
+      margin-bottom: 10px;
+      color: var(--navy);
+      font-size: 13px;
+      letter-spacing: .06em;
+    }
+    nav ol { margin: 0; padding-left: 1.25em; }
+    nav li { margin: 8px 0; }
+    nav a { color: #33465d; text-decoration: none; }
+    nav a:hover { color: var(--blue); text-decoration: underline; }
+    main { min-width: 0; padding: 40px 54px 70px; }
+    section { scroll-margin-top: 20px; margin: 0 0 48px; }
+    h2 {
+      margin: 0 0 19px;
+      padding: 9px 0 10px 16px;
+      color: var(--navy);
+      border-left: 5px solid var(--blue);
+      border-bottom: 1px solid var(--line);
+      font-size: 24px;
+    }
+    h3 { margin: 28px 0 10px; color: #263d58; font-size: 18px; }
+    p { margin: 10px 0; }
+    ul, ol { padding-left: 1.55em; }
+    li { margin: 5px 0; }
+    .summary-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 14px;
+    }
+    .summary-card {
+      padding: 18px;
+      border: 1px solid var(--line);
+      border-top: 4px solid var(--blue);
+      border-radius: var(--radius);
+      background: #fff;
+    }
+    .summary-card strong { display: block; margin-bottom: 5px; color: var(--navy); }
+    .summary-card.go { border-top-color: var(--green); }
+    .summary-card.hold { border-top-color: var(--amber); }
+    .summary-card.stop { border-top-color: var(--red); }
+    .status {
+      display: inline-block;
+      margin: 2px 6px 2px 0;
+      padding: 2px 9px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: .04em;
+    }
+    .status.done { color: #185334; background: #dff2e5; }
+    .status.partial { color: #744800; background: #ffecc2; }
+    .status.pending { color: #753027; background: #ffe1dd; }
+    .callout, [data-evidence-type] {
+      margin: 16px 0;
+      padding: 14px 16px;
+      border: 1px solid var(--line);
+      border-left: 5px solid var(--blue);
+      border-radius: 8px;
+      background: var(--soft-blue);
+    }
+    [data-evidence-type]::before {
+      display: block;
+      margin-bottom: 4px;
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+    .evidence--published { border-left-color: var(--blue); background: var(--soft-blue); }
+    .evidence--published::before { content: "Published / 記録済み事実"; color: var(--blue); }
+    .evidence--assumption { border-left-color: var(--amber); background: var(--soft-amber); }
+    .evidence--assumption::before { content: "Assumption / 仮定"; color: var(--amber); }
+    .evidence--calculation { border-left-color: var(--teal); background: var(--soft-teal); }
+    .evidence--calculation::before { content: "Calculation / 計算結果"; color: var(--teal); }
+    .evidence--inference { border-left-color: var(--green); background: var(--soft-green); }
+    .evidence--inference::before { content: "Inference / 技術判断"; color: var(--green); }
+    .caution { border-left-color: var(--red); background: var(--soft-red); }
+    .recommendation { border-left-color: var(--green); background: var(--soft-green); }
+    .table-wrap {
+      margin: 17px 0 22px;
+      overflow-x: auto;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+    }
+    table { width: 100%; min-width: 680px; border-collapse: collapse; font-size: 14px; }
+    th, td {
+      padding: 11px 12px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+    }
+    th { color: #fff; background: var(--navy); font-weight: 700; }
+    tr:last-child td { border-bottom: 0; }
+    tbody tr:nth-child(even) { background: #f8fafc; }
+    .equation {
+      margin: 16px 0;
+      padding: 15px 18px;
+      overflow-x: auto;
+      border: 1px solid #cbd9e8;
+      border-radius: 8px;
+      color: #102d4b;
+      background: #f4f8fc;
+      font-family: "Cambria Math", "Times New Roman", serif;
+      font-size: 17px;
+      text-align: center;
+      white-space: nowrap;
+    }
+    code {
+      padding: .12em .34em;
+      border-radius: 4px;
+      background: #eef1f5;
+      font-family: "Cascadia Code", ui-monospace, monospace;
+      font-size: .92em;
+      overflow-wrap: anywhere;
+    }
+    .timeline { position: relative; margin: 20px 0 0 8px; padding-left: 28px; }
+    .timeline::before {
+      content: "";
+      position: absolute;
+      left: 6px;
+      top: 8px;
+      bottom: 8px;
+      width: 2px;
+      background: #bed0e2;
+    }
+    .timeline-item { position: relative; margin: 0 0 22px; }
+    .timeline-item::before {
+      content: "";
+      position: absolute;
+      left: -28px;
+      top: 8px;
+      width: 14px;
+      height: 14px;
+      border: 3px solid #fff;
+      border-radius: 50%;
+      background: var(--blue);
+      box-shadow: 0 0 0 2px #9db8d1;
+    }
+    .timeline-item time {
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: .05em;
+    }
+    .timeline-item strong { color: var(--navy); }
+    .sources { display: grid; gap: 12px; }
+    .source-card {
+      padding: 15px 17px;
+      border: 1px solid var(--line);
+      border-radius: 9px;
+      background: #fbfcfe;
+    }
+    .source-card strong { display: block; color: var(--navy); }
+    .muted { color: var(--muted); }
+    .small { font-size: 13px; }
+    @media (max-width: 860px) {
+      .page { width: min(100% - 20px, 760px); margin-top: 10px; }
+      .hero { padding: 36px 26px 30px; }
+      .layout { display: block; }
+      nav {
+        position: static;
+        max-height: none;
+        padding: 20px 26px;
+        border-right: 0;
+        border-bottom: 1px solid var(--line);
+      }
+      nav ol { columns: 2; column-gap: 28px; }
+      main { padding: 32px 26px 54px; }
+      .summary-grid { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 520px) {
+      body { font-size: 14px; }
+      .page { width: 100%; margin: 0; border: 0; border-radius: 0; }
+      .hero, main, nav { padding-left: 18px; padding-right: 18px; }
+      nav ol { columns: 1; }
+      h2 { font-size: 21px; }
+      .meta { display: grid; gap: 4px; }
+    }
+    @media print {
+      @page { margin: 14mm; }
+      html, body { background: #fff; }
+      body { color: #000; font-size: 10.5pt; }
+      .page { width: 100%; margin: 0; border: 0; box-shadow: none; }
+      .hero { padding: 0 0 18px; color: #000; background: none; border-bottom: 2px solid #000; }
+      .meta { border-top-color: #999; }
+      .layout { display: block; }
+      nav { display: none; }
+      main { padding: 24px 0 0; }
+      section { break-inside: auto; margin-bottom: 28px; }
+      h2, h3 { break-after: avoid; }
+      .summary-card, .callout, [data-evidence-type], .table-wrap, .source-card {
+        break-inside: avoid;
+      }
+      a { color: #000; text-decoration: none; }
+      a[href^="http"]::after { content: " (" attr(href) ")"; font-size: 8pt; }
+      table { min-width: 0; font-size: 9pt; }
+      th { color: #000; background: #e7e7e7; }
+    }
+  </style>
+</head>
+<body>
+  <article class="page">
+    <header class="hero">
+      <p class="eyebrow">Engineering progress report</p>
+      <h1>FEBio ABS解析・STEP修復・Fusion監視アドイン 進捗レポート</h1>
+      <p class="subtitle">
+        Terluran GP-22の非線形解析準備から、Bottom Frameのメッシュ障害調査、
+        Tet10成果物、Fusionによる選択的デフィーチャ監視までを、確認済み事実と未完事項に分けて整理する。
+      </p>
+      <div class="meta">
+        <span>作成日: 2026-07-28</span>
+        <span>対象: 02 Bottom Frame / V2.3_Assy</span>
+        <span>判断: 実設計トライアルへの移行可否</span>
+        <span>言語: 日本語</span>
+      </div>
+    </header>
+
+    <div class="layout">
+      <nav aria-label="レポート目次">
+        <strong>CONTENTS</strong>
+        <ol>
+          <li><a href="#executive-summary">要約</a></li>
+          <li><a href="#context">背景と判断課題</a></li>
+          <li><a href="#scope">範囲・条件・仮定</a></li>
+          <li><a href="#method">調査・検証方法</a></li>
+          <li><a href="#data">確認済みデータ</a></li>
+          <li><a href="#calculation">計算確認</a></li>
+          <li><a href="#results">進捗と解釈</a></li>
+          <li><a href="#recommendations">推奨アクション</a></li>
+          <li><a href="#verification">次回検証計画</a></li>
+          <li><a href="#limitations">限界・未解決事項</a></li>
+          <li><a href="#references">根拠資料</a></li>
+        </ol>
+      </nav>
+
+      <main>
+        <section id="executive-summary" data-report-section="executive-summary">
+          <h2>1. エグゼクティブサマリー</h2>
+          <div class="summary-grid">
+            <div class="summary-card hold">
+              <strong>ABS材料モデル</strong>
+              <span class="status partial">調査済み・校正未完</span>
+              <p>Terluran GP-22固有の実験曲線に基づくFEBio材料カードは未確定。NPLのABSモデルは候補モデルの根拠であり、そのまま転用する値ではない。</p>
+            </div>
+            <div class="summary-card go">
+              <strong>形状・Tet10メッシュ</strong>
+              <span class="status done">成果物生成・読込確認済み</span>
+              <p>82,882個の直線幾何型Tet10を生成し、FEBio Studio 3.1.0でC3D10 INPを実読込済み。ただし低品質238要素の位置確認が解析前に必要。</p>
+            </div>
+            <div class="summary-card hold">
+              <strong>Fusion修復モニタ</strong>
+              <span class="status partial">基準出力まで実機確認済み</span>
+              <p>複数ボディを含むコンポーネントでも、選択した1ボディを監視・単独STEP出力できた。実際の面削除後の自動比較とUndoは未実施。</p>
+            </div>
+          </div>
+
+          <div class="callout recommendation">
+            <strong>現在の判断:</strong>
+            実設計の原本ではなく<strong>使い捨てコピー</strong>を用いる条件で、
+            Fusion標準の面削除→自動STEP比較→Undoまでのトライアルへ進んでよい。
+            一方、Terluran GP-22の本解析開始は、材料曲線の校正と低品質要素の位置評価が終わるまで保留する。
+          </div>
+
+          <div class="evidence--inference" data-evidence-type="inference">
+            最大の残存リスクはソフトウェアの基本動作ではなく、(1) 面削除が実形状で意図したhealになるか、
+            (2) OpenCascadeの差分演算がこの形状で安定するか、(3) 低品質要素が荷重・接触・応力集中部に重なるか、
+            (4) GP-22固有の非線形応答を再現できるか、の4点である。
+          </div>
+        </section>
+
+        <section id="context" data-report-section="context">
+          <h2>2. 背景と判断課題</h2>
+          <p>
+            出発点は、射出成形ABS樹脂Terluran GP-22を用いた幾何学的・材料非線形解析である。
+            FEBio Studio上で材料・Solid formulation・メッシュ条件を検討したが、
+            Bottom FrameのSTEP形状をメッシュ生成すると、粗い条件や二次要素OFFでもクラッシュした。
+          </p>
+          <p>
+            調査により、単純なメッシュ密度の問題ではなく、極短辺・微小面・スリバー面を含むB-Repトポロジーが
+            メッシャを不安定化させることが主因と判断された。外部自動ヒーリングだけでは形状品質とメッシュ品質を
+            同時に満たせなかったため、Fusionの標準面削除/healを人が実行し、その前後を外部比較する安全指向の
+            監視アドインへ方針を展開した。
+          </p>
+
+          <div class="evidence--published" data-evidence-type="published">
+            Autodeskの現行Fusion APIでは、STEP出力対象として現在有効なのはComponentである。
+            そのため、選択BRepBodyだけを出力する実装では、同一Component内の他ボディを一時的に非表示にし、
+            非表示ボディを含めずComponentを出力する必要がある
+            <a href="#ref-fusion-api">[R12]</a>。
+          </div>
+
+          <h3>このレポートが支える判断</h3>
+          <ul>
+            <li>Fusionアドインを、実形状の面削除トライアルへ進められるか。</li>
+            <li>現在のTet10成果物を、非線形解析モデル作成の開始点として使えるか。</li>
+            <li>Terluran GP-22材料カードについて、何が確定し、何が校正待ちか。</li>
+          </ul>
+        </section>
+
+        <section id="scope" data-report-section="scope">
+          <h2>3. 範囲・条件・仮定</h2>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr><th>項目</th><th>本レポートの対象</th><th>対象外または未確定</th></tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td>材料</td>
+                  <td>ABS候補モデル、FEBioの材料ファミリ、校正に必要な情報</td>
+                  <td>GP-22固有の確定カード、温度・速度・成形異方性を含む許容値</td>
+                </tr>
+                <tr>
+                  <td>形状</td>
+                  <td>02 Bottom FrameのSTEP、修復候補、0728_C、Fusion実アセンブリの選択ボディ</td>
+                  <td>他部品への一般化、元パラメトリックCADの恒久修正</td>
+                </tr>
+                <tr>
+                  <td>メッシュ</td>
+                  <td>Gmsh HXT、直線幾何型Tet10、C3D10/FSM、品質台帳</td>
+                  <td>荷重・接触を考慮した最終局所細分化、収束性の確定</td>
+                </tr>
+                <tr>
+                  <td>Fusionアドイン</td>
+                  <td>1選択ボディ、追加ボディを含むComponent、単独STEP出力、外部比較</td>
+                  <td>複数選択、サーフェス/メッシュ/T-Spline、自動修復、自動Undo</td>
+                </tr>
+                <tr>
+                  <td>解析</td>
+                  <td>解析準備状況と次の検証ゲート</td>
+                  <td>境界条件、接触、荷重、解析結果、製品判定</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="evidence--assumption" data-evidence-type="assumption">
+            次回の面削除検証は、原本ではなく複製したFusionドキュメントで行い、選択ボディ以外の構造・位置・表示状態を
+            変更しないものとする。置換条件は、実機スモークテストを完了して監視停止・Undo・子プロセス終了まで確認した時点である。
+          </div>
+          <div class="evidence--assumption" data-evidence-type="assumption">
+            初期解析候補としては3Dソリッド、Tet10、Solid formulation=<code>default</code>を出発点とする。
+            ただし要素ロッキング、材料の圧縮性、接触条件、実測収束性により見直す。Poisson比や材料モデルの選択だけで
+            <code>three-field-solid</code>等を先に固定しない。
+          </div>
+        </section>
+
+        <section id="method" data-report-section="method">
+          <h2>4. 調査・検証方法</h2>
+          <ol>
+            <li>材料文献とFEBio実装候補を調査し、公開ABSモデルとGP-22固有カードを区別した。</li>
+            <li>元STEPと修復候補をOpenCascade/Gmshで比較し、体積・外形・トポロジー・メッシュ成否を記録した。</li>
+            <li>0728_Cから直線幾何型Tet10を生成し、MSH/INP/VTUの座標・接続一致、体積、品質を独立検証した。</li>
+            <li>Fusionアドインをテスト駆動で実装し、選択、トークン再解決、表示分離、STEP出力、外部比較を自動試験した。</li>
+            <li>実FusionのV2.3_Assyで、Bottom Frameの1ボディ選択、候補面検出、基準STEP出力、表示状態復元を確認した。</li>
+          </ol>
+
+          <h3>情報源の優先順位</h3>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr><th>優先</th><th>情報源</th><th>適用</th><th>主な限界</th></tr>
+              </thead>
+              <tbody>
+                <tr><td>1</td><td>実Fusionセッション、STEP、JSON、FSM、品質ファイル</td><td>対象形状・対象PCでの事実</td><td>未実施の操作は証明しない</td></tr>
+                <tr><td>2</td><td>自動テスト・配布検証</td><td>実装契約と回帰防止</td><td>Fusion実APIの全挙動は代替しない</td></tr>
+                <tr><td>3</td><td>Autodesk公式API資料</td><td>STEP出力APIの設計根拠</td><td>モデル固有の成否は保証しない</td></tr>
+                <tr><td>4</td><td>NPL一次報告書</td><td>ABS非線形モデル候補</td><td>Terluran GP-22固有データではない</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section id="data" data-report-section="data">
+          <h2>5. 確認済みデータ</h2>
+
+          <h3>5.1 材料モデル調査</h3>
+          <div class="evidence--published" data-evidence-type="published">
+            NPL MATC(A)35は、ゴム強化ABSの引張・圧縮・せん断挙動について、キャビテーション、圧力依存降伏、
+            配向硬化を含む弾塑性モデルを示す。報告対象は23&nbsp;°C、有効ひずみ速度0.004&nbsp;s<sup>−1</sup>、
+            ゴム38 vol%のABSであり、Terluran GP-22のメーカー材料カードではない
+            <a href="#ref-npl">[R1]</a>。
+          </div>
+          <p>
+            FEBio側では、<code>reactive plasticity</code>、ユーザー指定塑性流動曲線、
+            von Mises系、圧力依存系を候補として確認済みである。ただし公開ABS値をそのまま最終カードにせず、
+            GP-22の成形試験片による引張・必要に応じ圧縮データへフィットする方針である。
+          </p>
+
+          <h3>5.2 初期STEP修復とメッシュ試験</h3>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr><th>試験</th><th>結果</th><th>解釈</th></tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td>OpenCascade修復候補</td>
+                  <td>有効ソリッド1、体積差−0.000167%、面数660→655</td>
+                  <td>全体形状の保存性は高い</td>
+                </tr>
+                <tr>
+                  <td>Netgen Tet4 粗</td>
+                  <td><code>Illegal position in Geomsearch</code></td>
+                  <td>クラッシュ誘因は軽減したが、完了メッシュなし</td>
+                </tr>
+                <tr>
+                  <td>Netgen Tet4 細</td>
+                  <td>2面で表面メッシュ失敗、4分超で停止</td>
+                  <td>単純な細分化で解決しない</td>
+                </tr>
+                <tr>
+                  <td>Gmsh HXT 26,722 Tet4</td>
+                  <td>生成完了、最小minSICN=0.0000958</td>
+                  <td>非線形解析品質として不十分</td>
+                </tr>
+                <tr>
+                  <td>Gmsh 834,098 Tet4</td>
+                  <td>最小minSICN=0.00393</td>
+                  <td>大規模化しても局所品質が低い</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <p class="small muted">出典: 修復・メッシュ報告 <a href="#ref-repair-report">[R2]</a>。</p>
+
+          <h3>5.3 0728_C 直線幾何型Tet10成果物</h3>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr><th>指標</th><th>値</th><th>状態</th></tr>
+              </thead>
+              <tbody>
+                <tr><td>節点数</td><td>150,533</td><td>MSH/INP/VTU一致</td></tr>
+                <tr><td>Tet10要素数</td><td>82,882</td><td>FEBio Studio 3.1.0でC3D10実読込済み</td></tr>
+                <tr><td>非正のminSICN</td><td>0要素</td><td>反転なし</td></tr>
+                <tr><td>非正の四隅節点体積</td><td>0要素</td><td>一次幾何として反転なし</td></tr>
+                <tr><td>最小minSICN</td><td>9.9956×10<sup>−5</sup></td><td>局所的に非常に低い</td></tr>
+                <tr><td>minSICN &lt; 0.10</td><td>238要素</td><td>位置台帳CSV/VTUあり</td></tr>
+                <tr><td>CAD体積</td><td>4,662.197833 mm³</td><td>基準</td></tr>
+                <tr><td>メッシュ体積</td><td>4,661.592084 mm³</td><td>差 −0.01299%</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p class="small muted">
+            出典: Tet10 README、品質サマリ、配布検証 <a href="#ref-tet10-readme">[R3]</a>
+            <a href="#ref-tet10-validation">[R4]</a>
+            <a href="#ref-quality-summary">[R5]</a>。
+          </p>
+
+          <h3>5.4 Fusionアドインと実機確認</h3>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr><th>確認項目</th><th>結果</th><th>根拠</th></tr>
+              </thead>
+              <tbody>
+                <tr><td>Component内の追加ボディ</td><td>選択1ボディなら許可</td><td>設計・実装・回帰テスト</td></tr>
+                <tr><td>Occurrence proxy token</td><td>active assembly解決用に保持</td><td>実機不具合再現後に修正</td></tr>
+                <tr><td>単独STEP出力</td><td>他ボディを一時非表示、非表示ボディ除外、finallyで復元</td><td>実装・成功/失敗テスト</td></tr>
+                <tr><td>実対象</td><td>02_Bottom Frame_v1.0 / ボディ1</td><td>V2.3_Assy</td></tr>
+                <tr><td>候補面</td><td>147面</td><td>Fusionパレット実表示</td></tr>
+                <tr><td>基準STEP</td><td>1ソリッド、valid、closed</td><td>実セッションmetrics</td></tr>
+                <tr><td>表示状態復元</td><td>Body1=on、screw R=off、screw L=off</td><td>実機確認</td></tr>
+                <tr><td>全自動テスト</td><td>90 passed / 75.58 s</td><td>2026-07-28再実行</td></tr>
+                <tr><td>配布検証</td><td>PASS、自己完結step_compare.exeを含む</td><td>dist/verification.json</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="evidence--published" data-evidence-type="published">
+            最新実セッションの基準形状は、面660、辺1,891、頂点1,242、体積4,662.197833&nbsp;mm³、
+            外形53.975584 × 72.924769 × 16.540000&nbsp;mm、validかつclosed solidである。
+            ただし対称差Booleanは、同一形状にもかかわらず不整合なcut結果を返したため数値を抑止し、
+            <code>WARNING</code>とした <a href="#ref-session">[R9]</a>。
+          </div>
+        </section>
+
+        <section id="calculation" data-report-section="calculation">
+          <h2>6. 計算確認</h2>
+
+          <h3>6.1 初期修復候補の体積保存</h3>
+          <div class="equation">
+            ΔV% = (4,674.941466 − 4,674.949283) / 4,674.949283 × 100
+            = −0.000167%
+          </div>
+          <div class="evidence--calculation" data-evidence-type="calculation">
+            <strong>目的:</strong> 修復候補が全体体積を大きく変えていないか。<br>
+            <strong>入力:</strong> 元形状4,674.949283 mm³、候補4,674.941466 mm³（記録済み事実）。<br>
+            <strong>境界条件:</strong> STEP形状同士の静的比較。荷重・材料なし。<br>
+            <strong>基準:</strong> 監視ツールの既定FAIL限界0.01%に対して十分小さい。<br>
+            <strong>感度:</strong> 単位、読み込むSTEP版、微小体積の数値許容差。
+          </div>
+
+          <h3>6.2 Tet10の体積表現誤差</h3>
+          <div class="equation">
+            e<sub>V</sub> = (4,661.592084 − 4,662.197833) / 4,662.197833 × 100
+            = −0.01299%
+          </div>
+          <div class="evidence--calculation" data-evidence-type="calculation">
+            <strong>目的:</strong> 直線幾何型Tet10の四隅節点体積がCAD体積をどの程度再現するか。<br>
+            <strong>入力:</strong> CAD 4,662.197833 mm³、要素合計4,661.592084 mm³。<br>
+            <strong>結果:</strong> −0.605749 mm³、相対差−0.01299%。<br>
+            <strong>基準:</strong> 配布整合性検証はPASS。製品解析の許容値は未定義のため、工学的合否は未解決。<br>
+            <strong>感度:</strong> 曲面近似、局所要素寸法、直線幾何型の採用。
+          </div>
+
+          <h3>6.3 低品質要素の割合</h3>
+          <div class="equation">
+            r<sub>low</sub> = 238 / 82,882 × 100 = 0.2872%
+          </div>
+          <div class="evidence--calculation" data-evidence-type="calculation">
+            <strong>目的:</strong> <code>minSICN &lt; 0.10</code>要素の規模を把握する。<br>
+            <strong>結果:</strong> 238要素、全体の0.2872%。うち<code>minSICN &lt; 0.01</code>は54要素、0.06515%。<br>
+            <strong>基準:</strong> 割合だけで合否を決めない。荷重点・拘束・接触・応力集中との重なりを判定基準とする。<br>
+            <strong>感度:</strong> CAD極小辺、要素サイズ、曲面追従方式。
+          </div>
+        </section>
+
+        <section id="results" data-report-section="results">
+          <h2>7. 進捗と技術的解釈</h2>
+
+          <h3>7.1 時系列</h3>
+          <div class="timeline">
+            <div class="timeline-item">
+              <time>材料・解析準備</time>
+              <strong>ABS非線形モデル候補を特定</strong>
+              <p>reactive plasticity等の構成を確認。GP-22固有の曲線校正は未完。</p>
+            </div>
+            <div class="timeline-item">
+              <time>FEBio Studioメッシュ障害</time>
+              <strong>粗密・二次要素設定だけではクラッシュ回避せず</strong>
+              <p>形状トポロジー起因へ調査軸を変更。</p>
+            </div>
+            <div class="timeline-item">
+              <time>STEP外部修復</time>
+              <strong>クラッシュ誘因を軽減した修復候補を生成</strong>
+              <p>形状保存性は高いが、Netgen完了メッシュと十分なGmsh品質は得られず。</p>
+            </div>
+            <div class="timeline-item">
+              <time>0728_C メッシュ成果物</time>
+              <strong>直線幾何型Tet10を生成・FEBio Studioで読込</strong>
+              <p>82,882要素、反転なし。低品質238要素を別台帳化。</p>
+            </div>
+            <div class="timeline-item">
+              <time>Fusionアドイン実装</time>
+              <strong>検出→手動面削除→外部比較の監視ループを構築</strong>
+              <p>自動削除や自動Undoは行わない安全設計。</p>
+            </div>
+            <div class="timeline-item">
+              <time>実アセンブリ不具合修正</time>
+              <strong>「Component内で唯一のBody」制約を撤廃</strong>
+              <p>選択したsolid bodyが1個なら、同一Componentの未選択ボディを許可。</p>
+            </div>
+            <div class="timeline-item">
+              <time>2026-07-28 現在</time>
+              <strong>選択・候補表示・単独基準STEP出力まで実機確認</strong>
+              <p>次は使い捨てコピー上での面削除後比較、Undo、基準昇格、停止処理。</p>
+            </div>
+          </div>
+
+          <h3>7.2 到達点</h3>
+          <div class="evidence--inference" data-evidence-type="inference">
+            最初の「FEBio Studioがメッシュ生成時に落ちる」状態から、
+            (a) 直接使えるTet10成果物を別ルートで得る、
+            (b) CAD側の局所修復を定量監視する、という2つの実務ルートが確立した。
+            これにより、作業は原因不明のクラッシュ調査から、局所品質と修復差分を管理する段階へ進んだ。
+          </div>
+
+          <h3>7.3 まだ完了とは言えない理由</h3>
+          <ul>
+            <li>Fusionで候補面を実際に削除した後の自動candidate STEP出力は、最新実機検証では未実施。</li>
+            <li>OpenCascadeの対称差Booleanは対象形状で不安定で、体積・外形・validity等の代替指標が重要。</li>
+            <li>Tet10には反転はないが、極端に低いminSICN要素が局所的に残る。</li>
+            <li>材料、単位系、境界条件、接触、荷重を設定した解析モデルはまだ作成していない。</li>
+            <li>実装変更は作業ツリーに未コミット変更を含み、リリース凍結状態ではない。</li>
+          </ul>
+        </section>
+
+        <section id="recommendations" data-report-section="recommendations">
+          <h2>8. 推奨アクション</h2>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>優先</th><th>アクション</th><th>対処するリスク</th>
+                  <th>期待効果・トレードオフ</th><th>完了判定</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td>1</td>
+                  <td>Fusionドキュメントのコピーで候補面を1つ削除し、全監視ループを通す</td>
+                  <td>実API/実形状での未確認経路</td>
+                  <td>最重要のE2E証拠を得る。失敗時はコピーを破棄できる</td>
+                  <td>candidate STEP、結果JSON、Undo、停止後プロセス0件</td>
+                </tr>
+                <tr>
+                  <td>2</td>
+                  <td>低品質238要素を荷重・接触・拘束・応力集中領域と重ねる</td>
+                  <td>局所数値誤差</td>
+                  <td>影響がなければ現メッシュを試解析に使用可能。重なる場合はCAD修正が必要</td>
+                  <td>CSV/VTU上の該当領域レビュー記録</td>
+                </tr>
+                <tr>
+                  <td>3</td>
+                  <td>GP-22成形試験片の引張曲線を準備し、最小構成の材料モデルへフィット</td>
+                  <td>材料カードの非移植性</td>
+                  <td>実部品に近い応答。試験コストと条件管理が必要</td>
+                  <td>初期剛性、降伏、塑性域、除荷の目標誤差を満足</td>
+                </tr>
+                <tr>
+                  <td>4</td>
+                  <td>粗・中・細のメッシュ収束と荷重増分収束を確認</td>
+                  <td>単一メッシュ依存</td>
+                  <td>変位・反力・関心部ひずみの安定性を評価。計算時間増</td>
+                  <td>主要応答差の合意済み閾値以内</td>
+                </tr>
+                <tr>
+                  <td>5</td>
+                  <td>実装を整理し、全テスト後にリリース候補を固定</td>
+                  <td>未コミット変更と配布物の不一致</td>
+                  <td>再現可能な版を作れる。並行変更の整理が必要</td>
+                  <td>90テストPASS、配布検証PASS、実機チェックリスト完了</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section id="verification" data-report-section="verification">
+          <h2>9. 次回検証計画</h2>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>試験</th><th>条件・制御変数</th><th>測定出力</th>
+                  <th>受入基準</th><th>タイミング・試料数</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td>Fusion面削除E2E</td>
+                  <td>V2.3_Assyのコピー、Bottom Frame/Body1、候補面1個</td>
+                  <td>revision、candidate STEP、solid/valid/closed、体積・外形差、結果表示</td>
+                  <td>ERROR/FAILなし。WARNING時は理由を人が確認</td>
+                  <td>削除直後、比較完了後。まず1候補</td>
+                </tr>
+                <tr>
+                  <td>Undo安全性</td>
+                  <td>上記面削除の直後にFusion Undo</td>
+                  <td>形状復帰、revision、監視状態、ドキュメント操作性</td>
+                  <td>原形状復帰、クラッシュなし、監視が整合</td>
+                  <td>面削除E2Eと同一セッション</td>
+                </tr>
+                <tr>
+                  <td>選択ボディ分離</td>
+                  <td>Body1=on、screw R/L=offから出力</td>
+                  <td>STEP solid_count、各light-bulb状態</td>
+                  <td>solid_count=1、全状態が出力前と一致</td>
+                  <td>baselineとcandidateの各出力後</td>
+                </tr>
+                <tr>
+                  <td>低品質要素位置</td>
+                  <td>最終荷重/接触/拘束領域をVTUへ重畳</td>
+                  <td>minSICN&lt;0.10要素との空間重なり</td>
+                  <td>重要領域に重なる要素はCAD修正または局所再メッシュ</td>
+                  <td>解析条件確定時、1モデル</td>
+                </tr>
+                <tr>
+                  <td>材料同定</td>
+                  <td>GP-22、成形方向、温度、速度、含水条件を記録</td>
+                  <td>公称/真応力–ひずみ、横ひずみ、除荷があれば残留</td>
+                  <td>目標曲線誤差は試験データ取得後に設定</td>
+                  <td>最低3試験片/条件を推奨、最終数は試験計画で決定</td>
+                </tr>
+                <tr>
+                  <td>解析収束</td>
+                  <td>粗・中・細、同一材料/接触/荷重履歴</td>
+                  <td>反力、変位、関心部ひずみ、エネルギー、収束履歴</td>
+                  <td>主要応答の差が合意閾値以内、負体積なし</td>
+                  <td>材料校正後、各1解析以上</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section id="limitations" data-report-section="limitations">
+          <h2>10. 限界・未解決事項</h2>
+          <div class="callout caution">
+            <strong>本レポート時点でのNO-GO条件:</strong>
+            GP-22の最終材料カード、製品荷重条件、接触、許容変形、破損判定を仮定して本解析結果を出すこと。
+            これらは未設定であり、現成果物は形状・メッシュ・修復監視までである。
+          </div>
+          <ul>
+            <li>NPLのABSはゴム38 vol%、23 °C、0.004 s<sup>−1</sup>の研究材料で、GP-22の成形品とは適用条件が一致しない。</li>
+            <li>射出成形によるウェルド、残留応力、分子配向、局所板厚、温度、ひずみ速度依存は未導入。</li>
+            <li>直線幾何型Tet10は二次変位補間を維持する一方、CAD曲面への中間節点投影を行わない。</li>
+            <li>minSICNの絶対受入値は、ソルバ・材料・荷重条件に対して普遍ではない。局所位置と収束性で評価する。</li>
+            <li>OpenCascadeのBoolean対称差はこの形状で不安定であり、数値が得られない場合はWARNINGとして扱う。</li>
+            <li>最新Fusion実機試験では、意図的な形状変更を避けたため、面削除後の自動比較経路は未確認。</li>
+            <li>古い0724_A修復候補と最新0728_Cは異なるSTEP版であり、両者の体積差を修復量として横断比較しない。</li>
+          </ul>
+        </section>
+
+        <section id="references" data-report-section="references">
+          <h2>11. 根拠資料</h2>
+          <div class="sources">
+            <div class="source-card" id="ref-npl">
+              <strong>[R1] NPL Report MATC(A)35, 2001</strong>
+              <a href="https://eprintspublications.npl.co.uk/2029/1/matc35.pdf">
+                Effects of Cavity Growth and Orientation Hardening on the Stress/Strain Behaviour of Rubber-toughened Plastics
+              </a>
+              <span class="muted">ABS非線形モデルの一次文献。GP-22固有カードではない。</span>
+            </div>
+            <div class="source-card" id="ref-repair-report">
+              <strong>[R2] Bottom Frame STEP repair and meshing report</strong>
+              <a href="../02_Bottom%20Frame_v1.0,0724_A_repair_report.md">02_Bottom Frame_v1.0,0724_A_repair_report.md</a>
+              <span class="muted">初期修復候補の形状比較、Netgen/Gmsh試験。</span>
+            </div>
+            <div class="source-card" id="ref-tet10-readme">
+              <strong>[R3] 02 Bottom Frame Tet10 README</strong>
+              <a href="../02_Bottom_Frame_Tet10/README_ja.md">02_Bottom_Frame_Tet10/README_ja.md</a>
+              <span class="muted">成果物、生成条件、実読込、局所品質の要約。</span>
+            </div>
+            <div class="source-card" id="ref-tet10-validation">
+              <strong>[R4] Tet10 delivery validation</strong>
+              <a href="../02_Bottom_Frame_Tet10/DELIVERY/validation_report.json">DELIVERY/validation_report.json</a>
+              <span class="muted">座標・接続、要素数、体積、品質台帳の独立検証。</span>
+            </div>
+            <div class="source-card" id="ref-quality-summary">
+              <strong>[R5] Straight Tet10 quality summary</strong>
+              <a href="../02_Bottom_Frame_Tet10/02_Bottom%20Frame_v1.0,0728_C_direct_straight_quality_summary.json">
+                02_Bottom Frame_v1.0,0728_C_direct_straight_quality_summary.json
+              </a>
+              <span class="muted">minSICN、gamma、minSIGE、低品質要素の重心範囲。</span>
+            </div>
+            <div class="source-card" id="ref-design">
+              <strong>[R6] Fusion STEP Repair Monitor design</strong>
+              <a href="../.worktrees/fusion-step-repair-monitor/docs/superpowers/specs/2026-07-27-fusion-step-repair-monitor-design.md">
+                2026-07-27-fusion-step-repair-monitor-design.md
+              </a>
+              <span class="muted">安全設計、比較契約、分類規則、受入基準。</span>
+            </div>
+            <div class="source-card" id="ref-implementation-plan">
+              <strong>[R7] Selected body in multi-body component plan</strong>
+              <a href="../.worktrees/fusion-step-repair-monitor/docs/superpowers/plans/2026-07-28-selected-body-multibody-component.md">
+                2026-07-28-selected-body-multibody-component.md
+              </a>
+              <span class="muted">選択規則、proxy token、単独出力、実機確認計画。</span>
+            </div>
+            <div class="source-card" id="ref-tests">
+              <strong>[R8] Fusion gateway regression tests</strong>
+              <a href="../.worktrees/fusion-step-repair-monitor/fusion_step_repair_monitor/tests/unit/test_candidate_service.py">
+                tests/unit/test_candidate_service.py
+              </a>
+              <span class="muted">複数ボディComponent、proxy token、表示分離・復元のテスト。</span>
+            </div>
+            <div class="source-card" id="ref-session">
+              <strong>[R9] 実Fusionセッション 20260728-213009-V2 3 Assy</strong>
+              <code>C:\Users\backo\AppData\Local\BRepSliverMonitor\sessions\20260728-213009-V2 3 Assy</code>
+              <span class="muted">baseline STEP、session.json、metrics、stdout/stderr。</span>
+            </div>
+            <div class="source-card" id="ref-distribution">
+              <strong>[R10] Distribution verification</strong>
+              <a href="../.worktrees/fusion-step-repair-monitor/fusion_step_repair_monitor/dist/verification.json">
+                dist/verification.json
+              </a>
+              <span class="muted">配布構造、ハッシュ、自己完結比較exe、スモーク。</span>
+            </div>
+            <div class="source-card" id="ref-smoke">
+              <strong>[R11] Fusion smoke verification checklist</strong>
+              <a href="../.worktrees/fusion-step-repair-monitor/fusion_step_repair_monitor/tests/fusion_smoke_checklist.md">
+                tests/fusion_smoke_checklist.md
+              </a>
+              <span class="muted">実機で完了した項目と未完項目。</span>
+            </div>
+            <div class="source-card" id="ref-fusion-api">
+              <strong>[R12] Autodesk Fusion API — createSTEPExportOptions</strong>
+              <a href="https://help.autodesk.com/cloudhelp/ENU/Fusion-360-API/files/ExportManager_createSTEPExportOptions.htm">
+                ExportManager.createSTEPExportOptions Method
+              </a>
+              <span class="muted">STEP出力対象geometryは現在Componentが有効。</span>
+            </div>
+          </div>
+          <p class="small muted">
+            注: ローカル一次資料は2026-07-28時点の作業ツリーおよび実セッションを参照。
+            自動テストは同日に再実行し、90件PASSを確認した。
+          </p>
+        </section>
+      </main>
+    </div>
+  </article>
+</body>
+</html>
