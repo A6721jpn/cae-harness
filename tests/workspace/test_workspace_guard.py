@@ -60,6 +60,32 @@ def test_validate_case_accepts_active_case_with_required_schema(tmp_path: Path):
     assert validate_case(case) == []
 
 
+def test_validate_case_accepts_windows_powershell_utf8_bom(tmp_path: Path):
+    case = tmp_path / "2026-07-30_Project_Case_BOM_r01"
+    for name in (
+        "01_Input",
+        "02_Model",
+        "03_Result",
+        "04_Report",
+        "05_Verification",
+        "90_Temporary",
+    ):
+        (case / name).mkdir(parents=True)
+    manifest = {
+        "schema_version": 1,
+        "analysis_id": case.name,
+        "project": "Project",
+        "status": "active",
+        "git_prohibited": True,
+    }
+    (case / "CASE_MANIFEST.json").write_text(
+        json.dumps(manifest),
+        encoding="utf-8-sig",
+    )
+
+    assert validate_case(case) == []
+
+
 def test_validate_cae_root_rejects_git_marker(tmp_path: Path):
     (tmp_path / "01_Active" / "case" / ".git").mkdir(parents=True)
 

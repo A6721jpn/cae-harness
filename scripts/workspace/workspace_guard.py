@@ -33,7 +33,7 @@ def validate_case(case_dir: Path) -> list[str]:
     if not manifest_path.is_file():
         return ["Missing CASE_MANIFEST.json"]
     try:
-        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        data = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError) as exc:
         return [f"Invalid CASE_MANIFEST.json: {exc}"]
     if data.get("schema_version") != 1:
