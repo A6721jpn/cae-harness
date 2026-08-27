@@ -84,6 +84,52 @@ def test_headless_rejects_raw_attempt_root(tmp_path: Path) -> None:
         run_headless_febio(attempt.root, intent, _forged_runtime(), input_path)  # type: ignore[arg-type]
 
 
+def test_headless_rejects_fully_populated_forged_attempt_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    attempt, intent, input_path = _authority_context(tmp_path, case_id="case-a")
+    runtime = _issued_runtime(tmp_path, monkeypatch)
+    forged = object.__new__(AttemptWorkspace)
+    object.__setattr__(forged, "case_id", attempt.case_id)
+    object.__setattr__(forged, "attempt_id", attempt.attempt_id)
+    object.__setattr__(forged, "root", attempt.root)
+
+    class RejectingSupervisor:
+        def __init__(self, spec: SolverLaunchSpec, **context: object) -> None:
+            del spec, context
+            raise AssertionError("forged AttemptWorkspace reached SolverSupervisor")
+
+    monkeypatch.setattr(headless_module, "SolverSupervisor", RejectingSupervisor)
+
+    with pytest.raises(HeadlessConfigurationError, match="registered|issued|live"):
+        run_headless_febio(forged, intent, runtime, input_path)
+
+
+def test_headless_rejects_mutated_issued_attempt_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    attempt, intent, input_path = _authority_context(tmp_path, case_id="case-a")
+    runtime = _issued_runtime(tmp_path, monkeypatch)
+    del input_path
+    store = object.__getattribute__(intent, "_store")
+    store.record_attempt("attempt-b")
+    intent = store.issue_intent_snapshot()
+    mutated_root = attempt.root.parent / "attempt-b"
+    mutated_input = mutated_root / "model.feb"
+    mutated_input.write_text("synthetic completed FEB", encoding="utf-8")
+    object.__setattr__(attempt, "root", mutated_root)
+
+    class RejectingSupervisor:
+        def __init__(self, spec: SolverLaunchSpec, **context: object) -> None:
+            del spec, context
+            raise AssertionError("mutated AttemptWorkspace reached SolverSupervisor")
+
+    monkeypatch.setattr(headless_module, "SolverSupervisor", RejectingSupervisor)
+
+    with pytest.raises(HeadlessConfigurationError, match="registered|binding|live"):
+        run_headless_febio(attempt, intent, runtime, mutated_input)
+
+
 def test_headless_rejects_foreign_attempt_and_intent(tmp_path: Path) -> None:
     attempt_a, intent_a, input_a = _authority_context(tmp_path / "a", case_id="case-a")
     attempt_b, intent_b, input_b = _authority_context(tmp_path / "b", case_id="case-b")

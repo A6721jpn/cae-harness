@@ -218,12 +218,13 @@ def _validate_context(
             "headless launch requires an exact IntentSnapshotAuthority capability"
         )
     try:
+        root = Path(os.fspath(attempt_workspace))
         case_id = attempt_workspace.case_id
         attempt_id = attempt_workspace.attempt_id
-        root = attempt_workspace.root
         intent_case_id = intent_snapshot.case_id
         intent_id = intent_snapshot.intent_sha256
         intent_case_root = object.__getattribute__(intent_snapshot, "_case_workspace").root
+        os.fspath(attempt_workspace)
     except Exception as error:
         raise HeadlessConfigurationError("headless launch requires live authorities") from error
     if case_id != intent_case_id or intent_case_root != root.parents[2]:
