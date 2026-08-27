@@ -748,8 +748,83 @@ def test_failed_case_creation_final_removal_fails_closed_on_replacement(
 
     monkeypatch.setattr("febio_cae_harness.workspace.shutil.copyfileobj", fail)
 
-    with pytest.raises(WorkspaceBoundaryError, match="cannot remove case root"):
+    if os.name == "nt":
+        with pytest.raises(RuntimeError, match="creation failed"):
+            workspace.create_case("case-a", [source])
+        assert foreign_marker is None
+    else:
+        with pytest.raises(WorkspaceBoundaryError, match="cannot remove case root"):
+            workspace.create_case("case-a", [source])
+        assert foreign_marker is not None
+        assert foreign_marker.read_text(encoding="utf-8") == "foreign"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows handle-bound deletion")
+def test_failed_case_creation_deletes_authoritative_case_not_foreign_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "input.feb"
+    source.write_bytes(b"input")
+    workspace = make_workspace(tmp_path)
+    case_path = workspace.cae_root / "case-a"
+    original_rmdir = Path.rmdir
+    original_identity_stamp = workspace_module._identity_stamp
+    displaced = tmp_path / "displaced-case"
+    identity_checks = 0
+    swapped = False
+
+    def track_identity_stamp(
+        path: str | Path,
+        label: str,
+        expected: tuple[int, int] | None = None,
+    ) -> tuple[int, int]:
+        nonlocal identity_checks
+        stamp = original_identity_stamp(path, label, expected)
+        if Path(path) == case_path and label == "case root":
+            identity_checks += 1
+        return stamp
+
+    def swap_case_path() -> None:
+        nonlocal swapped
+        assert identity_checks > 0
+        case_path.rename(displaced)
+        case_path.mkdir()
+        swapped = True
+
+    def replace_before_final_rmdir(path: Path) -> None:
+        if path == case_path:
+            swap_case_path()
+        original_rmdir(path)
+
+    original_handle_delete = getattr(
+        workspace_module,
+        "_delete_open_directory",
+        None,
+    )
+
+    def replace_before_handle_delete(handle: int, label: str) -> None:
+        swap_case_path()
+        assert original_handle_delete is not None
+        original_handle_delete(handle, label)
+
+    monkeypatch.setattr(workspace_module, "_identity_stamp", track_identity_stamp)
+    monkeypatch.setattr(Path, "rmdir", replace_before_final_rmdir)
+    monkeypatch.setattr(
+        workspace_module,
+        "_delete_open_directory",
+        replace_before_handle_delete,
+        raising=False,
+    )
+
+    def fail(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("creation failed")
+
+    monkeypatch.setattr("febio_cae_harness.workspace.shutil.copyfileobj", fail)
+
+    with pytest.raises(RuntimeError, match="creation failed"):
         workspace.create_case("case-a", [source])
 
-    assert foreign_marker is not None
-    assert foreign_marker.read_text(encoding="utf-8") == "foreign"
+    assert swapped
+    assert not displaced.exists(), "authoritative case directory must be deleted"
+    assert case_path.is_dir(), "foreign replacement must remain untouched"

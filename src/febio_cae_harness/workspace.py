@@ -137,6 +137,37 @@ def _close_handle(handle: int) -> None:
         os.close(handle)
 
 
+def _delete_open_directory(handle: int, label: str) -> None:
+    """Mark an open Windows directory handle for deletion."""
+
+    if os.name != "nt":
+        raise WorkspaceBoundaryError(f"handle-bound directory deletion is unavailable for {label}")
+
+    import ctypes
+
+    class FileDispositionInfo(ctypes.Structure):
+        _fields_ = [("DeleteFile", ctypes.c_ubyte)]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    set_file_information = kernel32.SetFileInformationByHandle
+    set_file_information.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+    ]
+    set_file_information.restype = ctypes.c_int
+    disposition = FileDispositionInfo(1)
+    if not set_file_information(
+        ctypes.c_void_p(handle),
+        4,
+        ctypes.byref(disposition),
+        ctypes.sizeof(disposition),
+    ):
+        error = ctypes.get_last_error()
+        raise WorkspaceBoundaryError(f"cannot remove {label} by handle ({error})")
+
+
 def _open_directory(path: Path, label: str) -> int:
     if os.name != "nt":
         flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
@@ -145,7 +176,12 @@ def _open_directory(path: Path, label: str) -> int:
         except OSError as error:
             raise WorkspaceBoundaryError(f"cannot open {label}: {path}") from error
     return _windows_create(
-        path, 0x0001 | 0x0080, 0x0001 | 0x0002, 3, 0x02000000 | 0x00200000, label
+        path,
+        0x0001 | 0x0080 | 0x00010000,
+        0x0001 | 0x0002 | 0x0004,
+        3,
+        0x02000000 | 0x00200000,
+        label,
     )
 
 
@@ -290,13 +326,15 @@ def _case_creation_guard(
                 already_guarded=True,
             )
             _identity_stamp(checked, "case root", case_stamp)
-            _close_handle(handle)
-            handle = -1
-            _identity_stamp(checked, "case root", case_stamp)
-            try:
-                checked.rmdir()
-            except OSError as error:
-                raise WorkspaceBoundaryError(f"cannot remove case root: {checked}") from error
+            if os.name == "nt":
+                _delete_open_directory(handle, "case root")
+                _close_handle(handle)
+                handle = -1
+            else:
+                try:
+                    checked.rmdir()
+                except OSError as error:
+                    raise WorkspaceBoundaryError(f"cannot remove case root: {checked}") from error
             raise
         else:
             _identity_stamp(checked, "case root", case_stamp)
