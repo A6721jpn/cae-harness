@@ -1,265 +1,169 @@
 from __future__ import annotations
 
+import copy
+import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from febio_cae_harness.reporting import (
     AttemptIdentity,
+    EvidenceKind,
     EvidenceProvenance,
     EvidenceReference,
     FreshOutputValidation,
+    ReportAuthority,
+    ReportAuthorityManager,
     ReportEvidence,
-    SolverRunResult,
+    ResultReport,
+    SuccessGateEvaluation,
     assemble_report,
     evaluate_success_gates,
 )
 from febio_cae_harness.solver import (
-    FbsValidation,
-    LogValidation,
-    SolverClassification,
-    SolverState,
+    FbsAdapterManager,
+    SolverLaunchSpec,
+    SolverRunResult,
+    SolverSupervisor,
 )
 
-IDENTITY = AttemptIdentity(case_id="case-a", intent_id="intent-a", attempt_id="attempt-1")
-LOG_PATH = Path("attempt-1.log")
-XPLT_PATH = Path("attempt-1.xplt")
+
+class _Adapter:
+    def read_fields(self, _path: Path, fields: tuple[str, ...]) -> dict[str, float]:
+        return {field: 1.0 for field in fields}
 
 
-def make_log(*, classification: SolverClassification | None = None) -> LogValidation:
-    return LogValidation(
-        path=LOG_PATH,
-        exists=True,
-        normal_termination=classification is None,
-        observed_steps=2,
-        observed_final_time=1.0,
-        expected_steps=2,
+def make_authority(tmp_path: Path) -> tuple[ReportAuthority, SolverRunResult]:
+    root = tmp_path / "attempt"
+    root.mkdir(parents=True)
+    input_path = root / "model.feb"
+    log_path = root / "result.log"
+    xplt_path = root / "result.xplt"
+    input_path.write_text("synthetic", encoding="utf-8")
+    log = "time step 1\ntime = 1.0\nnormal termination\n"
+    code = (
+        "from pathlib import Path; "
+        f"Path({str(log_path)!r}).write_text({log!r}); "
+        f"Path({str(xplt_path)!r}).write_bytes(b'synthetic-xplt')"
+    )
+    spec = SolverLaunchSpec(
+        executable=Path(sys.executable),
+        input_path=input_path,
+        attempt_root=root,
+        log_path=log_path,
+        xplt_path=xplt_path,
+        arguments=("-c", code),
+        expected_steps=1,
         expected_final_time=1.0,
-        classification=classification,
+        requested_fields=("stress",),
     )
-
-
-def make_fbs(*, official: bool = True, valid: bool = True) -> FbsValidation:
-    return FbsValidation(
-        xplt_path=XPLT_PATH,
-        requested_fields=("displacement",),
-        available_fields=("displacement",),
-        values={"displacement": [0.1, 0.2]},
-        missing_fields=(),
-        non_finite_fields=(),
-        valid=valid,
-        official=official,
-        provenance="official-fbs" if official else "synthetic-adapter",
-        issues=(),
+    fbs = FbsAdapterManager(_Adapter(), "synthetic-runtime", root).issue_authority()
+    supervisor = SolverSupervisor(
+        spec,
+        case_id="case-a",
+        intent_id="intent-a",
+        attempt_id="attempt-a",
+        fbs_adapter=fbs,
+        requested_fields=("stress",),
     )
-
-
-def make_solver(
-    *,
-    classification: SolverClassification = SolverClassification.SUCCESS,
-    return_code: int | None = 0,
-    log: LogValidation | None = None,
-    fbs: FbsValidation | None = None,
-) -> SolverRunResult:
-    return SolverRunResult(
-        state=SolverState.NORMAL_EXIT,
-        classification=classification,
-        return_code=return_code,
-        pid=123,
-        command=("febio", "model.feb"),
-        log_path=LOG_PATH,
-        xplt_path=XPLT_PATH,
-        log_validation=log or make_log(),
-        fbs_validation=fbs or make_fbs(),
+    result = supervisor.run()
+    evidence = {kind: root / f"{kind.value}.json" for kind in EvidenceKind}
+    for kind, path in evidence.items():
+        path.write_text(f"synthetic {kind.value}", encoding="utf-8")
+    manager = ReportAuthorityManager(
+        supervisor, result, AttemptIdentity("case-a", "intent-a", "attempt-a")
     )
+    return manager.issue(evidence), result
 
 
-def make_outputs(log: LogValidation | None = None) -> FreshOutputValidation:
-    return FreshOutputValidation(
-        attempt_id=IDENTITY.attempt_id,
-        log_path=LOG_PATH,
-        xplt_path=XPLT_PATH,
-        log_fresh=True,
-        xplt_fresh=True,
-        log_validation=log or make_log(),
-    )
+def live_evaluation(authority: ReportAuthority) -> SuccessGateEvaluation:
+    try:
+        return evaluate_success_gates(authority)
+    except TypeError as error:
+        pytest.fail(str(error))
 
 
-def make_reference(kind: str) -> EvidenceReference:
-    return EvidenceReference(
-        kind=kind,
-        reference=f"90_Temporary/attempts/{IDENTITY.attempt_id}/{kind}.json",
-        case_id=IDENTITY.case_id,
-        intent_id=IDENTITY.intent_id,
-        attempt_id=IDENTITY.attempt_id,
+def live_report(authority: ReportAuthority) -> ResultReport:
+    try:
+        return assemble_report(authority)
+    except TypeError as error:
+        pytest.fail(str(error))
+
+
+def test_only_live_report_authority_can_evaluate_and_synthetic_is_unverified(
+    tmp_path: Path,
+) -> None:
+    authority, result = make_authority(tmp_path)
+
+    evaluation = live_evaluation(authority)
+    report = live_report(authority)
+
+    assert type(authority) is ReportAuthority
+    assert evaluation.checks["report_authority"]
+    assert evaluation.checks["owned_process_normal_exit"]
+    assert evaluation.checks["fresh_log"]
+    assert evaluation.checks["fresh_xplt"]
+    assert not evaluation.checks["official_fbs"]
+    assert not evaluation.checks["mesh_evidence"]
+    assert not evaluation.checks["official_provenance"]
+    assert not evaluation.success
+    assert not evaluation.verified
+    assert report.solver_result is result
+    assert report.provenance is not EvidenceProvenance.OFFICIAL
+    assert not report.success
+    assert not report.verified
+
+
+@pytest.mark.parametrize(
+    "forged",
+    [
+        True,
+        {"official": True, "verified": True, "fresh": True, "satisfies_intent": True},
+    ],
+)
+def test_caller_values_and_legacy_validation_arguments_are_rejected(
+    tmp_path: Path, forged: object
+) -> None:
+    authority, result = make_authority(tmp_path)
+    fresh = FreshOutputValidation("attempt-a", result.log_path, result.xplt_path)
+    fbs = result.fbs_validation
+    reference = EvidenceReference(
+        EvidenceKind.MESH,
+        "mesh.json",
+        "case-a",
+        "intent-a",
+        "attempt-a",
         verified=True,
         satisfies_intent=True,
         provenance=EvidenceProvenance.OFFICIAL,
     )
+    evidence = ReportEvidence(mesh=reference)
+
+    with pytest.raises(TypeError):
+        evaluate_success_gates(forged)  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        evaluate_success_gates(  # type: ignore[call-arg]
+            authority, result, fresh, fbs, evidence, provenance="official"
+        )
 
 
-def make_evidence() -> ReportEvidence:
-    return ReportEvidence(
-        mesh=make_reference("mesh"),
-        jacobian=make_reference("jacobian"),
-        roi=make_reference("roi"),
-        evaluation=make_reference("evaluation"),
-    )
-
-
-def test_all_authority_conditions_are_required_for_success() -> None:
-    evaluation = evaluate_success_gates(
-        IDENTITY,
-        make_solver(),
-        make_outputs(),
-        make_fbs(),
-        make_evidence(),
-        provenance=EvidenceProvenance.OFFICIAL,
-    )
-
-    assert evaluation.success
-    assert evaluation.passed
-    assert not evaluation.failures
-    assert set(evaluation.checks) >= {
-        "attempt_identity",
-        "owned_process_normal_exit",
-        "fresh_log",
-        "fresh_xplt",
-        "log_termination",
-        "log_expected_step",
-        "log_final_time",
-        "log_no_fatal_or_negative_jacobian",
-        "official_fbs",
-        "required_fields_finite",
-        "mesh_evidence",
-        "jacobian_evidence",
-        "roi_evidence",
-        "evaluation_evidence",
-        "evidence_binding",
-        "official_provenance",
-    }
-
-
-def test_zero_exit_and_output_presence_cannot_bypass_log_and_evidence_gates() -> None:
-    bad_log = make_log(classification=SolverClassification.INVALID_LOG)
-    evidence = ReportEvidence(
-        mesh=make_reference("mesh"),
-        jacobian=make_reference("jacobian"),
-        roi=make_reference("roi"),
-        evaluation=EvidenceReference(
-            kind="evaluation",
-            reference="evaluation.json",
-            case_id="other-case",
-            intent_id=IDENTITY.intent_id,
-            attempt_id=IDENTITY.attempt_id,
-            verified=True,
-            satisfies_intent=True,
-            provenance=EvidenceProvenance.OFFICIAL,
-        ),
-    )
-
-    evaluation = evaluate_success_gates(
-        IDENTITY,
-        make_solver(log=bad_log),
-        make_outputs(bad_log),
-        make_fbs(),
-        evidence,
-        provenance=EvidenceProvenance.OFFICIAL,
-    )
-
-    assert not evaluation.success
-    assert not evaluation.checks["log_termination"]
-    assert not evaluation.checks["evidence_binding"]
-
-
-def test_synthetic_fbs_is_explicitly_unverified_and_cannot_produce_success() -> None:
-    synthetic_fbs = make_fbs(official=False)
-    evaluation = evaluate_success_gates(
-        IDENTITY,
-        make_solver(
-            classification=SolverClassification.FBS_UNVERIFIED,
-            fbs=synthetic_fbs,
-        ),
-        make_outputs(),
-        synthetic_fbs,
-        make_evidence(),
-        provenance=EvidenceProvenance.SYNTHETIC,
-    )
-    report = assemble_report(
-        IDENTITY,
-        make_solver(
-            classification=SolverClassification.FBS_UNVERIFIED,
-            fbs=synthetic_fbs,
-        ),
-        make_outputs(),
-        synthetic_fbs,
-        make_evidence(),
-        provenance=EvidenceProvenance.SYNTHETIC,
-    )
-
-    assert not evaluation.success
-    assert not evaluation.checks["official_fbs"]
-    assert not evaluation.checks["official_provenance"]
-    assert report.provenance is EvidenceProvenance.SYNTHETIC
-    assert not report.success
-
-
-def test_freshness_and_all_evidence_categories_must_be_authoritative() -> None:
-    evidence = make_evidence()
-    invalid = EvidenceReference(
-        kind="jacobian",
-        reference="jacobian.json",
-        case_id=IDENTITY.case_id,
-        intent_id=IDENTITY.intent_id,
-        attempt_id=IDENTITY.attempt_id,
-        verified=True,
-        satisfies_intent=False,
-        provenance=EvidenceProvenance.OFFICIAL,
-    )
-    evidence = ReportEvidence(
-        mesh=evidence.mesh,
-        jacobian=invalid,
-        roi=evidence.roi,
-        evaluation=evidence.evaluation,
-    )
-    outputs = FreshOutputValidation(
-        attempt_id=IDENTITY.attempt_id,
-        log_path=LOG_PATH,
-        xplt_path=XPLT_PATH,
-        log_fresh=True,
-        xplt_fresh=False,
-        log_validation=make_log(),
-    )
-
-    evaluation = evaluate_success_gates(
-        IDENTITY,
-        make_solver(),
-        outputs,
-        make_fbs(),
-        evidence,
-        provenance=EvidenceProvenance.OFFICIAL,
-    )
-
-    assert not evaluation.success
-    assert not evaluation.checks["fresh_xplt"]
-    assert not evaluation.checks["jacobian_evidence"]
-
-
-def test_reporting_does_not_execute_processes_or_read_result_files(
-    monkeypatch: pytest.MonkeyPatch,
+def test_gate_and_report_objects_cannot_be_publicly_forged_or_rebound(
+    tmp_path: Path,
 ) -> None:
-    def no_file_access(*args: object, **kwargs: object) -> bool:
-        del args, kwargs
-        raise AssertionError("reporting must consume supplied validation only")
+    authority, _ = make_authority(tmp_path / "a")
+    other_authority, _ = make_authority(tmp_path / "b")
+    evaluation = live_evaluation(authority)
+    report = live_report(authority)
 
-    monkeypatch.setattr(Path, "is_file", no_file_access)
-    evaluation = evaluate_success_gates(
-        IDENTITY,
-        make_solver(),
-        make_outputs(),
-        make_fbs(),
-        make_evidence(),
-        provenance=EvidenceProvenance.OFFICIAL,
-    )
+    for value in (evaluation, report):
+        for operation in (copy.copy, copy.deepcopy):
+            with pytest.raises(TypeError):
+                operation(value)
+        with pytest.raises(TypeError):
+            replace(value, provenance=EvidenceProvenance.OFFICIAL)
 
-    assert evaluation.success
+    with pytest.raises(TypeError):
+        evaluate_success_gates(object())  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        assemble_report(other_authority, evaluation)  # type: ignore[call-arg]

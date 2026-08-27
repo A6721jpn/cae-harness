@@ -14,7 +14,7 @@ from enum import StrEnum
 from os import fspath
 from pathlib import Path
 from types import MappingProxyType
-from typing import Self
+from typing import NoReturn, Self, cast
 
 from febio_cae_harness.solver import (
     FbsValidation,
@@ -545,23 +545,70 @@ def _json_value(value: object) -> object:
     return str(value)
 
 
-@dataclass(frozen=True, slots=True)
-class SuccessGateEvaluation:
-    """Immutable result of evaluating every authority condition."""
+_GATE_REGISTRY: dict[int, tuple[object, bool, EvidenceProvenance]] = {}
+_REPORT_REGISTRY: dict[int, tuple[object, object, EvidenceProvenance]] = {}
 
-    passed: bool
+
+def _forbidden_copy(self: object, *args: object) -> NoReturn:
+    del self, args
+    raise TypeError("issued reporting objects cannot be copied or pickled")
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class SuccessGateEvaluation:
+    """Immutable diagnostics issued by the success-gate evaluator."""
+
+    authority: object
+    identity: AttemptIdentity
     checks: Mapping[str, bool]
     failures: tuple[str, ...]
     provenance: EvidenceProvenance
+    _claimed_passed: bool
 
-    def __post_init__(self) -> None:
-        checks = {str(name): _bool(value, f"check {name}") for name, value in self.checks.items()}
-        object.__setattr__(self, "checks", MappingProxyType(checks))
-        object.__setattr__(self, "passed", _bool(self.passed, "passed"))
-        object.__setattr__(self, "failures", tuple(str(value) for value in self.failures))
-        object.__setattr__(self, "provenance", _provenance(self.provenance))
-        if self.passed != (not self.failures and all(checks.values())):
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise TypeError("SuccessGateEvaluation instances are evaluator-issued")
+
+    @classmethod
+    def _issue(
+        cls,
+        *,
+        authority: object,
+        identity: AttemptIdentity,
+        checks: Mapping[str, bool],
+        failures: tuple[str, ...],
+        provenance: EvidenceProvenance,
+        passed: bool,
+    ) -> Self:
+        if cls is not SuccessGateEvaluation:
+            raise TypeError("SuccessGateEvaluation cannot be subclassed")
+        frozen_checks = MappingProxyType(
+            {str(name): _bool(value, f"check {name}") for name, value in checks.items()}
+        )
+        frozen_failures = tuple(str(value) for value in failures)
+        claimed = _bool(passed, "passed")
+        if claimed != (not frozen_failures and all(frozen_checks.values())):
             raise ValueError("passed must equal the conjunction of checks and absence of failures")
+        result = object.__new__(cls)
+        object.__setattr__(result, "authority", authority)
+        object.__setattr__(result, "identity", identity)
+        object.__setattr__(result, "checks", frozen_checks)
+        object.__setattr__(result, "failures", frozen_failures)
+        object.__setattr__(result, "provenance", _provenance(provenance))
+        object.__setattr__(result, "_claimed_passed", claimed)
+        _GATE_REGISTRY[id(result)] = (result, claimed, result.provenance)
+        return result
+
+    def _issued_record(self) -> tuple[object, bool, EvidenceProvenance] | None:
+        record = _GATE_REGISTRY.get(id(self))
+        if record is None or record[0] is not self:
+            return None
+        return record
+
+    @property
+    def passed(self) -> bool:
+        record = self._issued_record()
+        return bool(record is not None and record[1])
 
     @property
     def success(self) -> bool:
@@ -573,6 +620,10 @@ class SuccessGateEvaluation:
     @property
     def valid(self) -> bool:
         return self.passed
+
+    @property
+    def verified(self) -> bool:
+        return self.success and self.provenance is EvidenceProvenance.OFFICIAL
 
     @property
     def failed_checks(self) -> tuple[str, ...]:
@@ -602,21 +653,25 @@ class SuccessGateEvaluation:
         return {
             "passed": self.passed,
             "success": self.success,
+            "verified": self.verified,
             "checks": dict(self.checks),
             "failed_checks": list(self.failed_checks),
             "failures": list(self.failures),
             "provenance": self.provenance.value,
         }
 
+    __copy__ = __deepcopy__ = __reduce__ = __reduce_ex__ = _forbidden_copy
+
 
 GateEvaluation = SuccessGateEvaluation
 SuccessGateResult = SuccessGateEvaluation
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class ResultReport:
-    """Pure assembled report for one attempt and its supplied evidence."""
+    """Immutable diagnostics issued from one exact report authority."""
 
+    authority: object
     identity: AttemptIdentity
     solver_result: SolverRunResult
     fresh_outputs: FreshOutputValidation | None
@@ -624,6 +679,43 @@ class ResultReport:
     evidence: ReportEvidence
     gates: SuccessGateEvaluation
     provenance: EvidenceProvenance
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise TypeError("ResultReport instances are assembler-issued")
+
+    @classmethod
+    def _issue(
+        cls,
+        *,
+        authority: object,
+        identity: AttemptIdentity,
+        solver_result: SolverRunResult,
+        fresh_outputs: FreshOutputValidation | None,
+        fbs_validation: FbsValidation | None,
+        evidence: ReportEvidence,
+        gates: SuccessGateEvaluation,
+        provenance: EvidenceProvenance,
+    ) -> Self:
+        if cls is not ResultReport:
+            raise TypeError("ResultReport cannot be subclassed")
+        result = object.__new__(cls)
+        object.__setattr__(result, "authority", authority)
+        object.__setattr__(result, "identity", identity)
+        object.__setattr__(result, "solver_result", solver_result)
+        object.__setattr__(result, "fresh_outputs", fresh_outputs)
+        object.__setattr__(result, "fbs_validation", fbs_validation)
+        object.__setattr__(result, "evidence", evidence)
+        object.__setattr__(result, "gates", gates)
+        object.__setattr__(result, "provenance", _provenance(provenance))
+        _REPORT_REGISTRY[id(result)] = (result, gates, result.provenance)
+        return result
+
+    def _issued_record(self) -> tuple[object, object, EvidenceProvenance] | None:
+        record = _REPORT_REGISTRY.get(id(self))
+        if record is None or record[0] is not self:
+            return None
+        return record
 
     @property
     def attempt_identity(self) -> AttemptIdentity:
@@ -651,7 +743,8 @@ class ResultReport:
 
     @property
     def success(self) -> bool:
-        return self.gates.success
+        record = self._issued_record()
+        return bool(record is not None and cast(SuccessGateEvaluation, record[1]).success)
 
     @property
     def passed(self) -> bool:
@@ -698,6 +791,7 @@ class ResultReport:
             "identity": self.identity.to_dict(),
             "provenance": self.provenance.value,
             "success": self.success,
+            "verified": self.verified,
             "solver": {
                 "state": self.solver_result.state.value,
                 "classification": self.solver_result.classification.value,
@@ -714,7 +808,17 @@ class ResultReport:
             "gates": self.gates.to_dict(),
         }
 
+    __copy__ = __deepcopy__ = __reduce__ = __reduce_ex__ = _forbidden_copy
+
 
 Report = ResultReport
 ReportAssembly = ResultReport
 AssembledReport = ResultReport
+
+
+def _issue_gate(**kwargs: object) -> SuccessGateEvaluation:
+    return SuccessGateEvaluation._issue(**kwargs)  # type: ignore[arg-type]
+
+
+def _issue_report(**kwargs: object) -> ResultReport:
+    return ResultReport._issue(**kwargs)  # type: ignore[arg-type]

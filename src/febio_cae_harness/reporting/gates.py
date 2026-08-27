@@ -1,10 +1,11 @@
-"""Pure evaluation of the FEBio result success authority."""
+"""Fail-closed evaluation of a live report authority."""
 
 from __future__ import annotations
 
 import math
 from collections.abc import Mapping
 from pathlib import Path
+from typing import Any, cast
 
 from febio_cae_harness.solver import (
     FbsValidation,
@@ -14,6 +15,7 @@ from febio_cae_harness.solver import (
     SolverState,
 )
 
+from .authority import ReportAuthority, _require_issued_authority
 from .types import (
     AttemptIdentity,
     EvidenceKind,
@@ -22,6 +24,7 @@ from .types import (
     FreshOutputValidation,
     ReportEvidence,
     SuccessGateEvaluation,
+    _issue_gate,
 )
 
 __all__ = [
@@ -41,364 +44,186 @@ _LOG_FAILURES = {
 }
 
 
-def _same_path(left: object, right: object) -> bool:
-    try:
-        return Path(left) == Path(right)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
-        return False
-
-
-def _normalise_provenance(value: EvidenceProvenance | str) -> EvidenceProvenance:
-    if isinstance(value, EvidenceProvenance):
-        return value
-    aliases = {
-        "official": EvidenceProvenance.OFFICIAL,
-        "official-fbs": EvidenceProvenance.OFFICIAL,
-        "fbs": EvidenceProvenance.OFFICIAL,
-        "synthetic": EvidenceProvenance.SYNTHETIC,
-        "synthetic-adapter": EvidenceProvenance.SYNTHETIC,
-        "fixture": EvidenceProvenance.SYNTHETIC,
-        "unverified": EvidenceProvenance.UNVERIFIED,
-        "unknown": EvidenceProvenance.UNVERIFIED,
-    }
-    if not isinstance(value, str):
-        raise TypeError("provenance must be an EvidenceProvenance or string")
-    try:
-        return aliases[value.strip().casefold()]
-    except KeyError as error:
-        raise ValueError("provenance must be official, synthetic, or unverified") from error
-
-
-def _fbs_provenance(validation: FbsValidation | None) -> EvidenceProvenance:
-    if validation is None:
-        return EvidenceProvenance.UNVERIFIED
-    value = str(validation.provenance).casefold()
-    if "synthetic" in value or "fixture" in value:
-        return EvidenceProvenance.SYNTHETIC
-    if validation.official and value in {"official", "official-fbs", "fbs"}:
-        return EvidenceProvenance.OFFICIAL
-    return EvidenceProvenance.UNVERIFIED
-
-
-def _derive_provenance(
-    fresh_outputs: FreshOutputValidation | None,
-    fbs_validation: FbsValidation | None,
-    evidence: ReportEvidence,
-    supplied: EvidenceProvenance | str | None,
-) -> EvidenceProvenance:
-    values = [_fbs_provenance(fbs_validation)]
-    if fresh_outputs is not None:
-        values.append(fresh_outputs.normalized_provenance)
-    values.extend(reference.normalized_provenance for reference in evidence.references)
-    if any(value is EvidenceProvenance.UNVERIFIED for value in values):
-        observed = EvidenceProvenance.UNVERIFIED
-    elif any(value is EvidenceProvenance.SYNTHETIC for value in values):
-        observed = EvidenceProvenance.SYNTHETIC
-    else:
-        observed = EvidenceProvenance.OFFICIAL
-    if supplied is None:
-        return observed
-    requested = _normalise_provenance(supplied)
-    if requested is EvidenceProvenance.UNVERIFIED:
-        return requested
-    if requested is EvidenceProvenance.SYNTHETIC:
-        return requested if observed is EvidenceProvenance.OFFICIAL else observed
-    return observed
-
-
-def _empty_evidence() -> ReportEvidence:
-    return ReportEvidence()
-
-
-def _coerce_reference(value: object) -> EvidenceReference | None:
-    if isinstance(value, EvidenceReference):
-        return value
-    if not isinstance(value, Mapping):
-        return None
-    values = dict(value)
-    aliases = {
-        "path": "reference",
-        "locator": "reference",
-        "intent_digest": "intent_id",
-        "evidence_kind": "kind",
-        "intent_satisfied": "satisfies_intent",
-        "authoritative": "verified",
-    }
-    for alias, canonical in aliases.items():
-        if alias in values and canonical not in values:
-            values[canonical] = values[alias]
-        values.pop(alias, None)
-    try:
-        return EvidenceReference(**values)
-    except (TypeError, ValueError):
-        return None
-
-
-def _coerce_evidence(value: ReportEvidence | Mapping[str, object] | None) -> ReportEvidence:
-    if isinstance(value, ReportEvidence):
-        return value
-    if not isinstance(value, Mapping):
-        return _empty_evidence()
-    aliases = {
-        "mesh_quality": "mesh",
-        "mesh_evidence": "mesh",
-        "jacobian_quality": "jacobian",
-        "jacobian_evidence": "jacobian",
-        "roi_evidence": "roi",
-        "evaluation_quantities": "evaluation",
-        "evaluation_evidence": "evaluation",
-    }
-    values: dict[str, object] = dict(value)
-    for alias, canonical in aliases.items():
-        if alias in values and canonical not in values:
-            values[canonical] = values[alias]
-        values.pop(alias, None)
-    for name in ("mesh", "jacobian", "roi", "evaluation"):
-        if name in values:
-            values[name] = _coerce_reference(values[name])
-    additional = values.get("additional", ())
-    if isinstance(additional, (list, tuple)):
-        values["additional"] = tuple(
-            reference for raw in additional if (reference := _coerce_reference(raw)) is not None
-        )
-    else:
-        values["additional"] = ()
-    try:
-        return ReportEvidence.from_mapping(values)
-    except (TypeError, ValueError):
-        return _empty_evidence()
-
-
-def _identity_check(identity: object) -> bool:
+def _authority_provenance(record: tuple[Any, ...]) -> EvidenceProvenance:
     return (
-        isinstance(identity, AttemptIdentity)
-        and bool(identity.case_id)
-        and bool(identity.intent_id)
-        and bool(identity.attempt_id)
+        EvidenceProvenance.OFFICIAL if record[10] == "official" else EvidenceProvenance.UNVERIFIED
     )
 
 
-def _log_validation(
-    fresh_outputs: FreshOutputValidation | None,
-    solver_result: SolverRunResult,
-) -> LogValidation | None:
-    if fresh_outputs is not None and fresh_outputs.log_validation is not None:
-        return fresh_outputs.log_validation
-    return solver_result.log_validation
+def _diagnostic_evidence(
+    identity: AttemptIdentity,
+    paths: Mapping[EvidenceKind, Path],
+) -> ReportEvidence:
+    def reference(kind: EvidenceKind) -> EvidenceReference:
+        return EvidenceReference(
+            kind, paths[kind], identity.case_id, identity.intent_id, identity.attempt_id
+        )
+
+    return ReportEvidence(
+        reference(EvidenceKind.MESH),
+        reference(EvidenceKind.JACOBIAN),
+        reference(EvidenceKind.ROI),
+        reference(EvidenceKind.EVALUATION),
+        identity=identity,
+    )
 
 
-def evaluate_success_gates(
-    attempt_identity: AttemptIdentity,
-    solver_result: SolverRunResult,
-    fresh_outputs: FreshOutputValidation | None = None,
-    fbs_validation: FbsValidation | None = None,
-    evidence: ReportEvidence | Mapping[str, object] | None = None,
-    *,
-    provenance: EvidenceProvenance | str | None = None,
+def _diagnostic_inputs(
+    authority: ReportAuthority,
+) -> tuple[
+    tuple[Any, ...],
+    AttemptIdentity,
+    SolverRunResult,
+    FbsValidation,
+    FreshOutputValidation,
+    ReportEvidence,
+]:
+    record = _require_issued_authority(authority)
+    identity = cast(AttemptIdentity, record[4])
+    result = cast(SolverRunResult, record[3])
+    fbs = result.fbs_validation
+    if type(fbs) is not FbsValidation:
+        raise TypeError("report authority result has no exact FbsValidation")
+    paths = cast(Mapping[EvidenceKind, Path], record[6])
+    fresh = FreshOutputValidation(
+        identity.attempt_id,
+        result.log_path,
+        result.xplt_path,
+        True,
+        True,
+        result.log_validation,
+        True,
+        True,
+        EvidenceProvenance.UNVERIFIED,
+    )
+    return record, identity, result, fbs, fresh, _diagnostic_evidence(identity, paths)
+
+
+def _evaluate_authority(
+    record: tuple[Any, ...],
+    identity: AttemptIdentity,
+    result: SolverRunResult,
+    fbs: FbsValidation,
+    fresh: FreshOutputValidation,
+    evidence: ReportEvidence,
+    authority: ReportAuthority,
 ) -> SuccessGateEvaluation:
-    """Evaluate every authority condition without touching external state.
-
-    All validation objects are supplied by earlier phases.  The function only
-    compares their typed fields; it never executes a process or checks a path
-    on disk.  Missing or malformed evidence therefore fails closed.
-    """
-
-    report_evidence = _coerce_evidence(evidence)
-    supplied_fbs = fbs_validation
-    if supplied_fbs is None and isinstance(solver_result, SolverRunResult):
-        supplied_fbs = solver_result.fbs_validation
-
-    identity_ok = _identity_check(attempt_identity)
-    solver_ok = isinstance(solver_result, SolverRunResult)
-    outputs_ok = isinstance(fresh_outputs, FreshOutputValidation)
-    outputs = fresh_outputs if outputs_ok else None
-    log = _log_validation(fresh_outputs, solver_result) if solver_ok else None
-
-    checks: dict[str, bool] = {}
-    checks["attempt_identity"] = identity_ok
-    checks["owned_process_normal_exit"] = bool(
-        solver_ok
-        and solver_result.state is SolverState.NORMAL_EXIT
-        and solver_result.return_code == 0
-        and solver_result.pid is not None
+    log = result.log_validation
+    files = cast(Mapping[Path, tuple[Any, ...]], record[7])
+    provenance = _authority_provenance(record)
+    identity_ok = type(identity) is AttemptIdentity and all(
+        (identity.case_id, identity.intent_id, identity.attempt_id)
     )
-    checks["solver_classification"] = bool(
-        solver_ok and solver_result.classification is SolverClassification.SUCCESS
-    )
-    checks["solver_error_free"] = bool(solver_ok and not solver_result.error)
-
-    checks["fresh_log"] = bool(
-        outputs_ok
-        and identity_ok
-        and outputs is not None
-        and outputs.attempt_id == attempt_identity.attempt_id
-        and _same_path(outputs.log_path, solver_result.log_path)
-        and outputs.log_fresh
-        and outputs.log_present
-    )
-    checks["fresh_xplt"] = bool(
-        outputs_ok
-        and identity_ok
-        and outputs is not None
-        and outputs.attempt_id == attempt_identity.attempt_id
-        and _same_path(outputs.xplt_path, solver_result.xplt_path)
-        and outputs.xplt_fresh
-        and outputs.xplt_present
-    )
-    checks["distinct_output_paths"] = bool(
-        outputs_ok and outputs is not None and outputs.log_path != outputs.xplt_path
-    )
-
-    checks["log_termination"] = bool(
-        isinstance(log, LogValidation) and log.exists and log.normal_termination
-    )
-    checks["log_expected_step"] = bool(
-        isinstance(log, LogValidation)
-        and log.expected_steps is not None
-        and log.observed_steps == log.expected_steps
-    )
-    checks["log_final_time"] = bool(
-        isinstance(log, LogValidation)
-        and log.expected_final_time is not None
-        and log.observed_final_time is not None
+    log_ok = isinstance(log, LogValidation)
+    checked_log = cast(LogValidation, log)
+    checks: dict[str, bool] = {
+        "report_authority": True,
+        "attempt_identity": identity_ok,
+        "owned_process_normal_exit": result.state is SolverState.NORMAL_EXIT
+        and result.return_code == 0
+        and result.pid is not None,
+        "solver_classification": result.classification is SolverClassification.SUCCESS,
+        "solver_error_free": not result.error,
+        "fresh_log": identity_ok
+        and fresh.attempt_id == identity.attempt_id
+        and fresh.log_path == result.log_path
+        and fresh.log_fresh
+        and fresh.log_present
+        and result.log_path in files,
+        "fresh_xplt": identity_ok
+        and fresh.attempt_id == identity.attempt_id
+        and fresh.xplt_path == result.xplt_path
+        and fresh.xplt_fresh
+        and fresh.xplt_present
+        and result.xplt_path in files,
+        "distinct_output_paths": result.log_path != result.xplt_path,
+        "log_termination": log_ok and checked_log.exists and checked_log.normal_termination,
+        "log_expected_step": log_ok
+        and checked_log.expected_steps is not None
+        and checked_log.observed_steps == checked_log.expected_steps,
+        "log_final_time": log_ok
+        and checked_log.expected_final_time is not None
+        and checked_log.observed_final_time is not None
         and math.isclose(
-            log.observed_final_time,
-            float(log.expected_final_time),
+            checked_log.observed_final_time,
+            float(checked_log.expected_final_time),
             rel_tol=1e-9,
             abs_tol=1e-9,
-        )
-    )
-    checks["log_no_fatal_or_negative_jacobian"] = bool(
-        isinstance(log, LogValidation)
-        and log.exists
-        and log.classification not in _LOG_FAILURES
-        and not log.issues
-    )
-    checks["log_validation_binding"] = bool(
-        isinstance(log, LogValidation)
-        and outputs_ok
-        and outputs is not None
-        and _same_path(log.path, outputs.log_path)
-        and _same_path(log.path, solver_result.log_path)
-    )
-
-    checks["official_fbs"] = bool(
-        isinstance(supplied_fbs, FbsValidation)
-        and _same_path(supplied_fbs.xplt_path, solver_result.xplt_path)
-        and _fbs_provenance(supplied_fbs) is EvidenceProvenance.OFFICIAL
-        and supplied_fbs.valid
-    )
-    checks["required_fields_finite"] = bool(
-        isinstance(supplied_fbs, FbsValidation)
-        and supplied_fbs.valid
-        and supplied_fbs.all_requested_fields_finite
-    )
-
-    required: tuple[tuple[str, EvidenceKind], ...] = (
+        ),
+        "log_no_fatal_or_negative_jacobian": log_ok
+        and checked_log.exists
+        and checked_log.classification not in _LOG_FAILURES
+        and not checked_log.issues,
+        "log_validation_binding": log_ok
+        and checked_log.path == fresh.log_path
+        and checked_log.path == result.log_path,
+        "official_fbs": (fbs.xplt_path == result.xplt_path and fbs.valid and fbs.official is True),
+        "required_fields_finite": fbs.valid and fbs.all_requested_fields_finite,
+    }
+    for name, kind in (
         ("mesh", EvidenceKind.MESH),
         ("jacobian", EvidenceKind.JACOBIAN),
         ("roi", EvidenceKind.ROI),
         ("evaluation", EvidenceKind.EVALUATION),
+    ):
+        reference = evidence.for_kind(kind)
+        checks[f"{name}_evidence"] = reference is not None and reference.authoritative
+    checks["evidence_binding"] = evidence.matches(identity)
+    checks["all_evidence_authoritative"] = all(
+        reference.authoritative and reference.matches(identity) for reference in evidence.references
     )
-    for name, kind in required:
-        reference = report_evidence.for_kind(kind)
-        checks[f"{name}_evidence"] = bool(
-            reference is not None and reference.kind is kind and reference.authoritative
-        )
-
-    checks["evidence_binding"] = bool(identity_ok and report_evidence.matches(attempt_identity))
-    checks["all_evidence_authoritative"] = bool(
-        all(
-            reference.authoritative and identity_ok and reference.matches(attempt_identity)
-            for reference in report_evidence.references
-        )
+    checks["official_provenance"] = (
+        provenance is EvidenceProvenance.OFFICIAL
+        and checks["official_fbs"]
+        and checks["all_evidence_authoritative"]
     )
-    resolved_provenance = _derive_provenance(
-        fresh_outputs,
-        supplied_fbs,
-        report_evidence,
-        provenance,
-    )
-    checks["official_provenance"] = bool(
-        resolved_provenance is EvidenceProvenance.OFFICIAL
-        and isinstance(supplied_fbs, FbsValidation)
-        and _fbs_provenance(supplied_fbs) is EvidenceProvenance.OFFICIAL
-        and (outputs is not None and outputs.normalized_provenance is EvidenceProvenance.OFFICIAL)
-        and all(reference.authoritative for reference in report_evidence.references)
-    )
-
     failures = tuple(name for name, passed in checks.items() if not passed)
-    return SuccessGateEvaluation(
-        passed=not failures and all(checks.values()),
+    passed = provenance is EvidenceProvenance.OFFICIAL and not failures
+    return _issue_gate(
+        authority=authority,
+        identity=identity,
         checks=checks,
         failures=failures,
-        provenance=resolved_provenance,
-    )
-
-
-def evaluate_success_gate(
-    attempt_identity: AttemptIdentity,
-    solver_result: SolverRunResult,
-    fresh_outputs: FreshOutputValidation | None = None,
-    fbs_validation: FbsValidation | None = None,
-    evidence: ReportEvidence | Mapping[str, object] | None = None,
-    *,
-    provenance: EvidenceProvenance | str | None = None,
-) -> SuccessGateEvaluation:
-    """Singular-name alias for :func:`evaluate_success_gates`."""
-
-    return evaluate_success_gates(
-        attempt_identity,
-        solver_result,
-        fresh_outputs,
-        fbs_validation,
-        evidence,
         provenance=provenance,
+        passed=passed,
     )
 
 
-def evaluate_success(
-    attempt_identity: AttemptIdentity,
-    solver_result: SolverRunResult,
-    fresh_outputs: FreshOutputValidation | None = None,
-    fbs_validation: FbsValidation | None = None,
-    evidence: ReportEvidence | Mapping[str, object] | None = None,
-    *,
-    provenance: EvidenceProvenance | str | None = None,
-) -> SuccessGateEvaluation:
-    """Short-name alias for success-gate evaluation."""
+def _evaluate(
+    authority: ReportAuthority,
+) -> tuple[
+    SuccessGateEvaluation,
+    AttemptIdentity,
+    SolverRunResult,
+    FbsValidation,
+    FreshOutputValidation,
+    ReportEvidence,
+]:
+    record, identity, result, fbs, fresh, evidence = _diagnostic_inputs(authority)
+    evaluation = _evaluate_authority(record, identity, result, fbs, fresh, evidence, authority)
+    return evaluation, identity, result, fbs, fresh, evidence
 
-    return evaluate_success_gates(
-        attempt_identity,
-        solver_result,
-        fresh_outputs,
-        fbs_validation,
-        evidence,
-        provenance=provenance,
-    )
+
+def evaluate_success_gates(authority: ReportAuthority) -> SuccessGateEvaluation:
+    """Evaluate diagnostics from one exact, live, manager-issued authority."""
+
+    return _evaluate(authority)[0]
+
+
+def evaluate_success_gate(authority: ReportAuthority) -> SuccessGateEvaluation:
+    return evaluate_success_gates(authority)
+
+
+def evaluate_success(authority: ReportAuthority) -> SuccessGateEvaluation:
+    return evaluate_success_gates(authority)
 
 
 evaluate_result_success = evaluate_success_gates
 
 
 class SuccessGate:
-    """Stateless object façade for callers that prefer dependency injection."""
+    """Stateless facade that accepts only a live report authority."""
 
     @staticmethod
-    def evaluate(
-        attempt_identity: AttemptIdentity,
-        solver_result: SolverRunResult,
-        fresh_outputs: FreshOutputValidation | None = None,
-        fbs_validation: FbsValidation | None = None,
-        evidence: ReportEvidence | Mapping[str, object] | None = None,
-        *,
-        provenance: EvidenceProvenance | str | None = None,
-    ) -> SuccessGateEvaluation:
-        return evaluate_success_gates(
-            attempt_identity,
-            solver_result,
-            fresh_outputs,
-            fbs_validation,
-            evidence,
-            provenance=provenance,
-        )
+    def evaluate(authority: ReportAuthority) -> SuccessGateEvaluation:
+        return evaluate_success_gates(authority)
