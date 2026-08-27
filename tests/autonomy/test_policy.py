@@ -19,6 +19,8 @@ from febio_cae_harness.autonomy import (
     IntentState,
     Proposal,
     ProposalAction,
+    ProposalAuthority,
+    ProposalAuthorityManager,
     ProposalClass,
     RetryDecision,
     RetryLedger,
@@ -239,28 +241,47 @@ def test_negative_jacobian_and_nonlinear_failures_have_distinct_routes() -> None
     assert nonlinear.route is FailureRoute.NONLINEAR_DIAGNOSTIC
 
 
-def test_proposal_policy_respects_debug_class_and_physical_boundary() -> None:
-    intent = bound_intent()
+def test_proposal_policy_respects_debug_class_and_physical_boundary(tmp_path: Path) -> None:
+    intent = bound_intent(
+        allowed_mesh_changes={"mesh": {"element_ids": [1], "target_size": 0.5}},
+        allowed_numerical_changes={"numerical": {"time_step": 0.1}},
+    )
+    state_authority = run_transition(intent_snapshot(intent, tmp_path, "proposal"))
+    manager = ProposalAuthorityManager(state_authority)
     preserving = Proposal(
         proposal_id="mesh-1",
         proposal_class=ProposalClass.INTENT_PRESERVING,
         rationale="repair an evidenced local element",
         evidence_ids=("log-1",),
+        changes={"mesh": {"element_ids": (1,)}},
         authorized=True,
     )
-    assert decide_proposal(intent, preserving).action is ProposalAction.AUTO_APPLY
+    preserving_authority = manager.issue(preserving)
+    assert (
+        decide_proposal(state_authority, preserving, preserving_authority).action
+        is ProposalAction.AUTO_APPLY
+    )
 
     sensitive = Proposal(
         proposal_id="solver-1",
         proposal_class=ProposalClass.INTENT_SENSITIVE,
         rationale="change a numerical control",
         evidence_ids=("log-2",),
+        changes={"numerical": {"time_step": 0.1}},
         authorized=True,
     )
-    assert decide_proposal(intent, sensitive).action is ProposalAction.REQUIRE_VALIDATION
+    sensitive_authority = manager.issue(sensitive)
     assert (
-        decide_proposal(intent, sensitive, validation_passed=True).action
-        is ProposalAction.AUTO_APPLY
+        decide_proposal(state_authority, sensitive, sensitive_authority).action
+        is ProposalAction.REQUIRE_VALIDATION
+    )
+    with pytest.raises(EvidenceIntegrityError):
+        manager.validate(sensitive_authority)
+    assert (
+        decide_proposal(
+            state_authority, sensitive, sensitive_authority, validation_passed=True
+        ).action
+        is ProposalAction.REQUIRE_VALIDATION
     )
 
     changing = Proposal(
@@ -269,11 +290,159 @@ def test_proposal_policy_respects_debug_class_and_physical_boundary() -> None:
         rationale="change a load",
         requires_physical_decision=True,
     )
-    assert decide_proposal(intent, changing).action is ProposalAction.REJECT
+    assert decide_proposal(state_authority, changing).action is ProposalAction.REJECT
     unresolved = bound_intent(
         unresolved=({"condition": "load", "authoritative": True, "source": "user"},),
     )
-    assert decide_proposal(unresolved, changing).action is ProposalAction.ASK_AND_BLOCK
+    unresolved_state = run_transition(intent_snapshot(unresolved, tmp_path, "proposal-blocked"))
+    assert decide_proposal(unresolved_state, changing).action is ProposalAction.ASK_AND_BLOCK
+
+
+def test_proposal_authority_scope_exploits_fail_closed(tmp_path: Path) -> None:
+    cases = (
+        (
+            "empty",
+            bound_intent(),
+            Proposal(
+                proposal_id="empty",
+                proposal_class=ProposalClass.INTENT_PRESERVING,
+                evidence_ids=("caller-assertion",),
+                authorized=True,
+            ),
+            ProposalAction.REJECT,
+        ),
+        (
+            "undeclared-mesh",
+            bound_intent(
+                allowed_mesh_changes={"mesh": {"element_ids": [1], "target_size": 0.5}},
+            ),
+            Proposal(
+                proposal_id="undeclared-mesh",
+                proposal_class=ProposalClass.INTENT_PRESERVING,
+                evidence_ids=("caller-assertion",),
+                changes={"mesh": {"element_ids": (2,), "target_size": 0.5}},
+                authorized=True,
+                within_contract=True,
+            ),
+            ProposalAction.REJECT,
+        ),
+        (
+            "class-mismatch",
+            bound_intent(allowed_numerical_changes={"numerical": {"time_step": 0.1}}),
+            Proposal(
+                proposal_id="class-mismatch",
+                proposal_class=ProposalClass.INTENT_PRESERVING,
+                evidence_ids=("caller-assertion",),
+                changes={"numerical": {"time_step": 0.1}},
+                authorized=True,
+                within_contract=True,
+            ),
+            ProposalAction.REQUIRE_VALIDATION,
+        ),
+    )
+    for suffix, intent, proposal, expected in cases:
+        state = run_transition(intent_snapshot(intent, tmp_path, suffix))
+        authority = ProposalAuthorityManager(state).issue(proposal)
+        assert decide_proposal(state, proposal, authority).action is expected
+
+    numerical = Proposal(
+        proposal_id="evidence-free-validate",
+        proposal_class=ProposalClass.INTENT_SENSITIVE,
+        evidence_ids=("caller-assertion",),
+        changes={"numerical": {"time_step": 0.1}},
+        authorized=True,
+    )
+    numerical_state = run_transition(
+        intent_snapshot(
+            bound_intent(allowed_numerical_changes={"numerical": {"time_step": 0.1}}),
+            tmp_path,
+            "evidence-free-validate",
+        )
+    )
+    numerical_manager = ProposalAuthorityManager(numerical_state)
+    numerical_authority = numerical_manager.issue(numerical)
+    with pytest.raises(EvidenceIntegrityError):
+        numerical_manager.validate(numerical_authority)
+    assert (
+        decide_proposal(
+            numerical_state, numerical, numerical_authority, validation_passed=True
+        ).action
+        is ProposalAction.REQUIRE_VALIDATION
+    )
+
+
+def test_proposal_authority_requires_bound_state_and_exact_inputs(tmp_path: Path) -> None:
+    intent = bound_intent(allowed_mesh_changes={"mesh": {"element_ids": [1]}})
+    gathering = run_transition(intent_snapshot(bound_intent(contact=None), tmp_path, "gathering"))
+    with pytest.raises(EvidenceIntegrityError):
+        ProposalAuthorityManager(gathering)
+    state = run_transition(intent_snapshot(intent, tmp_path, "required"))
+    proposal = Proposal(
+        proposal_id="required",
+        proposal_class=ProposalClass.INTENT_PRESERVING,
+        evidence_ids=("log-1",),
+        changes={"mesh": {"element_ids": (1,)}},
+    )
+    assert (
+        decide_proposal(state, proposal, validation_passed=True).action
+        is ProposalAction.REQUIRE_VALIDATION
+    )
+    authority = ProposalAuthorityManager(state).issue(proposal)
+    assert decide_proposal(state, proposal, authority).action is ProposalAction.AUTO_APPLY
+    with pytest.raises(TypeError):
+        decide_proposal(state, proposal, proposal_authority=True)  # type: ignore[arg-type]
+
+
+def test_proposal_authority_rejects_forgery_foreign_and_tampered_state(tmp_path: Path) -> None:
+    snapshot = intent_snapshot(
+        bound_intent(allowed_mesh_changes={"mesh": "local"}), tmp_path, "authority-a"
+    )
+    state = run_transition(snapshot)
+    proposal = Proposal(
+        proposal_id="bound",
+        proposal_class=ProposalClass.INTENT_PRESERVING,
+        evidence_ids=("log-1",),
+        changes={"mesh": "local"},
+    )
+    authority = ProposalAuthorityManager(state).issue(proposal)
+    assert decide_proposal(state, proposal, authority).action is ProposalAction.AUTO_APPLY
+    foreign = run_transition(intent_snapshot(bound_intent(), tmp_path, "authority-b"))
+    with pytest.raises(EvidenceIntegrityError):
+        decide_proposal(foreign, proposal, authority)
+    with pytest.raises((TypeError, EvidenceIntegrityError)):
+        decide_proposal(state, proposal, object.__new__(ProposalAuthority))
+    for operation in (copy, deepcopy, pickle.dumps):
+        with pytest.raises(TypeError):
+            operation(authority)
+    with pytest.raises(TypeError):
+        replace(authority)  # type: ignore[type-var]
+    with pytest.raises((AttributeError, TypeError)):
+        object.__setattr__(authority, "forged", True)
+    with pytest.raises(TypeError):
+
+        class AuthorityChild(ProposalAuthority):
+            pass
+
+    with pytest.raises(EvidenceIntegrityError):
+        decide_proposal(state, copy(proposal), authority)
+    object.__setattr__(proposal, "evidence_ids", ("tampered-evidence",))
+    with pytest.raises(EvidenceIntegrityError):
+        decide_proposal(state, proposal, authority)
+    store = object.__getattribute__(snapshot, "_store")
+    payload = json.loads(store.intent_path.read_text(encoding="utf-8"))
+    payload["engineering_question"] = "tampered"
+    store.intent_path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(EvidenceIntegrityError):
+        decide_proposal(
+            state,
+            Proposal(
+                "bound",
+                ProposalClass.INTENT_PRESERVING,
+                evidence_ids=("log-1",),
+                changes={"mesh": "local"},
+            ),
+            authority,
+        )
 
 
 def test_retry_ledger_accounts_only_allowed_retries() -> None:
@@ -320,8 +489,8 @@ def test_sensitive_proposal_validation_is_required_before_retry_accounting() -> 
         proposal=proposal,
         validation_passed=True,
     )
-    assert applied.decision is RetryDecision.RETRY
-    assert applied.ledger.used == 1
+    assert applied.decision is RetryDecision.STOP
+    assert applied.ledger.used == 0
 
 
 def test_stale_ask_and_block_state_fails_closed_without_emitting_a_new_question() -> None:

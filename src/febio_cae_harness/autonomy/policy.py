@@ -14,7 +14,7 @@ from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from math import isfinite
 from types import MappingProxyType
-from typing import NoReturn, Self, cast
+from typing import Any, NoReturn, Self, cast
 
 from ..contracts import IntentContract, IntentState, JSONValue
 from ..evidence import EvidenceIntegrityError, IntentSnapshotAuthority
@@ -36,10 +36,13 @@ __all__ = [
     "IntentState",
     "PhysicalConditionEvidence",
     "Proposal",
+    "ProposalAuthority",
+    "ProposalAuthorityManager",
     "ProposalAction",
     "ProposalClass",
     "ProposalDecision",
     "ProposalKind",
+    "ProposalValidationReceipt",
     "RetryBudgetExceeded",
     "RetryDecision",
     "RetryLedger",
@@ -1007,6 +1010,218 @@ class Proposal:
         return self.classification
 
 
+def _structural_subset(candidate: object, declared: object) -> bool:
+    if isinstance(candidate, Mapping):
+        return isinstance(declared, Mapping) and all(
+            key in declared and _structural_subset(value, declared[key])
+            for key, value in candidate.items()
+        )
+    if isinstance(candidate, tuple):
+        return (
+            isinstance(declared, tuple)
+            and len(candidate) == len(declared)
+            and all(map(_structural_subset, candidate, declared))
+        )
+    return type(candidate) is type(declared) and candidate == declared
+
+
+def _matches_declaration(value: object, declarations: object, namespace: str) -> bool:
+    if isinstance(declarations, Mapping) and namespace in declarations:
+        declarations = declarations[namespace]
+    if isinstance(declarations, tuple):
+        return _structural_subset(value, declarations) or any(
+            _matches_declaration(value, declaration, namespace) for declaration in declarations
+        )
+    return _structural_subset(value, declarations)
+
+
+def _change_value_present(value: object) -> bool:
+    if value is None or isinstance(value, str) and not value.strip():
+        return False
+    if isinstance(value, Mapping):
+        return bool(value) and all(_change_value_present(item) for item in value.values())
+    return not isinstance(value, tuple) or bool(value)
+
+
+def _namespaced_scope(
+    changes: Mapping[str, JSONValue], declarations: object, namespace: str
+) -> str:
+    matched = _matches_declaration(
+        changes[namespace], declarations, namespace
+    ) or _matches_declaration(changes, declarations, namespace)
+    return namespace if matched else "invalid"
+
+
+def _proposal_scope(intent: IntentContract, proposal: Proposal) -> str:
+    changes = proposal.changes
+    if not isinstance(changes, Mapping):
+        return "invalid"
+    if not changes or proposal.requires_physical_decision:
+        return "physical"
+    if proposal.classification is ProposalClass.INTENT_CHANGING:
+        return "physical"
+    if not _change_value_present(changes):
+        return "invalid"
+    names = set(changes)
+    if names == {"mesh"}:
+        return _namespaced_scope(changes, intent.allowed_mesh_changes, "mesh")
+    if names == {"numerical"}:
+        return _namespaced_scope(changes, intent.allowed_numerical_changes, "numerical")
+    if _matches_declaration(changes, intent.allowed_numerical_changes, "numerical"):
+        return "numerical"
+    return "physical"
+
+
+class _Opaque:
+    __slots__ = ()
+
+    def _forbidden(self, *args: object) -> NoReturn:
+        raise TypeError("opaque proposal authorities cannot be copied or pickled")
+
+    __copy__ = __deepcopy__ = __reduce__ = __reduce_ex__ = _forbidden
+
+
+class ProposalAuthority(_Opaque):
+    __slots__ = ()
+
+    def __new__(cls, *, _factory: object | None = None) -> ProposalAuthority:
+        if cls is not ProposalAuthority or _factory is not _PROPOSAL_AUTHORITY_FACTORY:
+            raise TypeError("proposal tokens are manager-issued")
+        return object.__new__(cls)
+
+    def __init_subclass__(cls, **kwargs: object) -> NoReturn:
+        raise TypeError("proposal authorities cannot be subclassed")
+
+
+class ProposalAuthorityManager(_Opaque):
+    __slots__ = ()
+
+    def __init__(self, state_authority: IntentStateAuthority) -> None:
+        record = _state_authority_record(state_authority, bound=True)
+        snapshot = record[1]
+        _PROPOSAL_MANAGERS[id(self)] = (
+            self,
+            state_authority,
+            snapshot,
+            snapshot.case_id,
+            snapshot.case_sha256,
+            snapshot.intent_sha256,
+        )
+
+    def issue(self, proposal: Proposal) -> ProposalAuthority:
+        manager = _proposal_manager_record(self)
+        return _issue_proposal_token(manager, proposal)
+
+    def validate(
+        self,
+        proposal: Proposal | ProposalAuthority | ProposalValidationReceipt,
+    ) -> ProposalValidationReceipt:
+        _proposal_manager_record(self)
+        raise EvidenceIntegrityError(
+            "proposal validation requires a canonical result-validation authority"
+        )
+
+
+_PROPOSAL_AUTHORITY_FACTORY = object()
+ProposalValidationReceipt = ProposalAuthority
+type _ProposalManagerRecord = tuple[Any, ...]
+type _ProposalTokenRecord = tuple[Any, ...]
+_PROPOSAL_MANAGERS: dict[int, _ProposalManagerRecord] = {}
+_PROPOSAL_TOKENS: dict[int, _ProposalTokenRecord] = {}
+
+
+def _state_authority_record(value: object, *, bound: bool = False) -> _IntentStateRecord:
+    if type(value) is not IntentStateAuthority:
+        raise TypeError("proposal policy requires an exact IntentStateAuthority")
+    record = value._validated_record()
+    if bound and record[5] is not IntentState.BOUND:
+        raise EvidenceIntegrityError("proposal authorization requires a BOUND state authority")
+    return record
+
+
+def _proposal_manager_record(value: object) -> _ProposalManagerRecord:
+    if type(value) is not ProposalAuthorityManager:
+        raise TypeError("proposal manager must be an exact ProposalAuthorityManager")
+    record = _PROPOSAL_MANAGERS.get(id(value))
+    if record is None or record[0] is not value:
+        raise EvidenceIntegrityError("proposal manager is not manager-issued")
+    if (
+        _state_authority_record(record[1], bound=True)[1] is not record[2]
+        or (record[2].case_id, record[2].case_sha256, record[2].intent_sha256) != record[3:6]
+    ):
+        raise EvidenceIntegrityError("proposal manager binding is stale")
+    return record
+
+
+def _proposal_projection(proposal: Proposal) -> tuple[object, ...]:
+    if type(proposal) is not Proposal:
+        raise TypeError("proposal must be an exact Proposal")
+    try:
+        evidence_ids = tuple(proposal.evidence_ids)
+        frozen_changes = _freeze_json(proposal.changes)
+    except (AttributeError, TypeError, ValueError) as error:
+        raise EvidenceIntegrityError("proposal changes are invalid") from error
+    if any(not isinstance(value, str) or not value.strip() for value in evidence_ids):
+        raise EvidenceIntegrityError("proposal evidence identifiers are invalid")
+    return (
+        proposal.proposal_id,
+        proposal.proposal_class,
+        proposal.rationale,
+        evidence_ids,
+        frozen_changes,
+        proposal.authorized,
+        proposal.requires_physical_decision,
+        proposal.within_contract,
+    )
+
+
+def _issue_proposal_token(
+    manager: _ProposalManagerRecord,
+    proposal: Proposal,
+) -> ProposalAuthority:
+    projection = _proposal_projection(proposal)
+    if not proposal.evidence_ids:
+        raise EvidenceIntegrityError("proposal requires explicit evidence identifiers")
+    token = object.__new__(ProposalAuthority)
+    _PROPOSAL_TOKENS[id(token)] = (token, manager[0], manager[1], manager[2], proposal, projection)
+    return token
+
+
+def _proposal_token_record_for(value: object) -> _ProposalTokenRecord:
+    if type(value) is not ProposalAuthority:
+        raise TypeError("proposal authorization requires a manager-issued authority or receipt")
+    record = _PROPOSAL_TOKENS.get(id(value))
+    if record is None:
+        raise EvidenceIntegrityError("proposal authority or receipt is not manager-issued")
+    if record[0] is not value:
+        raise EvidenceIntegrityError("proposal authority or receipt is not manager-issued")
+    return record
+
+
+def _proposal_token_record(
+    value: object,
+    *,
+    manager: ProposalAuthorityManager,
+    state_authority: IntentStateAuthority | None = None,
+    proposal: Proposal | None = None,
+) -> _ProposalTokenRecord:
+    record = _proposal_token_record_for(value)
+    manager_record = _proposal_manager_record(manager)
+    if (
+        record[1] is not manager
+        or record[2] is not manager_record[1]
+        or (state_authority is not None and record[2] is not state_authority)
+    ):
+        raise EvidenceIntegrityError("proposal authorization belongs to another manager or state")
+    if _state_authority_record(record[2], bound=True)[1] is not record[3]:
+        raise EvidenceIntegrityError("proposal authorization snapshot is stale")
+    if proposal is not None and (
+        proposal is not record[4] or _proposal_projection(proposal) != record[5]
+    ):
+        raise EvidenceIntegrityError("proposal authorization does not match the proposal")
+    return record
+
+
 @dataclass(frozen=True, slots=True)
 class ProposalDecision:
     """Decision for a proposal, with no application side effect."""
@@ -1027,71 +1242,97 @@ class ProposalDecision:
 
 
 def decide_proposal(
-    intent: IntentContract,
+    state_authority: IntentStateAuthority | IntentContract,
     proposal: Proposal,
+    proposal_authority: ProposalAuthority | ProposalValidationReceipt | None = None,
     *,
+    validation_receipt: ProposalValidationReceipt | None = None,
+    authority: ProposalAuthority | ProposalValidationReceipt | None = None,
     validation_passed: bool = False,
 ) -> ProposalDecision:
-    """Apply debug-class policy while preserving the physical-condition boundary."""
+    """Decide a proposal; only a live manager authority can produce AUTO_APPLY."""
 
-    if not isinstance(intent, IntentContract):
-        raise TypeError("intent must be an IntentContract")
+    legacy = isinstance(state_authority, IntentContract)
+    if legacy:
+        intent = cast(IntentContract, state_authority)
+    else:
+        state_record = _state_authority_record(state_authority)
+        intent = state_record[3]
     if not isinstance(proposal, Proposal):
         raise TypeError("proposal must be a Proposal")
-    blocking = unresolved_authoritative_conditions(intent)
-    if intent.state is IntentState.ASK_AND_BLOCK and not blocking:
-        return ProposalDecision(
-            proposal=proposal,
-            action=ProposalAction.REJECT,
-            reason="ASK_AND_BLOCK state lacks a current authoritative condition record",
-            next_state=intent.state,
-        )
-    proposal_class = proposal.classification
-    physical_change = (
-        proposal.requires_physical_decision or proposal_class is ProposalClass.INTENT_CHANGING
+
+    supplied = tuple(
+        token for token in (proposal_authority, validation_receipt, authority) if token is not None
     )
-    if physical_change:
-        if blocking:
-            return ProposalDecision(
-                proposal=proposal,
-                action=ProposalAction.ASK_AND_BLOCK,
-                reason="authoritative physical condition requires a user decision",
-                next_state=IntentState.ASK_AND_BLOCK,
-                blocking_conditions=blocking,
-            )
+    if len(supplied) > 1:
+        raise TypeError("supply only one proposal authority or validation receipt")
+    token_record: _ProposalTokenRecord | None = None
+    if supplied:
+        if legacy:
+            raise TypeError("proposal authorization requires an IntentStateAuthority")
+        token_record = _proposal_token_record(
+            supplied[0],
+            manager=cast(ProposalAuthorityManager, _proposal_token_record_for(supplied[0])[1]),
+            state_authority=cast(IntentStateAuthority, state_authority),
+            proposal=proposal,
+        )
+        intent = token_record[2].intent
+
+    def result(
+        action: ProposalAction,
+        reason: str,
+        next_state: IntentState | None = None,
+        blocking_conditions: tuple[PhysicalConditionEvidence, ...] = (),
+    ) -> ProposalDecision:
         return ProposalDecision(
             proposal=proposal,
-            action=ProposalAction.REJECT,
-            reason="physical change has no unresolved authoritative condition to ask about",
-            next_state=intent.state,
+            action=action,
+            reason=reason,
+            next_state=intent.state if next_state is None else next_state,
+            blocking_conditions=blocking_conditions,
         )
 
-    has_evidence = bool(proposal.evidence_ids)
-    authorized = proposal.authorized or proposal.within_contract or not proposal.changes
-    if not has_evidence or not authorized:
-        return ProposalDecision(
-            proposal=proposal,
-            action=ProposalAction.REJECT,
-            reason="proposal lacks explicit evidence or contract authorization",
-            next_state=intent.state,
+    blocking = unresolved_authoritative_conditions(intent)
+    if intent.state is IntentState.ASK_AND_BLOCK and not blocking:
+        return result(
+            ProposalAction.REJECT,
+            "ASK_AND_BLOCK state lacks a current authoritative condition record",
         )
-    if proposal_class is ProposalClass.INTENT_SENSITIVE and not validation_passed:
-        return ProposalDecision(
-            proposal=proposal,
-            action=ProposalAction.REQUIRE_VALIDATION,
-            reason="intent-sensitive change requires result and intent validation",
-            next_state=intent.state,
+    scope = _proposal_scope(intent, proposal)
+    if scope == "physical":
+        if blocking:
+            return result(
+                ProposalAction.ASK_AND_BLOCK,
+                "authoritative physical condition requires a user decision",
+                IntentState.ASK_AND_BLOCK,
+                blocking,
+            )
+        return result(
+            ProposalAction.REJECT,
+            "physical change has no unresolved authoritative condition to ask about",
         )
-    return ProposalDecision(
-        proposal=proposal,
-        action=ProposalAction.AUTO_APPLY,
-        reason=(
-            "intent-preserving evidence-backed proposal is within contract"
-            if proposal_class is ProposalClass.INTENT_PRESERVING
-            else "intent-sensitive proposal passed validation"
-        ),
-        next_state=intent.state,
-    )
+    if scope == "invalid":
+        return result(
+            ProposalAction.REJECT,
+            "proposal changes are not explicitly declared by the live intent contract",
+        )
+
+    if not proposal.evidence_ids:
+        return result(
+            ProposalAction.REJECT,
+            "proposal lacks explicit evidence identifiers",
+        )
+    if scope == "numerical":
+        return result(
+            ProposalAction.REQUIRE_VALIDATION,
+            "declared numerical change requires canonical result validation",
+        )
+    if token_record is None:
+        return result(
+            ProposalAction.REQUIRE_VALIDATION,
+            "manager-issued proposal authority is required before APPLY",
+        )
+    return result(ProposalAction.AUTO_APPLY, "declared mesh change has manager authority")
 
 
 @dataclass(frozen=True, slots=True)
