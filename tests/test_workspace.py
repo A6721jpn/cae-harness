@@ -627,7 +627,27 @@ def test_directory_guard_blocks_rename_while_held(tmp_path: Path) -> None:
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires Windows handle-bound deletion")
-def test_nested_cleanup_deletes_authoritative_child_not_foreign_replacement(
+def test_cleanup_directory_handle_blocks_rename_until_exact_delete_and_close(
+    tmp_path: Path,
+) -> None:
+    guarded = tmp_path / "guarded"
+    renamed = tmp_path / "renamed"
+    guarded.mkdir()
+    handle = workspace_module._open_cleanup_directory(guarded, "guarded")
+
+    try:
+        with pytest.raises(OSError):
+            guarded.rename(renamed)
+        workspace_module._delete_open_directory(handle, "guarded")
+    finally:
+        workspace_module._close_handle(handle)
+
+    assert not guarded.exists()
+    assert not renamed.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows handle-bound deletion")
+def test_nested_cleanup_blocks_foreign_replacement_before_exact_delete(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -639,7 +659,7 @@ def test_nested_cleanup_deletes_authoritative_child_not_foreign_replacement(
     original_open_cleanup_directory = workspace_module._open_cleanup_directory
     original_delete_open_directory = workspace_module._delete_open_directory
     cleanup_handles: dict[int, Path] = {}
-    swapped = False
+    blocked = False
 
     def track_open(path: Path, label: str) -> int:
         handle = original_open_cleanup_directory(path, label)
@@ -647,11 +667,11 @@ def test_nested_cleanup_deletes_authoritative_child_not_foreign_replacement(
         return handle
 
     def replace_before_delete(handle: int, label: str) -> None:
-        nonlocal swapped
+        nonlocal blocked
         if cleanup_handles.get(handle) == child:
-            child.rename(displaced)
-            child.mkdir()
-            swapped = True
+            with pytest.raises(OSError):
+                child.rename(displaced)
+            blocked = True
         original_delete_open_directory(handle, label)
 
     monkeypatch.setattr(
@@ -668,9 +688,9 @@ def test_nested_cleanup_deletes_authoritative_child_not_foreign_replacement(
 
     workspace_module._remove_created_tree_contents(parent, parent_stamp, "parent")
 
-    assert swapped
-    assert not displaced.exists(), "authoritative child directory must be deleted"
-    assert child.is_dir(), "foreign replacement must remain untouched"
+    assert blocked
+    assert not displaced.exists(), "foreign replacement must not be installed"
+    assert not child.exists(), "authoritative child directory must be deleted"
 
 
 def test_failed_promotion_removes_destination_after_source_changes(
@@ -834,7 +854,7 @@ def test_failed_case_creation_deletes_authoritative_case_not_foreign_replacement
     original_identity_stamp = workspace_module._identity_stamp
     displaced = tmp_path / "displaced-case"
     identity_checks = 0
-    swapped = False
+    blocked = False
 
     def track_identity_stamp(
         path: str | Path,
@@ -848,11 +868,11 @@ def test_failed_case_creation_deletes_authoritative_case_not_foreign_replacement
         return stamp
 
     def swap_case_path() -> None:
-        nonlocal swapped
+        nonlocal blocked
         assert identity_checks > 0
-        case_path.rename(displaced)
-        case_path.mkdir()
-        swapped = True
+        with pytest.raises(OSError):
+            case_path.rename(displaced)
+        blocked = True
 
     def replace_before_final_rmdir(path: Path) -> None:
         if path == case_path:
@@ -888,6 +908,6 @@ def test_failed_case_creation_deletes_authoritative_case_not_foreign_replacement
     with pytest.raises(RuntimeError, match="creation failed"):
         workspace.create_case("case-a", [source])
 
-    assert swapped
-    assert not displaced.exists(), "authoritative case directory must be deleted"
-    assert case_path.is_dir(), "foreign replacement must remain untouched"
+    assert blocked
+    assert not displaced.exists(), "foreign replacement must not be installed"
+    assert not case_path.exists(), "authoritative case directory must be deleted"

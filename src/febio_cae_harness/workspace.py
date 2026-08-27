@@ -188,7 +188,7 @@ def _open_cleanup_directory(path: Path, label: str) -> int:
     return _windows_create(
         path,
         0x0001 | 0x0080 | 0x00010000,
-        0x0001 | 0x0002 | 0x0004,
+        0x0001 | 0x0002,
         3,
         0x02000000 | 0x00200000,
         label,
