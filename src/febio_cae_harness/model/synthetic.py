@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import stat
 from contextlib import suppress
 from dataclasses import dataclass
 from math import isfinite
@@ -104,8 +105,37 @@ def _has_alias(path: Path) -> bool:
         return True
     try:
         return bool(path.lstat().st_file_attributes & _REPARSE_POINT)
-    except (AttributeError, FileNotFoundError, OSError):
+    except (AttributeError, FileNotFoundError):
         return False
+
+
+def _regular_single_link_identity(path: Path, metadata: os.stat_result) -> tuple[int, int]:
+    if not stat.S_ISREG(metadata.st_mode):
+        raise ValueError(f"synthetic destination is not a regular file: {path}")
+    if metadata.st_nlink != 1:
+        raise ValueError(f"synthetic destination must have exactly one link: {path}")
+    return metadata.st_dev, metadata.st_ino
+
+
+def _verify_target_identity(target: Path, created_identity: tuple[int, int]) -> None:
+    observed = _regular_single_link_identity(target, target.lstat())
+    if observed != created_identity:
+        raise ValueError(f"synthetic destination identity changed: {target}")
+
+
+def _cleanup_created_target(target: Path, created_identity: tuple[int, int] | None) -> None:
+    if created_identity is None:
+        return
+    try:
+        metadata = target.lstat()
+    except OSError:
+        return
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        return
+    if (metadata.st_dev, metadata.st_ino) != created_identity:
+        return
+    with suppress(OSError):
+        target.unlink()
 
 
 def _reject_alias_components(path: Path) -> None:
@@ -172,22 +202,33 @@ def generate_synthetic_feb(
     if any(attempt.iterdir()):
         raise ValueError("attempt directory must be empty")
 
-    created = False
+    created_identity: tuple[int, int] | None = None
+    open_fd: int | None = None
     try:
-        with target.open("xb") as stream:
-            created = True
+        opened_fd = os.open(
+            os.fspath(target),
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0),
+            0o600,
+        )
+        open_fd = opened_fd
+        created_identity = _regular_single_link_identity(target, os.fstat(opened_fd))
+        with os.fdopen(opened_fd, "wb") as stream:
+            open_fd = None
             stream.write(_PAYLOAD)
             stream.flush()
             os.fsync(stream.fileno())
+        _verify_target_identity(target, created_identity)
         inspection = inspect_feb_file(target)
         preflight = run_preflight(feb=inspection)
         if not preflight.ready:
             details = "; ".join(item.message for item in preflight.diagnostics)
             raise ValueError(f"generated synthetic FEB failed preflight: {details}")
+        _verify_target_identity(target, created_identity)
     except BaseException:
-        if created:
+        if open_fd is not None:
             with suppress(OSError):
-                target.unlink()
+                os.close(open_fd)
+        _cleanup_created_target(target, created_identity)
         raise
 
     return SyntheticFebReceipt(

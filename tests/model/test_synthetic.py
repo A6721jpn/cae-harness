@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+import febio_cae_harness.model.synthetic as synthetic_module
 from febio_cae_harness.model import (
     SyntheticFebReceipt,
     generate_synthetic_feb,
@@ -113,3 +114,71 @@ def test_generator_rejects_unsafe_names_aliases_and_hardlinks(tmp_path: Path) ->
     with pytest.raises(FileExistsError):
         generate_synthetic_feb(attempt)
     assert outside.read_bytes() == b"sentinel"
+
+
+def test_generator_fails_closed_on_unexpected_lstat_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    attempt = tmp_path / "attempt"
+    attempt.mkdir()
+    original_lstat = Path.lstat
+
+    def fail_attempt_lstat(path: Path) -> object:
+        if path == attempt:
+            raise OSError("injected lstat failure")
+        return original_lstat(path)
+
+    monkeypatch.setattr(Path, "lstat", fail_attempt_lstat)
+
+    with pytest.raises(OSError, match="injected lstat failure"):
+        generate_synthetic_feb(attempt)
+    assert list(attempt.iterdir()) == []
+
+
+def test_generator_preserves_replacement_after_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    attempt = tmp_path / "attempt"
+    attempt.mkdir()
+    target = attempt / "synthetic.feb"
+    attacker_payload = b'<febio_spec version="4.0" />'
+    real_inspect = inspect_feb_file
+
+    def replace_before_inspection(source: Path) -> object:
+        target.unlink()
+        target.write_bytes(attacker_payload)
+        return real_inspect(source)
+
+    monkeypatch.setattr(synthetic_module, "inspect_feb_file", replace_before_inspection)
+
+    with pytest.raises(ValueError, match="identity"):
+        generate_synthetic_feb(attempt)
+    assert target.read_bytes() == attacker_payload
+
+
+def test_generator_preserves_hardlink_replacement_before_inspection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    attempt = tmp_path / "attempt"
+    attempt.mkdir()
+    target = attempt / "synthetic.feb"
+    attacker = tmp_path / "attacker.feb"
+    attacker_payload = b'<febio_spec version="4.0" />'
+    attacker.write_bytes(attacker_payload)
+    real_inspect = inspect_feb_file
+
+    def replace_with_hardlink(source: Path) -> object:
+        target.unlink()
+        try:
+            os.link(attacker, target)
+        except OSError as error:
+            pytest.fail(f"hardlink injection unavailable: {error}")
+        return real_inspect(source)
+
+    monkeypatch.setattr(synthetic_module, "inspect_feb_file", replace_with_hardlink)
+
+    with pytest.raises(ValueError, match="link|identity"):
+        generate_synthetic_feb(attempt)
+    assert target.read_bytes() == attacker_payload
+    assert attacker.read_bytes() == attacker_payload
+    assert target.stat().st_nlink == 2
