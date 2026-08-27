@@ -632,6 +632,13 @@ class SolverSupervisor:
                 raise SolverOwnershipError("process authority could not be verified") from error
             process.wait(timeout=2.0)
 
+    def _release_process_authority(self) -> None:
+        authority = self._process_authority
+        self._process_authority = None
+        if authority is not None:
+            with contextlib.suppress(OSError):
+                authority.close()
+
     def _register_result(self, result: SolverRunResult) -> None:
         if type(result) is not SolverRunResult:
             raise SolverOwnershipError("solver result must be an exact SolverRunResult instance")
@@ -775,9 +782,10 @@ class SolverSupervisor:
             return candidate
 
     def _complete(self, state: SolverState, return_code: int | None) -> SolverRunResult:
-        with self._lock:
+        with self._lock, contextlib.ExitStack() as cleanup:
             if self._result is not None:
                 return self._result
+            cleanup.callback(self._release_process_authority)
             started_at = self._started_at
             pid = self._process.pid if self._process is not None else None
 

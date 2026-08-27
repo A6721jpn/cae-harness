@@ -6,6 +6,7 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
@@ -31,6 +32,58 @@ def _supervisor(spec: SolverLaunchSpec) -> SolverSupervisor:
         intent_id="intent-a",
         attempt_id="attempt-a",
     )
+
+
+def _normal_spec(tmp_path: Path) -> SolverLaunchSpec:
+    input_path = tmp_path / "input.feb"
+    input_path.write_text("synthetic", encoding="utf-8")
+    return SolverLaunchSpec(
+        executable=Path(sys.executable),
+        input_path=input_path,
+        attempt_root=tmp_path / "attempt",
+        arguments=("-c", "pass"),
+    )
+
+
+@pytest.mark.parametrize(
+    ("terminal", "expected_state"),
+    (("normal", SolverState.NORMAL_EXIT), ("cancel", SolverState.CANCELLED)),
+)
+def test_terminal_completion_releases_parent_process_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    terminal: str,
+    expected_state: SolverState,
+) -> None:
+    spec = _normal_spec(tmp_path) if terminal == "normal" else _spec(tmp_path)
+    supervisor = _supervisor(spec).start()
+    authority = supervisor._process_authority
+    assert authority is not None
+    close = Mock(wraps=authority.close)
+    monkeypatch.setattr(authority, "close", close)
+
+    result = supervisor.wait() if terminal == "normal" else supervisor.cancel()
+
+    assert result.state is expected_state
+    close.assert_called_once_with()
+    assert supervisor._process_authority is None
+
+
+def test_reconnect_after_client_close_preserves_child_authority(tmp_path: Path) -> None:
+    spec = _spec(tmp_path)
+    original = _supervisor(spec).start()
+    authority = original._process_authority
+    assert authority is not None
+    authority.close()
+
+    resumed = SolverSupervisor.reconnect(
+        spec,
+        case_id="case-a",
+        intent_id="intent-a",
+        attempt_id="attempt-a",
+    )
+    assert resumed.state is SolverState.RUNNING
+    assert resumed.cancel().state is SolverState.CANCELLED
 
 
 def test_reconnect_resumes_monitoring_and_owned_cancellation(tmp_path: Path) -> None:
