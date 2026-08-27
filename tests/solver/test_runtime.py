@@ -6,6 +6,7 @@ import stat
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -22,6 +23,28 @@ def _fake_file(tmp_path: Path, *, executable: bool = True) -> Path:
     if executable:
         path.chmod(path.stat().st_mode | stat.S_IXUSR)
     return path
+
+
+def _patch_lstat_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    candidate: Path,
+    *,
+    file_attributes: int = 0,
+    nlink: int = 1,
+) -> None:
+    original_lstat = Path.lstat
+
+    def fake_lstat(path: Path) -> object:
+        metadata = original_lstat(path)
+        if path != candidate:
+            return metadata
+        return SimpleNamespace(
+            st_mode=metadata.st_mode,
+            st_file_attributes=file_attributes,
+            st_nlink=nlink,
+        )
+
+    monkeypatch.setattr(Path, "lstat", fake_lstat)
 
 
 def test_probe_fake_executable_returns_immutable_identity(
@@ -178,7 +201,9 @@ def test_probe_timeout_kills_process_and_does_not_report_identity(
 
 
 @pytest.mark.parametrize("kind", ["directory", "symlink", "hardlink"])
-def test_probe_rejects_nonregular_or_aliased_target(tmp_path: Path, kind: str) -> None:
+def test_probe_rejects_nonregular_or_aliased_target(
+    tmp_path: Path, kind: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
     target = tmp_path / "target"
     target.write_bytes(b"synthetic FEBio executable")
     target.chmod(target.stat().st_mode | stat.S_IXUSR)
@@ -191,15 +216,26 @@ def test_probe_rejects_nonregular_or_aliased_target(tmp_path: Path, kind: str) -
         try:
             candidate.symlink_to(target)
         except (OSError, NotImplementedError):
-            pytest.skip("symlink creation is unavailable")
+            candidate.write_bytes(target.read_bytes())
+            _patch_lstat_metadata(
+                monkeypatch,
+                candidate,
+                file_attributes=getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400),
+            )
     else:
         candidate = tmp_path / "hardlink"
         try:
             os.link(target, candidate)
         except (OSError, NotImplementedError):
-            pytest.skip("hardlink creation is unavailable")
+            candidate.write_bytes(target.read_bytes())
+            _patch_lstat_metadata(monkeypatch, candidate, nlink=2)
 
-    with pytest.raises(RuntimeProbeError):
+    expected_error = {
+        "directory": "not a regular file",
+        "symlink": "path contains an alias",
+        "hardlink": "must not be a hardlink",
+    }[kind]
+    with pytest.raises(RuntimeProbeError, match=expected_error):
         probe_febio(candidate)
 
 
