@@ -92,6 +92,7 @@ from .step import (
     inspect_step_text,
 )
 from .step_plan import StepMeshingPlan, StepMeshingRequest, plan_step_meshing
+from .synthetic import SyntheticFebReceipt, generate_synthetic_feb
 from .types import (
     ASK_AND_BLOCK,
     ConditionEvidence,
@@ -164,6 +165,7 @@ __all__ = [
     "StepMeshingPlan",
     "StepMeshingRequest",
     "StepUnitFact",
+    "SyntheticFebReceipt",
     "UnresolvedEvidenceField",
     "UnresolvedCondition",
     "XMLDefinition",
@@ -190,6 +192,7 @@ __all__ = [
     "inspect_step",
     "inspect_step_file",
     "inspect_step_text",
+    "generate_synthetic_feb",
     "inventory_feb_xml",
     "plan_derived_model",
     "plan_step_meshing",
