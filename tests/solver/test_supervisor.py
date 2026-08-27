@@ -2,16 +2,20 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
+import febio_cae_harness.solver.supervisor as supervisor_module
 from febio_cae_harness.contracts import IntentContract
 from febio_cae_harness.evidence import EvidenceStore
 from febio_cae_harness.solver import headless as headless_module
+from febio_cae_harness.solver.process_authority import ProcessAuthority
 from febio_cae_harness.solver.runtime import FebioRuntimeDiagnostic, probe_febio
 from febio_cae_harness.solver.supervisor import SolverSupervisor
 from febio_cae_harness.solver.types import (
@@ -104,6 +108,40 @@ def test_start_persists_attempt_owned_process_record(
             "log": str(spec.expected_outputs.log_path),
             "xplt": str(spec.expected_outputs.xplt_path),
         }
+        context = record["launch_context"]
+        assert isinstance(context, dict)
+        assert context["input_path"] == os.path.normcase(
+            os.path.realpath(os.path.abspath(os.fspath(spec.input_path)))
+        )
+        assert context["input_sha256"] == hashlib.sha256(spec.input_path.read_bytes()).hexdigest()
+        assert context["runtime_path"] == os.path.normcase(
+            os.path.realpath(os.path.abspath(os.fspath(spec.executable)))
+        )
+        runtime = object.__getattribute__(capability, "_runtime_diagnostic")
+        assert context["runtime_sha256"] == runtime.sha256
+        assert context["runtime_version"] == runtime.version
+        assert context["argv"] == list(spec.command)
+        assert context["cwd"] == os.path.normcase(
+            os.path.realpath(os.path.abspath(os.fspath(spec.cwd)))
+        )
+        assert context["output_paths"] == {
+            "log": os.path.normcase(
+                os.path.realpath(os.path.abspath(os.fspath(spec.expected_outputs.log_path)))
+            ),
+            "xplt": os.path.normcase(
+                os.path.realpath(os.path.abspath(os.fspath(spec.expected_outputs.xplt_path)))
+            ),
+        }
+        assert context["timeout_seconds"] is None
+        assert context["expected_steps"] is None
+        assert context["expected_final_time"] is None
+        assert context["requested_fields"] == []
+        assert isinstance(context["environment_digest"], str)
+        assert record["launch_context_digest"]
+        process_authority = record["process_authority"]
+        assert isinstance(process_authority, dict)
+        assert process_authority["context_digest"] == record["launch_context_digest"]
+        assert "FEBIO_CAE_HARNESS_AUTHORITY_CONTEXT" not in record_path.read_text(encoding="utf-8")
     finally:
         supervisor.cancel()
 
@@ -194,3 +232,124 @@ def test_start_revalidates_after_prepare_outputs_before_popen(
         supervisor.start()
 
     assert not popen_reached
+
+
+class _OrderingProcess:
+    pid = 4242
+
+    def __init__(self, events: list[str]) -> None:
+        self._events = events
+        self._return_code: int | None = None
+
+    def poll(self) -> int | None:
+        return self._return_code
+
+    def wait(self, timeout: float | None = None) -> int:
+        del timeout
+        self._return_code = self._return_code if self._return_code is not None else -15
+        return self._return_code
+
+    def kill(self) -> None:
+        self._events.append("process-kill")
+        self._return_code = -9
+
+
+class _OrderingAuthority:
+    def __init__(self, events: list[str]) -> None:
+        self._events = events
+        self._process: _OrderingProcess | None = None
+        self._context_digest = "f" * 64
+
+    @property
+    def claim(self) -> dict[str, object]:
+        return {
+            "kind": "windows-job",
+            "attempt_binding": "test",
+            "name": "test-job",
+            "context_digest": self._context_digest,
+        }
+
+    def child_environment(self) -> dict[str, str]:
+        return {}
+
+    def child_handle(self) -> int:
+        return 9876
+
+    def bind(self, pid: int) -> None:
+        assert pid == _OrderingProcess.pid
+        self._events.append("bind")
+
+    def resume(self, pid: int) -> None:
+        assert pid == _OrderingProcess.pid
+        self._events.append("resume")
+
+    def terminate(self, pid: int, *, force: bool = False) -> None:
+        del force
+        assert pid == _OrderingProcess.pid
+        self._events.append("terminate")
+        if self._process is not None:
+            self._process._return_code = -15
+
+    def close(self) -> None:
+        self._events.append("close")
+
+
+def test_windows_persists_bound_record_before_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ordering probe must fail on the old resume-before-record sequence."""
+
+    capability = _capability(tmp_path, monkeypatch, code="pass")
+    events: list[str] = []
+    authority = _OrderingAuthority(events)
+
+    class StartupInfo:
+        lpAttributeList: object | None = None
+
+    def fake_popen(*args: object, **kwargs: object) -> _OrderingProcess:
+        del args
+        creation_flags = kwargs["creationflags"]
+        assert isinstance(creation_flags, int)
+        assert creation_flags & 0x00000004
+        events.append("created-suspended")
+        process = _OrderingProcess(events)
+        authority._process = process
+        return process
+
+    monkeypatch.setattr(os, "name", "nt")
+    monkeypatch.setattr(subprocess, "STARTUPINFO", StartupInfo, raising=False)
+
+    def fake_create(attempt_root: Path, context_digest: str | None = None) -> _OrderingAuthority:
+        del attempt_root
+        if context_digest is not None:
+            authority._context_digest = context_digest
+        return authority
+
+    monkeypatch.setattr(ProcessAuthority, "create", fake_create)
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(
+        supervisor_module,
+        "_process_metadata",
+        lambda pid: supervisor_module._ProcessMetadata(
+            str(Path(sys.executable)), "windows:test", True, None
+        ),
+    )
+    original_write = SolverSupervisor._write_process_record
+
+    def record_write(supervisor: SolverSupervisor, record: dict[str, object]) -> None:
+        events.append(f"persist:{record.get('state')}")
+        original_write(supervisor, record)
+
+    monkeypatch.setattr(SolverSupervisor, "_write_process_record", record_write)
+    supervisor = SolverSupervisor(capability)
+    try:
+        supervisor.start()
+        first_persist = next(
+            index for index, event in enumerate(events) if event.startswith("persist:")
+        )
+        resume = events.index("resume")
+        assert first_persist < resume
+        assert events[first_persist] == "persist:BOUND_SUSPENDED"
+        assert events.index("persist:RUNNING") > resume
+    finally:
+        supervisor.cancel()

@@ -9,6 +9,7 @@ implementation.  FBS reads enter through the injected adapter boundary in
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import os
 import stat
@@ -472,6 +473,87 @@ def _spec_snapshot(spec: SolverLaunchSpec) -> tuple[object, ...]:
     )
 
 
+def _canonical_path(value: str | Path) -> str:
+    """Return the path spelling used by durable launch records."""
+
+    return os.path.normcase(os.path.realpath(os.path.abspath(os.fspath(value))))
+
+
+def _json_digest(value: object) -> str:
+    try:
+        encoded = json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError) as error:
+        raise SolverConfigurationError("launch context is not JSON-canonical") from error
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _environment_digest(environment: Mapping[str, str]) -> str:
+    """Digest environment values without placing them in durable evidence."""
+
+    return _json_digest(sorted(environment.items()))
+
+
+def _launch_context_projection(
+    spec: SolverLaunchSpec,
+    input_snapshot: tuple[object, ...],
+    runtime_diagnostic: object,
+) -> tuple[dict[str, object], str]:
+    """Build the exact, secret-free projection persisted for one launch."""
+
+    if len(input_snapshot) != 6 or not all(
+        isinstance(value, int) and not isinstance(value, bool) for value in input_snapshot[:5]
+    ):
+        raise SolverConfigurationError("solver input identity snapshot is invalid")
+    input_sha256 = input_snapshot[5]
+    if not isinstance(input_sha256, str) or not input_sha256:
+        raise SolverConfigurationError("solver input SHA256 snapshot is invalid")
+
+    runtime_path = getattr(runtime_diagnostic, "path", None)
+    runtime_sha256 = getattr(runtime_diagnostic, "sha256", None)
+    runtime_version = getattr(runtime_diagnostic, "version", None)
+    if not isinstance(runtime_path, Path):
+        raise SolverConfigurationError("runtime diagnostic path is invalid")
+    if not isinstance(runtime_sha256, str) or not runtime_sha256:
+        raise SolverConfigurationError("runtime diagnostic SHA256 is invalid")
+    if not isinstance(runtime_version, str) or not runtime_version:
+        raise SolverConfigurationError("runtime diagnostic version is invalid")
+
+    identity = {
+        "device": input_snapshot[0],
+        "inode": input_snapshot[1],
+        "nlink": input_snapshot[2],
+        "size": input_snapshot[3],
+        "mtime_ns": input_snapshot[4],
+    }
+    outputs = spec.expected_outputs
+    context: dict[str, object] = {
+        "input_path": _canonical_path(spec.input_path),
+        "input_sha256": input_sha256,
+        "input_identity": identity,
+        "runtime_path": _canonical_path(runtime_path),
+        "runtime_sha256": runtime_sha256,
+        "runtime_version": runtime_version,
+        "argv": list(spec.command),
+        "cwd": _canonical_path(spec.cwd),
+        "output_paths": {
+            "log": _canonical_path(outputs.log_path),
+            "xplt": _canonical_path(outputs.xplt_path),
+        },
+        "timeout_seconds": spec.timeout_seconds,
+        "expected_steps": spec.expected_steps,
+        "expected_final_time": spec.expected_final_time,
+        "requested_fields": list(spec.requested_fields),
+        "environment_digest": _environment_digest(spec.environment),
+    }
+    return context, _json_digest(context)
+
+
 def _input_snapshot(path: Path) -> tuple[object, ...]:
     """Capture a regular input's identity and bytes without changing it."""
 
@@ -550,7 +632,15 @@ def _require_issued_launch_capability(value: object) -> _LaunchCapabilityRecord:
 
 def _validate_launch_capability(
     value: object,
-) -> tuple[_LaunchCapabilityRecord, str, str, str, Path]:
+) -> tuple[
+    _LaunchCapabilityRecord,
+    str,
+    str,
+    str,
+    Path,
+    dict[str, object],
+    str,
+]:
     """Validate every live authority bound into a capability."""
 
     record = _require_issued_launch_capability(value)
@@ -662,7 +752,8 @@ def _validate_launch_capability(
         raise SolverConfigurationError(
             "solver launch capability authorities are not live"
         ) from error
-    return record, case_id, intent_id, attempt_id, root
+    context, context_digest = _launch_context_projection(spec, current_input, validated_runtime)
+    return record, case_id, intent_id, attempt_id, root, context, context_digest
 
 
 @dataclass(frozen=True, slots=True)

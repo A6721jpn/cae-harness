@@ -10,6 +10,7 @@ from unittest.mock import Mock
 
 import pytest
 
+import febio_cae_harness.solver.supervisor as supervisor_module
 from febio_cae_harness import workspace as workspace_module
 from febio_cae_harness.contracts import IntentContract
 from febio_cae_harness.evidence import EvidenceStore
@@ -332,3 +333,73 @@ def test_reconnect_revalidates_after_process_record_read_before_return(
             reconnected.cancel()
         else:
             original.cancel()
+
+
+def test_reconnect_rejects_fresh_capability_for_same_stem_alternate_input(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A nested same-stem input must not inherit an existing process record."""
+
+    capability = _capability(tmp_path, monkeypatch, code="import time; time.sleep(30)")
+    attempt = object.__getattribute__(capability, "_attempt_workspace")
+    intent = object.__getattribute__(capability, "_intent_snapshot")
+    runtime = object.__getattribute__(capability, "_runtime_diagnostic")
+    assert type(attempt) is AttemptWorkspace
+    assert type(runtime) is FebioRuntimeDiagnostic
+
+    input_a = attempt.write_text("nested-a/model.feb", "import time; time.sleep(30)")
+    input_b = attempt.write_text("nested-b/model.feb", "import time; time.sleep(30)")
+    original_capability = headless_module._issue_launch_capability(
+        attempt,
+        intent,
+        runtime,
+        input_a,
+        expected_steps=None,
+        expected_final_time=None,
+        timeout_seconds=None,
+    )
+    alternate_capability = headless_module._issue_launch_capability(
+        attempt,
+        intent,
+        runtime,
+        input_b,
+        expected_steps=None,
+        expected_final_time=None,
+        timeout_seconds=None,
+    )
+    original = SolverSupervisor(original_capability).start()
+    try:
+
+        def unexpected_process_metadata(pid: int) -> object:
+            del pid
+            raise AssertionError("alternate launch context reached process metadata")
+
+        monkeypatch.setattr(supervisor_module, "_process_metadata", unexpected_process_metadata)
+        with pytest.raises(SolverOwnershipError):
+            SolverSupervisor.reconnect(alternate_capability)
+    finally:
+        original.cancel()
+
+
+def test_reconnect_rejects_bound_suspended_record_before_process_access(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capability = _capability(tmp_path, monkeypatch, code="import time; time.sleep(30)")
+    original = SolverSupervisor(capability).start()
+    try:
+        record_path = original.process_record_path
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        record["state"] = "BOUND_SUSPENDED"
+        record_path.write_text(json.dumps(record), encoding="utf-8")
+
+        def unexpected_process_metadata(pid: int) -> object:
+            del pid
+            raise AssertionError("bound-suspended reconnect touched process metadata")
+
+        monkeypatch.setattr(supervisor_module, "_process_metadata", unexpected_process_metadata)
+        with pytest.raises(SolverOwnershipError, match="reconnectable|RUNNING"):
+            SolverSupervisor.reconnect(capability)
+    finally:
+        original.cancel()

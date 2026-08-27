@@ -6,6 +6,7 @@ import contextlib
 import ctypes
 import hashlib
 import os
+import re
 import secrets
 import signal
 from pathlib import Path
@@ -16,29 +17,40 @@ class ProcessAuthorityError(OSError):
     """Raised when the platform cannot attest the owned process."""
 
 
+_CONTEXT_ENVIRONMENT_KEY = "FEBIO_CAE_HARNESS_AUTHORITY_CONTEXT"
+
+
 def _attempt_binding(attempt_root: Path) -> str:
     value = os.path.normcase(os.path.realpath(os.path.abspath(os.fspath(attempt_root))))
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def _validate_context_digest(value: object) -> str:
+    if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise ProcessAuthorityError("process authority context binding is invalid")
+    return value
+
+
 class ProcessAuthority:
     @classmethod
-    def create(cls, attempt_root: Path) -> ProcessAuthority:
+    def create(cls, attempt_root: Path, context_digest: str) -> ProcessAuthority:
+        context_digest = _validate_context_digest(context_digest)
         if os.name == "nt":
-            return _WindowsProcessAuthority.create(attempt_root)
+            return _WindowsProcessAuthority.create(attempt_root, context_digest)
         if os.name == "posix":
-            return _PosixProcessAuthority.create(attempt_root)
+            return _PosixProcessAuthority.create(attempt_root, context_digest)
         raise ProcessAuthorityError("process attestation is unsupported on this platform")
 
     @classmethod
-    def from_claim(cls, attempt_root: Path, claim: object) -> ProcessAuthority:
+    def from_claim(cls, attempt_root: Path, claim: object, context_digest: str) -> ProcessAuthority:
+        context_digest = _validate_context_digest(context_digest)
         if not isinstance(claim, dict):
             raise ProcessAuthorityError("process authority claim is invalid")
         kind = claim.get("kind")
         if os.name == "nt" and kind == "windows-job":
-            return _WindowsProcessAuthority.from_claim(attempt_root, claim)
+            return _WindowsProcessAuthority.from_claim(attempt_root, claim, context_digest)
         if os.name == "posix" and kind == "posix-pipe":
-            return _PosixProcessAuthority.from_claim(attempt_root, claim)
+            return _PosixProcessAuthority.from_claim(attempt_root, claim, context_digest)
         raise ProcessAuthorityError("process authority kind is unsupported")
 
     def child_environment(self) -> dict[str, str]: ...  # type: ignore[empty-body]
@@ -62,16 +74,30 @@ class ProcessAuthority:
 
 
 class _PosixProcessAuthority(ProcessAuthority):
-    def __init__(self, attempt_root: Path, *, inode: int, write_fd: int | None) -> None:
+    def __init__(
+        self,
+        attempt_root: Path,
+        *,
+        inode: int,
+        write_fd: int | None,
+        context_digest: str,
+    ) -> None:
         if not Path("/proc").is_dir():
             raise ProcessAuthorityError("/proc is required for process attestation")
         self._binding = _attempt_binding(attempt_root)
+        self._context_digest = _validate_context_digest(context_digest)
         self._inode = inode
         self._write_fd = write_fd
-        self._claim = {"kind": "posix-pipe", "attempt_binding": self._binding, "pipe_inode": inode}
+        self._claim = {
+            "kind": "posix-pipe",
+            "attempt_binding": self._binding,
+            "pipe_inode": inode,
+            "context_digest": self._context_digest,
+        }
 
     @classmethod
-    def create(cls, attempt_root: Path) -> _PosixProcessAuthority:
+    def create(cls, attempt_root: Path, context_digest: str) -> _PosixProcessAuthority:
+        context_digest = _validate_context_digest(context_digest)
         if not Path("/proc").is_dir():
             raise ProcessAuthorityError("/proc is required for process attestation")
         read_fd, write_fd = os.pipe()
@@ -83,29 +109,45 @@ class _PosixProcessAuthority(ProcessAuthority):
             with contextlib.suppress(OSError):
                 os.close(write_fd)
             raise ProcessAuthorityError(f"unable to create process attestation: {error}") from error
-        return cls(attempt_root, inode=inode, write_fd=write_fd)
+        return cls(
+            attempt_root,
+            inode=inode,
+            write_fd=write_fd,
+            context_digest=context_digest,
+        )
 
     @classmethod
-    def from_claim(cls, attempt_root: Path, claim: object) -> _PosixProcessAuthority:
+    def from_claim(
+        cls, attempt_root: Path, claim: object, context_digest: str
+    ) -> _PosixProcessAuthority:
+        context_digest = _validate_context_digest(context_digest)
         if not isinstance(claim, dict) or claim.get("attempt_binding") != _attempt_binding(
             attempt_root
         ):
             raise ProcessAuthorityError("process authority attempt binding does not match")
+        if claim.get("context_digest") != context_digest:
+            raise ProcessAuthorityError("process authority context binding does not match")
         inode = claim.get("pipe_inode")
         if isinstance(inode, bool) or not isinstance(inode, int) or inode <= 0:
             raise ProcessAuthorityError("process authority pipe identity is invalid")
-        return cls(attempt_root, inode=inode, write_fd=None)
+        return cls(
+            attempt_root,
+            inode=inode,
+            write_fd=None,
+            context_digest=context_digest,
+        )
 
     @property
     def claim(self) -> dict[str, object]:
         return dict(self._claim)
 
     def child_environment(self) -> dict[str, str]:
-        return (
-            {}
-            if self._write_fd is None
-            else {"FEBIO_CAE_HARNESS_AUTHORITY_FD": str(self._write_fd)}
-        )
+        if self._write_fd is None:
+            return {}
+        return {
+            "FEBIO_CAE_HARNESS_AUTHORITY_FD": str(self._write_fd),
+            _CONTEXT_ENVIRONMENT_KEY: self._context_digest,
+        }
 
     def child_pass_fds(self) -> tuple[int, ...]:
         return () if self._write_fd is None else (self._write_fd,)
@@ -117,6 +159,7 @@ class _PosixProcessAuthority(ProcessAuthority):
     def verify(self, pid: int) -> None:
         if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
             raise ProcessAuthorityError("process authority PID is invalid")
+        proc_root = Path("/proc") / str(pid)
         getpgid = getattr(os, "getpgid", None)
         getsid = getattr(os, "getsid", None)
         if not callable(getpgid) or not callable(getsid):
@@ -125,6 +168,9 @@ class _PosixProcessAuthority(ProcessAuthority):
             if getpgid(pid) != pid or getsid(pid) != pid:
                 raise ProcessAuthorityError("process is not the attested session leader")
             expected = f"pipe:[{self._inode}]"
+            expected_context = f"{_CONTEXT_ENVIRONMENT_KEY}={self._context_digest}".encode()
+            if expected_context not in (proc_root / "environ").read_bytes().split(b"\0"):
+                raise ProcessAuthorityError("process context attestation does not match")
             with os.scandir(f"/proc/{pid}/fd") as entries:
                 found = any(
                     os.readlink(entry.path) == expected
@@ -181,11 +227,24 @@ class _WindowsProcessAuthority(ProcessAuthority):
             ("dwFlags", ctypes.c_uint32),
         ]
 
-    def __init__(self, attempt_root: Path, *, name: str, handle: Any) -> None:
+    def __init__(
+        self,
+        attempt_root: Path,
+        *,
+        name: str,
+        handle: Any,
+        context_digest: str,
+    ) -> None:
         self._binding = _attempt_binding(attempt_root)
+        self._context_digest = _validate_context_digest(context_digest)
         self._handle = handle
         self._bound_pid: int | None = None
-        self._claim = {"kind": "windows-job", "attempt_binding": self._binding, "name": name}
+        self._claim = {
+            "kind": "windows-job",
+            "attempt_binding": self._binding,
+            "name": name,
+            "context_digest": self._context_digest,
+        }
 
     @staticmethod
     def _kernel32() -> Any:
@@ -224,29 +283,45 @@ class _WindowsProcessAuthority(ProcessAuthority):
         return k
 
     @classmethod
-    def create(cls, attempt_root: Path) -> _WindowsProcessAuthority:
+    def create(cls, attempt_root: Path, context_digest: str) -> _WindowsProcessAuthority:
+        context_digest = _validate_context_digest(context_digest)
         binding = _attempt_binding(attempt_root)
-        name = f"Local\\febio-cae-{binding[:32]}-{secrets.token_hex(16)}"
+        name = f"Local\\febio-cae-{binding[:32]}-{context_digest[:32]}-{secrets.token_hex(16)}"
         k = cls._kernel32()
         security = cls._SecurityAttributes(ctypes.sizeof(cls._SecurityAttributes), None, 1)
         handle = k.CreateJobObjectW(ctypes.byref(security), name)
         if not handle:
             raise ProcessAuthorityError("unable to create process job attestation")
-        return cls(attempt_root, name=name, handle=handle)
+        return cls(
+            attempt_root,
+            name=name,
+            handle=handle,
+            context_digest=context_digest,
+        )
 
     @classmethod
-    def from_claim(cls, attempt_root: Path, claim: object) -> _WindowsProcessAuthority:
+    def from_claim(
+        cls, attempt_root: Path, claim: object, context_digest: str
+    ) -> _WindowsProcessAuthority:
+        context_digest = _validate_context_digest(context_digest)
         binding = _attempt_binding(attempt_root)
         name = claim.get("name") if isinstance(claim, dict) else None
-        prefix = f"Local\\febio-cae-{binding[:32]}-"
+        prefix = f"Local\\febio-cae-{binding[:32]}-{context_digest[:32]}-"
         if not isinstance(claim, dict) or claim.get("attempt_binding") != binding:
             raise ProcessAuthorityError("process authority attempt binding does not match")
+        if claim.get("context_digest") != context_digest:
+            raise ProcessAuthorityError("process authority context binding does not match")
         if not isinstance(name, str) or not name.startswith(prefix):
             raise ProcessAuthorityError("process authority job name is invalid")
         handle = cls._kernel32().OpenJobObjectW(cls._JOB_ACCESS, False, name)
         if not handle:
             raise ProcessAuthorityError("live process job attestation is unavailable")
-        return cls(attempt_root, name=name, handle=handle)
+        return cls(
+            attempt_root,
+            name=name,
+            handle=handle,
+            context_digest=context_digest,
+        )
 
     @property
     def claim(self) -> dict[str, object]:

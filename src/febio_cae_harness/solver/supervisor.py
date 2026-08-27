@@ -35,6 +35,7 @@ from .types import (
     SolverOwnershipError,
     SolverRunResult,
     SolverState,
+    _json_digest,
     _validate_launch_capability,
 )
 
@@ -226,12 +227,16 @@ class SolverSupervisor:
             intent_id,
             attempt_id,
             _attempt_root,
+            launch_context,
+            launch_context_digest,
         ) = _validate_launch_capability(launch_capability)
         self._launch_capability = launch_capability
         self.spec = _capability_record.spec
         self._case_id = case_id
         self._intent_id = intent_id
         self._attempt_id = attempt_id
+        self._launch_context = launch_context
+        self._launch_context_digest = launch_context_digest
         if fbs_adapter is not None:
             try:
                 _authority_record(fbs_adapter)
@@ -293,6 +298,8 @@ class SolverSupervisor:
             intent_id,
             attempt_id,
             _attempt_root,
+            launch_context,
+            launch_context_digest,
         ) = _validate_launch_capability(self._launch_capability)
         if capability_record.spec is not self.spec:
             raise SolverConfigurationError("supervisor launch binding is invalid")
@@ -302,6 +309,11 @@ class SolverSupervisor:
             self._attempt_id,
         ):
             raise SolverConfigurationError("supervisor authority binding is invalid")
+        if (
+            launch_context != self._launch_context
+            or launch_context_digest != self._launch_context_digest
+        ):
+            raise SolverConfigurationError("supervisor launch context binding is invalid")
 
     def start(self) -> SolverSupervisor:
         """Prepare fresh outputs and launch the owned process."""
@@ -315,6 +327,9 @@ class SolverSupervisor:
             self._revalidate_launch_binding()
 
             authority: ProcessAuthority | None = None
+            process: subprocess.Popen[bytes] | None = None
+            bound = False
+            record_written = False
             try:
                 self.spec.prepare_outputs()
                 self._revalidate_launch_binding()
@@ -324,7 +339,9 @@ class SolverSupervisor:
                     )
                 if not self.spec.input_path.is_file():
                     raise FileNotFoundError(f"solver input does not exist: {self.spec.input_path}")
-                authority = ProcessAuthority.create(self.spec.attempt_root)
+                authority = ProcessAuthority.create(
+                    self.spec.attempt_root, self._launch_context_digest
+                )
                 environment = os.environ.copy()
                 environment.update(self.spec.environment)
                 # These markers let a child process discover its owned attempt
@@ -336,8 +353,6 @@ class SolverSupervisor:
                 environment["FEBIO_CAE_HARNESS_XPLT"] = os.fspath(outputs.xplt_path)
                 environment.update(authority.child_environment())
 
-                process: subprocess.Popen[bytes] | None = None
-                bound = False
                 if os.name == "nt":
                     creation_flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | (
                         _CREATE_SUSPENDED
@@ -382,15 +397,28 @@ class SolverSupervisor:
                 metadata = _process_metadata(process.pid)
                 authority.bind(process.pid)
                 bound = True
+                self._revalidate_launch_binding()
                 if os.name == "nt":
+                    bound_record = self._make_process_record(
+                        process.pid,
+                        metadata,
+                        started_at,
+                        authority,
+                        state="BOUND_SUSPENDED",
+                    )
+                    self._write_process_record(bound_record)
+                    record_written = True
                     authority.resume(process.pid)
+                    self._revalidate_launch_binding()
+                running_record = self._make_process_record(
+                    process.pid, metadata, started_at, authority, state=SolverState.RUNNING.value
+                )
+                self._write_process_record(running_record)
+                record_written = True
                 self._process = process
                 self._started_at = started_at
                 self._process_authority = authority
-                self._process_record = self._make_process_record(
-                    process.pid, metadata, started_at, authority
-                )
-                self._write_process_record(self._process_record)
+                self._process_record = running_record
             except (OSError, OutputFreshnessError, ValueError) as error:
                 process = locals().get("process")
                 if process is not None:
@@ -412,6 +440,9 @@ class SolverSupervisor:
                             process.kill()
                 if authority is not None:
                     authority.close()
+                if record_written:
+                    with contextlib.suppress(OSError):
+                        self.process_record_path.unlink(missing_ok=True)
                 self._state = SolverState.FAILED
                 if isinstance(error, SolverConfigurationError):
                     raise
@@ -533,12 +564,18 @@ class SolverSupervisor:
         metadata: _ProcessMetadata,
         started_at: datetime,
         authority: ProcessAuthority,
+        *,
+        state: str,
     ) -> dict[str, object]:
         outputs = self.spec.expected_outputs
+        claim = authority.claim
+        if claim.get("context_digest") != self._launch_context_digest:
+            raise ProcessAuthorityError("process authority context binding is invalid")
         return {
             "case_id": self._case_id,
             "intent_id": self._intent_id,
             "attempt_id": self._attempt_id,
+            "state": state,
             "executable_path": str(self.spec.executable),
             "pid": pid,
             "process_creation_identity": metadata.creation_identity,
@@ -547,7 +584,9 @@ class SolverSupervisor:
                 "log": str(outputs.log_path),
                 "xplt": str(outputs.xplt_path),
             },
-            "process_authority": authority.claim,
+            "launch_context": self._launch_context,
+            "launch_context_digest": self._launch_context_digest,
+            "process_authority": claim,
         }
 
     def _write_process_record(self, record: dict[str, object]) -> None:
@@ -599,6 +638,32 @@ class SolverSupervisor:
         if any(record.get(name) != expected for name, expected in expected_ids.items()):
             raise SolverOwnershipError("process record identity does not match")
 
+        if record.get("state") != SolverState.RUNNING.value:
+            raise SolverOwnershipError("process record is not a reconnectable RUNNING state")
+        context = record.get("launch_context")
+        if not isinstance(context, dict):
+            raise SolverOwnershipError("process record launch context is invalid")
+        context_digest = record.get("launch_context_digest")
+        if not isinstance(context_digest, str):
+            raise SolverOwnershipError("process record launch context digest is invalid")
+        try:
+            recomputed_digest = _json_digest(context)
+        except SolverConfigurationError as error:
+            raise SolverOwnershipError("process record launch context is invalid") from error
+        if (
+            context_digest != self._launch_context_digest
+            or recomputed_digest != context_digest
+            or context != self._launch_context
+        ):
+            raise SolverOwnershipError("process record launch context does not match")
+
+        authority_claim = record.get("process_authority")
+        if (
+            not isinstance(authority_claim, dict)
+            or authority_claim.get("context_digest") != self._launch_context_digest
+        ):
+            raise SolverOwnershipError("process record authority context does not match")
+
         executable_value = record.get("executable_path")
         if not isinstance(executable_value, str) or not Path(executable_value).is_absolute():
             raise SolverOwnershipError("process record executable must be absolute")
@@ -626,28 +691,34 @@ class SolverSupervisor:
         self._validate_record_path(output_values.get("log"), outputs.log_path, "LOG path")
         self._validate_record_path(output_values.get("xplt"), outputs.xplt_path, "XPLT path")
 
-        try:
-            metadata = _process_metadata(pid)
-        except OSError as error:
-            raise SolverOwnershipError("recorded process is not live") from error
-        if not metadata.alive:
-            raise SolverOwnershipError("recorded process is not live")
-        if _normalise_executable(metadata.executable_path) != _normalise_executable(
-            executable_value
-        ):
-            raise SolverOwnershipError("current process executable does not match")
-        if metadata.creation_identity != identity:
-            raise SolverOwnershipError("current process creation identity does not match")
         authority: ProcessAuthority | None = None
         try:
             authority = ProcessAuthority.from_claim(
-                self.spec.attempt_root, record.get("process_authority")
+                self.spec.attempt_root,
+                authority_claim,
+                self._launch_context_digest,
             )
             authority.verify(pid)
         except ProcessAuthorityError as error:
             if authority is not None:
                 authority.close()
             raise SolverOwnershipError("recorded process authority is invalid") from error
+        try:
+            metadata = _process_metadata(pid)
+        except OSError as error:
+            authority.close()
+            raise SolverOwnershipError("recorded process is not live") from error
+        if not metadata.alive:
+            authority.close()
+            raise SolverOwnershipError("recorded process is not live")
+        if _normalise_executable(metadata.executable_path) != _normalise_executable(
+            executable_value
+        ):
+            authority.close()
+            raise SolverOwnershipError("current process executable does not match")
+        if metadata.creation_identity != identity:
+            authority.close()
+            raise SolverOwnershipError("current process creation identity does not match")
         if authority is None:  # pragma: no cover - defensive type/state guard
             raise SolverOwnershipError("recorded process authority is unavailable")
         return metadata, started_at, authority

@@ -48,11 +48,17 @@ class _FakeWindowsAuthority:
     def __init__(self, events: list[str]) -> None:
         self._events = events
         self._process: _FakeProcess | None = None
+        self._context_digest = "f" * 64
         self.close = Mock(side_effect=lambda: self._events.append("close"))
 
     @property
     def claim(self) -> dict[str, object]:
-        return {"kind": "windows-job", "attempt_binding": "test", "name": "test-job"}
+        return {
+            "kind": "windows-job",
+            "attempt_binding": "test",
+            "name": "test-job",
+            "context_digest": self._context_digest,
+        }
 
     def child_environment(self) -> dict[str, str]:
         return {}
@@ -134,7 +140,13 @@ def _patch_fake_windows(
     monkeypatch: pytest.MonkeyPatch, authority: _FakeWindowsAuthority, events: list[str]
 ) -> None:
     monkeypatch.setattr(os, "name", "nt")
-    monkeypatch.setattr(ProcessAuthority, "create", lambda attempt_root: authority)
+
+    def fake_create(attempt_root: Path, context_digest: str) -> _FakeWindowsAuthority:
+        del attempt_root
+        authority._context_digest = context_digest
+        return authority
+
+    monkeypatch.setattr(ProcessAuthority, "create", fake_create)
     monkeypatch.setattr(
         subprocess,
         "Popen",
