@@ -5,6 +5,7 @@ import importlib
 import math
 import sys
 from collections.abc import Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import cast
 
@@ -174,6 +175,99 @@ def test_validation_binds_authority_runtime_path_digest_and_fields(tmp_path: Pat
     assert result.runtime_identity == "synthetic-runtime" and result.xplt_path == path
     assert result.requested_fields == ("stress",)
     assert result.digest_before == result.digest_after and len(result.digest_before) == 64
+
+
+def test_only_validate_issued_validation_crosses_internal_boundary(
+    tmp_path: Path,
+) -> None:
+    module = importlib.import_module("febio_cae_harness.solver.fbs")
+    authority, path = make_authority(tmp_path)
+    issued = validate_requested_fields(authority, path, ("stress",))
+    registry = getattr(module, "_VALIDATION_REGISTRY", {})
+    assert id(issued) in registry
+
+    caller_built = FbsValidation(
+        xplt_path=path,
+        requested_fields=("stress",),
+        available_fields=("stress",),
+        values={"stress": 1.0},
+        missing_fields=(),
+        non_finite_fields=(),
+        valid=True,
+        authority=authority,
+        runtime_identity="synthetic-runtime",
+        digest_before=issued.digest_before,
+        digest_after=issued.digest_after,
+    )
+    assert id(caller_built) not in registry
+    check = module._require_issued_validation
+    assert (
+        check(
+            issued,
+            authority=authority,
+            xplt_path=path,
+            requested_fields=("stress",),
+        )
+        is issued
+    )
+    with pytest.raises(TypeError):
+        check(
+            caller_built,
+            authority=authority,
+            xplt_path=path,
+            requested_fields=("stress",),
+        )
+
+
+def test_issued_validation_rejects_context_forgery_and_state_changes(
+    tmp_path: Path,
+) -> None:
+    module = importlib.import_module("febio_cae_harness.solver.fbs")
+    authority, path = make_authority(tmp_path)
+    issued = validate_requested_fields(authority, path, ("stress",))
+    check = module._require_issued_validation
+    other_authority, other_path = make_authority(tmp_path / "other")
+
+    for forged, expected_authority, expected_path in (
+        (object.__new__(FbsValidation), authority, path),
+        (copy.copy(issued), authority, path),
+        (replace(issued), authority, path),
+        (issued, other_authority, path),
+        (issued, authority, other_path),
+    ):
+        with pytest.raises(TypeError):
+            check(
+                forged,
+                authority=expected_authority,
+                xplt_path=expected_path,
+                requested_fields=("stress",),
+            )
+
+    original_digest = issued.digest_before
+    object.__setattr__(issued, "digest_before", "forged")
+    try:
+        with pytest.raises(TypeError):
+            check(
+                issued,
+                authority=authority,
+                xplt_path=path,
+                requested_fields=("stress",),
+            )
+    finally:
+        object.__setattr__(issued, "digest_before", original_digest)
+
+
+def test_validation_values_are_deep_frozen_against_adapter_mutation(
+    tmp_path: Path,
+) -> None:
+    nested = {"component": [1.0]}
+    authority, path = make_authority(tmp_path, MappingAdapter({"stress": nested}))
+    issued = validate_requested_fields(authority, path, ("stress",))
+
+    nested["component"].append(2.0)
+    assert issued.values["stress"] == {"component": (1.0,)}
+    with pytest.raises(TypeError):
+        cast(dict[str, object], issued.values["stress"])["component"] = ()
 
 
 def test_supervisor_rejects_arbitrary_adapter_and_caller_validation(tmp_path: Path) -> None:

@@ -87,8 +87,28 @@ class _AuthorityRecord:
     attempt_root: Path | None
 
 
+@dataclass(slots=True)
+class _ValidationRecord:
+    validation: FbsValidation
+    authority: FbsAdapterAuthority
+    runtime_identity: str
+    xplt_path: Path
+    requested_fields: tuple[str, ...]
+    available_fields: tuple[str, ...]
+    values: Mapping[str, object]
+    missing_fields: tuple[str, ...]
+    non_finite_fields: tuple[str, ...]
+    valid: bool
+    official: bool
+    provenance: str
+    issues: tuple[str, ...]
+    digest_before: str
+    digest_after: str
+
+
 _MANAGER_REGISTRY: dict[int, _ManagerRecord] = {}
 _AUTHORITY_REGISTRY: dict[int, _AuthorityRecord] = {}
+_VALIDATION_REGISTRY: dict[int, _ValidationRecord] = {}
 
 
 def _manager_record(value: object) -> _ManagerRecord:
@@ -261,6 +281,22 @@ def _finite_value(value: object) -> bool:
     return False
 
 
+def _freeze_value(value: object) -> object:
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {_freeze_value(key): _freeze_value(item) for key, item in value.items()}
+        )
+    if isinstance(value, (str, bytes, int, float, bool, type(None))):
+        return value
+    if isinstance(value, bytearray):
+        return bytes(value)
+    if isinstance(value, (set, frozenset)):
+        return frozenset(_freeze_value(item) for item in value)
+    if isinstance(value, Sequence):
+        return tuple(_freeze_value(item) for item in value)
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class FbsValidation:
     """Immutable, synthetic validation bound to one issued authority."""
@@ -287,7 +323,12 @@ class FbsValidation:
                 raise ValueError("validation runtime identity does not match authority")
             if self.official or self.provenance != _PROVENANCE:
                 raise ValueError("issued validation cannot claim unverified provenance")
-        object.__setattr__(self, "values", MappingProxyType(dict(self.values)))
+        values = dict(self.values)
+        object.__setattr__(
+            self,
+            "values",
+            MappingProxyType({key: _freeze_value(value) for key, value in values.items()}),
+        )
 
     @property
     def all_requested_fields_finite(self) -> bool:
@@ -304,6 +345,90 @@ def _field_snapshot(fields: object) -> tuple[str, ...]:
     return tuple(field for field in values if isinstance(field, str))
 
 
+def _register_validation(
+    validation: FbsValidation, authority: FbsAdapterAuthority
+) -> FbsValidation:
+    if type(validation) is not FbsValidation:
+        raise TypeError("validation is not an exact FbsValidation instance")
+    authority_record = _authority_record(authority)
+    if validation.authority is not authority:
+        raise TypeError("validation authority binding is invalid")
+    _VALIDATION_REGISTRY[id(validation)] = _ValidationRecord(
+        validation=validation,
+        authority=authority,
+        runtime_identity=authority_record.runtime_identity,
+        xplt_path=validation.xplt_path,
+        requested_fields=validation.requested_fields,
+        available_fields=validation.available_fields,
+        values=validation.values,
+        missing_fields=validation.missing_fields,
+        non_finite_fields=validation.non_finite_fields,
+        valid=validation.valid,
+        official=validation.official,
+        provenance=validation.provenance,
+        issues=validation.issues,
+        digest_before=validation.digest_before,
+        digest_after=validation.digest_after,
+    )
+    return validation
+
+
+def _issued_validation_record(value: object) -> _ValidationRecord:
+    if type(value) is not FbsValidation:
+        raise TypeError("value is not an exact FbsValidation instance")
+    record = _VALIDATION_REGISTRY.get(id(value))
+    if record is None or record.validation is not value:
+        raise TypeError("FbsValidation was not issued by validate_requested_fields")
+    try:
+        authority_record = _authority_record(record.authority)
+        matches = (
+            authority_record.runtime_identity == record.runtime_identity
+            and record.xplt_path.is_absolute()
+            and value.authority is record.authority
+            and value.runtime_identity == record.runtime_identity
+            and value.xplt_path == record.xplt_path
+            and value.requested_fields == record.requested_fields
+            and value.available_fields == record.available_fields
+            and value.values is record.values
+            and value.missing_fields == record.missing_fields
+            and value.non_finite_fields == record.non_finite_fields
+            and value.valid is record.valid
+            and value.official is record.official
+            and value.provenance == record.provenance
+            and value.issues == record.issues
+            and value.digest_before == record.digest_before
+            and value.digest_after == record.digest_after
+        )
+    except (AttributeError, TypeError, ValueError):
+        matches = False
+    if not matches:
+        raise TypeError("FbsValidation issuance binding is invalid")
+    return record
+
+
+def _require_issued_validation(
+    value: object,
+    authority: FbsAdapterAuthority,
+    xplt_path: str | Path,
+    requested_fields: Iterable[str],
+) -> FbsValidation:
+    record = _issued_validation_record(value)
+    expected_authority = _authority_record(authority)
+    expected_path = _path(xplt_path)
+    try:
+        expected_fields = _normalise_fields(requested_fields)
+    except (TypeError, ValueError) as error:
+        raise TypeError("validation context is invalid") from error
+    if (
+        record.authority is not authority
+        or expected_authority.runtime_identity != record.runtime_identity
+        or expected_path != record.xplt_path
+        or expected_fields != record.requested_fields
+    ):
+        raise TypeError("validation does not match the requested authority context")
+    return cast(FbsValidation, value)
+
+
 def _invalid_validation(
     authority: FbsAdapterAuthority,
     xplt_path: str | Path,
@@ -315,7 +440,7 @@ def _invalid_validation(
 ) -> FbsValidation:
     record = _authority_record(authority)
     fields = _field_snapshot(requested_fields)
-    return FbsValidation(
+    validation = FbsValidation(
         authority=authority,
         runtime_identity=record.runtime_identity,
         xplt_path=_path(xplt_path),
@@ -330,6 +455,7 @@ def _invalid_validation(
         digest_after=digest_after,
         issues=(issue,),
     )
+    return _register_validation(validation, authority)
 
 
 def _build_validation(
@@ -351,7 +477,7 @@ def _build_validation(
         issues.append("missing requested fields: " + ", ".join(missing))
     if non_finite:
         issues.append("non-finite requested fields: " + ", ".join(non_finite))
-    return FbsValidation(
+    validation = FbsValidation(
         authority=authority,
         runtime_identity=record.runtime_identity,
         xplt_path=path,
@@ -366,6 +492,7 @@ def _build_validation(
         digest_after=digest_after,
         issues=tuple(issues),
     )
+    return _register_validation(validation, authority)
 
 
 def validate_requested_fields(
