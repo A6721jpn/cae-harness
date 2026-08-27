@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "febio-cae-harness"
+version = "0.1.0"
+description = "Headless orchestration harness for evidence-driven FEBio CAE workflows"
+requires-python = ">=3.12,<3.13"
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+  "build>=1.2",
+  "mypy>=1.17",
+  "pytest>=8.3",
+  "ruff>=0.12",
+]
+
+[project.scripts]
+febio-cae = "febio_cae_harness.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+febio_cae_harness = ["py.typed"]
+
+[tool.pytest.ini_options]
+addopts = [
+  "--strict-config",
+  "--strict-markers",
+  "-p",
+  "no:cacheprovider",
+  "--basetemp=.pytest_tmp",
+]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+exclude = [".git", ".mypy_cache", ".pytest_cache", ".pytest_tmp", ".ruff_cache", ".venv", "build", "dist"]
+
+[tool.ruff.lint]
+select = ["B", "E", "F", "I", "SIM", "UP"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+mypy_path = "src"
+exclude = "(?x)(^|/)([.]git|[.]mypy_cache|[.]pytest_cache|[.]pytest_tmp|[.]ruff_cache|[.]venv|build|dist)/"
