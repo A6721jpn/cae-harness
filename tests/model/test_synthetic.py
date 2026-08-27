@@ -43,8 +43,13 @@ def test_generator_writes_a_closed_structural_input_and_immutable_receipt(
     assert b"mm-N-s" in payload
     assert b'type="neo-Hookean"' in payload
     assert b"<E>1000</E>" in payload
-    assert b'<fix bc="x,y,z" node_set="fixed"' in payload
-    assert b'<nodal_load bc="z" node_set="loaded" type="dead">1' in payload
+    assert b'<solver type="solid"/>' in payload
+    assert b'<bc type="zero displacement" node_set="fixed_nodes">' in payload
+    assert b"<x_dof>1</x_dof>" in payload
+    assert b"<y_dof>1</y_dof>" in payload
+    assert b"<z_dof>1</z_dof>" in payload
+    assert b'<nodal_load type="nodal_load" node_set="loaded_node">' in payload
+    assert b"<dof>z</dof>" in payload
     assert b"<time_steps>1</time_steps>" in payload
     assert b"final_time=1 s" in payload
     assert b"<Result" not in payload
@@ -56,6 +61,24 @@ def test_generator_writes_a_closed_structural_input_and_immutable_receipt(
     assert inspection.tag_counts["elem"] == 1
     assert inspection.tag_counts["material"] == 1
     assert inspection.tag_counts["Step"] == 1
+    step = next(node for node in inspection.nodes if node.tag == "step")
+    assert step.path == "/febio_spec/Step[1]/step[1]"
+    assert dict(step.attributes) == {"id": "1", "name": "synthetic_step"}
+    assert {
+        node.path
+        for node in inspection.nodes
+        if node.path.startswith("/febio_spec/Step[1]/step[1]/")
+    } >= {
+        "/febio_spec/Step[1]/step[1]/Control[1]",
+        "/febio_spec/Step[1]/step[1]/Boundary[1]",
+        "/febio_spec/Step[1]/step[1]/Loads[1]",
+    }
+    domain = next(node for node in inspection.nodes if node.tag == "SolidDomain")
+    assert domain.path == "/febio_spec/MeshDomains[1]/SolidDomain[1]"
+    assert dict(domain.attributes) == {
+        "name": "synthetic_body",
+        "mat": "synthetic_material",
+    }
     assert inspection.references
     assert inspection.unresolved_references == ()
     assert inspection.duplicate_keys == ()

@@ -26,18 +26,23 @@ _PAYLOAD = b"""<?xml version="1.0" encoding="UTF-8"?>
 <!-- synthetic: units=mm-N-s; material=neo-Hookean; load=1 N; -->
 <!-- synthetic: constraint=fixed; steps=1; final_time=1 s -->
 <febio_spec version="4.0">
-<Module type="solid"/><Control><analysis type="static"/>
+<Module type="solid"/><Control><analysis type="static"/><solver type="solid"/>
 <time_steps>1</time_steps><step_size>1</step_size></Control>
 <Globals><Constants><T>0</T><R>0</R><Fc>0</Fc></Constants></Globals>
 <Material><material id="1" name="synthetic_material" type="neo-Hookean">
 <E>1000</E><v>0.3</v></material></Material>
 <Mesh><Nodes name="synthetic_nodes"><node id="1">0,0,0</node><node id="2">1,0,0</node>
 <node id="3">0,1,0</node><node id="4">0,0,1</node></Nodes>
-<Elements type="tet4" name="synthetic_body" mat="1"><elem id="1">1,2,3,4</elem></Elements>
-<NodeSet name="fixed">1,2,3</NodeSet><NodeSet name="loaded">4</NodeSet></Mesh>
-<Step name="synthetic_step"><Control><time_steps>1</time_steps><step_size>1</step_size></Control>
-<Boundary><fix bc="x,y,z" node_set="fixed"/></Boundary><Loads>
-<nodal_load bc="z" node_set="loaded" type="dead">1</nodal_load></Loads></Step>
+<NodeSet name="fixed_nodes">1,2,3</NodeSet><NodeSet name="loaded_node">4</NodeSet>
+<Elements type="tet4" name="synthetic_body"><elem id="1">1,2,3,4</elem></Elements></Mesh>
+<MeshDomains><SolidDomain name="synthetic_body" mat="synthetic_material"/></MeshDomains>
+<Step><step id="1" name="synthetic_step"><Control>
+<time_steps>1</time_steps><step_size>1</step_size></Control>
+<Boundary><bc type="zero displacement" node_set="fixed_nodes">
+<x_dof>1</x_dof><y_dof>1</y_dof><z_dof>1</z_dof>
+</bc></Boundary><Loads>
+<nodal_load type="nodal_load" node_set="loaded_node"><dof>z</dof>
+<scale>1.0</scale></nodal_load></Loads></step></Step>
 </febio_spec>
 """
 

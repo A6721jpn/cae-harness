@@ -373,6 +373,12 @@ def _resolve(
     for item in candidates:
         if item.kind in accepted:
             return item
+        if (
+            target_kind == "material"
+            and item.tag.lower() == "material"
+            and item.attribute == "name"
+        ):
+            return item
     # A generic named reference is allowed to resolve against a specialized
     # named definition (for example a contact pair or node set).
     if target_kind == "name":
@@ -402,10 +408,13 @@ def _walk(
     )
     for attribute, value in element.attrib.items():
         if attribute in {"id", "name"} and str(value).strip():
+            definition_kind = _definition_kind(tag)
+            if attribute == "name":
+                definition_kind = "domain" if tag.lower().endswith("domain") else "name"
             definitions.append(
                 XMLDefinition(
                     identifier=str(value).strip(),
-                    kind=("name" if attribute == "name" else _definition_kind(tag)),
+                    kind=definition_kind,
                     tag=tag,
                     attribute=attribute,
                     path=path,

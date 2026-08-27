@@ -113,6 +113,31 @@ def test_feb_duplicate_ids_are_scoped_to_definition_kind() -> None:
     assert duplicate_inspection.reference_closure.duplicate_keys == (("material", "1"),)
 
 
+def test_feb_domain_namespaces_and_named_material_references_are_structural() -> None:
+    domain_fixture = b"""<febio_spec version='4.0'>
+<Material><material id='1' name='synthetic-material'/></Material>
+<Mesh><Elements name='body'/></Mesh>
+<MeshDomains><SolidDomain name='body' mat='synthetic-material' elem_set='body'/></MeshDomains>
+</febio_spec>"""
+    inspection = inspect_feb_xml(domain_fixture)
+
+    assert inspection.duplicate_keys == ()
+    material_reference = next(
+        reference for reference in inspection.references if reference.attribute == "mat"
+    )
+    assert material_reference.value == "synthetic-material"
+    assert material_reference.resolved is True
+    assert inspection.unresolved_references == ()
+
+    duplicate_domain = domain_fixture.replace(
+        b"<SolidDomain name='body' mat='synthetic-material' elem_set='body'/>",
+        b"<SolidDomain name='body' mat='synthetic-material' elem_set='body'/>"
+        b"<SolidDomain name='body' mat='synthetic-material' elem_set='body'/>",
+    )
+    duplicate_inspection = inspect_feb_xml(duplicate_domain)
+    assert duplicate_inspection.duplicate_keys == (("domain", "body"),)
+
+
 def test_completeness_reports_only_explicit_authoritative_conditions() -> None:
     authoritative = EvidenceProvenance(
         source="synthetic-intent",
