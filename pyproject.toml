@@ -35,6 +35,7 @@ addopts = [
   "--basetemp=.pytest_tmp",
 ]
 testpaths = ["tests"]
+norecursedirs = [".git", ".venv", "dist", "*.egg-info", ".pytest_tmp"]
 
 [tool.ruff]
 line-length = 100
