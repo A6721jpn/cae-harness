@@ -1,64 +1,131 @@
 from __future__ import annotations
 
+import copy
+import pickle
 import subprocess
+import sys
 from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
 
-from scripts.build.build import (
-    BuildFailure,
-    BuildRequest,
-    require_clean_repository,
-    run_clean_build,
-)
+import scripts.build.build as build_script
+from scripts.build.build import BuildFailure, BuildRequest, run_clean_build
+
+CleanBuildReceipt = build_script.CleanBuildReceipt
 
 
 def completed(
-    command: Sequence[str],
-    *,
-    stdout: str = "",
-    stderr: str = "",
-    returncode: int = 0,
+    command: Sequence[str], *, stdout: str = "", stderr: str = "", returncode: int = 0
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.CompletedProcess(tuple(command), returncode, stdout, stderr)
 
 
-def test_require_clean_repository_rejects_dirty_status() -> None:
-    def runner(command: Sequence[str], **_: object) -> subprocess.CompletedProcess[str]:
-        return completed(command, stdout=" M src/febio_cae_harness/cli.py\n")
-
-    with pytest.raises(BuildFailure, match="clean repository"):
-        require_clean_repository(Path.cwd(), runner=runner)
-
-
-def test_clean_build_runs_gates_before_returning_wheel(tmp_path: Path) -> None:
-    commands: list[tuple[str, ...]] = []
-
-    def runner(command: Sequence[str], **_: object) -> subprocess.CompletedProcess[str]:
+def fake_runner(
+    root: Path,
+    calls: list[tuple[tuple[str, ...], dict[str, object]]],
+    *,
+    version: str = "febio-cae 0.1.0\n",
+) -> build_script.CommandRunner:
+    def run(command: Sequence[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         normalised = tuple(command)
-        commands.append(normalised)
-        if normalised[:2] == ("git", "rev-parse"):
-            return completed(normalised, stdout="abc123\n")
-        if normalised[:2] == ("git", "status"):
-            return completed(normalised)
-        if "-m" in normalised and "build" in normalised:
-            dist = tmp_path / "dist"
+        calls.append((normalised, kwargs))
+        if normalised[-1:] == ("--version",):
+            return completed(normalised, stdout=version)
+        if normalised == (str(Path(sys.executable).resolve()), "-m", "build"):
+            dist = root / "dist"
             dist.mkdir(exist_ok=True)
             (dist / "febio_cae_harness-0.1.0-py3-none-any.whl").write_bytes(b"wheel")
         return completed(normalised)
 
-    result = run_clean_build(
-        BuildRequest(tmp_path, python_executable="python", run_installed_smoke=False),
-        runner=runner,
-    )
+    return run
 
-    assert result.commit_sha == "abc123"
-    assert result.wheel.name == "febio_cae_harness-0.1.0-py3-none-any.whl"
-    assert result.steps == ("pytest", "format", "lint", "mypy", "boundary", "package")
-    assert commands[2][2:] == ("pytest",)
-    assert commands[3][2:] == ("ruff", "format", "--check", ".")
-    assert commands[4][2:] == ("ruff", "check", ".")
-    assert commands[5][2:] == ("mypy", "src", "tests")
-    assert commands[6][1:] == ("scripts/scan_cae_data.py", "--root", ".")
-    assert commands[7][2:] == ("build",)
+
+def test_command_plan_runs_gates_with_bound_environment_but_no_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[tuple[str, ...], dict[str, object]]] = []
+    runner = fake_runner(tmp_path, calls)
+    monkeypatch.setenv("PYTHONPATH", "inherited-value")
+    request = BuildRequest(tmp_path)
+    evidence = list(build_script._execute_command_plan(request, runner=runner))
+    evidence.extend(build_script._run_installed_smoke(tmp_path / "dist" / "febio_cae_harness-0.1.0-py3-none-any.whl", tmp_path, runner=runner))
+
+    assert [item[0] for item in evidence] == [
+        "pytest",
+        "format",
+        "lint",
+        "mypy",
+        "boundary",
+        "package",
+        "smoke-venv",
+        "smoke-install",
+        "smoke-version",
+    ]
+    expected_python = str(Path(sys.executable).resolve())
+    assert all(command[0] == expected_python for command, _ in calls[:6])
+    assert all(kwargs["env"]["PYTHONPATH"] == str(tmp_path / "src") for _, kwargs in calls[:6])  # type: ignore[index]
+    assert all("PYTHONPATH" not in kwargs["env"] for _, kwargs in calls[6:])  # type: ignore[operator]
+    assert build_script._RECEIPTS == {}
+
+
+def test_installed_smoke_requires_exact_version_output(tmp_path: Path) -> None:
+    wheel = tmp_path / "wheel.whl"
+    wheel.write_bytes(b"wheel")
+    with pytest.raises(BuildFailure, match="smoke-version"):
+        build_script._run_installed_smoke(
+            wheel, tmp_path, runner=fake_runner(tmp_path, [], version="forged\n")
+        )
+
+
+def test_stale_wheel_is_rejected_by_non_authoritative_plan(tmp_path: Path) -> None:
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    (dist / "stale.whl").write_bytes(b"old")
+    with pytest.raises(BuildFailure, match="stale"):
+        build_script._execute_command_plan(BuildRequest(tmp_path), runner=fake_runner(tmp_path, []))
+
+
+def test_authority_rejects_runner_python_stage_and_build_id_overrides(tmp_path: Path) -> None:
+    with pytest.raises(TypeError):
+        run_clean_build(BuildRequest(tmp_path), runner=fake_runner(tmp_path, []))  # type: ignore[call-arg]
+    with pytest.raises(TypeError):
+        BuildRequest(tmp_path, python_executable="python-shim")  # type: ignore[call-arg]
+    with pytest.raises(TypeError):
+        run_clean_build(
+            BuildRequest(tmp_path),
+            stage_source=tmp_path / "arbitrary-source",  # type: ignore[call-arg]
+            local_app_data=tmp_path / "arbitrary-app",  # type: ignore[call-arg]
+            build_id="forged-build-id",  # type: ignore[call-arg]
+        )
+    with pytest.raises(BuildFailure, match="mandatory"):
+        BuildRequest(tmp_path, run_installed_smoke=False)
+
+
+def test_cli_has_no_untrusted_authority_arguments() -> None:
+    parser = build_script.build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--python", "python-shim"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--stage-source", "arbitrary-source"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--build-id", "forged-build-id"])
+
+
+def test_receipt_is_exact_opaque_authority_and_staging_is_fail_closed() -> None:
+    assert build_script.BuildResult is CleanBuildReceipt
+    with pytest.raises(TypeError):
+        CleanBuildReceipt()  # type: ignore[call-arg]
+    forged = object.__new__(CleanBuildReceipt)
+    with pytest.raises(TypeError):
+        _ = forged.wheel
+    for operation in (lambda: copy.copy(forged), lambda: copy.deepcopy(forged), lambda: pickle.dumps(forged)):
+        with pytest.raises(TypeError):
+            operation()
+    with pytest.raises(TypeError):
+
+        class ReceiptChild(CleanBuildReceipt):
+            pass
+
+    with pytest.raises(BuildFailure, match="staging is unavailable"):
+        build_script.stage_clean_build(forged, Path("arbitrary-source"), Path("arbitrary-app"))
