@@ -10,6 +10,7 @@ import hashlib
 import os
 import shutil
 import stat
+import tempfile
 from collections.abc import Iterable
 from contextlib import suppress
 from dataclasses import dataclass
@@ -133,6 +134,95 @@ def _validate_sha256(value: str) -> str:
     return value.casefold()
 
 
+def _atomic_replace_bytes(target: Path, data: bytes, label: str) -> Path:
+    """Write bytes by replacing the owned directory entry atomically.
+
+    A regular file may have a hard-link name outside the case tree.  Opening
+    such a target with truncation would mutate that outside inode, so writes
+    always land in a fresh file before replacing the target name.
+    """
+
+    parent = _reject_reparse_alias(target.parent, f"{label} parent")
+    parent.mkdir(parents=True, exist_ok=True)
+    _reject_reparse_alias(parent, f"{label} parent")
+    _reject_reparse_alias(target, label)
+
+    try:
+        existing_mode = stat.S_IMODE(target.stat().st_mode)
+    except FileNotFoundError:
+        existing_mode = 0o666
+    except OSError as error:
+        raise WorkspaceBoundaryError(f"cannot inspect {label}: {target}") from error
+
+    descriptor: int | None = None
+    temporary_path: Path | None = None
+    try:
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{target.name}.",
+            dir=os.fspath(parent),
+        )
+        temporary_path = Path(temporary_name)
+        _reject_reparse_alias(temporary_path, f"{label} temporary file")
+        with os.fdopen(descriptor, "wb") as stream:
+            descriptor = None
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary_path, existing_mode)
+        os.replace(os.fspath(temporary_path), os.fspath(target))
+    except WorkspaceBoundaryError:
+        raise
+    except OSError as error:
+        raise WorkspaceBoundaryError(f"cannot write {label}: {target}") from error
+    finally:
+        if descriptor is not None:
+            with suppress(OSError):
+                os.close(descriptor)
+        if temporary_path is not None:
+            with suppress(OSError):
+                temporary_path.unlink()
+    return target
+
+
+def _append_bytes(target: Path, data: bytes, label: str) -> Path:
+    """Append bytes only to a file with one directory entry.
+
+    Append-only evidence must retain physical append semantics.  Rejecting a
+    multiply-linked inode before writing prevents an append through a case
+    name from changing an outside hard-link name.
+    """
+
+    parent = _reject_reparse_alias(target.parent, f"{label} parent")
+    parent.mkdir(parents=True, exist_ok=True)
+    _reject_reparse_alias(parent, f"{label} parent")
+    _reject_reparse_alias(target, label)
+
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            os.fspath(target),
+            os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+            0o666,
+        )
+        with os.fdopen(descriptor, "ab") as stream:
+            descriptor = None
+            metadata = os.fstat(stream.fileno())
+            if metadata.st_nlink != 1:
+                raise WorkspaceBoundaryError(f"{label} cannot be a hard link")
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except WorkspaceBoundaryError:
+        raise
+    except OSError as error:
+        raise WorkspaceBoundaryError(f"cannot append {label}: {target}") from error
+    finally:
+        if descriptor is not None:
+            with suppress(OSError):
+                os.close(descriptor)
+    return target
+
+
 @dataclass(frozen=True, slots=True, init=False)
 class AttemptWorkspace:
     """A bounded writer for one case-owned temporary attempt directory."""
@@ -174,12 +264,7 @@ class AttemptWorkspace:
 
     def write_bytes(self, relative_path: str | Path, data: bytes) -> Path:
         target = _resolve_owned_target(self.root, relative_path)
-        _reject_reparse_alias(target.parent, "attempt target parent")
-        target.parent.mkdir(parents=True, exist_ok=True)
-        _reject_reparse_alias(target.parent, "attempt target parent")
-        _reject_reparse_alias(target, "attempt target")
-        target.write_bytes(data)
-        return target
+        return _atomic_replace_bytes(target, data, "attempt target")
 
     def write_text(
         self,
@@ -189,12 +274,7 @@ class AttemptWorkspace:
         encoding: str = "utf-8",
     ) -> Path:
         target = _resolve_owned_target(self.root, relative_path)
-        _reject_reparse_alias(target.parent, "attempt target parent")
-        target.parent.mkdir(parents=True, exist_ok=True)
-        _reject_reparse_alias(target.parent, "attempt target parent")
-        _reject_reparse_alias(target, "attempt target")
-        target.write_text(text, encoding=encoding)
-        return target
+        return _atomic_replace_bytes(target, text.encode(encoding), "attempt target")
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -320,12 +400,7 @@ class CaseWorkspace:
 
     def write_bytes(self, relative_path: str | Path, data: bytes) -> Path:
         target = self._temporary_write_target(relative_path)
-        _reject_reparse_alias(target.parent, "case target parent")
-        target.parent.mkdir(parents=True, exist_ok=True)
-        _reject_reparse_alias(target.parent, "case target parent")
-        _reject_reparse_alias(target, "case target")
-        target.write_bytes(data)
-        return target
+        return _atomic_replace_bytes(target, data, "case target")
 
     def write_text(
         self,
@@ -335,12 +410,7 @@ class CaseWorkspace:
         encoding: str = "utf-8",
     ) -> Path:
         target = self._temporary_write_target(relative_path)
-        _reject_reparse_alias(target.parent, "case target parent")
-        target.parent.mkdir(parents=True, exist_ok=True)
-        _reject_reparse_alias(target.parent, "case target parent")
-        _reject_reparse_alias(target, "case target")
-        target.write_text(text, encoding=encoding)
-        return target
+        return _atomic_replace_bytes(target, text.encode(encoding), "case target")
 
     def _write_control_text(
         self,
@@ -352,10 +422,13 @@ class CaseWorkspace:
         """Write a root-level evidence control file for ``EvidenceStore``."""
 
         target = self._control_write_target(relative_path)
-        _reject_reparse_alias(target.parent, "control target parent")
-        _reject_reparse_alias(target, "control target")
-        target.write_text(text, encoding=encoding)
-        return target
+        return _atomic_replace_bytes(target, text.encode(encoding), "control target")
+
+    def append_bytes(self, relative_path: str | Path, data: bytes) -> Path:
+        """Durably append bytes to a file in the temporary area."""
+
+        target = self._temporary_write_target(relative_path, allow_event_append=True)
+        return _append_bytes(target, data, "append target")
 
     def append_text(
         self,
@@ -371,20 +444,7 @@ class CaseWorkspace:
         ``write_text`` so callers cannot accidentally replace the chain.
         """
 
-        target = self._temporary_write_target(relative_path, allow_event_append=True)
-        _reject_reparse_alias(target.parent, "append target parent")
-        target.parent.mkdir(parents=True, exist_ok=True)
-        _reject_reparse_alias(target.parent, "append target parent")
-        data = text.encode(encoding)
-        try:
-            _reject_reparse_alias(target, "append target")
-            with target.open("ab") as stream:
-                stream.write(data)
-                stream.flush()
-                os.fsync(stream.fileno())
-        except OSError as error:
-            raise WorkspaceBoundaryError(f"cannot append temporary evidence: {target}") from error
-        return target
+        return self.append_bytes(relative_path, text.encode(encoding))
 
     def _copy_create_new(
         self,

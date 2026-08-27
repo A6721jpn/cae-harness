@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -32,6 +34,31 @@ def make_directory_junction(link: Path, target: Path) -> None:
         text=True,
     )
     assert link.is_dir()
+
+
+def make_file_hard_link(link: Path, target: Path) -> None:
+    os.link(target, link)
+    assert link.is_file()
+    assert link.stat().st_ino == target.stat().st_ino
+
+
+def assert_hard_link_write_is_contained(
+    target: Path,
+    outside: Path,
+    writer: Callable[[], Path],
+    expected: bytes,
+) -> None:
+    original = outside.read_bytes()
+    try:
+        written = writer()
+    except WorkspaceBoundaryError:
+        assert outside.read_bytes() == original
+        assert target.read_bytes() == original
+    else:
+        assert written == target
+        assert outside.read_bytes() == original
+        assert target.read_bytes() == expected
+        assert target.stat().st_ino != outside.stat().st_ino
 
 
 def test_create_case_copies_inputs_and_creates_canonical_layout(tmp_path: Path) -> None:
@@ -116,6 +143,99 @@ def test_case_handle_allows_normal_writes_only_in_temporary(tmp_path: Path) -> N
     for directory_name in ("02_Model", "03_Result", "04_Report", "05_Verification"):
         with pytest.raises(WorkspaceBoundaryError):
             case.write_text(Path(directory_name) / "derived.txt", "must be promoted")
+
+
+def test_case_text_write_cannot_mutate_outside_file_through_hard_link(tmp_path: Path) -> None:
+    case = make_workspace(tmp_path).create_case("case-a")
+    outside = tmp_path / "outside.txt"
+    outside.write_bytes(b"outside")
+    target = case.case_root / "90_Temporary" / "linked.txt"
+    make_file_hard_link(target, outside)
+
+    assert_hard_link_write_is_contained(
+        target,
+        outside,
+        lambda: case.write_text(Path("90_Temporary") / "linked.txt", "owned"),
+        b"owned",
+    )
+
+
+def test_case_bytes_write_cannot_mutate_outside_file_through_hard_link(tmp_path: Path) -> None:
+    case = make_workspace(tmp_path).create_case("case-a")
+    outside = tmp_path / "outside.bin"
+    outside.write_bytes(b"outside")
+    target = case.case_root / "90_Temporary" / "linked.bin"
+    make_file_hard_link(target, outside)
+
+    assert_hard_link_write_is_contained(
+        target,
+        outside,
+        lambda: case.write_bytes(Path("90_Temporary") / "linked.bin", b"owned"),
+        b"owned",
+    )
+
+
+def test_attempt_write_cannot_mutate_outside_file_through_hard_link(tmp_path: Path) -> None:
+    case = make_workspace(tmp_path).create_case("case-a")
+    attempt = case.allocate_attempt("attempt-1")
+    outside = tmp_path / "outside.txt"
+    outside.write_bytes(b"outside")
+    target = attempt.root / "linked.txt"
+    make_file_hard_link(target, outside)
+
+    assert_hard_link_write_is_contained(
+        target,
+        outside,
+        lambda: attempt.write_text("linked.txt", "owned"),
+        b"owned",
+    )
+
+
+@pytest.mark.parametrize("control_name", ["CASE_MANIFEST.json", "intent.json"])
+def test_control_write_cannot_mutate_outside_file_through_hard_link(
+    tmp_path: Path,
+    control_name: str,
+) -> None:
+    case = make_workspace(tmp_path).create_case("case-a")
+    outside = tmp_path / f"outside-{control_name}"
+    outside.write_bytes(b"outside")
+    target = case.case_root / control_name
+    make_file_hard_link(target, outside)
+
+    assert_hard_link_write_is_contained(
+        target,
+        outside,
+        lambda: case._write_control_text(control_name, "owned"),
+        b"owned",
+    )
+
+
+def test_event_append_rejects_hard_link_to_outside_file(tmp_path: Path) -> None:
+    case = make_workspace(tmp_path).create_case("case-a")
+    outside = tmp_path / "outside-events.jsonl"
+    outside.write_bytes(b"outside\n")
+    target = case.case_root / "90_Temporary" / "events.jsonl"
+    make_file_hard_link(target, outside)
+
+    with pytest.raises(WorkspaceBoundaryError):
+        case.append_text(Path("90_Temporary") / "events.jsonl", "owned\n")
+
+    assert outside.read_bytes() == b"outside\n"
+    assert target.read_bytes() == b"outside\n"
+
+
+def test_append_bytes_rejects_hard_link_to_outside_file(tmp_path: Path) -> None:
+    case = make_workspace(tmp_path).create_case("case-a")
+    outside = tmp_path / "outside-bytes.bin"
+    outside.write_bytes(b"outside")
+    target = case.case_root / "90_Temporary" / "linked.bin"
+    make_file_hard_link(target, outside)
+
+    with pytest.raises(WorkspaceBoundaryError):
+        case.append_bytes(Path("90_Temporary") / "linked.bin", b"owned")
+
+    assert outside.read_bytes() == b"outside"
+    assert target.read_bytes() == b"outside"
 
 
 def test_case_handles_cannot_be_forged_with_arbitrary_roots(tmp_path: Path) -> None:
@@ -247,6 +367,39 @@ def test_promotion_requires_persisted_evidence_store_authorization(tmp_path: Pat
     assert promoted == case.case_root / destination
     assert promoted.read_text(encoding="utf-8") == "derived"
     assert store.reopen() is store
+
+
+def test_verified_promotion_cannot_mutate_outside_file_through_hard_link(
+    tmp_path: Path,
+) -> None:
+    case = make_workspace(tmp_path).create_case("case-a")
+    store = EvidenceStore(
+        case,
+        IntentContract(engineering_question="What is the displacement?"),
+    )
+    store.record_attempt("attempt-1")
+    source = case.write_text(
+        Path("90_Temporary") / "attempts" / "attempt-1" / "derived.feb",
+        "derived",
+    )
+    destination = Path("02_Model") / "derived.feb"
+    verification = store.record_verification(
+        source,
+        destination,
+        attempt_id="attempt-1",
+    )
+    assert verification is not None
+
+    outside = tmp_path / "outside-promoted.feb"
+    outside.write_bytes(b"outside")
+    target = case.case_root / destination
+    make_file_hard_link(target, outside)
+
+    with pytest.raises(FileExistsError):
+        store.promote_verified(verification)
+
+    assert outside.read_bytes() == b"outside"
+    assert target.read_bytes() == b"outside"
 
 
 def test_promotion_verification_binds_exact_destination(tmp_path: Path) -> None:
