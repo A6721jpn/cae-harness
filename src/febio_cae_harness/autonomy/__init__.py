@@ -1,5 +1,10 @@
 """Evidence-driven, side-effect-free autonomy policy."""
 
+from .negative_jacobian import (
+    NegativeJacobianDiagnostic,
+    NegativeJacobianObservation,
+    diagnose_negative_jacobian,
+)
 from .policy import (
     ExecutionAction,
     ExecutionContext,
@@ -82,4 +87,7 @@ __all__ = [
     "transition_intent",
     "transition_state",
     "unresolved_authoritative_conditions",
+    "NegativeJacobianObservation",
+    "NegativeJacobianDiagnostic",
+    "diagnose_negative_jacobian",
 ]
