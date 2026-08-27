@@ -143,3 +143,86 @@ def test_inspect_invalid_step_is_nonzero_with_concise_stderr(tmp_path: Path) -> 
     assert completed.stderr.startswith("febio-cae: ")
     assert "not UTF-8/ASCII" in completed.stderr
     assert "Traceback" not in completed.stderr
+
+
+def test_preflight_feb_emits_deterministic_ready_json(tmp_path: Path) -> None:
+    source = tmp_path / "ready.feb"
+    source.write_text(
+        '<febio_spec version="4.0"><Material id="1" /><Load material="1" /></febio_spec>',
+        encoding="utf-8",
+    )
+
+    completed = _run_cli("preflight-feb", str(source))
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stderr == ""
+    payload = json.loads(completed.stdout)
+    assert payload == {
+        "completeness": None,
+        "diagnostics": [],
+        "ready": True,
+        "status": "READY",
+    }
+    assert completed.stdout == json.dumps(payload, sort_keys=True) + "\n"
+
+
+def test_preflight_feb_uses_distinct_blocking_exit_codes(tmp_path: Path) -> None:
+    cases = (
+        (
+            "invalid-root.feb",
+            '<febio><Material id="1" /></febio>',
+            2,
+            "INVALID_FEB_ROOT",
+        ),
+        (
+            "unresolved-reference.feb",
+            '<febio_spec><Load material="9" /></febio_spec>',
+            3,
+            "MISSING_REFERENCE",
+        ),
+        (
+            "duplicate-identifier.feb",
+            '<febio_spec><Material id="1" /><Material id="1" /></febio_spec>',
+            4,
+            "DUPLICATE_IDENTIFIER",
+        ),
+    )
+
+    exit_codes: list[int] = []
+    for filename, contents, expected_code, expected_diagnostic in cases:
+        source = tmp_path / filename
+        source.write_text(contents, encoding="utf-8")
+
+        completed = _run_cli("preflight-feb", str(source))
+
+        exit_codes.append(completed.returncode)
+        assert completed.returncode == expected_code
+        assert completed.stderr == ""
+        payload = json.loads(completed.stdout)
+        assert payload["ready"] is False
+        assert payload["status"] == "BLOCKED"
+        assert [item["code"] for item in payload["diagnostics"]] == [expected_diagnostic]
+    assert len(set(exit_codes)) == len(exit_codes)
+
+
+def test_preflight_feb_parse_error_is_concise_stderr(tmp_path: Path) -> None:
+    source = tmp_path / "invalid.feb"
+    source.write_text("not XML", encoding="utf-8")
+
+    completed = _run_cli("preflight-feb", str(source))
+
+    assert completed.returncode != 0
+    assert completed.stdout == ""
+    assert completed.stderr.startswith("febio-cae: ")
+    assert "invalid FEB XML" in completed.stderr
+    assert "Traceback" not in completed.stderr
+
+
+def test_preflight_feb_missing_input_is_concise_stderr(tmp_path: Path) -> None:
+    completed = _run_cli("preflight-feb", str(tmp_path / "missing.feb"))
+
+    assert completed.returncode != 0
+    assert completed.stdout == ""
+    assert completed.stderr.startswith("febio-cae: ")
+    assert "missing.feb" in completed.stderr
+    assert "Traceback" not in completed.stderr

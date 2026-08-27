@@ -8,7 +8,14 @@ from pathlib import Path
 
 from febio_cae_harness import __version__
 from febio_cae_harness.model.feb import inspect_feb_file
+from febio_cae_harness.model.preflight import PreflightResult, run_preflight
 from febio_cae_harness.model.step import inspect_step_file
+
+_PREFLIGHT_EXIT_CODES = {
+    "INVALID_FEB_ROOT": 2,
+    "MISSING_REFERENCE": 3,
+    "DUPLICATE_IDENTIFIER": 4,
+}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -20,6 +27,11 @@ def build_parser() -> argparse.ArgumentParser:
         "inspect-feb", help="inspect FEB XML structure and explicit references"
     )
     inspect_feb.add_argument("path", type=Path, metavar="PATH")
+
+    preflight_feb = commands.add_parser(
+        "preflight-feb", help="preflight FEB XML structure and explicit references"
+    )
+    preflight_feb.add_argument("path", type=Path, metavar="PATH")
 
     inspect_step = commands.add_parser(
         "inspect-step", help="inspect STEP structure and explicit unit evidence"
@@ -43,8 +55,28 @@ def _emit_inspection(path: Path, command: str) -> int:
     return 0
 
 
+def _preflight_exit_code(result: PreflightResult) -> int:
+    for diagnostic in result.diagnostics:
+        exit_code = _PREFLIGHT_EXIT_CODES.get(diagnostic.code)
+        if exit_code is not None:
+            return exit_code
+    return 0 if result.ready else 1
+
+
+def _emit_preflight(path: Path) -> int:
+    try:
+        inspection = inspect_feb_file(path)
+    except (OSError, ValueError) as error:
+        return _error(str(error))
+    result = run_preflight(feb=inspection)
+    print(json.dumps(result.to_dict(), sort_keys=True))
+    return _preflight_exit_code(result)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = build_parser().parse_args(argv)
     if arguments.command in {"inspect-feb", "inspect-step"}:
         return _emit_inspection(arguments.path, arguments.command)
+    if arguments.command == "preflight-feb":
+        return _emit_preflight(arguments.path)
     return 0
