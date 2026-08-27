@@ -174,12 +174,14 @@ def test_authority_forgery_and_state_copies_are_rejected(tmp_path: Path) -> None
         "derived",
     )
 
+    event_log_before = store.events_path.read_text(encoding="utf-8")
     with pytest.raises(EvidenceIntegrityError):
         store.record_verification(
             source,
             Path("02_Model") / "derived.feb",
             attempt_id="attempt-1",
         )
+    assert store.events_path.read_text(encoding="utf-8") == event_log_before
     forged = object.__new__(ValidatorAuthority)
     object.__setattr__(forged, "_registry", manager._registry)  # type: ignore[attr-defined]
     object.__setattr__(forged, "_capability", object())
@@ -424,7 +426,7 @@ def test_concurrent_store_event_writers_do_not_race_sequence_or_predecessor(
     assert store_b.reopen() is store_b
 
 
-def test_record_verification_persists_bound_evidence_and_issues_opaque_receipt(
+def test_caller_true_validator_is_diagnostic_not_authoritative(
     tmp_path: Path,
 ) -> None:
     _, case, intent = make_case(tmp_path)
@@ -442,13 +444,11 @@ def test_record_verification_persists_bound_evidence_and_issues_opaque_receipt(
         attempt_id="attempt-1",
         authority=authority,
     )
-
-    assert isinstance(receipt, VerificationReceipt)
-    assert repr(receipt) == "VerificationReceipt(<opaque>)"
+    assert receipt is None
     with pytest.raises(EvidenceIntegrityError):
-        store.promote_verified({"evidence_digest": str(receipt)})  # type: ignore[arg-type]
+        store.promote_verified(receipt)  # type: ignore[arg-type]
     record = json.loads(store.events_path.read_text(encoding="utf-8").splitlines()[-1])
-    assert record["event_type"] == "artifact_verified"
+    assert record["event_type"] == "artifact_validation_diagnostic"
     payload = record["payload"]
     assert payload["case_id"] == case.case_id
     assert payload["attempt_id"] == "attempt-1"
@@ -459,7 +459,8 @@ def test_record_verification_persists_bound_evidence_and_issues_opaque_receipt(
     assert payload["runtime"] == "synthetic"
     assert payload["result"] is True
     assert isinstance(payload["evidence_digest"], str)
-    assert str(receipt).endswith(payload["evidence_digest"])
+    assert payload["authority"] == "unverified"
+    assert payload["promotable"] is False
 
 
 def test_failed_verification_has_no_promotion_receipt(tmp_path: Path) -> None:
@@ -536,14 +537,16 @@ def test_validator_source_mutation_never_issues_receipt(tmp_path: Path) -> None:
     )
 
 
-def test_artifact_verified_cannot_be_fabricated_through_generic_event_api(
+@pytest.mark.parametrize("event_type", ["artifact_verified", "artifact_validation_diagnostic"])
+def test_internal_verification_events_cannot_be_fabricated_through_generic_event_api(
     tmp_path: Path,
+    event_type: str,
 ) -> None:
     _, case, intent = make_case(tmp_path)
     store = EvidenceStore(case, intent)
 
     with pytest.raises(EvidenceIntegrityError):
-        store.append_event("artifact_verified", {})
+        store.append_event(event_type, {})
     assert store.events_path.read_text(encoding="utf-8") == ""
 
 
@@ -562,7 +565,7 @@ def test_verification_rejects_duplicate_and_source_mutation(tmp_path: Path) -> N
         attempt_id="attempt-1",
         authority=authority,
     )
-    assert receipt is not None
+    assert receipt is None
 
     with pytest.raises(EvidenceIntegrityError):
         store.record_verification(
@@ -573,7 +576,7 @@ def test_verification_rejects_duplicate_and_source_mutation(tmp_path: Path) -> N
         )
     source.write_text("mutated", encoding="utf-8")
     with pytest.raises(EvidenceIntegrityError):
-        store.promote_verified(receipt)
+        store.promote_verified(receipt)  # type: ignore[arg-type]
 
 
 def test_receipt_is_case_bound_even_for_identical_case_ids(tmp_path: Path) -> None:
@@ -592,13 +595,19 @@ def test_receipt_is_case_bound_even_for_identical_case_ids(tmp_path: Path) -> No
         attempt_id="attempt-1",
         authority=authority,
     )
-    assert receipt is not None
+    assert receipt is None
+    payload = json.loads(store_a.events_path.read_text(encoding="utf-8").splitlines()[-1])[
+        "payload"
+    ]
+    receipt_like = VerificationReceipt._issue(
+        store_a._receipt_case_token(), payload["evidence_digest"]
+    )
 
     workspace_b = ValidatedCaseWorkspace(tmp_path / "tool-b", tmp_path / "02_CAE-b")
     case_b = workspace_b.create_case("case-a")
     store_b = EvidenceStore(case_b, IntentContract(engineering_question="q"))
     with pytest.raises(EvidenceIntegrityError):
-        store_b.promote_verified(receipt)
+        store_b.promote_verified(receipt_like)
 
 
 def test_promotion_is_create_new_and_rejects_duplicate_receipt_use(tmp_path: Path) -> None:
@@ -616,17 +625,13 @@ def test_promotion_is_create_new_and_rejects_duplicate_receipt_use(tmp_path: Pat
         attempt_id="attempt-1",
         authority=authority,
     )
-    assert receipt is not None
+    assert receipt is None
+    with pytest.raises(EvidenceIntegrityError):
+        store.promote_verified(receipt)  # type: ignore[arg-type]
+    assert not (case.case_root / "02_Model" / "derived.feb").exists()
 
-    assert store.promote_verified(receipt).read_text(encoding="utf-8") == "derived"
-    with pytest.raises(FileExistsError):
-        store.promote_verified(receipt)
 
-
-def test_promotion_consumes_receipt_before_copy_failure(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_promotion_rejects_diagnostic_receipt_before_copy(tmp_path: Path) -> None:
     _, case, intent = make_case(tmp_path)
     manager, authority = make_authority()
     store = EvidenceStore(case, intent, manager)
@@ -641,30 +646,13 @@ def test_promotion_consumes_receipt_before_copy_failure(
         attempt_id="attempt-1",
         authority=authority,
     )
-    assert receipt is not None
-
-    def fail_copy(*args: object, **kwargs: object) -> Path:
-        del args, kwargs
-        raise OSError("simulated copy failure")
-
-    monkeypatch.setattr(CaseWorkspace, "_copy_create_new", fail_copy)
-    with pytest.raises(OSError, match="simulated copy failure"):
-        store.promote_verified(receipt)
-
-    event_lines = store.events_path.read_text(encoding="utf-8").splitlines()
-    records = [json.loads(line) for line in event_lines]
-    assert records[-1]["event_type"] == "artifact_promotion_consumed"
-    assert records[-1]["previous_sha256"] == records[-2]["sha256"]
-    assert records[-1]["payload"] == records[-2]["payload"]
-    assert str(receipt).endswith(records[-1]["payload"]["evidence_digest"])
+    assert receipt is None
+    with pytest.raises(EvidenceIntegrityError):
+        store.promote_verified(receipt)  # type: ignore[arg-type]
     assert not (case.case_root / "02_Model" / "derived.feb").exists()
 
-    monkeypatch.undo()
-    with pytest.raises(EvidenceIntegrityError):
-        store.promote_verified(receipt)
 
-
-def test_consumed_receipt_cannot_replay_after_destination_is_removed(tmp_path: Path) -> None:
+def test_unissued_receipt_cannot_replay_after_destination_is_removed(tmp_path: Path) -> None:
     _, case, intent = make_case(tmp_path)
     manager, authority = make_authority()
     store = EvidenceStore(case, intent, manager)
@@ -680,13 +668,101 @@ def test_consumed_receipt_cannot_replay_after_destination_is_removed(tmp_path: P
         attempt_id="attempt-1",
         authority=authority,
     )
-    assert receipt is not None
-
-    assert store.promote_verified(receipt) == destination
-    destination.write_text("tampered", encoding="utf-8")
+    assert receipt is None
     with pytest.raises(EvidenceIntegrityError):
-        store.promote_verified(receipt)
-    destination.unlink()
+        store.promote_verified(receipt)  # type: ignore[arg-type]
+    assert not destination.exists()
 
+
+def test_phase1_generic_validator_is_diagnostic_only(tmp_path: Path) -> None:
+    _, case, intent = make_case(tmp_path)
+    manager, authority = make_authority()
+    store = EvidenceStore(case, intent, manager)
+    store.record_attempt("attempt-1")
+    source = case.write_text(
+        Path("90_Temporary") / "attempts" / "attempt-1" / "derived.feb",
+        "derived",
+    )
+
+    diagnostic_receipt = store.record_verification(
+        source,
+        Path("02_Model") / "derived.feb",
+        attempt_id="attempt-1",
+        authority=authority,
+    )
+
+    assert diagnostic_receipt is None
+    event = json.loads(store.events_path.read_text(encoding="utf-8").splitlines()[-1])
+    assert event["event_type"] == "artifact_validation_diagnostic"
+    assert event["payload"]["result"] is True
+    assert event["payload"]["authority"] == "unverified"
+    assert event["payload"]["promotable"] is False
     with pytest.raises(EvidenceIntegrityError):
-        store.promote_verified(receipt)
+        store.promote_verified(diagnostic_receipt)  # type: ignore[arg-type]
+
+
+def test_default_verification_is_explicitly_unverified(tmp_path: Path) -> None:
+    _, case, intent = make_case(tmp_path)
+    store = EvidenceStore(case, intent)
+    store.record_attempt("attempt-1")
+    source = case.write_text(
+        Path("90_Temporary") / "attempts" / "attempt-1" / "derived.feb",
+        "derived",
+    )
+
+    receipt = store.record_verification(
+        source,
+        Path("02_Model") / "derived.feb",
+        attempt_id="attempt-1",
+    )
+
+    assert receipt is None
+    payload = json.loads(store.events_path.read_text(encoding="utf-8").splitlines()[-1])["payload"]
+    assert payload["validator"] == "unverified"
+    assert payload["result"] is False
+    assert payload["authority"] == "unverified"
+    assert payload["promotable"] is False
+
+
+def test_receipt_token_construction_and_reopen_store_are_not_authority(
+    tmp_path: Path,
+) -> None:
+    _, case, intent = make_case(tmp_path)
+    manager, authority = make_authority()
+    store = EvidenceStore(case, intent, manager)
+    store.record_attempt("attempt-1")
+    source = case.write_text(
+        Path("90_Temporary") / "attempts" / "attempt-1" / "derived.feb",
+        "derived",
+    )
+    store.record_verification(
+        source,
+        Path("02_Model") / "derived.feb",
+        attempt_id="attempt-1",
+        authority=authority,
+    )
+    payload = json.loads(store.events_path.read_text(encoding="utf-8").splitlines()[-1])["payload"]
+    token = (
+        f"{evidence_module._RECEIPT_PREFIX}{store._receipt_case_token()}"
+        f":{payload['evidence_digest']}"
+    )
+    forged = str.__new__(VerificationReceipt, token)
+    issued_like = VerificationReceipt._issue(
+        store._receipt_case_token(), payload["evidence_digest"]
+    )
+
+    for candidate in (token, forged, issued_like):
+        with pytest.raises(EvidenceIntegrityError):
+            store.promote_verified(candidate)  # type: ignore[arg-type]
+    with pytest.raises(EvidenceIntegrityError):
+        EvidenceStore.open(case, manager).promote_verified(forged)
+    with pytest.raises(TypeError):
+        copy(issued_like)
+    with pytest.raises(TypeError):
+        deepcopy(issued_like)
+    with pytest.raises(TypeError):
+        pickle.dumps(issued_like)
+    with pytest.raises(TypeError):
+        object.__new__(VerificationReceipt)
+    with pytest.raises(TypeError):
+        type("ForgedReceipt", (VerificationReceipt,), {})
