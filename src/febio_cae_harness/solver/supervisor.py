@@ -16,6 +16,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 
+from ..evidence import IntentSnapshotAuthority
 from .fbs import (
     FbsAdapterAuthority,
     FbsValidation,
@@ -314,6 +315,89 @@ class SolverSupervisor:
             or launch_context_digest != self._launch_context_digest
         ):
             raise SolverConfigurationError("supervisor launch context binding is invalid")
+
+    def _validated_retry_correlation(self) -> tuple[object, ...]:
+        """Return the live case/intent correlation bound to this supervisor."""
+
+        try:
+            (
+                capability_record,
+                case_id,
+                intent_sha256,
+                attempt_id,
+                attempt_root,
+                _launch_context,
+                _launch_context_digest,
+            ) = _validate_launch_capability(self._launch_capability)
+            if capability_record.spec is not self.spec:
+                raise SolverConfigurationError("supervisor launch binding is invalid")
+            if (case_id, intent_sha256, attempt_id) != (
+                self._case_id,
+                self._intent_id,
+                self._attempt_id,
+            ):
+                raise SolverConfigurationError("supervisor authority binding is invalid")
+
+            launch_snapshot = capability_record.intent_snapshot
+            if type(launch_snapshot) is not IntentSnapshotAuthority:
+                raise SolverConfigurationError("supervisor launch snapshot is invalid")
+            attempt_workspace = capability_record.attempt_workspace
+            case_workspace = object.__getattribute__(launch_snapshot, "_case_workspace")
+            case_sha256 = launch_snapshot.case_sha256
+            case_root = case_workspace.root
+            if not attempt_root.is_relative_to(case_root):
+                raise SolverConfigurationError("supervisor attempt is outside its case")
+
+            # Revalidate after reading the snapshot projection so a late
+            # capability or snapshot mutation cannot be returned as authority.
+            (
+                final_record,
+                final_case_id,
+                final_intent_sha256,
+                final_attempt_id,
+                final_attempt_root,
+                _final_launch_context,
+                _final_launch_context_digest,
+            ) = _validate_launch_capability(self._launch_capability)
+            final_snapshot = final_record.intent_snapshot
+            if type(final_snapshot) is not IntentSnapshotAuthority:
+                raise SolverConfigurationError("supervisor launch snapshot is invalid")
+            final_case_workspace = object.__getattribute__(final_snapshot, "_case_workspace")
+            final_case_sha256 = final_snapshot.case_sha256
+            final_case_root = final_case_workspace.root
+            if (
+                final_record is not capability_record
+                or final_record.spec is not self.spec
+                or final_case_id != case_id
+                or final_intent_sha256 != intent_sha256
+                or final_attempt_id != attempt_id
+                or final_attempt_root != attempt_root
+                or final_snapshot is not launch_snapshot
+                or final_case_workspace is not case_workspace
+                or final_case_sha256 != case_sha256
+                or final_case_root != case_root
+            ):
+                raise SolverConfigurationError(
+                    "supervisor retry correlation changed during validation"
+                )
+        except SolverConfigurationError:
+            raise
+        except Exception as error:
+            raise SolverConfigurationError("supervisor retry correlation is not live") from error
+
+        return (
+            self._launch_capability,
+            capability_record.spec,
+            attempt_workspace,
+            launch_snapshot,
+            case_workspace,
+            case_root,
+            case_id,
+            case_sha256,
+            intent_sha256,
+            attempt_id,
+            attempt_root,
+        )
 
     def start(self) -> SolverSupervisor:
         """Prepare fresh outputs and launch the owned process."""

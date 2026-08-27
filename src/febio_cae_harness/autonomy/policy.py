@@ -1748,6 +1748,149 @@ def _solver_result_is_authoritative(
     )
 
 
+def _validated_supervisor_correlation(value: object) -> tuple[object, ...] | None:
+    """Return only an exact supervisor's live launch correlation."""
+
+    if type(value) is not SolverSupervisor:
+        return None
+    try:
+        correlation = SolverSupervisor._validated_retry_correlation(value)
+    except Exception:
+        return None
+    if not isinstance(correlation, tuple) or len(correlation) != 11:
+        return None
+    return correlation
+
+
+def _live_snapshot_correlation(value: object) -> tuple[object, ...] | None:
+    """Read a snapshot's exact live case binding and immutable identities."""
+
+    if type(value) is not IntentSnapshotAuthority:
+        return None
+    try:
+        snapshot_case_workspace = object.__getattribute__(value, "_case_workspace")
+        if type(snapshot_case_workspace) is not CaseWorkspace:
+            return None
+        case_root = snapshot_case_workspace.root
+        case_id = value.case_id
+        case_sha256 = value.case_sha256
+        intent_sha256 = value.intent_sha256
+        intent = value.intent
+        if type(intent) is not IntentContract:
+            return None
+
+        # Re-read all identity-bearing values so a mutation during the
+        # projection cannot be mistaken for a stable authority.
+        if (
+            object.__getattribute__(value, "_case_workspace") is not snapshot_case_workspace
+            or snapshot_case_workspace.root != case_root
+            or value.case_id != case_id
+            or value.case_sha256 != case_sha256
+            or value.intent_sha256 != intent_sha256
+            or value.intent is not intent
+        ):
+            return None
+    except Exception:
+        return None
+    return (
+        value,
+        snapshot_case_workspace,
+        case_root,
+        case_id,
+        case_sha256,
+        intent_sha256,
+        intent,
+    )
+
+
+def _retry_authority_matches(
+    launch_correlation: tuple[object, ...],
+    state_record: _IntentStateRecord,
+) -> bool:
+    """Correlate a live launch capability with the exact live state snapshot."""
+
+    if len(launch_correlation) != 11:
+        return False
+    try:
+        (
+            _capability,
+            _spec,
+            attempt_workspace,
+            launch_snapshot,
+            launch_case_workspace,
+            launch_case_root,
+            launch_case_id,
+            launch_case_sha256,
+            launch_intent_sha256,
+            _attempt_id,
+            launch_attempt_root,
+        ) = launch_correlation
+        if type(attempt_workspace) is not AttemptWorkspace:
+            return False
+        launch_snapshot_record = _live_snapshot_correlation(launch_snapshot)
+        state_snapshot_record = _live_snapshot_correlation(state_record[1])
+        if launch_snapshot_record is None or state_snapshot_record is None:
+            return False
+        if launch_snapshot_record[0] is not launch_snapshot:
+            return False
+        if launch_snapshot_record[1] is not launch_case_workspace:
+            return False
+        if (
+            launch_snapshot_record[2] != launch_case_root
+            or launch_snapshot_record[3] != launch_case_id
+            or launch_snapshot_record[4] != launch_case_sha256
+            or launch_snapshot_record[5] != launch_intent_sha256
+        ):
+            return False
+
+        (
+            state_snapshot,
+            state_case_workspace,
+            state_case_root,
+            state_case_id,
+            state_case_sha256,
+            state_intent_sha256,
+            state_intent,
+        ) = state_snapshot_record
+        if state_intent is not state_record[2]:
+            return False
+        if type(state_snapshot) is not IntentSnapshotAuthority:
+            return False
+        if (
+            not isinstance(launch_case_root, Path)
+            or not isinstance(launch_attempt_root, Path)
+            or not launch_attempt_root.is_relative_to(launch_case_root)
+        ):
+            return False
+        return (
+            type(state_case_workspace) is CaseWorkspace
+            and launch_case_root == state_case_root
+            and launch_case_id == state_case_id == state_snapshot.case_id
+            and launch_case_sha256 == state_case_sha256 == state_snapshot.case_sha256
+            and launch_intent_sha256 == state_intent_sha256 == state_snapshot.intent_sha256
+        )
+    except Exception:
+        return False
+
+
+def _retry_authorities_are_same(
+    first: tuple[object, ...],
+    second: tuple[object, ...],
+) -> bool:
+    """Require the launch projection to remain the exact same authority."""
+
+    if len(first) != 11 or len(second) != 11:
+        return False
+    return (
+        first[0] is second[0]
+        and first[1] is second[1]
+        and first[2] is second[2]
+        and first[3] is second[3]
+        and first[4] is second[4]
+        and first[5:] == second[5:]
+    )
+
+
 _SOLVER_FAILURE_CLASSIFICATIONS: Mapping[SolverClassification, FailureClass] = MappingProxyType(
     {
         SolverClassification.SUCCESS: FailureClass.NONE,
@@ -1935,8 +2078,11 @@ def decide_retry(
         return stopped("retry requires a registry-issued ledger bound to the live intent")
     if not _solver_result_is_authoritative(effective_supervisor, effective_result):
         return stopped("retry requires the exact failed result issued by its solver supervisor")
-    if object.__getattribute__(effective_supervisor, "_case_id") != authority_record[1].case_id:
-        return stopped("solver result is not correlated to the live intent case")
+    launch_correlation = _validated_supervisor_correlation(effective_supervisor)
+    if launch_correlation is None:
+        return stopped("retry requires the exact live solver launch capability")
+    if not _retry_authority_matches(launch_correlation, authority_record):
+        return stopped("solver launch authority is not correlated to the live intent snapshot")
     issued_result = cast(SolverRunResult, effective_result)
     with _RETRY_CONSUMPTION_LOCK:
         # Revalidate all authority-bearing inputs immediately before mutating
@@ -1949,6 +2095,13 @@ def decide_retry(
             return stopped("intent or retry ledger authority became stale")
         if authority_record is None or refreshed_record[1] is not authority_record[1]:
             return stopped("intent state authority changed before retry accounting")
+        refreshed_launch_correlation = _validated_supervisor_correlation(effective_supervisor)
+        if refreshed_launch_correlation is None:
+            return stopped("solver launch authority became stale before retry accounting")
+        if not _retry_authorities_are_same(launch_correlation, refreshed_launch_correlation):
+            return stopped("solver launch authority changed before retry accounting")
+        if not _retry_authority_matches(refreshed_launch_correlation, refreshed_record):
+            return stopped("solver launch authority is not correlated before retry accounting")
         if not _solver_result_is_authoritative(effective_supervisor, issued_result):
             return stopped("retry result authority became stale before accounting")
         consumed_ledger = _RETRY_CONSUMED_LEDGERS.get(id(ledger))
@@ -1975,10 +2128,12 @@ def decide_retry(
         # result carries the complete supervisor binding; no raw evidence IDs may
         # become part of an authority-backed ledger record.
         evidence_ids: tuple[str, ...] = ()
-        attempt_id = getattr(effective_supervisor, "_attempt_id", None)
+        attempt_id_value = refreshed_launch_correlation[9]
+        if not isinstance(attempt_id_value, str) or not attempt_id_value.strip():
+            return stopped("solver launch authority attempt identity is invalid")
         record = RetryRecord(
             failure=classification,
-            attempt_id=attempt_id if isinstance(attempt_id, str) else None,
+            attempt_id=attempt_id_value,
             proposal_id=proposal.proposal_id if proposal is not None else None,
             evidence_ids=evidence_ids,
         )
