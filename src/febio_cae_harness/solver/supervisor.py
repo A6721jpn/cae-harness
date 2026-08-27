@@ -2,27 +2,142 @@
 
 from __future__ import annotations
 
+import contextlib
+import json
 import math
 import os
 import signal
 import subprocess
 import threading
+import time
 import uuid
 from collections.abc import Iterable
+from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
+from typing import cast
 
 from .fbs import FbsAdapterBoundary, FbsValidation, OfficialFbsAdapterBoundary
 from .log import LogValidation, LogValidator, validate_log
 from .types import (
     OutputFreshnessError,
     SolverClassification,
+    SolverConfigurationError,
     SolverLaunchError,
     SolverLaunchSpec,
+    SolverOwnershipError,
     SolverRunResult,
     SolverState,
 )
 
 __all__ = ["SolverSupervisor"]
+
+_PROCESS_RECORD_NAME = "process.json"
+
+
+@dataclass(frozen=True, slots=True)
+class _ProcessMetadata:
+    executable_path: str
+    creation_identity: str
+    alive: bool
+    return_code: int | None
+
+
+def _normalise_executable(path: str | Path) -> str:
+    return os.path.normcase(os.path.realpath(os.path.abspath(os.fspath(path))))
+
+
+def _windows_process_metadata(pid: int) -> _ProcessMetadata:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not handle:
+        raise ProcessLookupError(pid)
+    try:
+        exit_code = wintypes.DWORD()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            raise OSError(ctypes.get_last_error(), "unable to query process exit code")
+        code = exit_code.value
+        if code != 259:  # STILL_ACTIVE
+            return _ProcessMetadata("", "", False, code)
+        buffer = ctypes.create_unicode_buffer(32768)
+        size = wintypes.DWORD(len(buffer))
+        if not kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
+            raise OSError(ctypes.get_last_error(), "unable to query process executable")
+        times = [wintypes.FILETIME() for _ in range(4)]
+        if not kernel32.GetProcessTimes(handle, *(ctypes.byref(value) for value in times)):
+            raise OSError(ctypes.get_last_error(), "unable to query process creation time")
+        creation_value = (times[0].dwHighDateTime << 32) | times[0].dwLowDateTime
+        return _ProcessMetadata(
+            executable_path=buffer.value,
+            creation_identity=f"windows:{creation_value}",
+            alive=True,
+            return_code=None,
+        )
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _posix_process_metadata(pid: int) -> _ProcessMetadata:
+    proc_root = Path("/proc") / str(pid)
+    try:
+        stat_line = (proc_root / "stat").read_text(encoding="utf-8")
+        stat_fields = stat_line.rpartition(")")[2].split()
+        executable_path = os.readlink(os.fspath(proc_root / "exe"))
+    except OSError as error:
+        raise ProcessLookupError(pid) from error
+    if len(stat_fields) < 20:
+        raise OSError("unable to read process start identity")
+    state = stat_fields[0]
+    return _ProcessMetadata(
+        executable_path=executable_path,
+        creation_identity=f"posix:{stat_fields[19]}",
+        alive=state not in {"Z", "X"},
+        return_code=None if state not in {"Z", "X"} else 0,
+    )
+
+
+def _process_metadata(pid: int) -> _ProcessMetadata:
+    if os.name == "nt":
+        return _windows_process_metadata(pid)
+    if os.name == "posix":
+        return _posix_process_metadata(pid)
+    raise OSError("process identity is unsupported on this platform")
+
+
+def _process_action(process: subprocess.Popen[bytes] | _ReconnectedProcess, action: str) -> None:
+    getattr(process, action)()
+
+
+class _ReconnectedProcess:
+    """Small process handle for a process that is not this client's child."""
+
+    def __init__(self, pid: int, executable_path: str, creation_identity: str) -> None:
+        self.pid = pid
+        self._executable_path = executable_path
+        self._creation_identity = creation_identity
+
+    def poll(self) -> int | None:
+        metadata = _process_metadata(self.pid)
+        if metadata.alive and (
+            _normalise_executable(metadata.executable_path)
+            != _normalise_executable(self._executable_path)
+            or metadata.creation_identity != self._creation_identity
+        ):
+            raise SolverOwnershipError("reconnected process identity no longer matches")
+        return None if metadata.alive else metadata.return_code
+
+    def wait(self, timeout: float | None = None) -> int | None:
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            return_code = self.poll()
+            if return_code is not None:
+                return return_code
+            if deadline is not None and time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired(str(self.pid), timeout or 0.0)
+            time.sleep(0.05)
 
 
 class SolverSupervisor:
@@ -37,11 +152,22 @@ class SolverSupervisor:
         self,
         spec: SolverLaunchSpec,
         *,
+        case_id: str | None = None,
+        intent_id: str | None = None,
+        attempt_id: str | None = None,
         fbs_adapter: OfficialFbsAdapterBoundary | object | None = None,
         requested_fields: Iterable[str] | None = None,
         log_validator: LogValidator | None = None,
     ) -> None:
         self.spec = spec
+        if any(
+            value is not None and (not isinstance(value, str) or not value.strip())
+            for value in (case_id, intent_id, attempt_id)
+        ):
+            raise SolverConfigurationError("context identifiers must be non-empty strings")
+        self._case_id = case_id or ""
+        self._intent_id = intent_id or ""
+        self._attempt_id = attempt_id or spec.attempt_root.name
         if fbs_adapter is None or isinstance(fbs_adapter, OfficialFbsAdapterBoundary):
             self._fbs_adapter = fbs_adapter
         else:
@@ -53,9 +179,10 @@ class SolverSupervisor:
         self._owner_token = uuid.uuid4().hex
         self._lock = threading.RLock()
         self._state = SolverState.NOT_STARTED
-        self._process: subprocess.Popen[bytes] | None = None
+        self._process: subprocess.Popen[bytes] | _ReconnectedProcess | None = None
         self._started_at: datetime | None = None
         self._result: SolverRunResult | None = None
+        self._process_record: dict[str, object] | None = None
 
     @property
     def state(self) -> SolverState:
@@ -78,6 +205,12 @@ class SolverSupervisor:
         return self._owner_token
 
     @property
+    def process_record_path(self) -> Path:
+        """The only persisted authority used to reconnect this attempt."""
+
+        return self.spec.attempt_root / _PROCESS_RECORD_NAME
+
+    @property
     def result(self) -> SolverRunResult | None:
         with self._lock:
             return self._result
@@ -91,6 +224,10 @@ class SolverSupervisor:
 
             try:
                 self.spec.prepare_outputs()
+                if os.path.lexists(os.fspath(self.process_record_path)):
+                    raise SolverLaunchError(
+                        f"process record already exists: {self.process_record_path}"
+                    )
                 if not self.spec.input_path.is_file():
                     raise FileNotFoundError(f"solver input does not exist: {self.spec.input_path}")
                 environment = os.environ.copy()
@@ -103,6 +240,7 @@ class SolverSupervisor:
                 environment["FEBIO_CAE_HARNESS_LOG"] = os.fspath(outputs.log_path)
                 environment["FEBIO_CAE_HARNESS_XPLT"] = os.fspath(outputs.xplt_path)
 
+                process: subprocess.Popen[bytes] | None = None
                 if os.name == "nt":
                     creation_flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
                     process = subprocess.Popen(
@@ -126,12 +264,22 @@ class SolverSupervisor:
                         stderr=subprocess.DEVNULL,
                         start_new_session=True,
                     )
+                started_at = datetime.now(UTC)
+                metadata = _process_metadata(process.pid)
+                self._process = process
+                self._started_at = started_at
+                self._process_record = self._make_process_record(process.pid, metadata, started_at)
+                self._write_process_record(self._process_record)
             except (OSError, OutputFreshnessError, ValueError) as error:
+                process = locals().get("process")
+                if isinstance(process, subprocess.Popen):
+                    try:
+                        self._terminate_owned_process(process)
+                    except (OSError, ProcessLookupError, subprocess.TimeoutExpired):
+                        _process_action(process, "kill")
                 self._state = SolverState.FAILED
                 raise SolverLaunchError(f"unable to launch solver: {error}") from error
 
-            self._process = process
-            self._started_at = datetime.now(UTC)
             self._state = SolverState.RUNNING
             return self
 
@@ -142,7 +290,43 @@ class SolverSupervisor:
 
         with self._lock:
             process = self._process
-        return process.poll() if process is not None else None
+        if process is None:
+            return None
+        return process.poll()
+
+    @classmethod
+    def reconnect(
+        cls,
+        spec: SolverLaunchSpec,
+        *,
+        case_id: str | None = None,
+        intent_id: str | None = None,
+        attempt_id: str | None = None,
+        fbs_adapter: OfficialFbsAdapterBoundary | object | None = None,
+        requested_fields: Iterable[str] | None = None,
+        log_validator: LogValidator | None = None,
+    ) -> SolverSupervisor:
+        """Rebuild a supervisor only after validating its owned record."""
+
+        supervisor = cls(
+            spec,
+            case_id=case_id,
+            intent_id=intent_id,
+            attempt_id=attempt_id,
+            fbs_adapter=fbs_adapter,
+            requested_fields=requested_fields,
+            log_validator=log_validator,
+        )
+        record = supervisor._read_process_record()
+        metadata, started_at = supervisor._validate_process_record(record)
+        supervisor._process_record = record
+        pid = cast(int, record["pid"])
+        supervisor._process = _ReconnectedProcess(
+            pid, metadata.executable_path, metadata.creation_identity
+        )
+        supervisor._started_at = started_at
+        supervisor._state = SolverState.RUNNING
+        return supervisor
 
     def wait(self, timeout_seconds: float | None = None) -> SolverRunResult:
         """Wait for completion, enforcing the configured timeout if present."""
@@ -205,7 +389,117 @@ class SolverSupervisor:
         self._terminate_owned_process(process)
         return self._complete(SolverState.CANCELLED, process.poll())
 
-    def _terminate_owned_process(self, process: subprocess.Popen[bytes]) -> None:
+    def _make_process_record(
+        self, pid: int, metadata: _ProcessMetadata, started_at: datetime
+    ) -> dict[str, object]:
+        outputs = self.spec.expected_outputs
+        return {
+            "case_id": self._case_id,
+            "intent_id": self._intent_id,
+            "attempt_id": self._attempt_id,
+            "executable_path": str(self.spec.executable),
+            "pid": pid,
+            "process_creation_identity": metadata.creation_identity,
+            "start_time": started_at.isoformat(),
+            "owned_output_paths": {
+                "log": str(outputs.log_path),
+                "xplt": str(outputs.xplt_path),
+            },
+        }
+
+    def _write_process_record(self, record: dict[str, object]) -> None:
+        path = self.process_record_path
+        temporary = path.with_name(f".{path.name}.{self._owner_token}.tmp")
+        try:
+            with temporary.open("x", encoding="utf-8") as stream:
+                json.dump(record, stream, indent=2, sort_keys=True)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(os.fspath(temporary), os.fspath(path))
+        except (OSError, TypeError, ValueError) as error:
+            with contextlib.suppress(OSError):
+                temporary.unlink(missing_ok=True)
+            raise OSError(f"unable to persist process record: {error}") from error
+
+    def _read_process_record(self) -> dict[str, object]:
+        path = self.process_record_path
+        if not path.is_file() or path.is_symlink():
+            raise SolverOwnershipError(f"missing process record: {path}")
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise SolverOwnershipError(f"invalid process record: {path}") from error
+        if not isinstance(record, dict):
+            raise SolverOwnershipError("process record must be a JSON object")
+        return record
+
+    def _validate_record_path(self, value: object, expected: Path, label: str) -> None:
+        if not isinstance(value, str) or not Path(value).is_absolute():
+            raise SolverOwnershipError(f"{label} must be an absolute path")
+        candidate = Path(os.path.abspath(value))
+        root = self.spec.attempt_root
+        if (
+            candidate != expected
+            or not candidate.is_relative_to(root)
+            or not Path(os.path.realpath(candidate)).is_relative_to(root)
+        ):
+            raise SolverOwnershipError(f"{label} escapes the attempt root")
+
+    def _validate_process_record(
+        self, record: dict[str, object]
+    ) -> tuple[_ProcessMetadata, datetime]:
+        expected_ids = {
+            "case_id": self._case_id,
+            "intent_id": self._intent_id,
+            "attempt_id": self._attempt_id,
+        }
+        if any(record.get(name) != expected for name, expected in expected_ids.items()):
+            raise SolverOwnershipError("process record identity does not match")
+
+        executable_value = record.get("executable_path")
+        if not isinstance(executable_value, str) or not Path(executable_value).is_absolute():
+            raise SolverOwnershipError("process record executable must be absolute")
+        if _normalise_executable(executable_value) != _normalise_executable(self.spec.executable):
+            raise SolverOwnershipError("process record executable does not match")
+
+        pid = record.get("pid")
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+            raise SolverOwnershipError("process record PID is invalid")
+        identity = record.get("process_creation_identity")
+        if not isinstance(identity, str) or not identity:
+            raise SolverOwnershipError("process record creation identity is invalid")
+
+        started_value = record.get("start_time")
+        if not isinstance(started_value, str):
+            raise SolverOwnershipError("process record start time is invalid")
+        try:
+            started_at = datetime.fromisoformat(started_value)
+        except ValueError as error:
+            raise SolverOwnershipError("process record start time is invalid") from error
+        output_values = record.get("owned_output_paths")
+        if not isinstance(output_values, dict):
+            raise SolverOwnershipError("process record output paths are invalid")
+        outputs = self.spec.expected_outputs
+        self._validate_record_path(output_values.get("log"), outputs.log_path, "LOG path")
+        self._validate_record_path(output_values.get("xplt"), outputs.xplt_path, "XPLT path")
+
+        try:
+            metadata = _process_metadata(pid)
+        except OSError as error:
+            raise SolverOwnershipError("recorded process is not live") from error
+        if not metadata.alive:
+            raise SolverOwnershipError("recorded process is not live")
+        if _normalise_executable(metadata.executable_path) != _normalise_executable(
+            executable_value
+        ):
+            raise SolverOwnershipError("current process executable does not match")
+        if metadata.creation_identity != identity:
+            raise SolverOwnershipError("current process creation identity does not match")
+        return metadata, started_at
+
+    def _terminate_owned_process(
+        self, process: subprocess.Popen[bytes] | _ReconnectedProcess
+    ) -> None:
         """Terminate only the process group created by this supervisor."""
 
         if process.poll() is not None:
@@ -219,25 +513,25 @@ class SolverSupervisor:
                     text=True,
                 )
             except OSError:
-                process.terminate()
+                _process_action(process, "terminate")
         else:
             try:
                 if not self._kill_process_group(process.pid, "SIGTERM"):
-                    process.terminate()
+                    _process_action(process, "terminate")
             except (OSError, ProcessLookupError):
-                process.terminate()
+                _process_action(process, "terminate")
 
         try:
             process.wait(timeout=2.0)
         except subprocess.TimeoutExpired:
             if os.name == "nt":
-                process.kill()
+                _process_action(process, "kill")
             else:
                 try:
                     if not self._kill_process_group(process.pid, "SIGKILL"):
-                        process.kill()
+                        _process_action(process, "kill")
                 except (OSError, ProcessLookupError):
-                    process.kill()
+                    _process_action(process, "kill")
             process.wait(timeout=2.0)
 
     @staticmethod
