@@ -1,11 +1,14 @@
 """Pure completed-FEB workflow state machine."""
 
 from collections.abc import Iterable, Mapping
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import asdict, dataclass, field, is_dataclass
 from enum import StrEnum
 from math import isfinite
 from types import MappingProxyType
 from typing import cast
+
+from ..contracts import IntentContract, IntentState
+from ..evidence import IntentSnapshotAuthority
 
 __all__ = ["WorkflowIdentity", "WorkflowPhase", "WorkflowState", "transition"]
 
@@ -45,12 +48,27 @@ class WorkflowIdentity:
         }
 
 
+_BLOCKED_BINDINGS: dict[
+    int,
+    tuple[
+        object,
+        object,
+        WorkflowIdentity,
+        tuple[str, str, str],
+        WorkflowPhase,
+        tuple[str, ...],
+        _FrozenValue,
+    ],
+] = {}
+
+
 @dataclass(frozen=True, slots=True)
 class WorkflowState:
     identity: WorkflowIdentity
     state: WorkflowPhase = WorkflowPhase.CREATED
     evidence_ids: tuple[str, ...] = ()
     reason: object | None = None
+    _intent_snapshot: object | None = field(default=None, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.identity, WorkflowIdentity):
@@ -61,14 +79,25 @@ class WorkflowState:
             raise ValueError("state must be a canonical WorkflowPhase") from error
         object.__setattr__(self, "state", normalized_state)
         object.__setattr__(self, "evidence_ids", _normalise_evidence_ids(self.evidence_ids))
-        if normalized_state is WorkflowPhase.ASK_AND_BLOCK and not _is_authoritative_unresolved(
-            self.reason
-        ):
-            raise ValueError("ASK_AND_BLOCK requires an explicit authoritative unresolved fact")
-        if self.reason is not None:
+        if normalized_state is WorkflowPhase.ASK_AND_BLOCK:
+            snapshot, intent = _require_live_snapshot(self.identity, self.reason)
+            projection = _reason_projection(intent)
+            object.__setattr__(self, "_intent_snapshot", snapshot)
+            object.__setattr__(self, "reason", projection)
+            _BLOCKED_BINDINGS[id(self)] = (
+                self,
+                snapshot,
+                self.identity,
+                (self.identity.case_id, self.identity.intent_id, self.identity.attempt_id),
+                normalized_state,
+                self.evidence_ids,
+                projection,
+            )
+        elif self.reason is not None:
             object.__setattr__(self, "reason", _freeze(self.reason))
 
     def to_dict(self) -> dict[str, object]:
+        _validate_state_binding(self)
         return {
             "identity": self.identity.to_dict(),
             "state": self.state.value,
@@ -91,6 +120,7 @@ def transition(
         raise TypeError("identity must be a WorkflowIdentity")
     if current.identity != identity:
         raise ValueError("transition identity does not match current state")
+    _validate_state_binding(current)
     try:
         next_state = WorkflowPhase(target)
     except (TypeError, ValueError) as error:
@@ -107,8 +137,6 @@ def transition(
     additions = _normalise_evidence_ids(evidence_ids)
     if set(current.evidence_ids).intersection(additions):
         raise ValueError("evidence IDs must be unique across the workflow")
-    if next_state is WorkflowPhase.ASK_AND_BLOCK and not _is_authoritative_unresolved(reason):
-        raise ValueError("ASK_AND_BLOCK requires an explicit authoritative unresolved fact")
     return WorkflowState(
         identity=current.identity,
         state=next_state,
@@ -128,7 +156,6 @@ _NEXT_STATE: dict[WorkflowPhase, WorkflowPhase] = {
 _TERMINAL_STATES = frozenset(
     {WorkflowPhase.REPORTED, WorkflowPhase.FAILED, WorkflowPhase.ASK_AND_BLOCK}
 )
-_MISSING = object()
 
 
 def _required_text(value: str, name: str) -> str:
@@ -159,26 +186,69 @@ def _normalise_evidence_ids(values: Iterable[str]) -> tuple[str, ...]:
     return tuple(result)
 
 
-def _field(value: object, name: str) -> tuple[bool, object]:
-    if isinstance(value, Mapping):
-        return (name in value, value.get(name))
-    marker = getattr(value, name, _MISSING)
-    return (marker is not _MISSING, marker)
+def _require_live_snapshot(
+    identity: WorkflowIdentity,
+    value: object | None,
+) -> tuple[IntentSnapshotAuthority, IntentContract]:
+    if type(value) is not IntentSnapshotAuthority:
+        raise ValueError("ASK_AND_BLOCK requires an EvidenceStore-issued intent snapshot")
+    snapshot = value
+    if snapshot.case_id != identity.case_id:
+        raise ValueError("ASK_AND_BLOCK snapshot case does not match workflow identity")
+    intent = snapshot.intent
+    if type(intent) is not IntentContract:
+        raise ValueError("ASK_AND_BLOCK snapshot must resolve to an IntentContract")
+    if intent.state is not IntentState.ASK_AND_BLOCK:
+        raise ValueError("ASK_AND_BLOCK snapshot intent must be in ASK_AND_BLOCK state")
+    if not _nonempty(intent.unresolved):
+        raise ValueError("ASK_AND_BLOCK snapshot intent must contain unresolved conditions")
+    if not _nonempty(intent.condition_sources):
+        raise ValueError("ASK_AND_BLOCK snapshot intent must contain condition sources")
+    return snapshot, intent
 
 
-def _is_authoritative_unresolved(value: object | None) -> bool:
-    if value is None or isinstance(value, (str, bool)):
-        return False
-    present, authoritative = _field(value, "authoritative")
-    if not present:
-        present, authoritative = _field(value, "is_authoritative")
-    if not present or authoritative is not True:
-        return False
-    present, unresolved = _field(value, "unresolved")
-    if present and unresolved is not True:
-        return False
-    present, resolved = _field(value, "resolved")
-    return not present or resolved is False
+def _nonempty(value: object) -> bool:
+    if isinstance(value, str):
+        return bool(value.strip())
+    return value is not None and bool(value)
+
+
+def _reason_projection(intent: IntentContract) -> _FrozenValue:
+    return _freeze(
+        {
+            "condition_sources": intent.condition_sources,
+            "unresolved": intent.unresolved,
+        }
+    )
+
+
+def _validate_state_binding(state: WorkflowState) -> None:
+    binding = _BLOCKED_BINDINGS.get(id(state))
+    if state.state is not WorkflowPhase.ASK_AND_BLOCK:
+        if binding is not None:
+            raise ValueError("workflow state binding was changed")
+        return
+    if binding is None or binding[0] is not state:
+        raise ValueError("ASK_AND_BLOCK state is not bound to a live intent snapshot")
+    _, snapshot, identity, identity_values, phase, evidence_ids, reason = binding
+    try:
+        bound_snapshot = object.__getattribute__(state, "_intent_snapshot")
+    except AttributeError as error:
+        raise ValueError("ASK_AND_BLOCK state binding is invalid") from error
+    if (
+        bound_snapshot is not snapshot
+        or state.identity is not identity
+        or (state.identity.case_id, state.identity.intent_id, state.identity.attempt_id)
+        != identity_values
+        or state.state is not phase
+        or state.evidence_ids is not evidence_ids
+        or state.reason is not reason
+        or type(snapshot) is not IntentSnapshotAuthority
+    ):
+        raise ValueError("ASK_AND_BLOCK state binding was changed")
+    _, intent = _require_live_snapshot(state.identity, snapshot)
+    if state.reason != _reason_projection(intent):
+        raise ValueError("ASK_AND_BLOCK reason projection was changed")
 
 
 def _freeze(value: object) -> _FrozenValue:
