@@ -1,0 +1,25 @@
+# Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Build and coverage output
+build/
+dist/
+*.egg-info/
+.coverage
+htmlcov/
+
+# Local tooling output
+debug.log
+
+# Real CAE data must remain outside the tool repository
+02_CAE/
+**/02_CAE/
+*.feb
+*.xplt
+*.fbs
