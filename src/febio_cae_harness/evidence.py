@@ -11,9 +11,8 @@ import json
 import os
 import stat
 import threading
-import time
 from collections.abc import Callable, Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NoReturn, SupportsIndex, cast
@@ -586,63 +585,152 @@ def _local_event_lock(key: str) -> threading.RLock:
         return lock
 
 
-@contextmanager
-def _exclusive_event_lock(lock_path: Path) -> Iterator[None]:
-    """Serialize event-chain transactions across threads and processes."""
+def _event_lock_identity(case_root: Path, case_id: str) -> str:
+    """Return the stable OS-lock key for one validated case identity."""
 
-    key = str(_lexical_path(lock_path)).casefold()
+    try:
+        validated_root = _reject_reparse_alias(case_root, "evidence case")
+        metadata = validated_root.stat()
+    except (OSError, WorkspaceBoundaryError) as error:
+        raise EvidenceIntegrityError("evidence case identity is invalid") from error
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise EvidenceIntegrityError("evidence case identity is not a directory")
+    root_text = str(_lexical_path(validated_root))
+    if os.name == "nt":
+        root_text = root_text.casefold()
+    return _digest({"case_id": case_id, "case_root": root_text})
+
+
+def _acquire_posix_event_lock(case_root: Path) -> int:
+    """Lock the validated case directory, whose inode is not events.lock."""
+
+    descriptor = -1
+    try:
+        import fcntl
+
+        descriptor = os.open(case_root, os.O_RDONLY)
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise EvidenceIntegrityError("evidence case lock target is not a directory")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)  # type: ignore[attr-defined]
+        except OSError:
+            os.close(descriptor)
+            raise
+        return descriptor
+    except EvidenceIntegrityError:
+        if descriptor >= 0:
+            with suppress(OSError):
+                os.close(descriptor)
+        raise
+    except OSError as error:
+        if descriptor >= 0:
+            with suppress(OSError):
+                os.close(descriptor)
+        raise EvidenceIntegrityError("cannot acquire case event lock") from error
+
+
+def _release_posix_event_lock(descriptor: int) -> None:
+    try:
+        import fcntl
+
+        fcntl.flock(descriptor, fcntl.LOCK_UN)  # type: ignore[attr-defined]
+    except OSError:
+        pass
+    with suppress(OSError):
+        os.close(descriptor)
+
+
+def _acquire_windows_event_lock(identity: str) -> tuple[Any, Any]:
+    """Acquire a named mutex so replacement of events.lock is irrelevant."""
+
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+    kernel32.CreateMutexW.restype = wintypes.HANDLE
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.ReleaseMutex.argtypes = [wintypes.HANDLE]
+    kernel32.ReleaseMutex.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    mutex_name = f"Global\\FEBioCaeHarnessEventLock-{identity}"
+    handle = kernel32.CreateMutexW(None, False, mutex_name)
+    if not handle:
+        error = ctypes.get_last_error()
+        raise EvidenceIntegrityError(f"cannot create case event lock ({error})")
+    wait_result = kernel32.WaitForSingleObject(handle, 30_000)
+    if wait_result not in {0x00000000, 0x00000080}:  # WAIT_OBJECT_0/WAIT_ABANDONED
+        kernel32.CloseHandle(handle)
+        if wait_result == 0x00000102:  # WAIT_TIMEOUT
+            raise EvidenceIntegrityError("timed out waiting for case event lock")
+        raise EvidenceIntegrityError(f"cannot acquire case event lock ({wait_result})")
+    return kernel32, handle
+
+
+def _release_windows_event_lock(lock: tuple[Any, Any]) -> None:
+    kernel32, handle = lock
+    with suppress(AttributeError, OSError):
+        kernel32.ReleaseMutex(handle)
+    with suppress(OSError):
+        kernel32.CloseHandle(handle)
+
+
+def _open_event_lock_marker(lock_path: Path) -> Any:
+    try:
+        stream = lock_path.open("a+b")
+        metadata = os.fstat(stream.fileno())
+        if metadata.st_nlink != 1:
+            stream.close()
+            raise EvidenceIntegrityError("event log lock cannot be a hard link")
+        if not stat.S_ISREG(metadata.st_mode):
+            stream.close()
+            raise EvidenceIntegrityError("event log lock is not a regular file")
+        return stream
+    except EvidenceIntegrityError:
+        raise
+    except OSError as error:
+        raise EvidenceIntegrityError("cannot validate event log lock") from error
+
+
+@contextmanager
+def _exclusive_event_lock(
+    lock_path: Path,
+    *,
+    case_root: Path,
+    case_identity: str,
+) -> Iterator[None]:
+    """Serialize event-chain transactions with a case-scoped OS authority."""
+
+    key = case_identity
     local_lock = _local_event_lock(key)
     local_lock.acquire()
-    stream = None
-    locked = False
+    marker_stream = None
+    os_lock: Any = None
     try:
         try:
-            stream = lock_path.open("a+b")
-            metadata = os.fstat(stream.fileno())
-            if metadata.st_nlink != 1:
-                raise EvidenceIntegrityError("event log lock cannot be a hard link")
-            stream.seek(0)
             if os.name == "nt":
-                import msvcrt
-
-                deadline = time.monotonic() + 30.0
-                while True:
-                    try:
-                        msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
-                        break
-                    except OSError as error:
-                        if time.monotonic() >= deadline:
-                            raise EvidenceIntegrityError(
-                                "timed out waiting for event log lock"
-                            ) from error
-                        time.sleep(0.01)
-                locked = True
+                os_lock = _acquire_windows_event_lock(case_identity)
             else:
-                import fcntl
-
-                fcntl.flock(stream.fileno(), fcntl.LOCK_EX)  # type: ignore[attr-defined]
-                locked = True
+                os_lock = _acquire_posix_event_lock(case_root)
+            marker_stream = _open_event_lock_marker(lock_path)
         except EvidenceIntegrityError:
             raise
         except OSError as error:
             raise EvidenceIntegrityError("cannot acquire event log lock") from error
         yield
     finally:
-        if stream is not None:
-            try:
-                if locked:
-                    if os.name == "nt":
-                        import msvcrt
-
-                        stream.seek(0)
-                        msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
-                    else:
-                        import fcntl
-
-                        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)  # type: ignore[attr-defined]
-            except OSError:
-                pass
-            stream.close()
+        if marker_stream is not None:
+            with suppress(OSError):
+                marker_stream.close()
+        if os_lock is not None:
+            if os.name == "nt":
+                _release_windows_event_lock(os_lock)
+            else:
+                _release_posix_event_lock(os_lock)
         local_lock.release()
 
 
@@ -1056,7 +1144,13 @@ class EvidenceStore:
         return manager
 
     def _event_lock(self) -> Any:
-        return _exclusive_event_lock(self._safe_case_path(EVENT_LOCK_FILE))
+        case_root = _reject_reparse_alias(self.case_workspace.case_root, "evidence case")
+        case_identity = _event_lock_identity(case_root, self.case_workspace.case_id)
+        return _exclusive_event_lock(
+            self._safe_case_path(EVENT_LOCK_FILE),
+            case_root=case_root,
+            case_identity=case_identity,
+        )
 
     @staticmethod
     def _validate_validator(validator: str) -> str:

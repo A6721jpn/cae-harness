@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+import multiprocessing
 import os
 import pickle
 import threading
@@ -10,13 +11,14 @@ import time
 from copy import copy, deepcopy
 from dataclasses import replace
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
 import febio_cae_harness.evidence as evidence_module
 from febio_cae_harness.contracts import IntentContract
 from febio_cae_harness.evidence import (
+    EVENT_LOCK_FILE,
     EVENTS_FILE,
     EvidenceIntegrityError,
     EvidenceStore,
@@ -42,6 +44,31 @@ def make_case(tmp_path: Path) -> tuple[ValidatedCaseWorkspace, CaseWorkspace, In
         units={"length": "mm", "force": "N"},
     )
     return workspace, case, intent
+
+
+def _append_event_from_replacement_process(
+    tool_root: str,
+    cae_root: str,
+    case_id: str,
+    lock_relative_path: str,
+    started: Any,
+    completed: Any,
+    results: Any,
+) -> None:
+    """Attempt an append through a replacement lock pathname in a fresh process."""
+
+    started.set()
+    try:
+        evidence_module.EVENT_LOCK_FILE = lock_relative_path
+        workspace = ValidatedCaseWorkspace(Path(tool_root), Path(cae_root))
+        store = EvidenceStore.open(workspace.open_case(case_id))
+        event = store.append_event("replacement-child")
+    except BaseException as error:  # pragma: no cover - assertion reports details
+        results.put(("error", type(error).__name__, str(error)))
+    else:
+        results.put(("ok", event["sequence"]))
+    finally:
+        completed.set()
 
 
 def test_verification_authority_is_manager_bound() -> None:
@@ -243,6 +270,59 @@ def test_event_lock_rejects_existing_hard_link_before_writing(tmp_path: Path) ->
     assert outside.read_bytes() == b""
     assert target.read_bytes() == b""
     assert not (case.case_root / "intent.json").exists()
+
+
+def test_replaced_event_lock_path_cannot_create_second_append_authority(
+    tmp_path: Path,
+) -> None:
+    _, case, intent = make_case(tmp_path)
+    store = EvidenceStore(case, intent)
+    temporary_root = case.case_root / "90_Temporary"
+    lock_path = temporary_root / "events.lock"
+    replacement_path = temporary_root / "events.lock.replacement"
+    replacement_path.write_bytes(b"")
+    replacement_relative_path = "90_Temporary/events.lock.replacement"
+
+    context = multiprocessing.get_context("spawn")
+    started = context.Event()
+    completed = context.Event()
+    results = context.Queue()
+    child: Any = None
+    child_lock_relative_path = EVENT_LOCK_FILE
+
+    try:
+        with store._event_lock():
+            try:
+                os.replace(replacement_path, lock_path)
+            except PermissionError:
+                # Windows denies replacing an open file.  Pointing the child at
+                # the prepared replacement inode exercises the same split-path
+                # condition without weakening the production lock contract.
+                child_lock_relative_path = replacement_relative_path
+
+            child = context.Process(
+                target=_append_event_from_replacement_process,
+                args=(
+                    str(tmp_path / "tool"),
+                    str(tmp_path / "02_CAE"),
+                    case.case_id,
+                    child_lock_relative_path,
+                    started,
+                    completed,
+                    results,
+                ),
+            )
+            child.start()
+            assert started.wait(timeout=10)
+            assert not completed.wait(timeout=2)
+    finally:
+        if child is not None:
+            child.join(timeout=10)
+
+    assert child is not None
+    assert not child.is_alive()
+    assert child.exitcode == 0
+    assert results.get(timeout=2)[0] == "ok"
 
 
 def test_events_are_chained_and_append_only(tmp_path: Path) -> None:
