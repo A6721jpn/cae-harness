@@ -26,9 +26,7 @@ __all__ = [
 
 _DEFAULT_TIMEOUT_SECONDS: Final[float] = 5.0
 _REPARSE_POINT: Final[int] = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
-_VERSION_BANNER: Final[re.Pattern[str]] = re.compile(
-    r"FEBio version (?P<version>[0-9]+\.[0-9]+(?:\.[0-9]+)?)"
-)
+_VERSION_BANNER: Final[re.Pattern[str]] = re.compile(r"version (?P<version>[0-9]+\.[0-9]+\.[0-9]+)")
 
 
 class RuntimeProbeError(RuntimeError):
@@ -52,7 +50,7 @@ class FebioRuntimeDiagnostic:
             raise ValueError("runtime diagnostic SHA256 is invalid")
         if isinstance(self.size, bool) or not isinstance(self.size, int) or self.size < 0:
             raise ValueError("runtime diagnostic size is invalid")
-        if _VERSION_BANNER.fullmatch(f"FEBio version {self.version}") is None:
+        if _VERSION_BANNER.fullmatch(f"version {self.version}") is None:
             raise ValueError("runtime diagnostic version is invalid")
         object.__setattr__(self, "path", path)
 

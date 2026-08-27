@@ -56,7 +56,7 @@ def test_probe_fake_executable_returns_immutable_identity(
         returncode = 0
 
         def communicate(self, input: bytes, timeout: float) -> tuple[bytes, bytes]:
-            return b"FEBio version 4.2.0\n", b""
+            return b"version 4.2.0\n", b""
 
     monkeypatch.setattr(
         "febio_cae_harness.solver.runtime.subprocess.Popen",
@@ -92,7 +92,7 @@ def test_probe_uses_exact_path_and_no_shell(
         def communicate(self, input: bytes, timeout: float) -> tuple[bytes, bytes]:
             observed["input"] = input
             observed["timeout"] = timeout
-            return b"FEBio version 4.2.0\n", b""
+            return b"version 4.2.0\n", b""
 
     def fake_popen(command: object, **kwargs: object) -> CompletedProcess:
         observed["command"] = command
@@ -112,8 +112,16 @@ def test_probe_uses_exact_path_and_no_shell(
     assert observed["input"] == b"quit\n"
 
 
-def test_probe_rejects_version_banner_that_is_not_exact(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    "output",
+    [
+        b"not version 4.2.0\n",
+        b"version 4.2.0\nversion 4.2.0\n",
+        b"FEBio is ready\n",
+    ],
+)
+def test_probe_rejects_nonexact_version_banner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, output: bytes
 ) -> None:
     executable = _fake_file(tmp_path)
 
@@ -121,7 +129,7 @@ def test_probe_rejects_version_banner_that_is_not_exact(
         returncode = 0
 
         def communicate(self, input: bytes, timeout: float) -> tuple[bytes, bytes]:
-            return b"not FEBio version 4.2.0\n", b""
+            return output, b""
 
     monkeypatch.setattr(
         "febio_cae_harness.solver.runtime.subprocess.Popen",
@@ -139,7 +147,7 @@ def test_probe_requires_clean_exit(tmp_path: Path, monkeypatch: pytest.MonkeyPat
         returncode = 7
 
         def communicate(self, input: bytes, timeout: float) -> tuple[bytes, bytes]:
-            return b"FEBio version 4.2.0\n", b""
+            return b"version 4.2.0\n", b""
 
     monkeypatch.setattr(
         "febio_cae_harness.solver.runtime.subprocess.Popen",
@@ -160,7 +168,7 @@ def test_probe_hashes_again_after_process_exit(
 
         def communicate(self, input: bytes, timeout: float) -> tuple[bytes, bytes]:
             executable.write_bytes(b"modified synthetic FEBio executable")
-            return b"FEBio version 4.2.0\n", b""
+            return b"version 4.2.0\n", b""
 
     monkeypatch.setattr(
         "febio_cae_harness.solver.runtime.subprocess.Popen",
@@ -253,7 +261,7 @@ def test_probe_accepts_synthetic_python_runner_argument(tmp_path: Path) -> None:
     script = tmp_path / "fake_febio.py"
     script.write_text(
         "import sys\n"
-        "print('FEBio version 4.2.0', flush=True)\n"
+        "print('version 4.2.0', flush=True)\n"
         "assert sys.stdin.readline().strip() == 'quit'\n",
         encoding="utf-8",
     )
@@ -262,3 +270,17 @@ def test_probe_accepts_synthetic_python_runner_argument(tmp_path: Path) -> None:
     diagnostic = probe_febio(executable, runner_arguments=(str(script),))
 
     assert diagnostic.version == "4.2.0"
+
+
+def test_probe_accepts_trimmed_runtime_banner_fixture(tmp_path: Path) -> None:
+    script = tmp_path / "fake_febio_runtime.py"
+    script.write_text(
+        "import sys\n"
+        "print('version 4.12.0', flush=True)\n"
+        "assert sys.stdin.readline().strip() == 'quit'\n",
+        encoding="utf-8",
+    )
+
+    diagnostic = probe_febio(Path(sys.executable), runner_arguments=(str(script),))
+
+    assert diagnostic.version == "4.12.0"
