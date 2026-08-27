@@ -10,11 +10,13 @@ from febio_cae_harness.contracts import IntentContract
 from febio_cae_harness.evidence import EvidenceStore
 from febio_cae_harness.model import (
     ASK_AND_BLOCK,
+    CompletenessResult,
     ConditionEvidence,
     ContactIntent,
     DerivedModelPlan,
     EvaluationIntent,
     EvidenceProvenance,
+    MissingConditionFact,
     ModelChange,
     OriginalModel,
     PreflightSeverity,
@@ -258,3 +260,80 @@ def test_intent_descriptors_and_preflight_diagnostics_remain_typed() -> None:
     assert preflight.blocking_diagnostics
     assert any(d.severity is PreflightSeverity.BLOCKING for d in preflight.diagnostics)
     assert any(d.code == "MISSING_REFERENCE" for d in preflight.diagnostics)
+
+
+def test_preflight_rejects_forged_completeness_before_units_resolution() -> None:
+    forged = CompletenessResult(
+        required=("units",),
+        resolved=("units",),
+        missing=(),
+        unresolved=(),
+        state="BOUND",
+    )
+    no_units = inspect_step(
+        b"ISO-10303-21;HEADER;ENDSEC;DATA;"
+        b"#1 = CARTESIAN_POINT('',(0.,0.,0.));ENDSEC;"
+        b"END-ISO-10303-21;"
+    )
+
+    preflight = run_preflight(step=no_units, completeness=forged)
+    codes = {diagnostic.code for diagnostic in preflight.diagnostics}
+
+    assert preflight.ready is False
+    assert "INVALID_COMPLETENESS_AUTHORITY" in codes
+    assert "UNRESOLVED_UNITS" in codes
+    assert "MISSING_PHYSICAL_CONDITION" not in codes
+    assert "UNRESOLVED_PHYSICAL_CONDITION" not in codes
+
+
+def test_preflight_does_not_project_forged_completeness_questions() -> None:
+    forged = CompletenessResult(
+        required=("loads",),
+        resolved=(),
+        missing=(MissingConditionFact("loads", "caller supplied a fact"),),
+        unresolved=(),
+        state=ASK_AND_BLOCK,
+    )
+
+    preflight = run_preflight(completeness=forged)
+    codes = {diagnostic.code for diagnostic in preflight.diagnostics}
+
+    assert preflight.ready is False
+    assert "INVALID_COMPLETENESS_AUTHORITY" in codes
+    assert "MISSING_PHYSICAL_CONDITION" not in codes
+    assert "INCOMPLETE_CONDITION_RESULT" not in codes
+    assert "UNRESOLVED_PHYSICAL_CONDITION" not in codes
+    assert preflight.to_dict()["completeness"] is None
+
+
+def test_preflight_preserves_live_completeness_ready_and_missing_behavior(
+    tmp_path: Path,
+) -> None:
+    workspace = ValidatedCaseWorkspace(tmp_path / "tool", tmp_path / "02_CAE")
+    case = workspace.create_case("case")
+    store = EvidenceStore(
+        case,
+        IntentContract(
+            units={"length": "mm"},
+            material="neo-Hookean",
+            condition_sources={
+                "units": {"source": "synthetic-intent", "location": "intent.json"},
+                "material": {"source": "synthetic-intent", "location": "intent.json"},
+            },
+        ),
+    )
+
+    complete = assess_completeness(
+        issue_completeness_authority(store.issue_intent_snapshot(), ("units", "material"))
+    )
+    ready = run_preflight(completeness=complete)
+    assert ready.ready is True
+    assert ready.diagnostics == ()
+
+    incomplete = assess_completeness(
+        issue_completeness_authority(store.issue_intent_snapshot(), ("units", "loads"))
+    )
+    blocked = run_preflight(completeness=incomplete)
+    assert blocked.ready is False
+    assert any(item.code == "MISSING_PHYSICAL_CONDITION" for item in blocked.diagnostics)
+    assert not any(item.code == "INVALID_COMPLETENESS_AUTHORITY" for item in blocked.diagnostics)

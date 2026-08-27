@@ -6,11 +6,22 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 
-from .completeness import CompletenessResult, assess_completeness
+from ..evidence import EvidenceIntegrityError
+from .completeness import (
+    CompletenessResult,
+    _validated_authoritative_result,
+    assess_completeness,
+)
 from .feb import FEBInspection
 from .plan import DerivedModelPlan
 from .step import STEPInspection
-from .types import EvidenceProvenance, PhysicalConditionName, normalise_provenance
+from .types import (
+    EvidenceProvenance,
+    MissingConditionFact,
+    PhysicalConditionName,
+    UnresolvedEvidenceField,
+    normalise_provenance,
+)
 
 
 class PreflightSeverity(StrEnum):
@@ -119,6 +130,46 @@ def run_preflight(
     if completeness is None and (required_conditions is not None or evidence is not None):
         completeness = assess_completeness(required_conditions, evidence)
     diagnostics: list[PreflightDiagnostic] = []
+    completeness_fields: (
+        tuple[
+            tuple[str, ...],
+            tuple[MissingConditionFact, ...],
+            tuple[UnresolvedEvidenceField, ...],
+            str,
+        ]
+        | None
+    ) = None
+    if completeness is not None:
+        try:
+            _validated_authoritative_result(completeness)
+            resolved_values = tuple(completeness.resolved)
+            missing_values = tuple(completeness.missing)
+            unresolved_values = tuple(completeness.unresolved)
+            state_value = completeness.state
+            # Revalidate after consuming every result field used for action.
+            _validated_authoritative_result(completeness)
+            completeness_fields = (
+                resolved_values,
+                missing_values,
+                unresolved_values,
+                state_value,
+            )
+        except EvidenceIntegrityError:
+            diagnostics.append(
+                PreflightDiagnostic(
+                    code="INVALID_COMPLETENESS_AUTHORITY",
+                    message="completeness result is not a validated live authority result",
+                    location="completeness",
+                )
+            )
+        except Exception:
+            diagnostics.append(
+                PreflightDiagnostic(
+                    code="INVALID_COMPLETENESS_AUTHORITY",
+                    message="completeness result is not a validated live authority result",
+                    location="completeness",
+                )
+            )
 
     if feb is not None:
         if feb.root_tag != "febio_spec":
@@ -158,7 +209,7 @@ def run_preflight(
                     location=step.source_name or "STEP",
                 )
             )
-        units_resolved = completeness is not None and "units" in completeness.resolved
+        units_resolved = completeness_fields is not None and "units" in completeness_fields[0]
         if not step.units and not units_resolved:
             diagnostics.append(
                 PreflightDiagnostic(
@@ -190,8 +241,9 @@ def run_preflight(
                     )
                 )
 
-    if completeness is not None:
-        for missing in completeness.missing:
+    if completeness_fields is not None:
+        _, missing_values, unresolved_values, state = completeness_fields
+        for missing in missing_values:
             diagnostics.append(
                 PreflightDiagnostic(
                     code="MISSING_PHYSICAL_CONDITION",
@@ -200,7 +252,7 @@ def run_preflight(
                     evidence=missing.evidence,
                 )
             )
-        if completeness.state == "ASK_AND_BLOCK" and not completeness.missing:
+        if state == "ASK_AND_BLOCK" and not missing_values:
             diagnostics.append(
                 PreflightDiagnostic(
                     code="INCOMPLETE_CONDITION_RESULT",
@@ -208,8 +260,9 @@ def run_preflight(
                     location="completeness",
                 )
             )
-        for unresolved in completeness.unresolved:
-            if unresolved.field_name not in {item.condition for item in completeness.missing}:
+        missing_conditions = {item.condition for item in missing_values}
+        for unresolved in unresolved_values:
+            if unresolved.field_name not in missing_conditions:
                 diagnostics.append(
                     PreflightDiagnostic(
                         code="UNRESOLVED_PHYSICAL_CONDITION",
@@ -229,7 +282,10 @@ def run_preflight(
                 ),
             )
         )
-    return PreflightResult(diagnostics=tuple(diagnostics), completeness=completeness)
+    return PreflightResult(
+        diagnostics=tuple(diagnostics),
+        completeness=completeness if completeness_fields is not None else None,
+    )
 
 
 preflight = run_preflight
