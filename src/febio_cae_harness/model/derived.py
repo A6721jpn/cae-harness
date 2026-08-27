@@ -17,8 +17,10 @@ from ..autonomy.policy import (
     ProposalAction,
     ProposalAuthority,
     decide_proposal,
+    validate_attempt_workspace,
 )
 from ..evidence import EvidenceIntegrityError
+from ..workspace import AttemptWorkspace
 from .plan import OriginalModel
 from .types import EvidenceProvenance, IntentImpact, normalise_provenance
 
@@ -293,12 +295,16 @@ def write_derived_feb(
     original: OriginalModel,
     patches: Iterable[FebPatch],
     destination: str | Path,
-    attempt_root: str | Path,
+    attempt_workspace: AttemptWorkspace,
     *,
     state_authority: IntentStateAuthority,
     proposal: Proposal,
     proposal_authority: ProposalAuthority,
 ) -> DerivedFebReceipt:
+    if type(attempt_workspace) is not AttemptWorkspace:
+        raise TypeError("attempt_workspace must be an exact AttemptWorkspace")
+    validate_attempt_workspace(state_authority, attempt_workspace)
+    attempt_root = Path(os.fspath(attempt_workspace))
     if not isinstance(original, OriginalModel):
         raise TypeError("original must be an OriginalModel")
     if not original.verify():
@@ -321,6 +327,10 @@ def write_derived_feb(
     identity: tuple[int, int] | None = None
     fd: int | None = None
     try:
+        validate_attempt_workspace(state_authority, attempt_workspace)
+        current_attempt_root = Path(os.fspath(attempt_workspace))
+        if current_attempt_root != attempt_root:
+            raise EvidenceIntegrityError("attempt workspace changed during derivation")
         flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0)
         fd = os.open(os.fspath(target), flags, 0o600)
         created = True
@@ -348,6 +358,7 @@ def write_derived_feb(
             proposal_authority,
             patch_records,
         )
+        validate_attempt_workspace(state_authority, attempt_workspace)
         return DerivedFebReceipt(original.sha256, derived_sha256, target, applied)
     except BaseException:
         if fd is not None:

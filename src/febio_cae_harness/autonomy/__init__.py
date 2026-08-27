@@ -50,6 +50,7 @@ from .policy import (
     transition_intent,
     transition_state,
     unresolved_authoritative_conditions,
+    validate_attempt_workspace,
 )
 
 __all__ = [
@@ -97,6 +98,7 @@ __all__ = [
     "transition_intent",
     "transition_state",
     "unresolved_authoritative_conditions",
+    "validate_attempt_workspace",
     "NegativeJacobianObservation",
     "NegativeJacobianDiagnostic",
     "diagnose_negative_jacobian",

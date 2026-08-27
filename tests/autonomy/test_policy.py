@@ -33,6 +33,7 @@ from febio_cae_harness.autonomy import (
     route_failure,
     transition_intent,
     unresolved_authoritative_conditions,
+    validate_attempt_workspace,
 )
 from febio_cae_harness.contracts import IntentContract
 from febio_cae_harness.evidence import (
@@ -42,7 +43,11 @@ from febio_cae_harness.evidence import (
 )
 from febio_cae_harness.solver.supervisor import SolverSupervisor
 from febio_cae_harness.solver.types import SolverClassification, SolverLaunchSpec
-from febio_cae_harness.workspace import ValidatedCaseWorkspace
+from febio_cae_harness.workspace import (
+    AttemptWorkspace,
+    ValidatedCaseWorkspace,
+    WorkspaceBoundaryError,
+)
 
 
 def bound_intent(**overrides: object) -> IntentContract:
@@ -439,6 +444,44 @@ def test_proposal_authority_requires_bound_state_and_exact_inputs(tmp_path: Path
     assert decide_proposal(state, proposal, authority).action is ProposalAction.AUTO_APPLY
     with pytest.raises(TypeError):
         decide_proposal(state, proposal, proposal_authority=True)  # type: ignore[arg-type]
+
+
+def test_attempt_workspace_binding_is_live_and_case_root_exact(tmp_path: Path) -> None:
+    intent = bound_intent()
+    workspace = ValidatedCaseWorkspace(tmp_path / "tool", tmp_path / "02_CAE")
+    case = workspace.create_case("case-a")
+    store = EvidenceStore(case, intent)
+    store.record_attempt("attempt-a")
+    attempt = AttemptWorkspace._from_manager(
+        case,
+        "attempt-a",
+        case.temporary_root / "attempts" / "attempt-a",
+    )
+    state = run_transition(store.issue_intent_snapshot())
+
+    validate_attempt_workspace(state, attempt)
+
+    foreign_workspace = ValidatedCaseWorkspace(
+        tmp_path / "tool-foreign",
+        tmp_path / "02_CAE-foreign",
+    )
+    foreign_case = foreign_workspace.create_case(case.case_id)
+    foreign_attempt = foreign_case.allocate_attempt("attempt-a")
+    with pytest.raises(EvidenceIntegrityError):
+        validate_attempt_workspace(state, foreign_attempt)
+    with pytest.raises(TypeError):
+        validate_attempt_workspace(state, foreign_attempt.root)  # type: ignore[arg-type]
+
+    forged = object.__new__(AttemptWorkspace)
+    object.__setattr__(forged, "case_id", case.case_id)
+    object.__setattr__(forged, "attempt_id", "attempt-a")
+    object.__setattr__(forged, "root", attempt.root)
+    with pytest.raises(WorkspaceBoundaryError):
+        validate_attempt_workspace(state, forged)
+
+    object.__setattr__(attempt, "attempt_id", "changed")
+    with pytest.raises(WorkspaceBoundaryError):
+        validate_attempt_workspace(state, attempt)
 
 
 def test_proposal_authority_rejects_forgery_foreign_and_tampered_state(tmp_path: Path) -> None:

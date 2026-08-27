@@ -9,10 +9,12 @@ in the solver and workspace phases.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from math import isfinite
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any, NoReturn, Self, cast
 
@@ -20,6 +22,7 @@ from ..contracts import IntentContract, IntentState, JSONValue
 from ..evidence import EvidenceIntegrityError, IntentSnapshotAuthority
 from ..solver.supervisor import SolverSupervisor
 from ..solver.types import SolverClassification, SolverRunResult, SolverState
+from ..workspace import AttemptWorkspace, CaseWorkspace
 
 __all__ = [
     "ExecutionAction",
@@ -66,6 +69,7 @@ __all__ = [
     "transition_intent",
     "transition_state",
     "unresolved_authoritative_conditions",
+    "validate_attempt_workspace",
 ]
 
 
@@ -1127,6 +1131,42 @@ def _state_authority_record(value: object, *, bound: bool = False) -> _IntentSta
     if bound and record[5] is not IntentState.BOUND:
         raise EvidenceIntegrityError("proposal authorization requires a BOUND state authority")
     return record
+
+
+def validate_attempt_workspace(
+    state_authority: IntentStateAuthority,
+    attempt_workspace: AttemptWorkspace,
+) -> None:
+    """Require a live attempt issued for the state authority's exact case.
+
+    The workspace object is the capability; no caller-supplied path, case
+    identifier, or digest is accepted as an authorization input.  The helper
+    intentionally returns no identity material: consumers must retain the
+    manager-issued handle and use its checked filesystem protocol directly.
+    """
+
+    state_record = _state_authority_record(state_authority, bound=True)
+    snapshot = state_record[1]
+    if type(attempt_workspace) is not AttemptWorkspace:
+        raise TypeError("attempt_workspace must be an exact AttemptWorkspace")
+
+    # ``__fspath__`` performs the workspace registry, case, attempt, and live
+    # directory identity checks.  Keep that validation before reading any
+    # state from the handle so forged or stale handles fail closed.
+    attempt_root = Path(os.fspath(attempt_workspace))
+
+    try:
+        snapshot_case_workspace = object.__getattribute__(snapshot, "_case_workspace")
+    except AttributeError as error:
+        raise EvidenceIntegrityError("intent snapshot case binding is invalid") from error
+    if type(snapshot_case_workspace) is not CaseWorkspace:
+        raise EvidenceIntegrityError("intent snapshot case binding is invalid")
+
+    expected_attempt_root = (
+        Path(snapshot_case_workspace.temporary_root) / "attempts" / attempt_workspace.attempt_id
+    )
+    if attempt_root != expected_attempt_root:
+        raise EvidenceIntegrityError("attempt workspace is not inside the intent snapshot case")
 
 
 def _proposal_manager_record(value: object) -> _ProposalManagerRecord:

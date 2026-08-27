@@ -20,7 +20,11 @@ from febio_cae_harness.contracts import IntentContract, JSONValue
 from febio_cae_harness.evidence import EvidenceIntegrityError, EvidenceStore
 from febio_cae_harness.model import EvidenceProvenance, IntentImpact, OriginalModel
 from febio_cae_harness.model.derived import DerivedFebReceipt, FebPatch, write_derived_feb
-from febio_cae_harness.workspace import ValidatedCaseWorkspace
+from febio_cae_harness.workspace import (
+    AttemptWorkspace,
+    ValidatedCaseWorkspace,
+    WorkspaceBoundaryError,
+)
 
 FEB = b"""<?xml version="1.0" encoding="UTF-8"?>
 <febio_spec version="4.0">
@@ -76,7 +80,7 @@ def authorized_context(
     tmp_path: Path,
     change: Mapping[str, JSONValue],
     suffix: str = "authorized",
-) -> tuple[IntentStateAuthority, Proposal, ProposalAuthority, EvidenceStore]:
+) -> tuple[IntentStateAuthority, Proposal, ProposalAuthority, EvidenceStore, AttemptWorkspace]:
     intent = bound_intent(allowed_mesh_changes={"mesh": {"patches": (change,)}})
     workspace = ValidatedCaseWorkspace(
         tmp_path / f"tool-{suffix}",
@@ -84,6 +88,13 @@ def authorized_context(
     )
     case = workspace.create_case(f"case-{suffix}")
     store = EvidenceStore(case, intent)
+    attempt_id = f"attempt-{suffix}"
+    store.record_attempt(attempt_id)
+    attempt = AttemptWorkspace._from_manager(
+        case,
+        attempt_id,
+        case.temporary_root / "attempts" / attempt_id,
+    )
     state_authority = transition_intent(store.issue_intent_snapshot())
     manager = ProposalAuthorityManager(state_authority)
     proposal = Proposal(
@@ -95,17 +106,24 @@ def authorized_context(
         authorized=True,
     )
     proposal_authority = manager.issue(proposal)
-    return state_authority, proposal, proposal_authority, store
+    return state_authority, proposal, proposal_authority, store, attempt
 
 
 def write_authorized(
     original: OriginalModel,
     patches: tuple[FebPatch, ...],
     destination: Path,
-    attempt: Path,
-    context: tuple[IntentStateAuthority, Proposal, ProposalAuthority, EvidenceStore],
+    attempt: AttemptWorkspace,
+    context: tuple[
+        IntentStateAuthority,
+        Proposal,
+        ProposalAuthority,
+        EvidenceStore,
+        AttemptWorkspace,
+    ],
 ) -> DerivedFebReceipt:
-    state_authority, proposal, proposal_authority, _ = context
+    state_authority, proposal, proposal_authority, _, issued_attempt = context
+    assert attempt is issued_attempt
     return write_derived_feb(
         original,
         patches,
@@ -129,20 +147,19 @@ def test_patch_markers_cannot_authorize_a_derived_write(tmp_path: Path) -> None:
             OriginalModel.from_path(source),
             (patch(TIME, "TEXT", 8, provenance=(EVIDENCE,)),),
             destination,
-            attempt,
+            attempt,  # type: ignore[arg-type]
         )
     assert not destination.exists()
 
 
 def test_authorized_write_requires_exact_proposal_patch_binding(tmp_path: Path) -> None:
     source = tmp_path / "original.feb"
-    attempt = tmp_path / "attempt"
-    destination = attempt / "derived.feb"
     source.write_bytes(FEB)
-    attempt.mkdir()
     original = OriginalModel.from_path(source)
     change: dict[str, JSONValue] = {"target": TIME, "mode": "TEXT", "value": 8}
     context = authorized_context(tmp_path, change)
+    attempt = context[4]
+    destination = attempt.root / "derived.feb"
     receipt = write_authorized(
         original,
         (patch(TIME, "TEXT", 8),),
@@ -168,12 +185,11 @@ def test_authorized_write_rejects_any_patch_field_mismatch(
     tmp_path: Path, record: FebPatch
 ) -> None:
     source = tmp_path / "original.feb"
-    attempt = tmp_path / "attempt"
-    destination = attempt / "derived.feb"
     source.write_bytes(FEB)
-    attempt.mkdir()
     change: dict[str, JSONValue] = {"target": TIME, "mode": "TEXT", "value": 8}
     context = authorized_context(tmp_path, change, "mismatch")
+    attempt = context[4]
+    destination = attempt.root / "derived.feb"
 
     with pytest.raises((ValueError, EvidenceIntegrityError)):
         write_authorized(
@@ -192,7 +208,7 @@ def test_forged_foreign_stale_and_mismatched_authorities_never_write(tmp_path: P
     change: dict[str, JSONValue] = {"target": TIME, "mode": "TEXT", "value": 8}
 
     local_context = authorized_context(tmp_path, change, "authority")
-    state_authority, proposal, proposal_authority, store = local_context
+    state_authority, proposal, proposal_authority, store, local_attempt = local_context
     foreign_authority = authorized_context(tmp_path, change, "foreign")[2]
 
     cases: tuple[tuple[str, IntentStateAuthority, Proposal, object], ...] = (
@@ -200,30 +216,26 @@ def test_forged_foreign_stale_and_mismatched_authorities_never_write(tmp_path: P
         ("foreign", state_authority, proposal, foreign_authority),
     )
     for name, state, candidate, authority in cases:
-        attempt = tmp_path / f"attempt-{name}"
-        attempt.mkdir()
-        destination = attempt / "derived.feb"
+        destination = local_attempt.root / f"derived-{name}.feb"
         with pytest.raises((TypeError, ValueError, EvidenceIntegrityError)):
             write_authorized(
                 OriginalModel.from_path(source),
                 (patch(TIME, "TEXT", 8),),
                 destination,
-                attempt,
-                (state, candidate, cast(ProposalAuthority, authority), store),
+                local_attempt,
+                (state, candidate, cast(ProposalAuthority, authority), store, local_attempt),
             )
         assert not destination.exists()
 
     mismatched = replace(proposal, proposal_id="different-proposal")
-    attempt = tmp_path / "attempt-mismatched"
-    attempt.mkdir()
-    destination = attempt / "derived.feb"
+    destination = local_attempt.root / "derived-mismatched.feb"
     with pytest.raises((TypeError, ValueError, EvidenceIntegrityError)):
         write_authorized(
             OriginalModel.from_path(source),
             (patch(TIME, "TEXT", 8),),
             destination,
-            attempt,
-            (state_authority, mismatched, proposal_authority, store),
+            local_attempt,
+            (state_authority, mismatched, proposal_authority, store, local_attempt),
         )
     assert not destination.exists()
 
@@ -232,15 +244,14 @@ def test_forged_foreign_stale_and_mismatched_authorities_never_write(tmp_path: P
     payload = json.loads(stale_store.intent_path.read_text(encoding="utf-8"))
     payload["engineering_question"] = "tampered"
     stale_store.intent_path.write_text(json.dumps(payload), encoding="utf-8")
-    attempt = tmp_path / "attempt-stale"
-    attempt.mkdir()
-    destination = attempt / "derived.feb"
+    stale_attempt = stale_context[4]
+    destination = stale_attempt.root / "derived-stale.feb"
     with pytest.raises((TypeError, ValueError, EvidenceIntegrityError)):
         write_authorized(
             OriginalModel.from_path(source),
             (patch(TIME, "TEXT", 8),),
             destination,
-            attempt,
+            stale_attempt,
             stale_context,
         )
     assert not destination.exists()
@@ -248,15 +259,57 @@ def test_forged_foreign_stale_and_mismatched_authorities_never_write(tmp_path: P
         copy(proposal_authority)
 
 
+def test_derived_write_rejects_foreign_issued_and_raw_attempts_before_output(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "original.feb"
+    source.write_bytes(FEB)
+    change: dict[str, JSONValue] = {"target": TIME, "mode": "TEXT", "value": 8}
+    state_authority, proposal, proposal_authority, store, _ = authorized_context(
+        tmp_path, change, "attempt-binding"
+    )
+    local_case = store.case_workspace
+
+    foreign_workspace = ValidatedCaseWorkspace(
+        tmp_path / "tool-foreign-attempt",
+        tmp_path / "02_CAE-foreign-attempt",
+    )
+    foreign_case = foreign_workspace.create_case(local_case.case_id)
+    foreign_attempt = foreign_case.allocate_attempt("foreign")
+
+    forged_attempt = object.__new__(AttemptWorkspace)
+    object.__setattr__(forged_attempt, "case_id", local_case.case_id)
+    object.__setattr__(forged_attempt, "attempt_id", "foreign")
+    object.__setattr__(forged_attempt, "root", foreign_attempt.root)
+
+    supplied_attempts: tuple[object, ...] = (
+        foreign_attempt,
+        foreign_attempt.root,
+        forged_attempt,
+    )
+    for index, supplied_attempt in enumerate(supplied_attempts):
+        destination = foreign_attempt.root / f"rejected-{index}.feb"
+        with pytest.raises((TypeError, EvidenceIntegrityError, WorkspaceBoundaryError)):
+            write_derived_feb(
+                OriginalModel.from_path(source),
+                (patch(TIME, "TEXT", 8),),
+                destination,
+                supplied_attempt,  # type: ignore[arg-type]
+                state_authority=state_authority,
+                proposal=proposal,
+                proposal_authority=proposal_authority,
+            )
+        assert not destination.exists()
+
+
 def test_writes_detached_text_derived_and_receipt(tmp_path: Path) -> None:
     source = tmp_path / "original.feb"
-    attempt = tmp_path / "attempt"
-    destination = attempt / "derived.feb"
     source.write_bytes(FEB)
-    attempt.mkdir()
     original = OriginalModel.from_path(source)
     change: dict[str, JSONValue] = {"target": TIME, "mode": "TEXT", "value": 8}
     context = authorized_context(tmp_path, change, "detached")
+    attempt = context[4]
+    destination = attempt.root / "derived.feb"
 
     receipt = write_authorized(
         original,
@@ -277,9 +330,7 @@ def test_writes_detached_text_derived_and_receipt(tmp_path: Path) -> None:
 
 def test_writes_attribute_and_preserves_diagnostic_metadata(tmp_path: Path) -> None:
     source = tmp_path / "original.feb"
-    attempt = tmp_path / "attempt"
     source.write_bytes(FEB)
-    attempt.mkdir()
     patch_record = patch(
         MODULE,
         "ATTRIBUTE",
@@ -295,26 +346,26 @@ def test_writes_attribute_and_preserves_diagnostic_metadata(tmp_path: Path) -> N
         "value": "hex8",
     }
     context = authorized_context(tmp_path, change, "attribute")
+    attempt = context[4]
 
     write_authorized(
         OriginalModel.from_path(source),
         (patch_record,),
-        attempt / "x.feb",
+        attempt.root / "x.feb",
         attempt,
         context,
     )
 
-    assert b'type="hex8"' in (attempt / "x.feb").read_bytes()
+    assert b'type="hex8"' in (attempt.root / "x.feb").read_bytes()
 
 
 def test_rejects_unsafe_destination_and_dtd(tmp_path: Path) -> None:
-    attempt = tmp_path / "attempt"
-    attempt.mkdir()
-    destination = attempt / "derived.feb"
-    destination.write_bytes(b"existing")
     original = OriginalModel.from_bytes(FEB)
     change: dict[str, JSONValue] = {"target": TIME, "mode": "TEXT", "value": 2}
     context = authorized_context(tmp_path, change, "unsafe")
+    attempt = context[4]
+    destination = attempt.root / "derived.feb"
+    destination.write_bytes(b"existing")
 
     with pytest.raises(FileExistsError):
         write_authorized(
@@ -338,8 +389,8 @@ def test_rejects_unsafe_destination_and_dtd(tmp_path: Path) -> None:
         write_authorized(
             original.from_bytes(dtd),
             (patch(TIME, "TEXT", 2),),
-            attempt / "d.feb",
+            attempt.root / "d.feb",
             attempt,
             context,
         )
-    assert not (attempt / "d.feb").exists()
+    assert not (attempt.root / "d.feb").exists()
