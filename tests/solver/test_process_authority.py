@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -18,7 +19,11 @@ from febio_cae_harness.solver import headless as headless_module
 from febio_cae_harness.solver.process_authority import ProcessAuthority, ProcessAuthorityError
 from febio_cae_harness.solver.runtime import FebioRuntimeDiagnostic, probe_febio
 from febio_cae_harness.solver.supervisor import SolverSupervisor, _ProcessMetadata
-from febio_cae_harness.solver.types import SolverLaunchCapability, SolverLaunchError
+from febio_cae_harness.solver.types import (
+    SolverLaunchCapability,
+    SolverLaunchError,
+    SolverOwnershipError,
+)
 from febio_cae_harness.workspace import AttemptWorkspace, ValidatedCaseWorkspace
 
 pytestmark = pytest.mark.skipif(os.name != "nt", reason="Windows process ordering")
@@ -210,7 +215,7 @@ def test_windows_immediate_descendant_runs_only_after_primary_binding(
 
 
 @pytest.mark.parametrize("failure", ("bind", "resume"))
-def test_windows_native_failure_kills_only_created_process_without_authority_record(
+def test_windows_native_failure_preserves_only_durable_authority_record(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
 ) -> None:
     events: list[str] = []
@@ -228,5 +233,13 @@ def test_windows_native_failure_kills_only_created_process_without_authority_rec
         supervisor.start()
 
     assert ("process-kill" if failure == "bind" else "terminate") in events
-    assert not supervisor.process_record_path.exists()
+    authority.close.assert_called_once_with()
+    if failure == "bind":
+        assert not supervisor.process_record_path.exists()
+    else:
+        record = json.loads(supervisor.process_record_path.read_text(encoding="utf-8"))
+        assert record["state"] == "BOUND_SUSPENDED"
+        assert events.count("terminate") == 1
+        with pytest.raises(SolverOwnershipError, match="reconnectable|RUNNING"):
+            SolverSupervisor.reconnect(capability)
     assert supervisor.result is None

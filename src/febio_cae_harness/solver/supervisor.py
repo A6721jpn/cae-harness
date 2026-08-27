@@ -329,7 +329,6 @@ class SolverSupervisor:
             authority: ProcessAuthority | None = None
             process: subprocess.Popen[bytes] | None = None
             bound = False
-            record_written = False
             try:
                 self.spec.prepare_outputs()
                 self._revalidate_launch_binding()
@@ -407,14 +406,12 @@ class SolverSupervisor:
                         state="BOUND_SUSPENDED",
                     )
                     self._write_process_record(bound_record)
-                    record_written = True
                     authority.resume(process.pid)
                     self._revalidate_launch_binding()
                 running_record = self._make_process_record(
                     process.pid, metadata, started_at, authority, state=SolverState.RUNNING.value
                 )
                 self._write_process_record(running_record)
-                record_written = True
                 self._process = process
                 self._started_at = started_at
                 self._process_authority = authority
@@ -440,9 +437,6 @@ class SolverSupervisor:
                             process.kill()
                 if authority is not None:
                     authority.close()
-                if record_written:
-                    with contextlib.suppress(OSError):
-                        self.process_record_path.unlink(missing_ok=True)
                 self._state = SolverState.FAILED
                 if isinstance(error, SolverConfigurationError):
                     raise

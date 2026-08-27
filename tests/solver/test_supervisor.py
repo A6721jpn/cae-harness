@@ -21,7 +21,9 @@ from febio_cae_harness.solver.supervisor import SolverSupervisor
 from febio_cae_harness.solver.types import (
     SolverConfigurationError,
     SolverLaunchCapability,
+    SolverLaunchError,
     SolverLaunchSpec,
+    SolverOwnershipError,
     SolverState,
 )
 from febio_cae_harness.workspace import AttemptWorkspace, ValidatedCaseWorkspace
@@ -353,3 +355,80 @@ def test_windows_persists_bound_record_before_resume(
         assert events.index("persist:RUNNING") > resume
     finally:
         supervisor.cancel()
+
+
+def test_windows_late_failure_preserves_replaced_process_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    capability = _capability(tmp_path, monkeypatch, code="pass")
+    events: list[str] = []
+    authority = _OrderingAuthority(events)
+
+    class StartupInfo:
+        lpAttributeList: object | None = None
+
+    def fake_popen(*args: object, **kwargs: object) -> _OrderingProcess:
+        del args
+        creation_flags = kwargs["creationflags"]
+        assert isinstance(creation_flags, int)
+        assert creation_flags & 0x00000004
+        events.append("created-suspended")
+        process = _OrderingProcess(events)
+        authority._process = process
+        return process
+
+    monkeypatch.setattr(os, "name", "nt")
+    monkeypatch.setattr(subprocess, "STARTUPINFO", StartupInfo, raising=False)
+
+    def fake_create(attempt_root: Path, context_digest: str | None = None) -> _OrderingAuthority:
+        del attempt_root
+        if context_digest is not None:
+            authority._context_digest = context_digest
+        return authority
+
+    def fail_resume(pid: int) -> None:
+        assert pid == _OrderingProcess.pid
+        events.append("resume-failure")
+        raise OSError("synthetic late resume failure")
+
+    monkeypatch.setattr(ProcessAuthority, "create", fake_create)
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(
+        supervisor_module,
+        "_process_metadata",
+        lambda pid: supervisor_module._ProcessMetadata(
+            str(Path(sys.executable)), "windows:test", True, None
+        ),
+    )
+    monkeypatch.setattr(authority, "resume", fail_resume)
+    original_write = SolverSupervisor._write_process_record
+
+    def record_write(supervisor: SolverSupervisor, record: dict[str, object]) -> None:
+        original_write(supervisor, record)
+        if record.get("state") == "BOUND_SUSPENDED":
+            replacement = dict(record)
+            replacement["replacement_marker"] = "foreign-regular-file"
+            replacement_path = supervisor.process_record_path.with_name("foreign.json")
+            replacement_path.write_text(json.dumps(replacement, sort_keys=True), encoding="utf-8")
+            os.replace(os.fspath(replacement_path), os.fspath(supervisor.process_record_path))
+            events.append("replaced-process-record")
+
+    monkeypatch.setattr(SolverSupervisor, "_write_process_record", record_write)
+    supervisor = SolverSupervisor(capability)
+
+    with pytest.raises(SolverLaunchError, match="late resume failure"):
+        supervisor.start()
+
+    record_path = supervisor.process_record_path
+    replacement = json.loads(record_path.read_text(encoding="utf-8"))
+    assert record_path.is_file()
+    assert replacement["replacement_marker"] == "foreign-regular-file"
+    assert replacement["state"] == "BOUND_SUSPENDED"
+    assert supervisor.state is SolverState.FAILED
+    assert events.index("replaced-process-record") < events.index("resume-failure")
+    assert events.count("terminate") == 1
+    assert events.count("close") == 1
+    assert events.index("terminate") < events.index("close")
+
+    with pytest.raises(SolverOwnershipError, match="reconnectable|RUNNING"):
+        SolverSupervisor.reconnect(capability)
