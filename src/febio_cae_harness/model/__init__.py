@@ -17,6 +17,7 @@ from .completeness import (
     completeness_result,
     evaluate_completeness,
 )
+from .derived import DerivedFebReceipt, FebPatch, write_derived_feb
 from .descriptors import (
     ContactDescriptor,
     ContactIntent,
@@ -120,6 +121,7 @@ __all__ = [
     "DerivedModel",
     "DerivedModelPlan",
     "DerivedPlan",
+    "DerivedFebReceipt",
     "DiagnosticSeverity",
     "ElementDescriptor",
     "ElementIntent",
@@ -132,6 +134,7 @@ __all__ = [
     "FEBXMLInspection",
     "FEBXmlInspection",
     "FEBStructuralInventory",
+    "FebPatch",
     "IntentImpact",
     "IncompleteFebInventory",
     "MeshDescriptor",
@@ -191,4 +194,5 @@ __all__ = [
     "reference_closure",
     "normalise_provenance",
     "run_preflight",
+    "write_derived_feb",
 ]
