@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import copy
+import dataclasses
 import json
 import os
+import pickle
 import subprocess
 from collections.abc import Callable
 from pathlib import Path
@@ -430,3 +433,60 @@ def test_promotion_verification_binds_exact_destination(tmp_path: Path) -> None:
 
     with pytest.raises(EvidenceIntegrityError):
         store.promote_verified(verification)
+
+
+def test_workspace_authorities_reject_forged_cloned_and_rebound_objects(
+    tmp_path: Path,
+) -> None:
+    workspace = make_workspace(tmp_path)
+    case = workspace.create_case("case-a")
+    attempt = case.allocate_attempt("attempt-1")
+
+    forged_manager = object.__new__(ValidatedCaseWorkspace)
+    object.__setattr__(forged_manager, "tool_root", tmp_path / "forged-tool")
+    object.__setattr__(forged_manager, "cae_root", tmp_path / "forged-cae")
+    with pytest.raises(WorkspaceBoundaryError):
+        forged_manager.create_case("case-a")
+
+    forged_case = object.__new__(CaseWorkspace)
+    object.__setattr__(forged_case, "_manager", workspace)
+    object.__setattr__(forged_case, "case_id", "case-a")
+    object.__setattr__(forged_case, "case_root", tmp_path / "forged-case")
+    object.__setattr__(forged_case, "original_inputs", ())
+    object.__setattr__(forged_case, "source_inputs", ())
+    with pytest.raises(WorkspaceBoundaryError):
+        forged_case.write_text("90_Temporary/forged.txt", "must reject")
+
+    forged_attempt = object.__new__(AttemptWorkspace)
+    object.__setattr__(forged_attempt, "case_id", "case-a")
+    object.__setattr__(forged_attempt, "attempt_id", "attempt-1")
+    object.__setattr__(forged_attempt, "root", tmp_path / "forged-attempt")
+    with pytest.raises(WorkspaceBoundaryError):
+        forged_attempt.write_text("forged.txt", "must reject")
+
+    for authority in (workspace, case, attempt):
+        with pytest.raises(TypeError):
+            copy.copy(authority)
+        with pytest.raises(TypeError):
+            copy.deepcopy(authority)
+        with pytest.raises(TypeError):
+            pickle.dumps(authority)
+
+    with pytest.raises(TypeError):
+        dataclasses.replace(workspace)  # type: ignore[type-var]
+    with pytest.raises(TypeError):
+        dataclasses.replace(case)
+    with pytest.raises(TypeError):
+        dataclasses.replace(attempt)
+
+    object.__setattr__(workspace, "cae_root", tmp_path / "swapped-cae")
+    with pytest.raises(WorkspaceBoundaryError):
+        workspace.create_case("swapped")
+
+    object.__setattr__(case, "case_root", tmp_path / "swapped-case")
+    with pytest.raises(WorkspaceBoundaryError):
+        case.write_text("90_Temporary/swapped.txt", "must reject")
+
+    object.__setattr__(attempt, "attempt_id", "swapped-attempt")
+    with pytest.raises(WorkspaceBoundaryError):
+        attempt.write_text("swapped.txt", "must reject")

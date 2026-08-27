@@ -13,8 +13,9 @@ import stat
 import tempfile
 from collections.abc import Iterable
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import FrozenInstanceError, dataclass
 from pathlib import Path
+from typing import Any, SupportsIndex
 
 __all__ = [
     "AttemptWorkspace",
@@ -30,6 +31,12 @@ _PERMANENT_ROOTS = frozenset({"02_Model", "03_Result", "04_Report", "05_Verifica
 _CONTROL_FILES = frozenset({"CASE_MANIFEST.json", "intent.json"})
 _EVENTS_FILE = f"{_TEMPORARY_ROOT}/events.jsonl"
 _REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+_MANAGER_REGISTRY: dict[int, tuple[object, Path, Path]] = {}
+_CASE_REGISTRY: dict[
+    int,
+    tuple[object, object, str, Path, tuple[Path, ...], tuple[Path, ...]],
+] = {}
+_ATTEMPT_REGISTRY: dict[int, tuple[object, object, str, str, Path]] = {}
 
 
 class WorkspaceBoundaryError(PermissionError):
@@ -223,6 +230,82 @@ def _append_bytes(target: Path, data: bytes, label: str) -> Path:
     return target
 
 
+def _require_registered_manager(value: object) -> ValidatedCaseWorkspace:
+    if type(value) is not ValidatedCaseWorkspace:
+        raise WorkspaceBoundaryError("workspace authority is not a registered manager")
+    registration = _MANAGER_REGISTRY.get(id(value))
+    if registration is None or registration[0] is not value:
+        raise WorkspaceBoundaryError("workspace authority is not a registered manager")
+    _, registered_tool_root, registered_cae_root = registration
+    manager = value
+    try:
+        tool_root = manager.tool_root
+        cae_root = manager.cae_root
+        unchanged = (
+            type(tool_root) is type(registered_tool_root)
+            and type(cae_root) is type(registered_cae_root)
+            and tool_root == registered_tool_root
+            and cae_root == registered_cae_root
+        )
+    except Exception as error:
+        raise WorkspaceBoundaryError("workspace manager binding was changed") from error
+    if not unchanged:
+        raise WorkspaceBoundaryError("workspace manager binding was changed")
+    return manager
+
+
+def _require_registered_case(value: object) -> CaseWorkspace:
+    if type(value) is not CaseWorkspace:
+        raise WorkspaceBoundaryError("case workspace is not a registered handle")
+    registration = _CASE_REGISTRY.get(id(value))
+    if registration is None or registration[0] is not value:
+        raise WorkspaceBoundaryError("case workspace is not a registered handle")
+    _, manager_value, case_id, case_root, original_inputs, source_inputs = registration
+    case = value
+    try:
+        unchanged = (
+            case._manager is manager_value
+            and case.case_id == case_id
+            and type(case.case_root) is type(case_root)
+            and case.case_root == case_root
+            and type(case.original_inputs) is tuple
+            and case.original_inputs == original_inputs
+            and type(case.source_inputs) is tuple
+            and case.source_inputs == source_inputs
+        )
+    except Exception as error:
+        raise WorkspaceBoundaryError("case workspace binding was changed") from error
+    if not unchanged:
+        raise WorkspaceBoundaryError("case workspace binding was changed")
+    _require_registered_manager(manager_value)
+    return case
+
+
+def _require_registered_attempt(value: object) -> AttemptWorkspace:
+    if type(value) is not AttemptWorkspace:
+        raise WorkspaceBoundaryError("attempt workspace is not a registered handle")
+    registration = _ATTEMPT_REGISTRY.get(id(value))
+    if registration is None or registration[0] is not value:
+        raise WorkspaceBoundaryError("attempt workspace is not a registered handle")
+    _, case_value, case_id, attempt_id, root = registration
+    attempt = value
+    try:
+        unchanged = (
+            attempt.case_id == case_id
+            and attempt.attempt_id == attempt_id
+            and type(attempt.root) is type(root)
+            and attempt.root == root
+        )
+    except Exception as error:
+        raise WorkspaceBoundaryError("attempt workspace binding was changed") from error
+    if not unchanged:
+        raise WorkspaceBoundaryError("attempt workspace binding was changed")
+    case = _require_registered_case(case_value)
+    if case.case_id != case_id:
+        raise WorkspaceBoundaryError("attempt workspace case binding was changed")
+    return attempt
+
+
 @dataclass(frozen=True, slots=True, init=False)
 class AttemptWorkspace:
     """A bounded writer for one case-owned temporary attempt directory."""
@@ -240,8 +323,11 @@ class AttemptWorkspace:
     ) -> AttemptWorkspace:
         """Construct a handle only for the manager-owned attempt path."""
 
-        if not isinstance(case_workspace, CaseWorkspace):
+        if cls is not AttemptWorkspace:
+            raise TypeError("attempt workspace handles cannot be subclassed")
+        if type(case_workspace) is not CaseWorkspace:
             raise TypeError("attempt workspace requires a case workspace authority")
+        case_workspace = _require_registered_case(case_workspace)
         _validate_segment(case_workspace.case_id, "case_id")
         _validate_segment(attempt_id, "attempt_id")
         _reject_reparse_alias(case_workspace.case_root, "case root")
@@ -257,13 +343,43 @@ class AttemptWorkspace:
         object.__setattr__(instance, "case_id", case_workspace.case_id)
         object.__setattr__(instance, "attempt_id", attempt_id)
         object.__setattr__(instance, "root", actual_root)
+        _ATTEMPT_REGISTRY[id(instance)] = (
+            instance,
+            case_workspace,
+            case_workspace.case_id,
+            attempt_id,
+            actual_root,
+        )
         return instance
 
     def __fspath__(self) -> str:
-        return os.fspath(self.root)
+        attempt = _require_registered_attempt(self)
+        return os.fspath(attempt.root)
+
+    def __copy__(self) -> AttemptWorkspace:
+        raise TypeError("attempt workspace handles cannot be copied")
+
+    def __deepcopy__(self, memo: object) -> AttemptWorkspace:
+        del memo
+        raise TypeError("attempt workspace handles cannot be copied")
+
+    def __reduce__(self) -> str | tuple[Any, ...]:
+        raise TypeError("attempt workspace handles cannot be serialized")
+
+    def __reduce_ex__(self, protocol: SupportsIndex) -> str | tuple[Any, ...]:
+        del protocol
+        raise TypeError("attempt workspace handles cannot be serialized")
+
+    def __getstate__(self) -> object:
+        raise TypeError("attempt workspace state is not transferable")
+
+    def __setstate__(self, state: object) -> None:
+        del state
+        raise TypeError("attempt workspace state is not transferable")
 
     def write_bytes(self, relative_path: str | Path, data: bytes) -> Path:
-        target = _resolve_owned_target(self.root, relative_path)
+        attempt = _require_registered_attempt(self)
+        target = _resolve_owned_target(attempt.root, relative_path)
         return _atomic_replace_bytes(target, data, "attempt target")
 
     def write_text(
@@ -273,7 +389,8 @@ class AttemptWorkspace:
         *,
         encoding: str = "utf-8",
     ) -> Path:
-        target = _resolve_owned_target(self.root, relative_path)
+        attempt = _require_registered_attempt(self)
+        target = _resolve_owned_target(attempt.root, relative_path)
         return _atomic_replace_bytes(target, text.encode(encoding), "attempt target")
 
 
@@ -304,8 +421,11 @@ class CaseWorkspace:
         inside ``01_Input``.
         """
 
-        if not isinstance(manager, ValidatedCaseWorkspace):
+        if cls is not CaseWorkspace:
+            raise TypeError("case workspace handles cannot be subclassed")
+        if type(manager) is not ValidatedCaseWorkspace:
             raise TypeError("case workspace requires a validated workspace authority")
+        manager = _require_registered_manager(manager)
         _validate_segment(case_id, "case_id")
         _reject_reparse_alias(manager.cae_root, "cae root")
         expected_root = _reject_reparse_alias(
@@ -334,43 +454,74 @@ class CaseWorkspace:
             "source_inputs",
             tuple(_reject_reparse_alias(path, "source input") for path in source_inputs),
         )
+        _CASE_REGISTRY[id(instance)] = (
+            instance,
+            manager,
+            case_id,
+            actual_root,
+            tuple(normalised_originals),
+            instance.source_inputs,
+        )
         return instance
 
     @property
     def root(self) -> Path:
-        return self.case_root
+        return _require_registered_case(self).case_root
 
     @property
     def tool_root(self) -> Path:
-        return self._manager.tool_root
+        case = _require_registered_case(self)
+        return _require_registered_manager(case._manager).tool_root
 
     @property
     def cae_root(self) -> Path:
-        return self._manager.cae_root
+        case = _require_registered_case(self)
+        return _require_registered_manager(case._manager).cae_root
 
     @property
     def input_root(self) -> Path:
-        return self.case_root / "01_Input"
+        return _require_registered_case(self).case_root / "01_Input"
 
     @property
     def model_root(self) -> Path:
-        return self.case_root / "02_Model"
+        return _require_registered_case(self).case_root / "02_Model"
 
     @property
     def result_root(self) -> Path:
-        return self.case_root / "03_Result"
+        return _require_registered_case(self).case_root / "03_Result"
 
     @property
     def report_root(self) -> Path:
-        return self.case_root / "04_Report"
+        return _require_registered_case(self).case_root / "04_Report"
 
     @property
     def verification_root(self) -> Path:
-        return self.case_root / "05_Verification"
+        return _require_registered_case(self).case_root / "05_Verification"
 
     @property
     def temporary_root(self) -> Path:
-        return self.case_root / _TEMPORARY_ROOT
+        return _require_registered_case(self).case_root / _TEMPORARY_ROOT
+
+    def __copy__(self) -> CaseWorkspace:
+        raise TypeError("case workspace handles cannot be copied")
+
+    def __deepcopy__(self, memo: object) -> CaseWorkspace:
+        del memo
+        raise TypeError("case workspace handles cannot be copied")
+
+    def __reduce__(self) -> str | tuple[Any, ...]:
+        raise TypeError("case workspace handles cannot be serialized")
+
+    def __reduce_ex__(self, protocol: SupportsIndex) -> str | tuple[Any, ...]:
+        del protocol
+        raise TypeError("case workspace handles cannot be serialized")
+
+    def __getstate__(self) -> object:
+        raise TypeError("case workspace state is not transferable")
+
+    def __setstate__(self, state: object) -> None:
+        del state
+        raise TypeError("case workspace state is not transferable")
 
     def _temporary_write_target(
         self,
@@ -378,10 +529,11 @@ class CaseWorkspace:
         *,
         allow_event_append: bool = False,
     ) -> Path:
-        target = _resolve_owned_target(self.case_root, relative_path)
-        temporary_root = _reject_reparse_alias(self.temporary_root, "temporary root")
+        case = _require_registered_case(self)
+        target = _resolve_owned_target(case.case_root, relative_path)
+        temporary_root = _reject_reparse_alias(case.temporary_root, "temporary root")
         if target == temporary_root or not target.is_relative_to(temporary_root):
-            input_root = _reject_reparse_alias(self.input_root, "input root")
+            input_root = _reject_reparse_alias(case.input_root, "input root")
             if target == input_root or target.is_relative_to(input_root):
                 raise ImmutableInputError("01_Input is immutable after case creation")
             raise WorkspaceBoundaryError("normal writes are restricted to 90_Temporary")
@@ -392,8 +544,9 @@ class CaseWorkspace:
         return target
 
     def _control_write_target(self, relative_path: str | Path) -> Path:
-        target = _resolve_owned_target(self.case_root, relative_path)
-        relative = target.relative_to(self.case_root).as_posix()
+        case = _require_registered_case(self)
+        target = _resolve_owned_target(case.case_root, relative_path)
+        relative = target.relative_to(case.case_root).as_posix()
         if relative not in _CONTROL_FILES:
             raise WorkspaceBoundaryError("only evidence control files may use an internal write")
         return target
@@ -460,20 +613,21 @@ class CaseWorkspace:
         is not a promotion authority.
         """
 
+        case = _require_registered_case(self)
         expected = _validate_sha256(expected_sha256)
-        source_path = _resolve_owned_target(self.case_root, source, allow_absolute=True)
-        temporary_root = _reject_reparse_alias(self.temporary_root, "temporary root")
+        source_path = _resolve_owned_target(case.case_root, source, allow_absolute=True)
+        temporary_root = _reject_reparse_alias(case.temporary_root, "temporary root")
         if source_path == temporary_root or not source_path.is_relative_to(temporary_root):
             raise WorkspaceBoundaryError("promotion source must be inside 90_Temporary")
         if not source_path.is_file():
             raise WorkspaceBoundaryError("promotion source must be a regular file")
 
         destination_path = _resolve_owned_target(
-            self.case_root,
+            case.case_root,
             destination,
             allow_absolute=True,
         )
-        relative_destination = destination_path.relative_to(self.case_root)
+        relative_destination = destination_path.relative_to(case.case_root)
         if (
             len(relative_destination.parts) < 2
             or relative_destination.parts[0] not in _PERMANENT_ROOTS
@@ -523,6 +677,7 @@ class CaseWorkspace:
         accidental calls fail explicitly without exposing a bypass.
         """
 
+        _require_registered_case(self)
         del source, destination, expected_sha256
         raise TypeError("promotion requires EvidenceStore.promote_verified receipt")
 
@@ -535,24 +690,25 @@ class CaseWorkspace:
     ) -> Path:
         """Reject the legacy raw-digest promotion alias."""
 
+        _require_registered_case(self)
         del source, destination, expected_sha256
         raise TypeError("promotion requires EvidenceStore.promote_verified receipt")
 
     def allocate_attempt(self, attempt_id: str) -> AttemptWorkspace:
+        case = _require_registered_case(self)
         _validate_segment(attempt_id, "attempt_id")
-        _reject_reparse_alias(self.case_root, "case root")
-        _reject_reparse_alias(self.temporary_root, "temporary root")
+        _reject_reparse_alias(case.case_root, "case root")
+        _reject_reparse_alias(case.temporary_root, "temporary root")
         _reject_reparse_alias(
-            self.temporary_root / "attempts",
+            case.temporary_root / "attempts",
             "attempts root",
         )
-        attempt_root = self.temporary_root / "attempts" / attempt_id
+        attempt_root = case.temporary_root / "attempts" / attempt_id
         _reject_reparse_alias(attempt_root, "attempt root")
         attempt_root.mkdir(parents=False, exist_ok=False)
-        return AttemptWorkspace._from_manager(self, attempt_id, attempt_root)
+        return AttemptWorkspace._from_manager(case, attempt_id, attempt_root)
 
 
-@dataclass(frozen=True, slots=True)
 class ValidatedCaseWorkspace:
     """Manager for isolated, case-owned workspaces.
 
@@ -560,22 +716,61 @@ class ValidatedCaseWorkspace:
     ``02_CAE`` root.  Neither root itself is a writable case target.
     """
 
+    __slots__ = ("tool_root", "cae_root")
+
     tool_root: Path
     cae_root: Path
 
-    def __post_init__(self) -> None:
-        tool_root = _reject_reparse_alias(self.tool_root, "tool root")
-        cae_root = _reject_reparse_alias(self.cae_root, "cae root")
+    def __init__(self, tool_root: Path, cae_root: Path) -> None:
+        if type(self) is not ValidatedCaseWorkspace:
+            raise TypeError("workspace managers cannot be subclassed")
+        if id(self) in _MANAGER_REGISTRY:
+            raise TypeError("workspace manager cannot be reinitialised")
+        tool_root = _reject_reparse_alias(tool_root, "tool root")
+        cae_root = _reject_reparse_alias(cae_root, "cae root")
         if tool_root == cae_root:
             raise ValueError("tool_root and cae_root must be different roots")
         if tool_root.is_relative_to(cae_root) or cae_root.is_relative_to(tool_root):
             raise ValueError("tool_root and cae_root must not overlap")
         object.__setattr__(self, "tool_root", tool_root)
         object.__setattr__(self, "cae_root", cae_root)
+        _MANAGER_REGISTRY[id(self)] = (self, tool_root, cae_root)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if name in self.__slots__ and hasattr(self, name):
+            raise FrozenInstanceError(f"cannot assign to field '{name}'")
+        object.__setattr__(self, name, value)
+
+    def __delattr__(self, name: str) -> None:
+        if name in self.__slots__ and hasattr(self, name):
+            raise FrozenInstanceError(f"cannot delete field '{name}'")
+        object.__delattr__(self, name)
+
+    def __copy__(self) -> ValidatedCaseWorkspace:
+        raise TypeError("workspace managers cannot be copied")
+
+    def __deepcopy__(self, memo: object) -> ValidatedCaseWorkspace:
+        del memo
+        raise TypeError("workspace managers cannot be copied")
+
+    def __reduce__(self) -> str | tuple[Any, ...]:
+        raise TypeError("workspace managers cannot be serialized")
+
+    def __reduce_ex__(self, protocol: SupportsIndex) -> str | tuple[Any, ...]:
+        del protocol
+        raise TypeError("workspace managers cannot be serialized")
+
+    def __getstate__(self) -> object:
+        raise TypeError("workspace manager state is not transferable")
+
+    def __setstate__(self, state: object) -> None:
+        del state
+        raise TypeError("workspace manager state is not transferable")
 
     def _case_path(self, case_id: str) -> Path:
+        manager = _require_registered_manager(self)
         _validate_segment(case_id, "case_id")
-        return self.cae_root / case_id
+        return manager.cae_root / case_id
 
     @staticmethod
     def _normalise_inputs(
@@ -607,12 +802,13 @@ class ValidatedCaseWorkspace:
     ) -> CaseWorkspace:
         """Create a new case and copy source inputs without modifying them."""
 
-        _reject_reparse_alias(self.tool_root, "tool root")
-        _reject_reparse_alias(self.cae_root, "cae root")
-        case_path = _reject_reparse_alias(self._case_path(case_id), "case root")
+        manager = _require_registered_manager(self)
+        _reject_reparse_alias(manager.tool_root, "tool root")
+        _reject_reparse_alias(manager.cae_root, "cae root")
+        case_path = _reject_reparse_alias(manager._case_path(case_id), "case root")
         sources = self._normalise_inputs(original_inputs)
-        self.cae_root.mkdir(parents=True, exist_ok=True)
-        _reject_reparse_alias(self.cae_root, "cae root")
+        manager.cae_root.mkdir(parents=True, exist_ok=True)
+        _reject_reparse_alias(manager.cae_root, "cae root")
         _reject_reparse_alias(case_path, "case root")
         case_path.mkdir(parents=False, exist_ok=False)
 
@@ -636,15 +832,16 @@ class ValidatedCaseWorkspace:
             shutil.rmtree(case_path)
             raise
 
-        return CaseWorkspace._from_manager(self, case_id, case_path, copied_inputs, sources)
+        return CaseWorkspace._from_manager(manager, case_id, case_path, copied_inputs, sources)
 
     def open_case(self, case_id: str) -> CaseWorkspace:
         """Open an existing case without granting access outside its root."""
 
-        _reject_reparse_alias(self.tool_root, "tool root")
-        _reject_reparse_alias(self.cae_root, "cae root")
-        case_path = _reject_reparse_alias(self._case_path(case_id), "case root")
-        if not case_path.is_dir() or not case_path.is_relative_to(self.cae_root):
+        manager = _require_registered_manager(self)
+        _reject_reparse_alias(manager.tool_root, "tool root")
+        _reject_reparse_alias(manager.cae_root, "cae root")
+        case_path = _reject_reparse_alias(manager._case_path(case_id), "case root")
+        if not case_path.is_dir() or not case_path.is_relative_to(manager.cae_root):
             raise FileNotFoundError(f"case does not exist: {case_id}")
         _reject_reparse_alias(case_path, "case root")
         input_root = _reject_reparse_alias(case_path / "01_Input", "input root")
@@ -667,7 +864,7 @@ class ValidatedCaseWorkspace:
             original_inputs = tuple(sorted(normalised_entries, key=str))
         else:
             original_inputs = ()
-        return CaseWorkspace._from_manager(self, case_id, case_path, original_inputs)
+        return CaseWorkspace._from_manager(manager, case_id, case_path, original_inputs)
 
     def write_bytes(self, case_id: str, relative_path: str | Path, data: bytes) -> Path:
         return self.open_case(case_id).write_bytes(relative_path, data)
