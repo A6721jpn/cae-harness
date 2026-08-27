@@ -32,7 +32,6 @@ addopts = [
   "--strict-markers",
   "-p",
   "no:cacheprovider",
-  "--basetemp=.pytest_tmp",
 ]
 testpaths = ["tests"]
 pythonpath = ["src"]
