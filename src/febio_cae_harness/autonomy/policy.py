@@ -14,9 +14,10 @@ from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from math import isfinite
 from types import MappingProxyType
-from typing import Self, cast
+from typing import NoReturn, Self, cast
 
 from ..contracts import IntentContract, IntentState, JSONValue
+from ..evidence import EvidenceIntegrityError, IntentSnapshotAuthority
 
 __all__ = [
     "ExecutionAction",
@@ -30,6 +31,8 @@ __all__ = [
     "FailureKind",
     "FailureRoute",
     "FailureRouting",
+    "IntentSnapshotAuthority",
+    "IntentStateAuthority",
     "IntentState",
     "PhysicalConditionEvidence",
     "Proposal",
@@ -508,19 +511,163 @@ def has_authoritative_unresolved(intent: IntentContract) -> bool:
     return bool(unresolved_authoritative_conditions(intent))
 
 
-@dataclass(frozen=True, slots=True)
-class StateTransition:
-    """Immutable state transition result, including the updated intent."""
+_INTENT_STATE_FACTORY = object()
 
-    intent: IntentContract
-    previous: IntentState
-    current: IntentState
-    reason: str
-    blocking_conditions: tuple[PhysicalConditionEvidence, ...] = ()
+
+_IntentStateRecord = tuple[
+    object,
+    IntentSnapshotAuthority,
+    IntentContract,
+    IntentContract,
+    IntentState,
+    IntentState,
+    str,
+    tuple[PhysicalConditionEvidence, ...],
+]
+_INTENT_STATE_RECORDS: dict[int, _IntentStateRecord] = {}
+
+
+class IntentStateAuthority:
+    """Opaque, snapshot-bound authority for one derived intent transition."""
+
+    __slots__ = ()
+
+    def __new__(
+        cls,
+        *args: object,
+        _factory: object | None = None,
+        **kwargs: object,
+    ) -> IntentStateAuthority:
+        del args, kwargs
+        if cls is not IntentStateAuthority:
+            raise TypeError("intent state authorities cannot be subclassed")
+        if _factory is not _INTENT_STATE_FACTORY:
+            raise TypeError("intent state authorities are issued by transition_intent")
+        return object.__new__(cls)
+
+    def __init__(
+        self,
+        *args: object,
+        _factory: object | None = None,
+        **kwargs: object,
+    ) -> None:
+        del args, kwargs
+        if _factory is not _INTENT_STATE_FACTORY:
+            raise TypeError("intent state authorities are issued by transition_intent")
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        del kwargs
+        raise TypeError("intent state authorities cannot be subclassed")
+
+    @classmethod
+    def _issue(
+        cls,
+        snapshot: IntentSnapshotAuthority,
+    ) -> IntentStateAuthority:
+        if cls is not IntentStateAuthority:
+            raise TypeError("intent state authorities cannot be subclassed")
+        if type(snapshot) is not IntentSnapshotAuthority:
+            raise TypeError("intent state authority requires an IntentSnapshotAuthority")
+        persisted_intent = snapshot.intent
+        complete = _intent_has_current_authoritative_completeness(persisted_intent)
+        blocking = unresolved_authoritative_conditions(persisted_intent)
+        previous = persisted_intent.state
+        if blocking:
+            current = IntentState.ASK_AND_BLOCK
+            reason = "authoritative physical conditions remain unresolved"
+        elif previous is IntentState.BOUND and complete:
+            current = IntentState.BOUND
+            reason = "intent remains bound"
+        elif complete:
+            current = IntentState.BOUND
+            reason = "authoritative intent conditions are complete"
+        else:
+            current = IntentState.GATHERING
+            reason = "authoritative intent conditions are still being gathered"
+        intent = (
+            persisted_intent if current is previous else replace(persisted_intent, state=current)
+        )
+        authority = cls(_factory=_INTENT_STATE_FACTORY)
+        _INTENT_STATE_RECORDS[id(authority)] = (
+            authority,
+            snapshot,
+            persisted_intent,
+            intent,
+            previous,
+            current,
+            reason,
+            blocking,
+        )
+        return authority
+
+    def __repr__(self) -> str:
+        return "IntentStateAuthority(<opaque>)"
+
+    __str__ = __repr__
+
+    def __setattr__(self, name: str, value: object) -> None:
+        del name, value
+        raise AttributeError("intent state authorities are immutable")
+
+    def __delattr__(self, name: str) -> None:
+        del name
+        raise AttributeError("intent state authorities are immutable")
+
+    def __copy__(self) -> IntentStateAuthority:
+        raise TypeError("intent state authorities cannot be copied")
+
+    def __deepcopy__(self, memo: dict[int, object]) -> IntentStateAuthority:
+        del memo
+        raise TypeError("intent state authorities cannot be copied")
+
+    def __reduce__(self) -> NoReturn:
+        raise TypeError("intent state authorities cannot be pickled")
+
+    def __reduce_ex__(self, protocol: object) -> NoReturn:
+        del protocol
+        raise TypeError("intent state authorities cannot be pickled")
+
+    def _validated_record(self) -> _IntentStateRecord:
+        record = _INTENT_STATE_RECORDS.get(id(self))
+        if record is None or record[0] is not self:
+            raise EvidenceIntegrityError("intent state authority is invalid")
+        snapshot = record[1]
+        if type(snapshot) is not IntentSnapshotAuthority:
+            raise EvidenceIntegrityError("intent state snapshot authority is invalid")
+        if snapshot.intent is not record[2]:
+            raise EvidenceIntegrityError("intent state snapshot is stale")
+        return record
+
+    def _validated_for(self, snapshot: IntentSnapshotAuthority) -> _IntentStateRecord:
+        record = self._validated_record()
+        if type(snapshot) is not IntentSnapshotAuthority or snapshot is not record[1]:
+            raise EvidenceIntegrityError("intent state authority is bound to another snapshot")
+        return record
+
+    @property
+    def intent(self) -> IntentContract:
+        return self._validated_record()[3]
+
+    @property
+    def previous(self) -> IntentState:
+        return self._validated_record()[4]
+
+    @property
+    def current(self) -> IntentState:
+        return self._validated_record()[5]
+
+    @property
+    def reason(self) -> str:
+        return self._validated_record()[6]
+
+    @property
+    def blocking_conditions(self) -> tuple[PhysicalConditionEvidence, ...]:
+        return self._validated_record()[7]
 
     @property
     def changed(self) -> bool:
-        return self.previous is not self.current
+        record = self._validated_record()
+        return record[4] is not record[5]
 
     @property
     def state(self) -> IntentState:
@@ -539,48 +686,17 @@ class StateTransition:
         return self.current
 
 
-def transition_intent(
-    intent: IntentContract,
-    *,
-    conditions_complete: bool = False,
-    additional_conditions: Iterable[PhysicalConditionEvidence] = (),
-) -> StateTransition:
-    """Compute the next intent state without mutating the canonical contract.
+# Keep the established result name while making the authority's sealed class
+# canonical.  Both names refer to exactly the same runtime type.
+StateTransition = IntentStateAuthority
 
-    ``conditions_complete`` is only a caller request to evaluate binding.  The
-    policy revalidates every required current fact and its authoritative source
-    record; it does not infer completeness from geometry, field names, or
-    defaults.
-    """
 
-    if not isinstance(intent, IntentContract):
-        raise TypeError("intent must be an IntentContract")
-    if not isinstance(conditions_complete, bool):
-        raise TypeError("conditions_complete must be a bool")
-    complete = conditions_complete and _intent_has_current_authoritative_completeness(intent)
-    blocking = unresolved_authoritative_conditions(intent, additional_conditions)
-    previous = intent.state
-    if blocking:
-        current = IntentState.ASK_AND_BLOCK
-        reason = "authoritative physical conditions remain unresolved"
-    elif previous is IntentState.BOUND and complete:
-        # A bound intent remains bound until a new blocking condition appears.
-        current = IntentState.BOUND
-        reason = "intent remains bound"
-    elif complete:
-        current = IntentState.BOUND
-        reason = "authoritative intent conditions are complete"
-    else:
-        current = IntentState.GATHERING
-        reason = "authoritative intent conditions are still being gathered"
-    updated = intent if current is previous else replace(intent, state=current)
-    return StateTransition(
-        intent=updated,
-        previous=previous,
-        current=current,
-        reason=reason,
-        blocking_conditions=blocking,
-    )
+def transition_intent(snapshot: IntentSnapshotAuthority) -> StateTransition:
+    """Derive a sealed state authority from one live persisted intent snapshot."""
+
+    if type(snapshot) is not IntentSnapshotAuthority:
+        raise TypeError("snapshot must be an IntentSnapshotAuthority")
+    return StateTransition._issue(snapshot)
 
 
 transition_state = transition_intent

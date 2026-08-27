@@ -1,5 +1,12 @@
 from __future__ import annotations
 
+import inspect
+import json
+import pickle
+from copy import copy, deepcopy
+from dataclasses import is_dataclass, replace
+from pathlib import Path
+
 import pytest
 
 from febio_cae_harness.autonomy import (
@@ -15,6 +22,7 @@ from febio_cae_harness.autonomy import (
     ProposalClass,
     RetryDecision,
     RetryLedger,
+    StateTransition,
     classify_failure,
     decide_execution,
     decide_proposal,
@@ -24,6 +32,12 @@ from febio_cae_harness.autonomy import (
     unresolved_authoritative_conditions,
 )
 from febio_cae_harness.contracts import IntentContract
+from febio_cae_harness.evidence import (
+    EvidenceIntegrityError,
+    EvidenceStore,
+    IntentSnapshotAuthority,
+)
+from febio_cae_harness.workspace import ValidatedCaseWorkspace
 
 
 def bound_intent(**overrides: object) -> IntentContract:
@@ -57,9 +71,32 @@ def bound_intent(**overrides: object) -> IntentContract:
     return IntentContract(**values)  # type: ignore[arg-type]
 
 
-def test_transition_binds_only_when_complete_and_blocks_authoritative_unknowns() -> None:
+def intent_snapshot(
+    intent: IntentContract,
+    tmp_path: Path,
+    suffix: str = "a",
+) -> IntentSnapshotAuthority:
+    workspace = ValidatedCaseWorkspace(
+        tmp_path / f"tool-{suffix}",
+        tmp_path / f"02_CAE-{suffix}",
+    )
+    case = workspace.create_case(f"case-{suffix}")
+    return EvidenceStore(case, intent).issue_intent_snapshot()
+
+
+def run_transition(snapshot: IntentSnapshotAuthority) -> StateTransition:
+    try:
+        return transition_intent(snapshot)
+    except Exception as error:
+        raise AssertionError("transition requires a live intent snapshot") from error
+
+
+def test_transition_binds_only_when_complete_and_blocks_authoritative_unknowns(
+    tmp_path: Path,
+) -> None:
     intent = bound_intent()
-    transition = transition_intent(intent, conditions_complete=True)
+    snapshot = intent_snapshot(intent, tmp_path)
+    transition = run_transition(snapshot)
     assert transition.previous is IntentState.GATHERING
     assert transition.current is IntentState.BOUND
     assert transition.intent.state is IntentState.BOUND
@@ -67,20 +104,22 @@ def test_transition_binds_only_when_complete_and_blocks_authoritative_unknowns()
     unresolved = bound_intent(
         unresolved=({"condition": "contact", "authoritative": True, "source": "user"},),
     )
-    blocked = transition_intent(unresolved, conditions_complete=True)
+    blocked = run_transition(intent_snapshot(unresolved, tmp_path, "blocked"))
     assert blocked.current is IntentState.ASK_AND_BLOCK
     assert blocked.intent.state is IntentState.ASK_AND_BLOCK
 
 
-def test_non_authoritative_unknowns_do_not_trigger_ask_and_block() -> None:
+def test_non_authoritative_unknowns_do_not_trigger_ask_and_block(tmp_path: Path) -> None:
     intent = bound_intent(
         unresolved=({"condition": "contact", "authoritative": False, "source": "guess"},),
     )
     assert unresolved_authoritative_conditions(intent) == ()
-    assert transition_intent(intent, conditions_complete=True).current is IntentState.BOUND
+    assert run_transition(intent_snapshot(intent, tmp_path)).current is IntentState.BOUND
 
 
-def test_condition_source_mapping_can_authorize_a_named_unresolved_condition() -> None:
+def test_condition_source_mapping_can_authorize_a_named_unresolved_condition(
+    tmp_path: Path,
+) -> None:
     intent = bound_intent(
         unresolved=("contact",),
         condition_sources={"contact": "user"},
@@ -88,18 +127,44 @@ def test_condition_source_mapping_can_authorize_a_named_unresolved_condition() -
     conditions = unresolved_authoritative_conditions(intent)
     assert len(conditions) == 1
     assert conditions[0].condition == "contact"
-    assert transition_intent(intent, conditions_complete=True).current is IntentState.ASK_AND_BLOCK
+    assert run_transition(intent_snapshot(intent, tmp_path)).current is IntentState.ASK_AND_BLOCK
 
 
-def test_conditions_complete_flag_cannot_bind_empty_or_stale_intent() -> None:
+def test_conditions_complete_flag_cannot_bind_empty_or_stale_intent(tmp_path: Path) -> None:
+    signature = inspect.signature(transition_intent)
+    assert "conditions_complete" not in signature.parameters
+    assert "additional_conditions" not in signature.parameters
+
+    complete_snapshot = intent_snapshot(bound_intent(), tmp_path)
+    with pytest.raises(TypeError):
+        transition_intent(complete_snapshot, conditions_complete=True)  # type: ignore[call-arg]
+    with pytest.raises(TypeError):
+        transition_intent(
+            complete_snapshot,
+            additional_conditions=(
+                {"condition": "contact", "authoritative": True, "source": "caller"},
+            ),
+        )  # type: ignore[call-arg]
+
+    for forged in (bound_intent(), True, False, {}, {"state": "BOUND"}):
+        with pytest.raises((TypeError, EvidenceIntegrityError)):
+            transition_intent(forged)  # type: ignore[arg-type]
+
     empty = IntentContract()
-    assert transition_intent(empty, conditions_complete=True).current is IntentState.GATHERING
+    assert (
+        run_transition(intent_snapshot(empty, tmp_path, "empty")).current is IntentState.GATHERING
+    )
 
     incomplete = bound_intent(contact=None)
-    assert transition_intent(incomplete, conditions_complete=True).current is IntentState.GATHERING
+    assert (
+        run_transition(intent_snapshot(incomplete, tmp_path, "incomplete")).current
+        is IntentState.GATHERING
+    )
 
     stale = IntentContract(state=IntentState.BOUND)
-    assert transition_intent(stale, conditions_complete=False).current is IntentState.GATHERING
+    assert (
+        run_transition(intent_snapshot(stale, tmp_path, "stale")).current is IntentState.GATHERING
+    )
 
     sources = dict(bound_intent().condition_sources)  # type: ignore[arg-type]
     sources["material"] = {"authoritative": True, "source": "user", "stale": True}
@@ -107,9 +172,45 @@ def test_conditions_complete_flag_cannot_bind_empty_or_stale_intent() -> None:
         condition_sources=sources,
         state=IntentState.BOUND,
     )
-    assert (
-        transition_intent(stale_evidence, conditions_complete=True).current is IntentState.GATHERING
-    )
+    stale_snapshot = intent_snapshot(stale_evidence, tmp_path, "stale-evidence")
+    assert run_transition(stale_snapshot).current is IntentState.GATHERING
+
+
+def test_transition_authority_is_opaque_and_live_bound(tmp_path: Path) -> None:
+    snapshot = intent_snapshot(bound_intent(), tmp_path)
+    transition = run_transition(snapshot)
+
+    assert type(transition) is StateTransition
+    assert not is_dataclass(transition)
+    with pytest.raises(TypeError):
+        StateTransition()
+    forged = object.__new__(StateTransition)
+    with pytest.raises(EvidenceIntegrityError):
+        _ = forged.current
+    with pytest.raises(TypeError):
+        type("ForgedStateTransition", (StateTransition,), {})
+    with pytest.raises(TypeError):
+        copy(transition)
+    with pytest.raises(TypeError):
+        deepcopy(transition)
+    with pytest.raises(TypeError):
+        pickle.dumps(transition)
+    with pytest.raises(TypeError):
+        replace(transition, current=IntentState.ASK_AND_BLOCK)  # type: ignore[type-var]
+    with pytest.raises(AttributeError):
+        transition.current = IntentState.ASK_AND_BLOCK  # type: ignore[misc]
+    foreign_snapshot = intent_snapshot(bound_intent(), tmp_path, "foreign")
+    with pytest.raises(EvidenceIntegrityError):
+        transition._validated_for(foreign_snapshot)
+
+    store = object.__getattribute__(snapshot, "_store")
+    payload = json.loads(store.intent_path.read_text(encoding="utf-8"))
+    payload["engineering_question"] = "tampered"
+    store.intent_path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(EvidenceIntegrityError):
+        transition_intent(snapshot)
+    with pytest.raises(EvidenceIntegrityError):
+        _ = transition.current
 
 
 def test_failure_classification_is_explicit_and_deterministic() -> None:
