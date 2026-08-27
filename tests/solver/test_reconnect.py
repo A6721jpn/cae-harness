@@ -14,6 +14,7 @@ from febio_cae_harness import workspace as workspace_module
 from febio_cae_harness.contracts import IntentContract
 from febio_cae_harness.evidence import EvidenceStore
 from febio_cae_harness.solver import headless as headless_module
+from febio_cae_harness.solver import types as solver_types
 from febio_cae_harness.solver.runtime import FebioRuntimeDiagnostic, probe_febio
 from febio_cae_harness.solver.supervisor import SolverSupervisor, _process_metadata
 from febio_cae_harness.solver.types import (
@@ -265,6 +266,31 @@ def test_reconnect_rejects_attempt_identity_mutated_after_registry_validation(
         return validated
 
     monkeypatch.setattr(workspace_module, "_require_registered_attempt", racing_validate)
+
+    def unexpected_read(self: SolverSupervisor) -> dict[str, object]:
+        del self
+        raise AssertionError("raced reconnect reached process-record read")
+
+    monkeypatch.setattr(SolverSupervisor, "_read_process_record", unexpected_read)
+    with pytest.raises(SolverConfigurationError, match="authority|binding|live"):
+        SolverSupervisor.reconnect(capability)
+
+
+def test_reconnect_rejects_attempt_identity_mutated_after_input_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capability = _capability(tmp_path, monkeypatch, code="pass")
+    attempt = object.__getattribute__(capability, "_attempt_workspace")
+    assert type(attempt) is AttemptWorkspace
+    original_input_snapshot = solver_types._input_snapshot
+
+    def racing_input_snapshot(path: Path) -> tuple[object, ...]:
+        snapshot = original_input_snapshot(path)
+        object.__setattr__(attempt, "attempt_id", "attempt-b")
+        return snapshot
+
+    monkeypatch.setattr(solver_types, "_input_snapshot", racing_input_snapshot)
 
     def unexpected_read(self: SolverSupervisor) -> dict[str, object]:
         del self

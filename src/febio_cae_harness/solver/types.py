@@ -633,6 +633,29 @@ def _validate_launch_capability(
             raise SolverConfigurationError("launch capability command binding is invalid")
         if _spec_snapshot(spec) != record.spec_snapshot:
             raise SolverConfigurationError("solver launch specification was modified")
+
+        # Revalidate the exact workspace and intent after every runtime,
+        # input, and specification read.  The earlier revalidation does not
+        # lock these authorities, so a mutation after ``_input_snapshot``
+        # must still be rejected before the caller can read process.json or
+        # launch a process.
+        final_root = Path(os.fspath(attempt))
+        final_case_id = attempt.case_id
+        final_attempt_id = attempt.attempt_id
+        final_intent_case_id = intent.case_id
+        final_intent_id = intent.intent_sha256
+        final_intent_case_root = object.__getattribute__(intent, "_case_workspace").root
+        if (
+            final_root != root
+            or final_case_id != case_id
+            or final_attempt_id != attempt_id
+            or final_intent_case_id != intent_case_id
+            or final_intent_id != intent_id
+            or final_intent_case_root != intent_case_root
+        ):
+            raise SolverConfigurationError(
+                "launch capability authorities changed during validation"
+            )
     except SolverConfigurationError:
         raise
     except Exception as error:
