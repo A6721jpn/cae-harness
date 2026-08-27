@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import threading
 import time
 from pathlib import Path
@@ -50,6 +51,21 @@ def test_store_persists_intent_and_manifest_projection(tmp_path: Path) -> None:
     assert manifest["events"]["count"] == 0
     assert manifest["attempts"] == []
     assert len(manifest["case_sha256"]) == hashlib.sha256().digest_size * 2
+
+
+def test_event_lock_rejects_existing_hard_link_before_writing(tmp_path: Path) -> None:
+    _, case, intent = make_case(tmp_path)
+    outside = tmp_path / "outside-events.lock"
+    outside.write_bytes(b"")
+    target = case.case_root / "90_Temporary" / "events.lock"
+    os.link(outside, target)
+
+    with pytest.raises(EvidenceIntegrityError):
+        EvidenceStore(case, intent)
+
+    assert outside.read_bytes() == b""
+    assert target.read_bytes() == b""
+    assert not (case.case_root / "intent.json").exists()
 
 
 def test_events_are_chained_and_append_only(tmp_path: Path) -> None:
@@ -368,4 +384,69 @@ def test_promotion_is_create_new_and_rejects_duplicate_receipt_use(tmp_path: Pat
 
     assert store.promote_verified(receipt).read_text(encoding="utf-8") == "derived"
     with pytest.raises(FileExistsError):
+        store.promote_verified(receipt)
+
+
+def test_promotion_consumes_receipt_before_copy_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, case, intent = make_case(tmp_path)
+    store = EvidenceStore(case, intent)
+    store.record_attempt("attempt-1")
+    source = case.write_text(
+        Path("90_Temporary") / "attempts" / "attempt-1" / "derived.feb",
+        "derived",
+    )
+    receipt = store.record_verification(
+        source,
+        Path("02_Model") / "derived.feb",
+        attempt_id="attempt-1",
+    )
+    assert receipt is not None
+
+    def fail_copy(*args: object, **kwargs: object) -> Path:
+        del args, kwargs
+        raise OSError("simulated copy failure")
+
+    monkeypatch.setattr(CaseWorkspace, "_copy_create_new", fail_copy)
+    with pytest.raises(OSError, match="simulated copy failure"):
+        store.promote_verified(receipt)
+
+    event_lines = store.events_path.read_text(encoding="utf-8").splitlines()
+    records = [json.loads(line) for line in event_lines]
+    assert records[-1]["event_type"] == "artifact_promotion_consumed"
+    assert records[-1]["previous_sha256"] == records[-2]["sha256"]
+    assert records[-1]["payload"] == records[-2]["payload"]
+    assert str(receipt).endswith(records[-1]["payload"]["evidence_digest"])
+    assert not (case.case_root / "02_Model" / "derived.feb").exists()
+
+    monkeypatch.undo()
+    with pytest.raises(EvidenceIntegrityError):
+        store.promote_verified(receipt)
+
+
+def test_consumed_receipt_cannot_replay_after_destination_is_removed(tmp_path: Path) -> None:
+    _, case, intent = make_case(tmp_path)
+    store = EvidenceStore(case, intent)
+    store.record_attempt("attempt-1")
+    source = case.write_text(
+        Path("90_Temporary") / "attempts" / "attempt-1" / "derived.feb",
+        "derived",
+    )
+    destination = case.case_root / "02_Model" / "derived.feb"
+    receipt = store.record_verification(
+        source,
+        destination,
+        attempt_id="attempt-1",
+    )
+    assert receipt is not None
+
+    assert store.promote_verified(receipt) == destination
+    destination.write_text("tampered", encoding="utf-8")
+    with pytest.raises(EvidenceIntegrityError):
+        store.promote_verified(receipt)
+    destination.unlink()
+
+    with pytest.raises(EvidenceIntegrityError):
         store.promote_verified(receipt)

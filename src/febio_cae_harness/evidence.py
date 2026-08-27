@@ -48,6 +48,7 @@ _VERIFICATION_FIELDS = frozenset(
 _VERIFICATION_STATUSES = frozenset({"failed", "passed"})
 _RECEIPT_PREFIX = "febio-verification-v1:"
 _RECEIPT_FACTORY = object()
+_PROMOTION_CONSUMED_EVENT = "artifact_promotion_consumed"
 
 _LOCAL_EVENT_LOCKS: dict[str, threading.RLock] = {}
 _LOCAL_EVENT_LOCKS_GUARD = threading.Lock()
@@ -164,11 +165,9 @@ def _exclusive_event_lock(lock_path: Path) -> Iterator[None]:
     try:
         try:
             stream = lock_path.open("a+b")
-            stream.seek(0, 2)
-            if stream.tell() == 0:
-                stream.write(b"\0")
-                stream.flush()
-                os.fsync(stream.fileno())
+            metadata = os.fstat(stream.fileno())
+            if metadata.st_nlink != 1:
+                raise EvidenceIntegrityError("event log lock cannot be a hard link")
             stream.seek(0)
             if os.name == "nt":
                 import msvcrt
@@ -280,9 +279,9 @@ class EvidenceStore:
 
         if not isinstance(event_type, str) or not event_type.strip():
             raise ValueError("event_type must be a non-empty string")
-        if event_type == "artifact_verified":
+        if event_type in {"artifact_verified", _PROMOTION_CONSUMED_EVENT}:
             raise EvidenceIntegrityError(
-                "artifact_verified events must be recorded with record_verification"
+                "verification events must be recorded through their dedicated API"
             )
         with self._event_lock():
             self._load_and_validate(None)
@@ -452,8 +451,16 @@ class EvidenceStore:
                 raise EvidenceIntegrityError("verification paths are not canonical")
             if _file_digest(source_path) != expected_sha256:
                 raise EvidenceIntegrityError("verification source digest changed")
+            consumed = self._find_consumed(evidence_digest)
+            if consumed:
+                if not destination_path.exists() and not destination_path.is_symlink():
+                    raise EvidenceIntegrityError("verification receipt has already been consumed")
+                if destination_path.is_file() and _file_digest(destination_path) != expected_sha256:
+                    raise EvidenceIntegrityError("promoted destination changed")
+                raise FileExistsError(destination_path)
             if destination_path.exists() or destination_path.is_symlink():
                 raise FileExistsError(destination_path)
+            self._append_event(_PROMOTION_CONSUMED_EVENT, verification)
             return self.case_workspace._copy_create_new(
                 source_path,
                 destination,
@@ -534,21 +541,18 @@ class EvidenceStore:
         return None
 
     def _events_with_verifications(self) -> list[dict[str, Any]]:
-        try:
-            text = self.events_path.read_text(encoding="utf-8")
-        except OSError as error:
-            raise EvidenceIntegrityError("event log is missing or unreadable") from error
-        events: list[dict[str, Any]] = []
-        for line in text.splitlines():
-            try:
-                event = _as_mapping(json.loads(line), "event")
-            except (json.JSONDecodeError, EvidenceIntegrityError) as error:
-                raise EvidenceIntegrityError("event log contains invalid JSON") from error
-            if event.get("event_type") == "artifact_verified":
-                payload = event.get("payload")
-                if isinstance(payload, dict):
-                    events.append(event)
-        return events
+        events, _ = self._read_events()
+        return [event for event in events if event.get("event_type") == "artifact_verified"]
+
+    def _find_consumed(self, evidence_digest: str) -> bool:
+        events, _ = self._read_events()
+        for event in events:
+            if event.get("event_type") != _PROMOTION_CONSUMED_EVENT:
+                continue
+            payload = event.get("payload")
+            if isinstance(payload, dict) and payload.get("evidence_digest") == evidence_digest:
+                return True
+        return False
 
     def _reject_duplicate_verification(self, payload: Mapping[str, object]) -> None:
         evidence_digest = payload.get("evidence_digest")
@@ -658,6 +662,8 @@ class EvidenceStore:
         events: list[dict[str, Any]] = []
         previous_sha256: str | None = None
         verification_digests: set[str] = set()
+        verification_records: dict[str, dict[str, object]] = {}
+        consumed_digests: set[str] = set()
         for expected_sequence, line in enumerate(text.splitlines(), start=1):
             try:
                 event = _as_mapping(json.loads(line), "event")
@@ -699,9 +705,26 @@ class EvidenceStore:
                 if evidence_digest in verification_digests:
                     raise EvidenceIntegrityError("duplicate artifact verification")
                 verification_digests.add(evidence_digest)
+                verification_records[evidence_digest] = payload
+            elif event["event_type"] == _PROMOTION_CONSUMED_EVENT:
+                payload = self._validate_promotion_consumed_payload(event["payload"])
+                evidence_digest = payload["evidence_digest"]
+                if not isinstance(evidence_digest, str):
+                    raise EvidenceIntegrityError("consumed verification digest is invalid")
+                if evidence_digest in consumed_digests:
+                    raise EvidenceIntegrityError("duplicate consumed verification")
+                if verification_records.get(evidence_digest) != payload:
+                    raise EvidenceIntegrityError("consumed verification binding mismatch")
+                consumed_digests.add(evidence_digest)
             events.append(event)
             previous_sha256 = stored_sha256
         return events, previous_sha256
+
+    def _validate_promotion_consumed_payload(self, value: object) -> dict[str, object]:
+        payload = self._validate_verification_payload(value)
+        if payload["status"] != "passed":
+            raise EvidenceIntegrityError("failed verification cannot be consumed")
+        return payload
 
     def _validate_verification_payload(self, value: object) -> dict[str, object]:
         payload = _as_mapping(value, "artifact verification")
