@@ -7,6 +7,11 @@ from .fbs import (
     FbsValidation,
     validate_requested_fields,
 )
+from .headless import (
+    HeadlessRunDiagnostic,
+    headless_exit_code,
+    run_headless_febio,
+)
 from .log import LogValidation, LogValidator, validate_log, validate_solver_log
 from .runtime import (
     FebioRuntimeDiagnostic,
@@ -35,10 +40,12 @@ from .types import (
 
 __all__ = [
     "FailureClassification",
+    "HeadlessRunDiagnostic",
     "FbsAdapterAuthority",
     "FbsAdapterManager",
     "FbsAdapterProtocol",
     "FbsValidation",
+    "headless_exit_code",
     "LogValidation",
     "LogValidator",
     "FebioRuntimeDiagnostic",
@@ -60,6 +67,7 @@ __all__ = [
     "RuntimeProbeError",
     "probe_febio",
     "probe_runtime",
+    "run_headless_febio",
     "validate_log",
     "validate_requested_fields",
     "validate_solver_log",

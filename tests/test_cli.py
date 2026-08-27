@@ -263,3 +263,87 @@ def test_probe_febio_failure_is_concise_stderr(
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err == "febio-cae: synthetic probe failure\n"
+
+
+def test_run_febio_missing_executable_is_genuine_exit_one(tmp_path: Path) -> None:
+    attempt_root = tmp_path / "attempt"
+    attempt_root.mkdir()
+    input_path = attempt_root / "model.feb"
+    input_path.write_text("synthetic completed FEB", encoding="utf-8")
+
+    completed = _run_cli(
+        "run-febio",
+        "--executable",
+        str(tmp_path / "missing-febio.exe"),
+        "--input",
+        str(input_path),
+        "--attempt-root",
+        str(attempt_root),
+        "--case-id",
+        "case-a",
+        "--intent-id",
+        "intent-a",
+        "--attempt-id",
+        "attempt-a",
+    )
+
+    assert completed.returncode == 1
+    assert completed.stdout == ""
+    assert completed.stderr.startswith("febio-cae: ")
+    assert "does not exist" in completed.stderr
+    assert "Traceback" not in completed.stderr
+
+
+def test_run_febio_reports_fbs_unverified_as_exit_five(tmp_path: Path) -> None:
+    attempt_root = tmp_path / "attempt"
+    attempt_root.mkdir()
+    input_path = attempt_root / "model.feb"
+    input_path.write_text("synthetic completed FEB", encoding="utf-8")
+    probe_script = tmp_path / "probe_runtime.py"
+    probe_script.write_text(
+        "import sys\n"
+        "print('version 4.12.0', flush=True)\n"
+        "assert sys.stdin.readline().strip() == 'quit'\n",
+        encoding="utf-8",
+    )
+    log = "time step 1\ntime = 1.0\nnormal termination\n"
+    solver_code = (
+        "import os; from pathlib import Path; "
+        "Path(os.environ['FEBIO_CAE_HARNESS_LOG']).write_text(" + repr(log) + "); "
+        "Path(os.environ['FEBIO_CAE_HARNESS_XPLT']).write_bytes(b'synthetic xplt')"
+    )
+
+    completed = _run_cli(
+        "run-febio",
+        "--executable",
+        sys.executable,
+        "--input",
+        str(input_path),
+        "--attempt-root",
+        str(attempt_root),
+        "--case-id",
+        "case-a",
+        "--intent-id",
+        "intent-a",
+        "--attempt-id",
+        "attempt-a",
+        "--expected-steps",
+        "1",
+        "--expected-final-time",
+        "1.0",
+        "--timeout-seconds",
+        "5",
+        "--probe-argument=" + str(probe_script),
+        "--argument=-c",
+        "--argument=" + solver_code,
+    )
+
+    assert completed.returncode == 5
+    assert completed.stderr == ""
+    payload = json.loads(completed.stdout)
+    assert payload["classification"] == "FBS_UNVERIFIED"
+    assert payload["official_fbs"] is False
+    assert payload["success"] is False
+    assert payload["state"] == "NORMAL_EXIT"
+    assert payload["return_code"] == 0
+    assert payload["runtime"]["version"] == "4.12.0"
