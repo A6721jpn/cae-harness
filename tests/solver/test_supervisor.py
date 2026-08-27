@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -143,6 +144,8 @@ def test_start_persists_attempt_owned_process_record(
         process_authority = record["process_authority"]
         assert isinstance(process_authority, dict)
         assert process_authority["context_digest"] == record["launch_context_digest"]
+        assert process_authority["root_pid"] == record["pid"]
+        assert process_authority["root_creation_identity"] == record["process_creation_identity"]
         assert "FEBIO_CAE_HARNESS_AUTHORITY_CONTEXT" not in record_path.read_text(encoding="utf-8")
     finally:
         supervisor.cancel()
@@ -269,6 +272,8 @@ class _OrderingAuthority:
             "attempt_binding": "test",
             "name": "test-job",
             "context_digest": self._context_digest,
+            "root_pid": None if self._process is None else self._process.pid,
+            "root_creation_identity": "windows:test",
         }
 
     def child_environment(self) -> dict[str, str]:
@@ -277,8 +282,9 @@ class _OrderingAuthority:
     def child_handle(self) -> int:
         return 9876
 
-    def bind(self, pid: int) -> None:
+    def bind(self, pid: int, expected_creation_identity: str | None = None) -> None:
         assert pid == _OrderingProcess.pid
+        assert expected_creation_identity == "windows:test"
         self._events.append("bind")
 
     def resume(self, pid: int) -> None:
@@ -294,6 +300,9 @@ class _OrderingAuthority:
 
     def close(self) -> None:
         self._events.append("close")
+
+    def drain(self) -> None:
+        self._events.append("drain")
 
 
 def test_windows_persists_bound_record_before_resume(
@@ -321,8 +330,15 @@ def test_windows_persists_bound_record_before_resume(
     monkeypatch.setattr(os, "name", "nt")
     monkeypatch.setattr(subprocess, "STARTUPINFO", StartupInfo, raising=False)
 
-    def fake_create(attempt_root: Path, context_digest: str | None = None) -> _OrderingAuthority:
+    def fake_create(
+        attempt_root: Path,
+        context_digest: str | None = None,
+        *,
+        root_pid: int | None = None,
+        root_creation_identity: str | None = None,
+    ) -> _OrderingAuthority:
         del attempt_root
+        del root_pid, root_creation_identity
         if context_digest is not None:
             authority._context_digest = context_digest
         return authority
@@ -333,7 +349,11 @@ def test_windows_persists_bound_record_before_resume(
         supervisor_module,
         "_process_metadata",
         lambda pid: supervisor_module._ProcessMetadata(
-            str(Path(sys.executable)), "windows:test", True, None
+            str(Path(sys.executable)),
+            "windows:test",
+            True,
+            None,
+            datetime(2026, 1, 1, tzinfo=UTC),
         ),
     )
     original_write = SolverSupervisor._write_process_record
@@ -380,8 +400,15 @@ def test_windows_late_failure_preserves_replaced_process_record(
     monkeypatch.setattr(os, "name", "nt")
     monkeypatch.setattr(subprocess, "STARTUPINFO", StartupInfo, raising=False)
 
-    def fake_create(attempt_root: Path, context_digest: str | None = None) -> _OrderingAuthority:
+    def fake_create(
+        attempt_root: Path,
+        context_digest: str | None = None,
+        *,
+        root_pid: int | None = None,
+        root_creation_identity: str | None = None,
+    ) -> _OrderingAuthority:
         del attempt_root
+        del root_pid, root_creation_identity
         if context_digest is not None:
             authority._context_digest = context_digest
         return authority
@@ -397,7 +424,11 @@ def test_windows_late_failure_preserves_replaced_process_record(
         supervisor_module,
         "_process_metadata",
         lambda pid: supervisor_module._ProcessMetadata(
-            str(Path(sys.executable)), "windows:test", True, None
+            str(Path(sys.executable)),
+            "windows:test",
+            True,
+            None,
+            datetime(2026, 1, 1, tzinfo=UTC),
         ),
     )
     monkeypatch.setattr(authority, "resume", fail_resume)

@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import time
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -180,6 +182,49 @@ def test_reconnect_rejects_tampered_identity_and_escaping_output(tmp_path: Path)
         original.cancel()
 
 
+def test_reconnect_rejects_tampered_started_at(tmp_path: Path) -> None:
+    monkeypatch = pytest.MonkeyPatch()
+    capability = _capability(tmp_path, monkeypatch, code="import time; time.sleep(30)")
+    original = SolverSupervisor(capability).start()
+    record_path = original.process_record_path
+    try:
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        record["start_time"] = datetime(2000, 1, 1, tzinfo=UTC).isoformat()
+        record_path.write_text(json.dumps(record), encoding="utf-8")
+        with pytest.raises(SolverOwnershipError, match="start|identity|authority"):
+            SolverSupervisor.reconnect(capability)
+    finally:
+        original.cancel()
+
+
+def test_normal_exit_drains_owned_descendant_before_releasing_authority(
+    tmp_path: Path,
+) -> None:
+    monkeypatch = pytest.MonkeyPatch()
+    descendant_started = tmp_path / "descendant-started.txt"
+    descendant_survived = tmp_path / "descendant-survived.txt"
+    descendant_code = (
+        "from pathlib import Path; import time; "
+        f"Path({str(descendant_started)!r}).write_text('started', encoding='utf-8'); "
+        "time.sleep(1.0); "
+        f"Path({str(descendant_survived)!r}).write_text('survived', encoding='utf-8')"
+    )
+    root_code = (
+        "import subprocess, sys, time; "
+        f"subprocess.Popen([sys.executable, '-c', {descendant_code!r}]); "
+        "time.sleep(0.1)"
+    )
+    supervisor = SolverSupervisor(_capability(tmp_path, monkeypatch, code=root_code)).start()
+    result = supervisor.wait(timeout_seconds=5)
+    assert result.state is SolverState.NORMAL_EXIT
+    deadline = time.monotonic() + 2.0
+    while not descendant_started.exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    time.sleep(1.2)
+    assert descendant_started.exists()
+    assert not descendant_survived.exists()
+
+
 def test_reconnect_rejects_stale_process_record(tmp_path: Path) -> None:
     monkeypatch = pytest.MonkeyPatch()
     capability = _capability(tmp_path, monkeypatch, code="import time; time.sleep(30)")
@@ -225,6 +270,46 @@ def test_reconnect_rejects_forged_record_for_unrelated_matching_process(
         if unrelated.poll() is None:
             unrelated.terminate()
             unrelated.wait(timeout=5)
+
+
+def test_reconnect_rejects_same_job_descendant_even_when_record_claim_is_forged(
+    tmp_path: Path,
+) -> None:
+    monkeypatch = pytest.MonkeyPatch()
+    descendant_pid_path = tmp_path / "descendant.pid"
+    descendant_code = (
+        "from pathlib import Path; import os, time; "
+        f"Path({str(descendant_pid_path)!r}).write_text(str(os.getpid()), encoding='utf-8'); "
+        "time.sleep(30)"
+    )
+    root_code = (
+        "import subprocess, sys, time; "
+        f"subprocess.Popen([sys.executable, '-c', {descendant_code!r}]); "
+        "time.sleep(30)"
+    )
+    capability = _capability(tmp_path, monkeypatch, code=root_code)
+    original = SolverSupervisor(capability).start()
+    try:
+        deadline = time.monotonic() + 5.0
+        while not descendant_pid_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        descendant_pid = int(descendant_pid_path.read_text(encoding="utf-8"))
+        descendant_metadata = _process_metadata(descendant_pid)
+        assert descendant_metadata.started_at is not None
+        record = json.loads(original.process_record_path.read_text(encoding="utf-8"))
+        record["pid"] = descendant_pid
+        record["process_creation_identity"] = descendant_metadata.creation_identity
+        record["start_time"] = descendant_metadata.started_at.isoformat()
+        process_claim = record["process_authority"]
+        assert isinstance(process_claim, dict)
+        process_claim["root_pid"] = descendant_pid
+        process_claim["root_creation_identity"] = descendant_metadata.creation_identity
+        original.process_record_path.write_text(json.dumps(record), encoding="utf-8")
+
+        with pytest.raises(SolverOwnershipError, match="root|identity|authority"):
+            SolverSupervisor.reconnect(capability)
+    finally:
+        original.cancel()
 
 
 def test_reconnect_rejects_raw_launch_spec_before_record_read_or_file_creation(

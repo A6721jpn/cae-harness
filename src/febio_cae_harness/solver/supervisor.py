@@ -12,7 +12,7 @@ import time
 import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
 
@@ -89,6 +89,7 @@ class _ProcessMetadata:
     creation_identity: str
     alive: bool
     return_code: int | None
+    started_at: datetime | None = None
 
 
 def _normalise_executable(path: str | Path) -> str:
@@ -118,11 +119,13 @@ def _windows_process_metadata(pid: int) -> _ProcessMetadata:
         if not kernel32.GetProcessTimes(handle, *(ctypes.byref(value) for value in times)):
             raise OSError(ctypes.get_last_error(), "unable to query process creation time")
         creation_value = (times[0].dwHighDateTime << 32) | times[0].dwLowDateTime
+        started_at = datetime(1601, 1, 1, tzinfo=UTC) + timedelta(microseconds=creation_value // 10)
         return _ProcessMetadata(
             executable_path=buffer.value,
             creation_identity=f"windows:{creation_value}",
             alive=True,
             return_code=None,
+            started_at=started_at,
         )
     finally:
         kernel32.CloseHandle(handle)
@@ -139,11 +142,30 @@ def _posix_process_metadata(pid: int) -> _ProcessMetadata:
     if len(stat_fields) < 20:
         raise OSError("unable to read process start identity")
     state = stat_fields[0]
+    try:
+        boot_time = next(
+            int(line.split()[1])
+            for line in Path("/proc/stat").read_text(encoding="utf-8").splitlines()
+            if line.startswith("btime ")
+        )
+        sysconf = getattr(os, "sysconf", None)
+        if not callable(sysconf):
+            raise OSError("process clock tick query is unsupported")
+        clock_ticks = int(sysconf("SC_CLK_TCK"))
+        if clock_ticks <= 0 or not stat_fields[19].isdigit():
+            raise ValueError
+        started_at = datetime.fromtimestamp(
+            boot_time + int(stat_fields[19]) / clock_ticks,
+            UTC,
+        )
+    except (OSError, StopIteration, ValueError, TypeError, OverflowError) as error:
+        raise OSError("unable to read process start identity") from error
     return _ProcessMetadata(
         executable_path=executable_path,
         creation_identity=f"posix:{stat_fields[19]}",
         alive=state not in {"Z", "X"},
         return_code=None if state not in {"Z", "X"} else 0,
+        started_at=started_at,
     )
 
 
@@ -476,10 +498,21 @@ class SolverSupervisor:
                         start_new_session=True,
                         pass_fds=pass_fds,
                     )
-                started_at = datetime.now(UTC)
                 metadata = _process_metadata(process.pid)
-                authority.bind(process.pid)
+                authority.bind(process.pid, metadata.creation_identity)
                 bound = True
+                bound_metadata = _process_metadata(process.pid)
+                if (
+                    not bound_metadata.alive
+                    or bound_metadata.creation_identity != metadata.creation_identity
+                ):
+                    raise ProcessAuthorityError(
+                        "process creation identity changed during assignment"
+                    )
+                metadata = bound_metadata
+                if metadata.started_at is None:
+                    raise ProcessAuthorityError("process start identity is unavailable")
+                started_at = metadata.started_at
                 self._revalidate_launch_binding()
                 if os.name == "nt":
                     bound_record = self._make_process_record(
@@ -520,6 +553,9 @@ class SolverSupervisor:
                         with contextlib.suppress(OSError):
                             process.kill()
                 if authority is not None:
+                    if bound and os.name != "nt":
+                        with contextlib.suppress(ProcessAuthorityError):
+                            authority.drain()
                     authority.close()
                 self._state = SolverState.FAILED
                 if isinstance(error, SolverConfigurationError):
@@ -649,6 +685,12 @@ class SolverSupervisor:
         claim = authority.claim
         if claim.get("context_digest") != self._launch_context_digest:
             raise ProcessAuthorityError("process authority context binding is invalid")
+        if claim.get("root_pid") != pid:
+            raise ProcessAuthorityError("process authority root PID binding is invalid")
+        if claim.get("root_creation_identity") != metadata.creation_identity:
+            raise ProcessAuthorityError(
+                "process authority root creation identity binding is invalid"
+            )
         return {
             "case_id": self._case_id,
             "intent_id": self._intent_id,
@@ -739,6 +781,9 @@ class SolverSupervisor:
         if (
             not isinstance(authority_claim, dict)
             or authority_claim.get("context_digest") != self._launch_context_digest
+            or authority_claim.get("root_pid") != record.get("pid")
+            or authority_claim.get("root_creation_identity")
+            != record.get("process_creation_identity")
         ):
             raise SolverOwnershipError("process record authority context does not match")
 
@@ -762,6 +807,8 @@ class SolverSupervisor:
             started_at = datetime.fromisoformat(started_value)
         except ValueError as error:
             raise SolverOwnershipError("process record start time is invalid") from error
+        if started_at.tzinfo is None or started_at.utcoffset() is None:
+            raise SolverOwnershipError("process record start time is invalid")
         output_values = record.get("owned_output_paths")
         if not isinstance(output_values, dict):
             raise SolverOwnershipError("process record output paths are invalid")
@@ -797,9 +844,12 @@ class SolverSupervisor:
         if metadata.creation_identity != identity:
             authority.close()
             raise SolverOwnershipError("current process creation identity does not match")
+        if metadata.started_at is None or metadata.started_at != started_at:
+            authority.close()
+            raise SolverOwnershipError("current process start time does not match")
         if authority is None:  # pragma: no cover - defensive type/state guard
             raise SolverOwnershipError("recorded process authority is unavailable")
-        return metadata, started_at, authority
+        return metadata, metadata.started_at, authority
 
     def _terminate_owned_process(
         self, process: subprocess.Popen[bytes] | _ReconnectedProcess
@@ -827,10 +877,14 @@ class SolverSupervisor:
 
     def _release_process_authority(self) -> None:
         authority = self._process_authority
+        if authority is None:
+            return
+        try:
+            authority.drain()
+            authority.close()
+        except ProcessAuthorityError as error:
+            raise SolverOwnershipError("owned process descendants could not be drained") from error
         self._process_authority = None
-        if authority is not None:
-            with contextlib.suppress(OSError):
-                authority.close()
 
     def _register_result(self, result: SolverRunResult) -> None:
         if type(result) is not SolverRunResult:
