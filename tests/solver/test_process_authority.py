@@ -12,9 +12,14 @@ import pytest
 
 import febio_cae_harness.solver.process_authority as authority_module
 import febio_cae_harness.solver.supervisor as supervisor_module
+from febio_cae_harness.contracts import IntentContract
+from febio_cae_harness.evidence import EvidenceStore
+from febio_cae_harness.solver import headless as headless_module
 from febio_cae_harness.solver.process_authority import ProcessAuthority, ProcessAuthorityError
+from febio_cae_harness.solver.runtime import FebioRuntimeDiagnostic, probe_febio
 from febio_cae_harness.solver.supervisor import SolverSupervisor, _ProcessMetadata
-from febio_cae_harness.solver.types import SolverLaunchError, SolverLaunchSpec
+from febio_cae_harness.solver.types import SolverLaunchCapability, SolverLaunchError
+from febio_cae_harness.workspace import AttemptWorkspace, ValidatedCaseWorkspace
 
 pytestmark = pytest.mark.skipif(os.name != "nt", reason="Windows process ordering")
 
@@ -70,14 +75,48 @@ class _FakeWindowsAuthority:
             self._process._return_code = -15
 
 
-def _spec(tmp_path: Path, code: str = "pass") -> SolverLaunchSpec:
-    input_path = tmp_path / "input.feb"
-    input_path.write_text("synthetic", encoding="utf-8")
-    return SolverLaunchSpec(
-        executable=Path(sys.executable),
-        input_path=input_path,
-        attempt_root=tmp_path / "attempt",
-        arguments=("-c", code),
+def _issued_runtime(monkeypatch: pytest.MonkeyPatch) -> FebioRuntimeDiagnostic:
+    class ProbeProcess:
+        returncode = 0
+
+        def communicate(self, input: bytes, timeout: float) -> tuple[bytes, bytes]:
+            del timeout
+            assert input == b"quit\n"
+            return b"version 4.12.0\n", b""
+
+    with monkeypatch.context() as probe_patch:
+        probe_patch.setattr(
+            "febio_cae_harness.solver.runtime.subprocess.Popen",
+            lambda command, **kwargs: ProbeProcess(),
+        )
+        return probe_febio(Path(sys.executable))
+
+
+def _capability(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    code: str = "pass",
+) -> SolverLaunchCapability:
+    manager = ValidatedCaseWorkspace(tmp_path / "tool", tmp_path / "cae")
+    case = manager.create_case("case-a")
+    store = EvidenceStore(case, IntentContract())
+    store.record_attempt("attempt-a")
+    attempt = AttemptWorkspace._from_manager(
+        case,
+        "attempt-a",
+        case.temporary_root / "attempts" / "attempt-a",
+    )
+    intent = store.issue_intent_snapshot()
+    input_path = attempt.write_text("input.feb", code)
+    runtime = _issued_runtime(monkeypatch)
+    return headless_module._issue_launch_capability(
+        attempt,
+        intent,
+        runtime,
+        input_path,
+        expected_steps=None,
+        expected_final_time=None,
+        timeout_seconds=None,
     )
 
 
@@ -116,7 +155,8 @@ def test_windows_primary_process_is_bound_before_any_child_code_or_resume(
 
     _patch_fake_windows(monkeypatch, authority, events)
 
-    supervisor = SolverSupervisor(_spec(tmp_path))
+    capability = _capability(tmp_path, monkeypatch)
+    supervisor = SolverSupervisor(capability)
     supervisor.start()
     assert events[:3] == ["created-suspended", "bind", "resume"]
 
@@ -135,7 +175,7 @@ def test_windows_immediate_descendant_runs_only_after_primary_binding(
         f"subprocess.Popen([sys.executable, '-c', {descendant_code!r}]); "
         "time.sleep(30)"
     )
-    spec = _spec(tmp_path, child_code)
+    capability = _capability(tmp_path, monkeypatch, child_code)
     binding_observations: list[bool] = []
     native_bind = authority_module._WindowsProcessAuthority.bind
 
@@ -145,7 +185,7 @@ def test_windows_immediate_descendant_runs_only_after_primary_binding(
         binding_observations.append(sentinel.exists())
 
     monkeypatch.setattr(authority_module._WindowsProcessAuthority, "bind", observe_bind)
-    supervisor = SolverSupervisor(spec)
+    supervisor = SolverSupervisor(capability)
     supervisor.start()
     try:
         assert binding_observations == [False, False]
@@ -170,7 +210,8 @@ def test_windows_native_failure_kills_only_created_process_without_authority_rec
         Mock(side_effect=ProcessAuthorityError("bind failed")),
     )
 
-    supervisor = SolverSupervisor(_spec(tmp_path))
+    capability = _capability(tmp_path, monkeypatch)
+    supervisor = SolverSupervisor(capability)
     with pytest.raises(SolverLaunchError):
         supervisor.start()
 

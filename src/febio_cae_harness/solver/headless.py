@@ -18,6 +18,7 @@ from .supervisor import SolverSupervisor
 from .types import (
     SolverClassification,
     SolverConfigurationError,
+    SolverLaunchCapability,
     SolverLaunchSpec,
     SolverState,
 )
@@ -139,26 +140,22 @@ def run_headless_febio(
 ) -> HeadlessRunDiagnostic:
     """Run one attempt using only live, manager-issued context capabilities."""
 
-    case_id, intent_id, attempt_id, root = _validate_context(
+    _, _, _, root = _validate_context(
         attempt_workspace,
         intent_snapshot,
     )
     runtime = validate_runtime_diagnostic(runtime_diagnostic)
     input_file = _validate_input(input_path, root)
-    spec = SolverLaunchSpec(
-        executable=runtime.path,
-        input_path=input_file,
-        attempt_root=root,
-        timeout_seconds=timeout_seconds,
+    capability = _issue_launch_capability(
+        attempt_workspace,
+        intent_snapshot,
+        runtime,
+        input_file,
         expected_steps=expected_steps,
         expected_final_time=expected_final_time,
+        timeout_seconds=timeout_seconds,
     )
-    result = SolverSupervisor(
-        spec,
-        case_id=case_id,
-        intent_id=intent_id,
-        attempt_id=attempt_id,
-    ).run()
+    result = SolverSupervisor(capability).run()
     return HeadlessRunDiagnostic(
         runtime_identity=runtime,
         state=result.state,
@@ -183,26 +180,22 @@ def reconnect_headless_febio(
 ) -> SolverSupervisor:
     """Reconnect to one attempt using the same authority-bound launch contract."""
 
-    case_id, intent_id, attempt_id, root = _validate_context(
+    _, _, _, root = _validate_context(
         attempt_workspace,
         intent_snapshot,
     )
     runtime = validate_runtime_diagnostic(runtime_diagnostic)
     input_file = _validate_input(input_path, root)
-    spec = SolverLaunchSpec(
-        executable=runtime.path,
-        input_path=input_file,
-        attempt_root=root,
-        timeout_seconds=timeout_seconds,
+    capability = _issue_launch_capability(
+        attempt_workspace,
+        intent_snapshot,
+        runtime,
+        input_file,
         expected_steps=expected_steps,
         expected_final_time=expected_final_time,
+        timeout_seconds=timeout_seconds,
     )
-    return SolverSupervisor.reconnect(
-        spec,
-        case_id=case_id,
-        intent_id=intent_id,
-        attempt_id=attempt_id,
-    )
+    return SolverSupervisor.reconnect(capability)
 
 
 def _validate_context(
@@ -230,6 +223,41 @@ def _validate_context(
     if case_id != intent_case_id or intent_case_root != root.parents[2]:
         raise HeadlessConfigurationError("attempt and intent authorities must refer to one case")
     return case_id, intent_id, attempt_id, root
+
+
+def _issue_launch_capability(
+    attempt_workspace: AttemptWorkspace,
+    intent_snapshot: IntentSnapshotAuthority,
+    runtime: FebioRuntimeDiagnostic,
+    input_path: Path,
+    *,
+    expected_steps: int | None,
+    expected_final_time: float | None,
+    timeout_seconds: float | None,
+) -> SolverLaunchCapability:
+    """Build the sole supervisor input after the public boundary checks."""
+
+    # The values are deliberately supplied only by ``_validate_context`` and
+    # ``_validate_input`` in this module.  Keep this issuer private: callers
+    # must not be able to select executable, roots, or context labels.
+    attempt_root = Path(os.fspath(attempt_workspace))
+    spec = SolverLaunchSpec(
+        executable=runtime.path,
+        input_path=input_path,
+        attempt_root=attempt_root,
+        timeout_seconds=timeout_seconds,
+        expected_steps=expected_steps,
+        expected_final_time=expected_final_time,
+    )
+    return SolverLaunchCapability._issue(
+        # The capability itself retains the exact authority objects.  The
+        # arguments are recovered from the validated public call above rather
+        # than from caller-selected paths or labels.
+        attempt_workspace,
+        intent_snapshot,
+        runtime,
+        spec,
+    )
 
 
 def headless_exit_code(diagnostic: HeadlessRunDiagnostic) -> int:

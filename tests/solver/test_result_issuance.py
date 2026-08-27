@@ -9,13 +9,17 @@ from pathlib import Path
 
 import pytest
 
+from febio_cae_harness.contracts import IntentContract
+from febio_cae_harness.evidence import EvidenceStore
+from febio_cae_harness.solver import headless as headless_module
+from febio_cae_harness.solver.runtime import FebioRuntimeDiagnostic, probe_febio
 from febio_cae_harness.solver.supervisor import SolverSupervisor
 from febio_cae_harness.solver.types import (
     SolverClassification,
-    SolverLaunchSpec,
     SolverOwnershipError,
     SolverRunResult,
 )
+from febio_cae_harness.workspace import AttemptWorkspace, ValidatedCaseWorkspace
 
 _NORMAL_LOG = """
 FEBio run
@@ -27,37 +31,63 @@ N O R M A L   T E R M I N A T I O N
 """
 
 
-def _supervisor(tmp_path: Path, *, attempt: str = "attempt-a") -> SolverSupervisor:
-    tmp_path.mkdir(parents=True, exist_ok=True)
-    input_path = tmp_path / "model.feb"
-    log_path = tmp_path / "result.log"
-    xplt_path = tmp_path / "result.xplt"
-    input_path.write_text("synthetic", encoding="utf-8")
-    code = (
-        "from pathlib import Path; "
-        f"Path({str(log_path)!r}).write_text({_NORMAL_LOG!r}); "
-        f"Path({str(xplt_path)!r}).write_bytes(b'synthetic-xplt')"
+def _issued_runtime(monkeypatch: pytest.MonkeyPatch) -> FebioRuntimeDiagnostic:
+    class ProbeProcess:
+        returncode = 0
+
+        def communicate(self, input: bytes, timeout: float) -> tuple[bytes, bytes]:
+            del timeout
+            assert input == b"quit\n"
+            return b"version 4.12.0\n", b""
+
+    with monkeypatch.context() as probe_patch:
+        probe_patch.setattr(
+            "febio_cae_harness.solver.runtime.subprocess.Popen",
+            lambda command, **kwargs: ProbeProcess(),
+        )
+        return probe_febio(Path(sys.executable))
+
+
+def _supervisor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    attempt: str = "attempt-a",
+) -> SolverSupervisor:
+    del attempt
+    manager = ValidatedCaseWorkspace(tmp_path / "tool", tmp_path / "cae")
+    case = manager.create_case("case-a")
+    store = EvidenceStore(case, IntentContract())
+    store.record_attempt("attempt-a")
+    attempt_workspace = AttemptWorkspace._from_manager(
+        case,
+        "attempt-a",
+        case.temporary_root / "attempts" / "attempt-a",
     )
-    spec = SolverLaunchSpec(
-        executable=Path(sys.executable),
-        input_path=input_path,
-        attempt_root=tmp_path,
-        log_path=log_path,
-        xplt_path=xplt_path,
-        arguments=("-c", code),
+    intent = store.issue_intent_snapshot()
+    code = (
+        "import os; from pathlib import Path; "
+        f"Path(os.environ['FEBIO_CAE_HARNESS_LOG']).write_text({_NORMAL_LOG!r}); "
+        "Path(os.environ['FEBIO_CAE_HARNESS_XPLT']).write_bytes(b'synthetic-xplt')"
+    )
+    input_path = attempt_workspace.write_text("model.feb", code)
+    runtime = _issued_runtime(monkeypatch)
+    capability = headless_module._issue_launch_capability(
+        attempt_workspace,
+        intent,
+        runtime,
+        input_path,
         expected_steps=2,
         expected_final_time=1.0,
+        timeout_seconds=None,
     )
-    return SolverSupervisor(
-        spec,
-        case_id="case-a",
-        intent_id="intent-a",
-        attempt_id=attempt,
-    )
+    return SolverSupervisor(capability)
 
 
-def test_terminal_result_is_exactly_issued_and_reused(tmp_path: Path) -> None:
-    supervisor = _supervisor(tmp_path)
+def test_terminal_result_is_exactly_issued_and_reused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = _supervisor(tmp_path, monkeypatch)
 
     result = supervisor.run()
 
@@ -68,8 +98,10 @@ def test_terminal_result_is_exactly_issued_and_reused(tmp_path: Path) -> None:
     assert not result.success
 
 
-def test_caller_results_and_foreign_bindings_are_rejected(tmp_path: Path) -> None:
-    supervisor = _supervisor(tmp_path)
+def test_caller_results_and_foreign_bindings_are_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = _supervisor(tmp_path, monkeypatch)
     result = supervisor.run()
 
     class ResultChild(SolverRunResult):
@@ -87,13 +119,15 @@ def test_caller_results_and_foreign_bindings_are_rejected(tmp_path: Path) -> Non
         with pytest.raises(SolverOwnershipError):
             supervisor._validate_result(candidate)
 
-    foreign = _supervisor(tmp_path / "foreign", attempt="attempt-b")
+    foreign = _supervisor(tmp_path / "foreign", monkeypatch, attempt="attempt-b")
     with pytest.raises(SolverOwnershipError):
         foreign._validate_result(result)
 
 
-def test_tampered_supervisor_binding_and_result_fields_are_rejected(tmp_path: Path) -> None:
-    supervisor = _supervisor(tmp_path)
+def test_tampered_supervisor_binding_and_result_fields_are_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = _supervisor(tmp_path, monkeypatch)
     result = supervisor.run()
 
     object.__setattr__(supervisor, "_result", replace(result))

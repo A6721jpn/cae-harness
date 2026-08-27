@@ -282,7 +282,10 @@ def test_supervisor_rejects_arbitrary_adapter_and_caller_validation(tmp_path: Pa
         arguments=("-c", "pass"),
     )
     with pytest.raises(SolverConfigurationError):
-        SolverSupervisor(spec, fbs_adapter=cast(FbsAdapterAuthority, MappingAdapter()))
+        SolverSupervisor(
+            spec,  # type: ignore[arg-type]
+            fbs_adapter=cast(FbsAdapterAuthority, MappingAdapter()),
+        )
     forged = cast(FbsAdapterAuthority, object.__new__(FbsValidation))
     with pytest.raises(TypeError):
         validate_requested_fields(forged, tmp_path / "attempt.xplt", ("stress",))

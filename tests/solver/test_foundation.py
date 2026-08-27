@@ -8,16 +8,22 @@ from pathlib import Path
 
 import pytest
 
+from febio_cae_harness.contracts import IntentContract
+from febio_cae_harness.evidence import EvidenceStore
 from febio_cae_harness.solver import (
     FbsAdapterManager,
     OutputFreshnessError,
     SolverClassification,
+    SolverLaunchCapability,
     SolverLaunchSpec,
     SolverState,
     SolverSupervisor,
     validate_log,
     validate_requested_fields,
 )
+from febio_cae_harness.solver import headless as headless_module
+from febio_cae_harness.solver.runtime import FebioRuntimeDiagnostic, probe_febio
+from febio_cae_harness.workspace import AttemptWorkspace, ValidatedCaseWorkspace
 
 NORMAL_LOG = """
 FEBio run
@@ -65,6 +71,55 @@ class SyntheticFixtureAdapter:
         return {field: 1.0 for field in fields}
 
 
+def _issued_runtime(monkeypatch: pytest.MonkeyPatch) -> FebioRuntimeDiagnostic:
+    class ProbeProcess:
+        returncode = 0
+
+        def communicate(self, input: bytes, timeout: float) -> tuple[bytes, bytes]:
+            del timeout
+            assert input == b"quit\n"
+            return b"version 4.12.0\n", b""
+
+    with monkeypatch.context() as probe_patch:
+        probe_patch.setattr(
+            "febio_cae_harness.solver.runtime.subprocess.Popen",
+            lambda command, **kwargs: ProbeProcess(),
+        )
+        return probe_febio(Path(sys.executable))
+
+
+def _capability(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    code: str,
+    expected_steps: int | None = None,
+    expected_final_time: float | None = None,
+    timeout_seconds: float | None = None,
+) -> SolverLaunchCapability:
+    manager = ValidatedCaseWorkspace(tmp_path / "tool", tmp_path / "cae")
+    case = manager.create_case("case-a")
+    store = EvidenceStore(case, IntentContract())
+    store.record_attempt("attempt-a")
+    attempt = AttemptWorkspace._from_manager(
+        case,
+        "attempt-a",
+        case.temporary_root / "attempts" / "attempt-a",
+    )
+    intent = store.issue_intent_snapshot()
+    input_path = attempt.write_text("input.feb", code)
+    runtime = _issued_runtime(monkeypatch)
+    return headless_module._issue_launch_capability(
+        attempt,
+        intent,
+        runtime,
+        input_path,
+        expected_steps=expected_steps,
+        expected_final_time=expected_final_time,
+        timeout_seconds=timeout_seconds,
+    )
+
+
 def test_launch_spec_owns_command_and_fresh_attempt_outputs(tmp_path: Path) -> None:
     spec = make_spec(tmp_path, code="pass")
 
@@ -100,10 +155,12 @@ def test_log_validation_classifies_non_success_logs(
     assert not result.valid
 
 
-def test_supervisor_reports_missing_outputs_after_normal_exit(tmp_path: Path) -> None:
-    spec = make_spec(tmp_path, code="pass")
+def test_supervisor_reports_missing_outputs_after_normal_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    capability = _capability(tmp_path, monkeypatch, code="pass")
 
-    result = SolverSupervisor(spec).run()
+    result = SolverSupervisor(capability).run()
 
     assert result.state is SolverState.NORMAL_EXIT
     assert result.return_code == 0
@@ -113,18 +170,26 @@ def test_supervisor_reports_missing_outputs_after_normal_exit(tmp_path: Path) ->
 
 def test_supervisor_validates_log_xplt_and_synthetic_fbs_fields(tmp_path: Path) -> None:
     code = (
-        "from pathlib import Path; "
-        f"Path({str(tmp_path / 'attempt.log')!r}).write_text({NORMAL_LOG!r}); "
-        f"Path({str(tmp_path / 'attempt.xplt')!r}).write_bytes(b'xplt')"
+        "import os; from pathlib import Path; "
+        f"Path(os.environ['FEBIO_CAE_HARNESS_LOG']).write_text({NORMAL_LOG!r}); "
+        "Path(os.environ['FEBIO_CAE_HARNESS_XPLT']).write_bytes(b'xplt')"
     )
-    spec = make_spec(tmp_path, code=code, requested_fields=("displacement",))
+    monkeypatch = pytest.MonkeyPatch()
+    capability = _capability(
+        tmp_path,
+        monkeypatch,
+        code=code,
+        expected_steps=2,
+        expected_final_time=1.0,
+    )
     authority = FbsAdapterManager(
-        SyntheticVectorFixtureAdapter(), "synthetic-fixture", tmp_path
+        SyntheticVectorFixtureAdapter(), "synthetic-fixture", capability.spec.attempt_root
     ).issue_authority()
 
     result = SolverSupervisor(
-        spec,
+        capability,
         fbs_adapter=authority,
+        requested_fields=("displacement",),
     ).run()
 
     assert result.state is SolverState.NORMAL_EXIT
@@ -138,18 +203,26 @@ def test_supervisor_validates_log_xplt_and_synthetic_fbs_fields(tmp_path: Path) 
 
 def test_synthetic_fbs_adapter_is_not_reported_as_official(tmp_path: Path) -> None:
     code = (
-        "from pathlib import Path; "
-        f"Path({str(tmp_path / 'attempt.log')!r}).write_text({NORMAL_LOG!r}); "
-        f"Path({str(tmp_path / 'attempt.xplt')!r}).write_bytes(b'xplt')"
+        "import os; from pathlib import Path; "
+        f"Path(os.environ['FEBIO_CAE_HARNESS_LOG']).write_text({NORMAL_LOG!r}); "
+        "Path(os.environ['FEBIO_CAE_HARNESS_XPLT']).write_bytes(b'xplt')"
     )
-    spec = make_spec(tmp_path, code=code, requested_fields=("displacement",))
+    monkeypatch = pytest.MonkeyPatch()
+    capability = _capability(
+        tmp_path,
+        monkeypatch,
+        code=code,
+        expected_steps=2,
+        expected_final_time=1.0,
+    )
     authority = FbsAdapterManager(
-        SyntheticFixtureAdapter(), "synthetic-fixture", tmp_path
+        SyntheticFixtureAdapter(), "synthetic-fixture", capability.spec.attempt_root
     ).issue_authority()
 
     result = SolverSupervisor(
-        spec,
+        capability,
         fbs_adapter=authority,
+        requested_fields=("displacement",),
     ).run()
 
     assert result.fbs_validation is not None
@@ -180,17 +253,28 @@ def test_fbs_boundary_rejects_non_finite_requested_field(tmp_path: Path) -> None
     assert result.non_finite_fields == ("stress",)
 
 
-def test_supervisor_timeout_and_cancel_are_owned_states(tmp_path: Path) -> None:
-    spec = make_spec(tmp_path, code="import time; time.sleep(30)", timeout_seconds=0.05)
+def test_supervisor_timeout_and_cancel_are_owned_states(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    capability = _capability(
+        tmp_path,
+        monkeypatch,
+        code="import time; time.sleep(30)",
+        timeout_seconds=0.05,
+    )
 
-    result = SolverSupervisor(spec).run()
+    result = SolverSupervisor(capability).run()
 
     assert result.state is SolverState.TIMED_OUT
     assert result.classification is SolverClassification.TIMEOUT
     assert not result.success
 
-    spec2 = make_spec(tmp_path / "cancel", code="import time; time.sleep(30)")
-    supervisor = SolverSupervisor(spec2)
+    capability2 = _capability(
+        tmp_path / "cancel",
+        monkeypatch,
+        code="import time; time.sleep(30)",
+    )
+    supervisor = SolverSupervisor(capability2)
     supervisor.start()
     time.sleep(0.05)
     cancelled = supervisor.cancel()

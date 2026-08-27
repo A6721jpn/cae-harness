@@ -4,6 +4,7 @@ import inspect
 import os
 import stat
 import sys
+from copy import copy, deepcopy
 from pathlib import Path
 
 import pytest
@@ -21,8 +22,11 @@ from febio_cae_harness.solver.runtime import (
     RuntimeProbeError,
     probe_febio,
 )
+from febio_cae_harness.solver.supervisor import SolverSupervisor
 from febio_cae_harness.solver.types import (
     SolverClassification,
+    SolverConfigurationError,
+    SolverLaunchCapability,
     SolverLaunchSpec,
     SolverRunResult,
     SolverState,
@@ -171,18 +175,16 @@ def test_headless_derives_context_and_preserves_fbs_unverified(
 ) -> None:
     attempt, intent, input_path = _authority_context(tmp_path, case_id="case-a")
     runtime = _issued_runtime(tmp_path, monkeypatch)
-    observed: dict[str, object] = {}
-    captured_spec: SolverLaunchSpec | None = None
+    captured_capability: SolverLaunchCapability | None = None
 
     class FakeSupervisor:
-        def __init__(self, spec: SolverLaunchSpec, **context: object) -> None:
-            nonlocal captured_spec
-            captured_spec = spec
-            observed.update(context)
+        def __init__(self, capability: SolverLaunchCapability) -> None:
+            nonlocal captured_capability
+            captured_capability = capability
 
         def run(self) -> SolverRunResult:
-            assert captured_spec is not None
-            spec = captured_spec
+            assert captured_capability is not None
+            spec = captured_capability.spec
             outputs = spec.expected_outputs
             return SolverRunResult(
                 state=SolverState.NORMAL_EXIT,
@@ -197,11 +199,8 @@ def test_headless_derives_context_and_preserves_fbs_unverified(
     monkeypatch.setattr(headless_module, "SolverSupervisor", FakeSupervisor)
     diagnostic = run_headless_febio(attempt, intent, runtime, input_path)
 
-    assert captured_spec is not None
-    spec = captured_spec
-    assert observed["case_id"] == attempt.case_id
-    assert observed["intent_id"] == intent.intent_sha256
-    assert observed["attempt_id"] == attempt.attempt_id
+    assert captured_capability is not None
+    spec = captured_capability.spec
     assert spec.attempt_root == attempt.root
     assert spec.input_path == input_path
     assert spec.command == (os.fspath(runtime.path), "-i", os.fspath(input_path))
@@ -209,3 +208,87 @@ def test_headless_derives_context_and_preserves_fbs_unverified(
     assert diagnostic.classification is SolverClassification.FBS_UNVERIFIED
     assert diagnostic.success is False
     assert headless_exit_code(diagnostic) == 5
+
+
+def _capture_capability(
+    attempt: AttemptWorkspace,
+    intent: IntentSnapshotAuthority,
+    runtime: FebioRuntimeDiagnostic,
+    input_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> SolverLaunchCapability:
+    captured: SolverLaunchCapability | None = None
+
+    class CapturingSupervisor:
+        def __init__(self, capability: SolverLaunchCapability) -> None:
+            nonlocal captured
+            captured = capability
+
+        def run(self) -> SolverRunResult:
+            assert captured is not None
+            outputs = captured.spec.expected_outputs
+            return SolverRunResult(
+                state=SolverState.NORMAL_EXIT,
+                classification=SolverClassification.FBS_UNVERIFIED,
+                return_code=0,
+                pid=123,
+                command=captured.spec.command,
+                log_path=outputs.log_path,
+                xplt_path=outputs.xplt_path,
+            )
+
+    monkeypatch.setattr(headless_module, "SolverSupervisor", CapturingSupervisor)
+    run_headless_febio(attempt, intent, runtime, input_path)
+    assert captured is not None
+    return captured
+
+
+def test_launch_capability_cannot_be_copied_or_reused_as_a_forgery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempt, intent, input_path = _authority_context(tmp_path, case_id="case-a")
+    runtime = _issued_runtime(tmp_path, monkeypatch)
+    capability = _capture_capability(attempt, intent, runtime, input_path, monkeypatch)
+
+    for operation in (copy, deepcopy):
+        with pytest.raises(TypeError):
+            operation(capability)
+
+    object.__setattr__(capability, "_runtime_diagnostic", object())
+    with pytest.raises(SolverConfigurationError, match="binding|state|issued"):
+        SolverSupervisor(capability)
+
+
+@pytest.mark.parametrize("authority", ("attempt", "intent", "runtime", "input"))
+def test_stale_or_mutated_launch_authority_is_rejected_before_file_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    authority: str,
+) -> None:
+    attempt, intent, input_path = _authority_context(tmp_path, case_id="case-a")
+    runtime = _issued_runtime(tmp_path, monkeypatch)
+    capability = _capture_capability(attempt, intent, runtime, input_path, monkeypatch)
+    root = attempt.root
+
+    if authority == "attempt":
+        object.__setattr__(attempt, "root", root.parent / "attempt-b")
+    elif authority == "intent":
+        store = object.__getattribute__(intent, "_store")
+        store.record_attempt("attempt-b")
+    elif authority == "runtime":
+        object.__setattr__(runtime, "version", "4.12.1")
+    else:
+        input_path.write_text("mutated synthetic input", encoding="utf-8")
+
+    def unexpected_popen(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise AssertionError("stale launch authority reached Popen")
+
+    monkeypatch.setattr("febio_cae_harness.solver.supervisor.subprocess.Popen", unexpected_popen)
+    with pytest.raises(SolverConfigurationError, match="authority|binding|stale|live"):
+        SolverSupervisor(capability)
+
+    assert not (root / "process.json").exists()
+    assert not (root / "model.log").exists()
+    assert not (root / "model.xplt").exists()

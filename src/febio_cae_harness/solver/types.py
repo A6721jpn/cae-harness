@@ -8,6 +8,7 @@ implementation.  FBS reads enter through the injected adapter boundary in
 
 from __future__ import annotations
 
+import hashlib
 import math
 import os
 import stat
@@ -17,7 +18,7 @@ from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, SupportsIndex
 
 if TYPE_CHECKING:
     from .fbs import FbsValidation
@@ -32,6 +33,7 @@ __all__ = [
     "SolverClassification",
     "SolverConfigurationError",
     "SolverLaunchError",
+    "SolverLaunchCapability",
     "SolverLaunchSpec",
     "SolverOwnershipError",
     "SolverRunResult",
@@ -322,6 +324,297 @@ class SolverLaunchSpec:
 
     def prepare_outputs(self) -> OutputExpectation:
         return self.expected_outputs.prepare()
+
+
+_LAUNCH_CAPABILITY_FACTORY = object()
+
+
+class SolverLaunchCapability:
+    """Opaque, authority-bound launch contract for one solver attempt.
+
+    ``SolverLaunchSpec`` remains a useful value object for describing command
+    details in lower-level tests and diagnostics, but it is deliberately not a
+    supervisor input.  A capability can only be made by the private headless
+    boundary after it has validated the live workspace, intent, runtime, and
+    input authorities.  The registry and immutable snapshots let the
+    supervisor reject forged, copied, or mutated capability state before it
+    touches the attempt filesystem.
+    """
+
+    __slots__ = (
+        "_spec",
+        "_attempt_workspace",
+        "_intent_snapshot",
+        "_runtime_diagnostic",
+    )
+    _spec: SolverLaunchSpec
+    _attempt_workspace: object
+    _intent_snapshot: object
+    _runtime_diagnostic: object
+
+    def __new__(
+        cls,
+        *args: object,
+        _factory: object | None = None,
+        **kwargs: object,
+    ) -> SolverLaunchCapability:
+        del args, kwargs
+        if cls is not SolverLaunchCapability or _factory is not _LAUNCH_CAPABILITY_FACTORY:
+            raise TypeError("solver launch capabilities are issued by the headless boundary")
+        return super().__new__(cls)
+
+    def __init__(
+        self,
+        *args: object,
+        _factory: object | None = None,
+        **kwargs: object,
+    ) -> None:
+        del args, kwargs
+        if _factory is not _LAUNCH_CAPABILITY_FACTORY:
+            raise TypeError("solver launch capabilities are issued by the headless boundary")
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        del kwargs
+        raise TypeError("solver launch capabilities cannot be subclassed")
+
+    def __setattr__(self, name: str, value: object) -> None:
+        del name, value
+        raise AttributeError("solver launch capabilities are immutable")
+
+    def __delattr__(self, name: str) -> None:
+        del name
+        raise AttributeError("solver launch capabilities are immutable")
+
+    def __copy__(self) -> SolverLaunchCapability:
+        raise TypeError("solver launch capabilities cannot be copied")
+
+    def __deepcopy__(self, memo: dict[int, object]) -> SolverLaunchCapability:
+        del memo
+        raise TypeError("solver launch capabilities cannot be copied")
+
+    def __reduce__(self) -> str | tuple[Any, ...]:
+        raise TypeError("solver launch capabilities cannot be serialized")
+
+    def __reduce_ex__(self, protocol: SupportsIndex) -> str | tuple[Any, ...]:
+        del protocol
+        raise TypeError("solver launch capabilities cannot be serialized")
+
+    def __getstate__(self) -> object:
+        raise TypeError("solver launch capability state is not transferable")
+
+    @classmethod
+    def _issue(
+        cls,
+        attempt_workspace: object,
+        intent_snapshot: object,
+        runtime_diagnostic: object,
+        spec: SolverLaunchSpec,
+    ) -> SolverLaunchCapability:
+        """Create a capability for the private headless boundary only."""
+
+        if cls is not SolverLaunchCapability:
+            raise TypeError("solver launch capabilities cannot be subclassed")
+        if type(spec) is not SolverLaunchSpec:
+            raise TypeError("solver launch capability requires an exact launch spec")
+        capability = cls(_factory=_LAUNCH_CAPABILITY_FACTORY)
+        object.__setattr__(capability, "_spec", spec)
+        object.__setattr__(capability, "_attempt_workspace", attempt_workspace)
+        object.__setattr__(capability, "_intent_snapshot", intent_snapshot)
+        object.__setattr__(capability, "_runtime_diagnostic", runtime_diagnostic)
+        _LAUNCH_CAPABILITY_REGISTRY[id(capability)] = _LaunchCapabilityRecord(
+            capability=capability,
+            spec=spec,
+            spec_snapshot=_spec_snapshot(spec),
+            attempt_workspace=attempt_workspace,
+            intent_snapshot=intent_snapshot,
+            runtime_diagnostic=runtime_diagnostic,
+            attempt_root=spec.attempt_root,
+            input_path=spec.input_path,
+            input_snapshot=_input_snapshot(spec.input_path),
+        )
+        return capability
+
+    @property
+    def spec(self) -> SolverLaunchSpec:
+        return _require_issued_launch_capability(self).spec
+
+
+@dataclass(frozen=True, slots=True)
+class _LaunchCapabilityRecord:
+    capability: SolverLaunchCapability
+    spec: SolverLaunchSpec
+    spec_snapshot: tuple[object, ...]
+    attempt_workspace: object
+    intent_snapshot: object
+    runtime_diagnostic: object
+    attempt_root: Path
+    input_path: Path
+    input_snapshot: tuple[object, ...]
+
+
+_LAUNCH_CAPABILITY_REGISTRY: dict[int, _LaunchCapabilityRecord] = {}
+
+
+def _spec_snapshot(spec: SolverLaunchSpec) -> tuple[object, ...]:
+    return (
+        spec.executable,
+        spec.input_path,
+        spec.attempt_root,
+        spec.log_path,
+        spec.xplt_path,
+        spec.arguments,
+        spec.working_directory,
+        tuple(spec.environment.items()),
+        spec.timeout_seconds,
+        spec.expected_steps,
+        spec.expected_final_time,
+        spec.requested_fields,
+    )
+
+
+def _input_snapshot(path: Path) -> tuple[object, ...]:
+    """Capture a regular input's identity and bytes without changing it."""
+
+    _reject_alias(path, "solver input")
+    try:
+        metadata = path.lstat()
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise SolverConfigurationError("solver input must be a regular, unlinked file")
+        with path.open("rb") as stream:
+            opened = os.fstat(stream.fileno())
+            if (
+                opened.st_dev,
+                opened.st_ino,
+                opened.st_nlink,
+                opened.st_size,
+            ) != (
+                metadata.st_dev,
+                metadata.st_ino,
+                metadata.st_nlink,
+                metadata.st_size,
+            ):
+                raise SolverConfigurationError("solver input changed while opening")
+            digest = hashlib.sha256()
+            while chunk := stream.read(1024 * 1024):
+                digest.update(chunk)
+            finished = os.fstat(stream.fileno())
+    except SolverConfigurationError:
+        raise
+    except OSError as error:
+        raise SolverConfigurationError(f"unable to inspect solver input: {path}") from error
+    if (
+        finished.st_dev,
+        finished.st_ino,
+        finished.st_nlink,
+        finished.st_size,
+    ) != (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_nlink,
+        metadata.st_size,
+    ):
+        raise SolverConfigurationError("solver input changed while reading")
+    return (
+        int(metadata.st_dev),
+        int(metadata.st_ino),
+        int(metadata.st_nlink),
+        int(metadata.st_size),
+        int(metadata.st_mtime_ns),
+        digest.hexdigest(),
+    )
+
+
+def _require_issued_launch_capability(value: object) -> _LaunchCapabilityRecord:
+    if type(value) is not SolverLaunchCapability:
+        raise SolverConfigurationError(
+            "solver supervisor requires an exact issued launch capability"
+        )
+    record = _LAUNCH_CAPABILITY_REGISTRY.get(id(value))
+    if record is None or record.capability is not value:
+        raise SolverConfigurationError("solver launch capability was not issued by the boundary")
+    capability = value
+    try:
+        if (
+            capability._spec is not record.spec
+            or capability._attempt_workspace is not record.attempt_workspace
+            or capability._intent_snapshot is not record.intent_snapshot
+            or capability._runtime_diagnostic is not record.runtime_diagnostic
+        ):
+            raise SolverConfigurationError("solver launch capability binding was changed")
+    except AttributeError as error:
+        raise SolverConfigurationError("solver launch capability state is invalid") from error
+    if _spec_snapshot(record.spec) != record.spec_snapshot:
+        raise SolverConfigurationError("solver launch specification was modified")
+    return record
+
+
+def _validate_launch_capability(
+    value: object,
+) -> tuple[_LaunchCapabilityRecord, str, str, str, Path]:
+    """Validate every live authority bound into a capability."""
+
+    record = _require_issued_launch_capability(value)
+    spec = record.spec
+    try:
+        from ..evidence import IntentSnapshotAuthority
+        from ..workspace import AttemptWorkspace
+        from .runtime import validate_runtime_diagnostic
+
+        attempt = record.attempt_workspace
+        intent = record.intent_snapshot
+        runtime = record.runtime_diagnostic
+        if type(attempt) is not AttemptWorkspace:
+            raise SolverConfigurationError("launch capability attempt is not an exact workspace")
+        if type(intent) is not IntentSnapshotAuthority:
+            raise SolverConfigurationError("launch capability intent is not an exact authority")
+        root = Path(os.fspath(attempt))
+        if root != record.attempt_root or root != spec.attempt_root:
+            raise SolverConfigurationError("launch capability attempt root binding changed")
+        case_id = attempt.case_id
+        attempt_id = attempt.attempt_id
+        intent_case_id = intent.case_id
+        intent_id = intent.intent_sha256
+        intent_case_root = object.__getattribute__(intent, "_case_workspace").root
+        if case_id != intent_case_id or intent_case_root != root.parents[2]:
+            raise SolverConfigurationError("launch capability authorities refer to different cases")
+        if not isinstance(case_id, str) or not case_id.strip():
+            raise SolverConfigurationError("launch capability case identity is invalid")
+        if not isinstance(attempt_id, str) or not attempt_id.strip():
+            raise SolverConfigurationError("launch capability attempt identity is invalid")
+        if not isinstance(intent_id, str) or not intent_id.strip():
+            raise SolverConfigurationError("launch capability intent identity is invalid")
+        validated_runtime = validate_runtime_diagnostic(runtime)
+        input_path = spec.input_path
+        if input_path != record.input_path:
+            raise SolverConfigurationError("launch capability input binding changed")
+        if input_path == root or not input_path.is_relative_to(root):
+            raise SolverConfigurationError("solver input must be inside the attempt root")
+        root_metadata = root.lstat()
+        if not stat.S_ISDIR(root_metadata.st_mode):
+            raise SolverConfigurationError("attempt root is not a directory")
+        current_input = _input_snapshot(input_path)
+        if current_input != record.input_snapshot:
+            raise SolverConfigurationError("solver input authority is stale")
+        expected_log = root / f"{input_path.stem}.log"
+        expected_xplt = root / f"{input_path.stem}.xplt"
+        if (
+            spec.executable != validated_runtime.path
+            or spec.arguments != ()
+            or spec.environment
+            or spec.working_directory != root
+            or spec.log_path != expected_log
+            or spec.xplt_path != expected_xplt
+        ):
+            raise SolverConfigurationError("launch capability command binding is invalid")
+        if _spec_snapshot(spec) != record.spec_snapshot:
+            raise SolverConfigurationError("solver launch specification was modified")
+    except SolverConfigurationError:
+        raise
+    except Exception as error:
+        raise SolverConfigurationError(
+            "solver launch capability authorities are not live"
+        ) from error
+    return record, case_id, intent_id, attempt_id, root
 
 
 @dataclass(frozen=True, slots=True)

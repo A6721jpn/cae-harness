@@ -29,11 +29,13 @@ from .types import (
     OutputFreshnessError,
     SolverClassification,
     SolverConfigurationError,
+    SolverLaunchCapability,
     SolverLaunchError,
     SolverLaunchSpec,
     SolverOwnershipError,
     SolverRunResult,
     SolverState,
+    _validate_launch_capability,
 )
 
 __all__ = ["SolverSupervisor"]
@@ -212,24 +214,24 @@ class SolverSupervisor:
 
     def __init__(
         self,
-        spec: SolverLaunchSpec,
+        launch_capability: SolverLaunchCapability,
         *,
-        case_id: str | None = None,
-        intent_id: str | None = None,
-        attempt_id: str | None = None,
         fbs_adapter: FbsAdapterAuthority | None = None,
         requested_fields: Iterable[str] | None = None,
         log_validator: LogValidator | None = None,
     ) -> None:
-        self.spec = spec
-        if any(
-            value is not None and (not isinstance(value, str) or not value.strip())
-            for value in (case_id, intent_id, attempt_id)
-        ):
-            raise SolverConfigurationError("context identifiers must be non-empty strings")
-        self._case_id = case_id or ""
-        self._intent_id = intent_id or ""
-        self._attempt_id = attempt_id or spec.attempt_root.name
+        (
+            _capability_record,
+            case_id,
+            intent_id,
+            attempt_id,
+            _attempt_root,
+        ) = _validate_launch_capability(launch_capability)
+        self._launch_capability = launch_capability
+        self.spec = _capability_record.spec
+        self._case_id = case_id
+        self._intent_id = intent_id
+        self._attempt_id = attempt_id
         if fbs_adapter is not None:
             try:
                 _authority_record(fbs_adapter)
@@ -239,7 +241,7 @@ class SolverSupervisor:
                 ) from error
         self._fbs_adapter = fbs_adapter
         self._requested_fields = (
-            tuple(requested_fields) if requested_fields is not None else spec.requested_fields
+            tuple(requested_fields) if requested_fields is not None else self.spec.requested_fields
         )
         self._log_validator = log_validator
         self._owner_token = uuid.uuid4().hex
@@ -288,6 +290,24 @@ class SolverSupervisor:
         with self._lock:
             if self._state is not SolverState.NOT_STARTED:
                 raise RuntimeError(f"solver cannot start from state {self._state}")
+
+            # Revalidate every authority immediately before the first mutation
+            # of the attempt directory or process creation.
+            (
+                capability_record,
+                case_id,
+                intent_id,
+                attempt_id,
+                _attempt_root,
+            ) = _validate_launch_capability(self._launch_capability)
+            if capability_record.spec is not self.spec:
+                raise SolverConfigurationError("supervisor launch binding is invalid")
+            if (case_id, intent_id, attempt_id) != (
+                self._case_id,
+                self._intent_id,
+                self._attempt_id,
+            ):
+                raise SolverConfigurationError("supervisor authority binding is invalid")
 
             authority: ProcessAuthority | None = None
             try:
@@ -399,11 +419,8 @@ class SolverSupervisor:
     @classmethod
     def reconnect(
         cls,
-        spec: SolverLaunchSpec,
+        launch_capability: SolverLaunchCapability,
         *,
-        case_id: str | None = None,
-        intent_id: str | None = None,
-        attempt_id: str | None = None,
         fbs_adapter: FbsAdapterAuthority | None = None,
         requested_fields: Iterable[str] | None = None,
         log_validator: LogValidator | None = None,
@@ -411,10 +428,7 @@ class SolverSupervisor:
         """Rebuild a supervisor only after validating its owned record."""
 
         supervisor = cls(
-            spec,
-            case_id=case_id,
-            intent_id=intent_id,
-            attempt_id=attempt_id,
+            launch_capability,
             fbs_adapter=fbs_adapter,
             requested_fields=requested_fields,
             log_validator=log_validator,

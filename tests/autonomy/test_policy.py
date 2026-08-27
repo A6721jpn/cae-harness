@@ -4,10 +4,12 @@ import inspect
 import json
 import pickle
 import sys
+import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from copy import copy, deepcopy
 from dataclasses import is_dataclass, replace
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -42,8 +44,10 @@ from febio_cae_harness.evidence import (
     EvidenceStore,
     IntentSnapshotAuthority,
 )
+from febio_cae_harness.solver import headless as headless_module
+from febio_cae_harness.solver.runtime import probe_febio
 from febio_cae_harness.solver.supervisor import SolverSupervisor
-from febio_cae_harness.solver.types import SolverClassification, SolverLaunchSpec
+from febio_cae_harness.solver.types import SolverClassification
 from febio_cae_harness.workspace import (
     AttemptWorkspace,
     ValidatedCaseWorkspace,
@@ -108,32 +112,54 @@ def timeout_supervisor(
     case_id: str = "case-a",
     classification: SolverClassification | None = None,
 ) -> SolverSupervisor:
-    tmp_path.mkdir(parents=True, exist_ok=True)
-    input_path = tmp_path / "input.feb"
-    attempt_root = tmp_path / attempt_id
-    input_path.write_text("synthetic", encoding="utf-8")
-    arguments = ("-c", "import time; time.sleep(30)")
+    workspace_temp = tempfile.TemporaryDirectory(prefix="h3-", dir=tmp_path.parent.parent)
+    workspace_root = Path(workspace_temp.name)
+    manager = ValidatedCaseWorkspace(workspace_root / "t", workspace_root / "c")
+    case = manager.create_case(case_id)
+    store = EvidenceStore(case, IntentContract())
+    store.record_attempt(attempt_id)
+    attempt = AttemptWorkspace._from_manager(
+        case,
+        attempt_id,
+        case.temporary_root / "attempts" / attempt_id,
+    )
+    intent = store.issue_intent_snapshot()
     if classification is not None:
-        log_path = attempt_root / "input.log"
-        xplt_path = attempt_root / "input.xplt"
-        arguments = (
-            "-c",
-            "from pathlib import Path; "
-            f"Path({str(log_path)!r}).write_text('synthetic'); "
-            f"Path({str(xplt_path)!r}).write_bytes(b'synthetic-xplt')",
+        code = (
+            "import os; from pathlib import Path; "
+            "Path(os.environ['FEBIO_CAE_HARNESS_LOG']).write_text('synthetic'); "
+            "Path(os.environ['FEBIO_CAE_HARNESS_XPLT']).write_bytes(b'synthetic-xplt')"
         )
-    spec = SolverLaunchSpec(
-        executable=Path(sys.executable),
-        input_path=input_path,
-        attempt_root=attempt_root,
-        arguments=arguments,
+    else:
+        code = "import time; time.sleep(30)"
+    input_path = attempt.write_text("input.feb", code)
+
+    class ProbeProcess:
+        returncode = 0
+
+        def communicate(self, input: bytes, timeout: float) -> tuple[bytes, bytes]:
+            del timeout
+            assert input == b"quit\n"
+            return b"version 4.12.0\n", b""
+
+    with patch(
+        "febio_cae_harness.solver.runtime.subprocess.Popen",
+        lambda command, **kwargs: ProbeProcess(),
+    ):
+        runtime = probe_febio(Path(sys.executable))
+    capability = headless_module._issue_launch_capability(
+        attempt,
+        intent,
+        runtime,
+        input_path,
+        expected_steps=None,
+        expected_final_time=None,
+        timeout_seconds=None,
     )
-    supervisor = SolverSupervisor(
-        spec,
-        case_id=case_id,
-        intent_id="intent-a",
-        attempt_id=attempt_id,
-    )
+    supervisor = SolverSupervisor(capability)
+    # Keep the short synthetic workspace alive for the supervisor lifetime;
+    # this also avoids Windows MAX_PATH noise from pytest's long test names.
+    object.__setattr__(supervisor, "_test_workspace_temp", workspace_temp)
     if classification is not None:
 
         class SyntheticLogValidator:
@@ -713,9 +739,9 @@ def test_execution_policy_handles_timeout_cancel_and_disconnect_resume(tmp_path:
     supervisor = timeout_supervisor(tmp_path / "execution")
     supervisor.start()
     running = ExecutionContext(
-        case_id="case-a",
-        intent_id="intent-a",
-        attempt_id="attempt-a",
+        case_id=supervisor._case_id,
+        intent_id=supervisor._intent_id,
+        attempt_id=supervisor._attempt_id,
         process_owned=True,
         process_running=True,
         supervisor=supervisor,
@@ -1028,10 +1054,11 @@ def test_execution_authority_rejects_mismatched_context_and_tampered_supervisor(
 ) -> None:
     supervisor = timeout_supervisor(tmp_path / "execution-authority")
     supervisor.start()
+    original_case_id = supervisor._case_id
     context = ExecutionContext(
-        case_id="case-a",
-        intent_id="intent-a",
-        attempt_id="attempt-a",
+        case_id=supervisor._case_id,
+        intent_id=supervisor._intent_id,
+        attempt_id=supervisor._attempt_id,
         process_owned=True,
         process_running=True,
         supervisor=supervisor,
@@ -1042,5 +1069,5 @@ def test_execution_authority_rejects_mismatched_context_and_tampered_supervisor(
         object.__setattr__(supervisor, "_case_id", "case-b")
         assert decide_execution(ExecutionSignal.TIMEOUT, context).action is ExecutionAction.STOP
     finally:
-        object.__setattr__(supervisor, "_case_id", "case-a")
+        object.__setattr__(supervisor, "_case_id", original_case_id)
         supervisor.cancel()

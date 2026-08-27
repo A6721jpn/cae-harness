@@ -7,9 +7,12 @@ import sys
 from dataclasses import replace
 from pathlib import Path
 from typing import cast
+from unittest.mock import patch
 
 import pytest
 
+from febio_cae_harness.contracts import IntentContract
+from febio_cae_harness.evidence import EvidenceStore
 from febio_cae_harness.reporting import (
     AttemptIdentity,
     EvidenceKind,
@@ -20,10 +23,14 @@ from febio_cae_harness.reporting.authority import _require_issued_authority
 from febio_cae_harness.solver import (
     FbsAdapterManager,
     FbsValidation,
-    SolverLaunchSpec,
     SolverRunResult,
     SolverSupervisor,
 )
+from febio_cae_harness.solver import (
+    headless as headless_module,
+)
+from febio_cae_harness.solver.runtime import probe_febio
+from febio_cae_harness.workspace import AttemptWorkspace, ValidatedCaseWorkspace
 
 
 class _Adapter:
@@ -34,35 +41,50 @@ class _Adapter:
 def _case(
     tmp_path: Path,
 ) -> tuple[ReportAuthorityManager, SolverSupervisor, SolverRunResult, dict[EvidenceKind, Path]]:
-    root = tmp_path / "attempt"
-    root.mkdir()
-    input_path = root / "model.feb"
-    log_path = root / "result.log"
-    xplt_path = root / "result.xplt"
-    input_path.write_text("synthetic", encoding="utf-8")
+    workspace = ValidatedCaseWorkspace(tmp_path / "tool", tmp_path / "02_CAE")
+    case = workspace.create_case("case-a")
+    store = EvidenceStore(case, IntentContract())
+    store.record_attempt("attempt-a")
+    attempt = AttemptWorkspace._from_manager(
+        case,
+        "attempt-a",
+        case.temporary_root / "attempts" / "attempt-a",
+    )
+    intent = store.issue_intent_snapshot()
     log = "time step 1\ntime = 1.0\nnormal termination\n"
     code = (
-        "from pathlib import Path; "
-        f"Path({str(log_path)!r}).write_text({log!r}); "
-        f"Path({str(xplt_path)!r}).write_bytes(b'synthetic-xplt')"
+        "import os; from pathlib import Path; "
+        f"Path(os.environ['FEBIO_CAE_HARNESS_LOG']).write_text({log!r}); "
+        "Path(os.environ['FEBIO_CAE_HARNESS_XPLT']).write_bytes(b'synthetic-xplt')"
     )
-    spec = SolverLaunchSpec(
-        executable=Path(sys.executable),
-        input_path=input_path,
-        attempt_root=root,
-        log_path=log_path,
-        xplt_path=xplt_path,
-        arguments=("-c", code),
+    input_path = attempt.write_text("model.feb", code)
+
+    class ProbeProcess:
+        returncode = 0
+
+        def communicate(self, input: bytes, timeout: float) -> tuple[bytes, bytes]:
+            del timeout
+            assert input == b"quit\n"
+            return b"version 4.12.0\n", b""
+
+    with patch(
+        "febio_cae_harness.solver.runtime.subprocess.Popen",
+        lambda command, **kwargs: ProbeProcess(),
+    ):
+        runtime = probe_febio(Path(sys.executable))
+    capability = headless_module._issue_launch_capability(
+        attempt,
+        intent,
+        runtime,
+        input_path,
         expected_steps=1,
         expected_final_time=1.0,
-        requested_fields=("stress",),
+        timeout_seconds=None,
     )
+    root = capability.spec.attempt_root
     fbs = FbsAdapterManager(_Adapter(), "synthetic-runtime", root).issue_authority()
     supervisor = SolverSupervisor(
-        spec,
-        case_id="case-a",
-        intent_id="intent-a",
-        attempt_id="attempt-a",
+        capability,
         fbs_adapter=fbs,
         requested_fields=("stress",),
     )
@@ -71,7 +93,9 @@ def _case(
     for kind, path in evidence.items():
         path.write_text(f"synthetic {kind.value}", encoding="utf-8")
     manager = ReportAuthorityManager(
-        supervisor, result, AttemptIdentity("case-a", "intent-a", "attempt-a")
+        supervisor,
+        result,
+        AttemptIdentity(supervisor._case_id, supervisor._intent_id, supervisor._attempt_id),
     )
     return manager, supervisor, result, evidence
 
@@ -109,7 +133,7 @@ def test_issue_requires_exact_evidence_set_and_live_regular_paths(tmp_path: Path
     invalid[EvidenceKind.ROI] = evidence[EvidenceKind.MESH]
     with pytest.raises(ValueError):
         manager.issue(invalid)
-    hardlink = tmp_path / "attempt" / "hardlink.json"
+    hardlink = evidence[EvidenceKind.MESH].parent / "hardlink.json"
     os.link(evidence[EvidenceKind.MESH], hardlink)
     invalid[EvidenceKind.ROI] = hardlink
     with pytest.raises(ValueError):
