@@ -39,6 +39,43 @@ from .types import (
 __all__ = ["SolverSupervisor"]
 
 _PROCESS_RECORD_NAME = "process.json"
+_RESULT_FIELDS = (
+    "state",
+    "classification",
+    "return_code",
+    "pid",
+    "command",
+    "log_path",
+    "xplt_path",
+    "started_at",
+    "finished_at",
+    "log_validation",
+    "fbs_validation",
+    "error",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _ResultIssuance:
+    result: SolverRunResult
+    supervisor: SolverSupervisor
+    spec: SolverLaunchSpec
+    process: subprocess.Popen[bytes] | _ReconnectedProcess | None
+    process_record: dict[str, object] | None
+    case_id: str
+    intent_id: str
+    attempt_id: str
+    executable_path: str
+    process_identity: str | None
+    started_at: datetime | None
+    log_path: Path
+    xplt_path: Path
+    finished_at: datetime | None
+    snapshot: tuple[object, ...]
+
+
+_RESULT_REGISTRY: dict[int, _ResultIssuance] = {}
+_RESULT_REGISTRY_LOCK = threading.RLock()
 
 
 @dataclass(frozen=True, slots=True)
@@ -554,6 +591,148 @@ class SolverSupervisor:
         kill_group(get_group(pid), signal_value)
         return True
 
+    def _register_result(self, result: SolverRunResult) -> None:
+        if type(result) is not SolverRunResult:
+            raise SolverOwnershipError("solver result must be an exact SolverRunResult instance")
+        process_record = self._process_record
+        identity = process_record.get("process_creation_identity") if process_record else None
+        issuance = _ResultIssuance(
+            result=result,
+            supervisor=self,
+            spec=self.spec,
+            process=self._process,
+            process_record=process_record,
+            case_id=self._case_id,
+            intent_id=self._intent_id,
+            attempt_id=self._attempt_id,
+            executable_path=str(self.spec.executable),
+            process_identity=identity if isinstance(identity, str) else None,
+            started_at=self._started_at,
+            log_path=self.spec.expected_outputs.log_path,
+            xplt_path=self.spec.expected_outputs.xplt_path,
+            finished_at=result.finished_at,
+            snapshot=tuple(getattr(result, field) for field in _RESULT_FIELDS),
+        )
+        with _RESULT_REGISTRY_LOCK:
+            existing = _RESULT_REGISTRY.get(id(result))
+            if existing is not None and existing.result is not result:
+                raise SolverOwnershipError("solver result registry collision")
+            _RESULT_REGISTRY[id(result)] = issuance
+
+    def _validate_result(self, candidate: object) -> SolverRunResult:
+        if type(self) is not SolverSupervisor:
+            raise SolverOwnershipError("solver supervisor must be an exact instance")
+        if type(candidate) is not SolverRunResult:
+            raise SolverOwnershipError("solver result must be an exact SolverRunResult instance")
+        with self._lock:
+            with _RESULT_REGISTRY_LOCK:
+                issuance = _RESULT_REGISTRY.get(id(candidate))
+            if issuance is None or issuance.result is not candidate:
+                raise SolverOwnershipError("solver result was not issued by a supervisor")
+            if issuance.supervisor is not self:
+                raise SolverOwnershipError("solver result belongs to another supervisor")
+            if self._result is not candidate:
+                raise SolverOwnershipError("supervisor result binding is invalid")
+            if self.spec is not issuance.spec:
+                raise SolverOwnershipError("supervisor launch binding is invalid")
+            for value, expected, label in (
+                (self._case_id, issuance.case_id, "case_id"),
+                (self._intent_id, issuance.intent_id, "intent_id"),
+                (self._attempt_id, issuance.attempt_id, "attempt_id"),
+            ):
+                if (
+                    not isinstance(value, str)
+                    or not value.strip()
+                    or not isinstance(expected, str)
+                    or not expected.strip()
+                    or value != expected
+                ):
+                    raise SolverOwnershipError(f"solver result {label} binding is invalid")
+            if self._process is not issuance.process or self._process is None:
+                raise SolverOwnershipError("solver result process binding is invalid")
+            pid = getattr(self._process, "pid", None)
+            if (
+                isinstance(pid, bool)
+                or not isinstance(pid, int)
+                or pid <= 0
+                or candidate.pid != pid
+            ):
+                raise SolverOwnershipError("solver result process identity is invalid")
+
+            process_record = self._process_record
+            if process_record is None or process_record is not issuance.process_record:
+                raise SolverOwnershipError("solver result process record binding is invalid")
+            if process_record.get("pid") != pid:
+                raise SolverOwnershipError("solver result process record PID is invalid")
+            executable = process_record.get("executable_path")
+            if (
+                not isinstance(executable, str)
+                or not Path(executable).is_absolute()
+                or executable != issuance.executable_path
+                or _normalise_executable(executable) != _normalise_executable(self.spec.executable)
+            ):
+                raise SolverOwnershipError("solver result executable binding is invalid")
+            identity = process_record.get("process_creation_identity")
+            if (
+                issuance.process_identity is None
+                or not isinstance(identity, str)
+                or not identity.strip()
+                or identity != issuance.process_identity
+            ):
+                raise SolverOwnershipError("solver result process creation identity is invalid")
+
+            started_at = self._started_at
+            if (
+                issuance.started_at is None
+                or started_at is not issuance.started_at
+                or not isinstance(started_at, datetime)
+                or started_at.tzinfo is None
+                or started_at.utcoffset() is None
+                or candidate.started_at is not started_at
+            ):
+                raise SolverOwnershipError("solver result start time is invalid")
+            start_value = process_record.get("start_time")
+            if not isinstance(start_value, str):
+                raise SolverOwnershipError("solver result process start time is invalid")
+            try:
+                record_started_at = datetime.fromisoformat(start_value)
+            except ValueError as error:
+                raise SolverOwnershipError("solver result process start time is invalid") from error
+            if record_started_at != started_at:
+                raise SolverOwnershipError("solver result process start time does not match")
+
+            if (
+                issuance.finished_at is None
+                or not isinstance(candidate.finished_at, datetime)
+                or candidate.finished_at is not issuance.finished_at
+                or candidate.finished_at.tzinfo is None
+                or candidate.finished_at.utcoffset() is None
+                or candidate.finished_at < started_at
+            ):
+                raise SolverOwnershipError("solver result timestamps are invalid")
+            output_values = process_record.get("owned_output_paths")
+            if not isinstance(output_values, dict):
+                raise SolverOwnershipError("solver result output paths are invalid")
+            self._validate_record_path(output_values.get("log"), issuance.log_path, "LOG path")
+            self._validate_record_path(output_values.get("xplt"), issuance.xplt_path, "XPLT path")
+            for candidate_path, expected_path, path_label in (
+                (candidate.log_path, issuance.log_path, "LOG path"),
+                (candidate.xplt_path, issuance.xplt_path, "XPLT path"),
+            ):
+                if not isinstance(candidate_path, Path):
+                    raise SolverOwnershipError(f"{path_label} must be a Path")
+                self._validate_record_path(os.fspath(candidate_path), expected_path, path_label)
+                if candidate_path != expected_path:
+                    raise SolverOwnershipError(f"{path_label} binding is invalid")
+            for field, expected_value in zip(_RESULT_FIELDS, issuance.snapshot, strict=True):
+                try:
+                    value = getattr(candidate, field)
+                except AttributeError as error:
+                    raise SolverOwnershipError("solver result fields are invalid") from error
+                if value != expected_value:
+                    raise SolverOwnershipError("solver result contents were modified")
+            return candidate
+
     def _complete(self, state: SolverState, return_code: int | None) -> SolverRunResult:
         with self._lock:
             if self._result is not None:
@@ -613,6 +792,7 @@ class SolverSupervisor:
                 log_validation=log_validation,
                 fbs_validation=fbs_validation,
             )
+            self._register_result(result)
             self._state = state
             self._result = result
             return result
