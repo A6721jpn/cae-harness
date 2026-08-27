@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import subprocess
 from collections.abc import Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -12,6 +13,8 @@ from .deployment import (
     BuildIdentity,
     DeploymentError,
     DeploymentLayout,
+    deployment_lock,
+    verify_payload_identity,
 )
 
 
@@ -58,6 +61,11 @@ def os_fspath(path: Path) -> str:
 def read_build_identity(layout: DeploymentLayout) -> BuildIdentity:
     """Read and validate the identity persisted in the current deployment."""
 
+    with deployment_lock(layout):
+        return _read_build_identity_unlocked(layout)
+
+
+def _read_build_identity_unlocked(layout: DeploymentLayout) -> BuildIdentity:
     identity_path = layout.identity_path
     try:
         payload = json.loads(identity_path.read_text(encoding="utf-8"))
@@ -66,9 +74,34 @@ def read_build_identity(layout: DeploymentLayout) -> BuildIdentity:
     if not isinstance(payload, dict):
         raise LaunchError(f"build identity is not an object: {identity_path}")
     try:
-        return BuildIdentity.from_mapping(payload)
+        identity = BuildIdentity.from_mapping(payload)
+        return verify_payload_identity(layout.latest, identity)
     except (TypeError, ValueError) as error:
         raise LaunchError(f"invalid build identity: {identity_path}") from error
+    except DeploymentError as error:
+        raise LaunchError(str(error)) from error
+
+
+def _plan_cli_launch_unlocked(
+    resolved_layout: DeploymentLayout,
+    normalised_arguments: tuple[str, ...],
+    *,
+    require_published: bool,
+) -> LaunchPlan:
+    identity: BuildIdentity | None = None
+    if require_published:
+        if not resolved_layout.latest.is_dir() or not resolved_layout.launcher.is_file():
+            raise LaunchError("latest-development launcher is not installed")
+        identity = _read_build_identity_unlocked(resolved_layout)
+    elif resolved_layout.identity_path.is_file():
+        identity = _read_build_identity_unlocked(resolved_layout)
+
+    return LaunchPlan(
+        layout=resolved_layout,
+        argv=(str(resolved_layout.launcher), *normalised_arguments),
+        cwd=resolved_layout.latest,
+        build_identity=identity,
+    )
 
 
 def plan_cli_launch(
@@ -95,20 +128,13 @@ def plan_cli_launch(
     if any("\x00" in argument for argument in normalised_arguments):
         raise ValueError("launch arguments cannot contain NUL")
 
-    identity: BuildIdentity | None = None
-    if require_published:
-        if not resolved_layout.latest.is_dir() or not resolved_layout.launcher.is_file():
-            raise LaunchError("latest-development launcher is not installed")
-        identity = read_build_identity(resolved_layout)
-    elif resolved_layout.identity_path.is_file():
-        identity = read_build_identity(resolved_layout)
-
-    return LaunchPlan(
-        layout=resolved_layout,
-        argv=(str(resolved_layout.launcher), *normalised_arguments),
-        cwd=resolved_layout.latest,
-        build_identity=identity,
-    )
+    needs_lock = require_published or resolved_layout.identity_path.is_file()
+    with deployment_lock(resolved_layout) if needs_lock else nullcontext():
+        return _plan_cli_launch_unlocked(
+            resolved_layout,
+            normalised_arguments,
+            require_published=require_published,
+        )
 
 
 def launch_cli(
@@ -128,18 +154,23 @@ def launch_cli(
             if local_app_data is None
             else DeploymentLayout.from_local_app_data(local_app_data)
         )
-    plan = plan_cli_launch(resolved_layout, arguments, require_published=True)
-    try:
-        return subprocess.run(
-            plan.argv,
-            cwd=os_fspath(plan.cwd),
-            check=False,
-            shell=False,
-            text=True,
-            capture_output=False,
+    with deployment_lock(resolved_layout):
+        plan = _plan_cli_launch_unlocked(
+            resolved_layout,
+            tuple(arguments),
+            require_published=True,
         )
-    except OSError as error:
-        raise LaunchError(f"cannot execute launcher: {plan.launcher}") from error
+        try:
+            return subprocess.run(
+                plan.argv,
+                cwd=os_fspath(plan.cwd),
+                check=False,
+                shell=False,
+                text=True,
+                capture_output=False,
+            )
+        except OSError as error:
+            raise LaunchError(f"cannot execute launcher: {plan.launcher}") from error
 
 
 __all__ = [

@@ -16,9 +16,9 @@ import shutil
 import stat
 import tempfile
 import uuid
-from collections.abc import Mapping
-from contextlib import suppress
-from dataclasses import dataclass, field
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager, suppress
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Self
 
@@ -28,9 +28,19 @@ STAGING_DIRECTORY_NAME = ".staging"
 ROLLBACK_DIRECTORY_NAME = ".rollback"
 LAUNCHER_NAME = "febio-cae.exe"
 BUILD_IDENTITY_NAME = "build-identity.json"
+DEPLOYMENT_LOCK_NAME = ".deployment.lock"
 
 _REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
-_IDENTITY_FIELDS = frozenset({"artifact_sha256", "build_id", "commit_sha", "version"})
+_IDENTITY_FIELDS = frozenset(
+    {
+        "artifact_sha256",
+        "build_id",
+        "commit_sha",
+        "payload_sha256",
+        "version",
+    }
+)
+_PAYLOAD_DIGEST_PREFIX = b"FEBio CAE payload v1\0"
 
 
 class DeploymentError(RuntimeError):
@@ -102,12 +112,14 @@ class BuildIdentity:
     build_id: str
     version: str
     artifact_sha256: str | None = None
+    payload_sha256: str | None = None
 
     def __post_init__(self) -> None:
         _normalise_token(self.commit_sha, "commit_sha")
         _normalise_token(self.build_id, "build_id")
         _normalise_token(self.version, "version")
         object.__setattr__(self, "artifact_sha256", _validate_sha256(self.artifact_sha256))
+        object.__setattr__(self, "payload_sha256", _validate_sha256(self.payload_sha256))
 
     @property
     def commit(self) -> str:
@@ -122,12 +134,15 @@ class BuildIdentity:
         return self.build_id
 
     def to_dict(self) -> dict[str, str | None]:
-        return {
+        payload: dict[str, str | None] = {
             "artifact_sha256": self.artifact_sha256,
             "build_id": self.build_id,
             "commit_sha": self.commit_sha,
             "version": self.version,
         }
+        if self.payload_sha256 is not None:
+            payload["payload_sha256"] = self.payload_sha256
+        return payload
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, Any]) -> Self:
@@ -145,6 +160,7 @@ class BuildIdentity:
             build_id=payload["build_id"],
             version=payload["version"],
             artifact_sha256=payload.get("artifact_sha256"),
+            payload_sha256=payload.get("payload_sha256"),
         )
 
 
@@ -157,6 +173,7 @@ class DeploymentLayout:
     latest: Path = field(init=False)
     staging_root: Path = field(init=False)
     rollback_root: Path = field(init=False)
+    lock_path: Path = field(init=False)
 
     def __post_init__(self) -> None:
         local_app_data = _reject_reparse_alias(self.local_app_data, "LOCALAPPDATA")
@@ -166,6 +183,7 @@ class DeploymentLayout:
         object.__setattr__(self, "latest", app_root / LATEST_DIRECTORY_NAME)
         object.__setattr__(self, "staging_root", app_root / STAGING_DIRECTORY_NAME)
         object.__setattr__(self, "rollback_root", app_root / ROLLBACK_DIRECTORY_NAME)
+        object.__setattr__(self, "lock_path", app_root / DEPLOYMENT_LOCK_NAME)
 
     @classmethod
     def from_local_app_data(cls, local_app_data: str | Path) -> Self:
@@ -204,6 +222,74 @@ class DeploymentLayout:
     @property
     def identity_path(self) -> Path:
         return self.latest / BUILD_IDENTITY_NAME
+
+    @property
+    def deployment_lock(self) -> Path:
+        """Path of the stable cross-process deployment lock file."""
+
+        return self.lock_path
+
+
+def _ensure_application_root(layout: DeploymentLayout) -> Path:
+    app_root = _reject_reparse_alias(layout.app_root, "application root")
+    try:
+        app_root.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        raise DeploymentError(f"cannot create application root: {app_root}") from error
+    return _reject_reparse_alias(app_root, "application root")
+
+
+@contextmanager
+def deployment_lock(layout: DeploymentLayout) -> Iterator[None]:
+    """Hold the stable OS-owned lock across a complete publish or launch."""
+
+    app_root = _ensure_application_root(layout)
+    lock_path = _reject_reparse_alias(app_root / DEPLOYMENT_LOCK_NAME, "deployment lock")
+    stream = None
+    locked = False
+    try:
+        stream = lock_path.open("a+b")
+    except OSError as error:
+        raise DeploymentError(f"cannot acquire deployment lock: {lock_path}") from error
+    try:
+        stream.seek(0, os.SEEK_END)
+        if stream.tell() == 0:
+            stream.write(b"\0")
+            stream.flush()
+        stream.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(stream.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+
+            flock = fcntl.flock  # type: ignore[attr-defined]
+            flock(stream.fileno(), fcntl.LOCK_EX)  # type: ignore[attr-defined]
+        locked = True
+    except OSError as error:
+        if stream is not None:
+            with suppress(OSError):
+                stream.close()
+        raise DeploymentError(f"cannot acquire deployment lock: {lock_path}") from error
+    try:
+        yield
+    finally:
+        if stream is not None:
+            if locked:
+                with suppress(OSError):
+                    if os.name == "nt":
+                        import msvcrt
+
+                        stream.seek(0)
+                        msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+
+                        flock = fcntl.flock  # type: ignore[attr-defined]
+                        flock(stream.fileno(), fcntl.LOCK_UN)  # type: ignore[attr-defined]
+            with suppress(OSError):
+                stream.close()
 
 
 def _write_json_atomic(path: Path, payload: Mapping[str, object]) -> None:
@@ -247,6 +333,98 @@ def _validate_tree(root: Path, label: str) -> None:
             _reject_reparse_alias(current_path / name, label)
 
 
+def _payload_entries(root: Path) -> Iterator[tuple[str, Path, str]]:
+    _validate_tree(root, "payload")
+    for current, directory_names, file_names in os.walk(root, topdown=True, followlinks=False):
+        current_path = _reject_reparse_alias(current, "payload")
+        directory_names.sort()
+        file_names.sort()
+        relative = current_path.relative_to(root)
+        for name in directory_names:
+            entry = current_path / name
+            _reject_reparse_alias(entry, "payload")
+            relative_name = (relative / name).as_posix()
+            yield "directory", entry, relative_name
+        for name in file_names:
+            entry = current_path / name
+            _reject_reparse_alias(entry, "payload")
+            if relative == Path() and name == BUILD_IDENTITY_NAME:
+                continue
+            if not entry.is_file():
+                raise DeploymentError(f"payload contains a non-file entry: {entry}")
+            relative_name = (relative / name).as_posix()
+            yield "file", entry, relative_name
+
+
+def _hash_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError as error:
+        raise DeploymentError(f"cannot read payload file: {path}") from error
+    return digest.hexdigest()
+
+
+def compute_payload_sha256(root: str | Path) -> str:
+    """Return a deterministic SHA-256 digest for an exact, safe payload tree."""
+
+    payload_root = _reject_reparse_alias(root, "payload")
+    digest = hashlib.sha256(_PAYLOAD_DIGEST_PREFIX)
+    for kind, path, relative_name in _payload_entries(payload_root):
+        encoded_name = relative_name.encode("utf-8", "surrogateescape")
+        digest.update(kind[0].encode("ascii"))
+        digest.update(len(encoded_name).to_bytes(8, "big"))
+        digest.update(encoded_name)
+        if kind == "file":
+            try:
+                size_before = path.stat().st_size
+            except OSError as error:
+                raise DeploymentError(f"cannot inspect payload file: {path}") from error
+            digest.update(size_before.to_bytes(8, "big"))
+            try:
+                with path.open("rb") as stream:
+                    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                size_after = path.stat().st_size
+            except OSError as error:
+                raise DeploymentError(f"cannot read payload file: {path}") from error
+            if size_before != size_after:
+                raise DeploymentError(f"payload changed while it was hashed: {path}")
+    return digest.hexdigest()
+
+
+def _bound_payload_sha256(
+    payload_sha256: str,
+    identity: BuildIdentity,
+) -> str:
+    digest = hashlib.sha256(b"FEBio CAE bound payload v1\0")
+    for value in (
+        identity.commit_sha,
+        identity.build_id,
+        identity.version,
+        identity.artifact_sha256 or "",
+        payload_sha256,
+    ):
+        encoded = value.encode("utf-8", "surrogateescape")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+    return digest.hexdigest()
+
+
+def _artifact_candidates(root: Path, payload_sha256: str) -> set[str]:
+    candidates = {payload_sha256}
+    wheel_paths = tuple(
+        path
+        for kind, path, relative_name in _payload_entries(root)
+        if kind == "file" and relative_name.casefold().endswith(".whl")
+    )
+    if len(wheel_paths) == 1:
+        candidates.add(_hash_file(wheel_paths[0]))
+    return candidates
+
+
 def _copy_tree(source: Path, destination: Path) -> None:
     _validate_tree(source, "build source")
     if not destination.is_dir():
@@ -286,18 +464,53 @@ def _new_owned_directory(parent: Path, prefix: str) -> Path:
         ) from error
 
 
-def _identity_from_directory(directory: Path) -> BuildIdentity:
+def _read_identity_file(directory: Path) -> BuildIdentity:
     identity_path = directory / BUILD_IDENTITY_NAME
     try:
         payload = json.loads(identity_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
-        raise DeploymentRollbackError(f"cannot read build identity from {directory}") from error
+        raise DeploymentError(f"cannot read build identity from {directory}") from error
     if not isinstance(payload, Mapping):
-        raise DeploymentRollbackError(f"build identity is not an object: {identity_path}")
+        raise DeploymentError(f"build identity is not an object: {identity_path}")
     try:
         return BuildIdentity.from_mapping(payload)
     except (TypeError, ValueError) as error:
-        raise DeploymentRollbackError(f"invalid build identity: {identity_path}") from error
+        raise DeploymentError(f"invalid build identity: {identity_path}") from error
+
+
+def verify_payload_identity(directory: str | Path, identity: BuildIdentity) -> BuildIdentity:
+    """Verify that a persisted identity still describes its payload tree."""
+
+    if identity.payload_sha256 is None:
+        raise DeploymentError("build identity is missing payload_sha256")
+    payload_root = _reject_reparse_alias(directory, "published payload")
+    actual_tree_digest = compute_payload_sha256(payload_root)
+    expected_digest = _bound_payload_sha256(actual_tree_digest, identity)
+    if identity.payload_sha256 != expected_digest:
+        raise DeploymentError("published payload digest does not match build identity")
+    return identity
+
+
+def _identity_from_directory(directory: Path) -> BuildIdentity:
+    try:
+        identity = _read_identity_file(directory)
+        return verify_payload_identity(directory, identity)
+    except DeploymentError as error:
+        raise DeploymentRollbackError(str(error)) from error
+
+
+def _materialise_identity(staging: Path, requested: BuildIdentity) -> BuildIdentity:
+    actual_tree_digest = compute_payload_sha256(staging)
+    artifact_digest = requested.artifact_sha256 or actual_tree_digest
+    effective = replace(requested, artifact_sha256=artifact_digest)
+    if requested.payload_sha256 is not None:
+        bound_digest = _bound_payload_sha256(actual_tree_digest, effective)
+        if requested.payload_sha256 not in {actual_tree_digest, bound_digest}:
+            raise DeploymentError("claimed payload digest does not match staged payload")
+    elif requested.artifact_sha256 is not None:
+        if requested.artifact_sha256 not in _artifact_candidates(staging, actual_tree_digest):
+            raise DeploymentError("claimed artifact digest does not match staged payload")
+    return replace(effective, payload_sha256=_bound_payload_sha256(actual_tree_digest, effective))
 
 
 @dataclass(frozen=True, slots=True)
@@ -308,6 +521,7 @@ class DeploymentReceipt:
     build_identity: BuildIdentity
     latest: Path
     rollback_path: Path | None
+    previous_identity: BuildIdentity | None = None
 
     @property
     def identity(self) -> BuildIdentity:
@@ -325,40 +539,44 @@ class DeploymentReceipt:
         newer deployment.
         """
 
-        current = _reject_reparse_alias(self.latest, "latest deployment")
-        if not current.is_dir():
-            raise DeploymentRollbackError("latest deployment is missing")
-        if _identity_from_directory(current) != self.build_identity:
-            raise DeploymentRollbackError("latest deployment identity does not match receipt")
+        with deployment_lock(self.layout):
+            current = _reject_reparse_alias(self.latest, "latest deployment")
+            if not current.is_dir():
+                raise DeploymentRollbackError("latest deployment is missing")
+            if _identity_from_directory(current) != self.build_identity:
+                raise DeploymentRollbackError("latest deployment identity does not match receipt")
 
-        temporary = _new_owned_directory(self.layout.staging_root, "rollback-current-")
-        _remove_owned_tree(temporary, "rollback staging")
-        moved_current = False
-        try:
-            os.replace(os.fspath(current), os.fspath(temporary))
-            moved_current = True
             if self.rollback_path is None:
-                _remove_owned_tree(temporary, "rollback staging")
-            else:
-                rollback = _reject_reparse_alias(self.rollback_path, "rollback deployment")
-                if not rollback.is_dir():
-                    raise DeploymentRollbackError("rollback build is missing")
+                raise DeploymentRollbackError("rollback build is missing")
+            rollback = _reject_reparse_alias(self.rollback_path, "rollback deployment")
+            if not rollback.is_dir():
+                raise DeploymentRollbackError("rollback build is missing")
+            rollback_identity = _identity_from_directory(rollback)
+            if self.previous_identity is not None and rollback_identity != self.previous_identity:
+                raise DeploymentRollbackError("rollback deployment identity does not match receipt")
+
+            temporary = _new_owned_directory(self.layout.staging_root, "rollback-current-")
+            _remove_owned_tree(temporary, "rollback staging")
+            moved_current = False
+            try:
+                os.replace(os.fspath(current), os.fspath(temporary))
+                moved_current = True
                 os.replace(os.fspath(rollback), os.fspath(current))
                 _remove_owned_tree(temporary, "rollback staging")
-        except DeploymentRollbackError:
-            if moved_current and not current.exists() and temporary.exists():
-                os.replace(os.fspath(temporary), os.fspath(current))
-            raise
-        except OSError as error:
-            if moved_current and not current.exists() and temporary.exists():
-                try:
+            except DeploymentRollbackError:
+                if moved_current and not current.exists() and temporary.exists():
                     os.replace(os.fspath(temporary), os.fspath(current))
-                except OSError as restore_error:
-                    raise DeploymentRollbackError(
-                        "rollback failed and restoring latest also failed"
-                    ) from restore_error
-            raise DeploymentRollbackError("rollback failed") from error
-        return current
+                raise
+            except OSError as error:
+                if moved_current and not current.exists() and temporary.exists():
+                    try:
+                        os.replace(os.fspath(temporary), os.fspath(current))
+                    except OSError as restore_error:
+                        raise DeploymentRollbackError(
+                            "rollback failed and restoring latest also failed"
+                        ) from restore_error
+                raise DeploymentRollbackError("rollback failed") from error
+            return current
 
 
 def stage_latest_development(
@@ -397,50 +615,66 @@ def stage_latest_development(
     if source_path == layout.app_root or source_path.is_relative_to(layout.app_root):
         raise DeploymentError("build source cannot be inside the application root")
 
-    staging = _new_owned_directory(
-        layout.staging_root,
-        f"{build_identity.build_id}-",
-    )
-    try:
-        _copy_tree(source_path, staging)
-        _write_json_atomic(staging / BUILD_IDENTITY_NAME, build_identity.to_dict())
-
-        app_root = _reject_reparse_alias(layout.app_root, "application root")
-        app_root.mkdir(parents=True, exist_ok=True)
-        _reject_reparse_alias(app_root, "application root")
-        latest = _reject_reparse_alias(layout.latest, "latest deployment")
-        rollback_path: Path | None = None
-        if os.path.lexists(os.fspath(latest)):
-            _validate_tree(latest, "latest deployment")
-            rollback_parent = _reject_reparse_alias(layout.rollback_root, "rollback root")
-            rollback_parent.mkdir(parents=True, exist_ok=True)
-            _reject_reparse_alias(rollback_parent, "rollback root")
-            rollback_path = rollback_parent / f"previous-{uuid.uuid4().hex}"
-            os.replace(os.fspath(latest), os.fspath(rollback_path))
-
+    with deployment_lock(layout):
+        staging = _new_owned_directory(
+            layout.staging_root,
+            f"{build_identity.build_id}-",
+        )
         try:
-            os.replace(os.fspath(staging), os.fspath(latest))
-        except OSError as error:
-            if rollback_path is not None and not latest.exists() and rollback_path.exists():
+            if (source_path / BUILD_IDENTITY_NAME).exists():
+                raise DeploymentError(
+                    f"build source cannot contain reserved file: {BUILD_IDENTITY_NAME}"
+                )
+            _copy_tree(source_path, staging)
+            effective_identity = _materialise_identity(staging, build_identity)
+            _write_json_atomic(staging / BUILD_IDENTITY_NAME, effective_identity.to_dict())
+            verify_payload_identity(staging, effective_identity)
+
+            latest = _reject_reparse_alias(layout.latest, "latest deployment")
+            rollback_path: Path | None = None
+            previous_identity: BuildIdentity | None = None
+            if os.path.lexists(os.fspath(latest)):
+                _validate_tree(latest, "latest deployment")
                 try:
-                    os.replace(os.fspath(rollback_path), os.fspath(latest))
-                except OSError as restore_error:
-                    raise DeploymentError(
-                        "publish failed and restoring the previous deployment also failed"
-                    ) from restore_error
-            raise DeploymentError("cannot atomically publish latest-development") from error
-        if not keep_rollback and rollback_path is not None:
-            _remove_owned_tree(rollback_path, "rollback deployment")
-            rollback_path = None
-        return DeploymentReceipt(layout, build_identity, latest, rollback_path)
-    except DeploymentError:
-        if staging.exists():
-            _remove_owned_tree(staging, "deployment staging")
-        raise
-    except (OSError, ValueError) as error:
-        if staging.exists():
-            _remove_owned_tree(staging, "deployment staging")
-        raise DeploymentError("deployment failed") from error
+                    previous_identity = _identity_from_directory(latest)
+                except DeploymentRollbackError as error:
+                    raise DeploymentError("existing deployment identity is invalid") from error
+                rollback_parent = _reject_reparse_alias(layout.rollback_root, "rollback root")
+                rollback_parent.mkdir(parents=True, exist_ok=True)
+                _reject_reparse_alias(rollback_parent, "rollback root")
+                rollback_path = rollback_parent / f"previous-{uuid.uuid4().hex}"
+                os.replace(os.fspath(latest), os.fspath(rollback_path))
+
+            try:
+                os.replace(os.fspath(staging), os.fspath(latest))
+            except OSError as error:
+                if rollback_path is not None and not latest.exists() and rollback_path.exists():
+                    try:
+                        os.replace(os.fspath(rollback_path), os.fspath(latest))
+                    except OSError as restore_error:
+                        raise DeploymentError(
+                            "publish failed and restoring the previous deployment also failed"
+                        ) from restore_error
+                raise DeploymentError("cannot atomically publish latest-development") from error
+            if not keep_rollback and rollback_path is not None:
+                _remove_owned_tree(rollback_path, "rollback deployment")
+                rollback_path = None
+                previous_identity = None
+            return DeploymentReceipt(
+                layout,
+                effective_identity,
+                latest,
+                rollback_path,
+                previous_identity,
+            )
+        except DeploymentError:
+            if staging.exists():
+                _remove_owned_tree(staging, "deployment staging")
+            raise
+        except (OSError, ValueError) as error:
+            if staging.exists():
+                _remove_owned_tree(staging, "deployment staging")
+            raise DeploymentError("deployment failed") from error
 
 
 @dataclass(frozen=True, slots=True)
@@ -481,6 +715,8 @@ __all__ = [
     "AtomicDeployer",
     "BUILD_IDENTITY_NAME",
     "BuildIdentity",
+    "compute_payload_sha256",
+    "DEPLOYMENT_LOCK_NAME",
     "DeploymentError",
     "DeploymentLayout",
     "DeploymentManager",
@@ -491,6 +727,8 @@ __all__ = [
     "PRODUCT_DIRECTORY_NAME",
     "ROLLBACK_DIRECTORY_NAME",
     "STAGING_DIRECTORY_NAME",
+    "deployment_lock",
     "deployment_layout",
     "stage_latest_development",
+    "verify_payload_identity",
 ]

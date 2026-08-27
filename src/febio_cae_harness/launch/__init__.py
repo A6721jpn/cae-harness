@@ -2,6 +2,7 @@
 
 from .deployment import (
     BUILD_IDENTITY_NAME,
+    DEPLOYMENT_LOCK_NAME,
     LATEST_DIRECTORY_NAME,
     LAUNCHER_NAME,
     PRODUCT_DIRECTORY_NAME,
@@ -14,8 +15,11 @@ from .deployment import (
     DeploymentManager,
     DeploymentReceipt,
     DeploymentRollbackError,
+    compute_payload_sha256,
     deployment_layout,
+    deployment_lock,
     stage_latest_development,
+    verify_payload_identity,
 )
 from .planner import LaunchError, LaunchPlan, launch_cli, plan_cli_launch, read_build_identity
 from .shortcut import (
@@ -33,6 +37,8 @@ __all__ = [
     "AtomicDeployer",
     "BUILD_IDENTITY_NAME",
     "BuildIdentity",
+    "compute_payload_sha256",
+    "DEPLOYMENT_LOCK_NAME",
     "DeploymentError",
     "DeploymentLayout",
     "DeploymentManager",
@@ -50,6 +56,7 @@ __all__ = [
     "STAGING_DIRECTORY_NAME",
     "ShortcutDescriptor",
     "default_start_menu_root",
+    "deployment_lock",
     "deployment_layout",
     "fixed_shortcut_descriptor",
     "launch_cli",
@@ -57,5 +64,6 @@ __all__ = [
     "read_build_identity",
     "shortcut_descriptor",
     "stage_latest_development",
+    "verify_payload_identity",
     "write_shortcut_descriptor",
 ]
