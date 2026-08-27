@@ -15,6 +15,7 @@ from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from math import isfinite
 from pathlib import Path
+from threading import Lock
 from types import MappingProxyType
 from typing import Any, NoReturn, Self, cast
 
@@ -1394,6 +1395,9 @@ type _RetryLedgerRecord = tuple[
     tuple[object, ...],
 ]
 _RETRY_LEDGER_RECORDS: dict[int, _RetryLedgerRecord] = {}
+_RETRY_CONSUMPTION_LOCK = Lock()
+_RETRY_CONSUMED_RESULTS: dict[int, SolverRunResult] = {}
+_RETRY_CONSUMED_PAIRS: dict[tuple[int, int], tuple[RetryLedger, SolverRunResult]] = {}
 
 
 @dataclass(frozen=True, slots=True)
@@ -1783,30 +1787,43 @@ def decide_retry(
         return stopped("retry requires the exact failed result issued by its solver supervisor")
     if object.__getattribute__(effective_supervisor, "_case_id") != authority_record[1].case_id:
         return stopped("solver result is not correlated to the live intent case")
-    if not ledger.can_retry:
-        return RetryResult(
-            decision=RetryDecision.BUDGET_EXHAUSTED,
-            ledger=ledger,
+    issued_result = cast(SolverRunResult, effective_result)
+    with _RETRY_CONSUMPTION_LOCK:
+        pair_key = (id(ledger), id(issued_result))
+        consumed_pair = _RETRY_CONSUMED_PAIRS.get(pair_key)
+        consumed_result = _RETRY_CONSUMED_RESULTS.get(id(issued_result))
+        if consumed_result is issued_result or (
+            consumed_pair is not None
+            and consumed_pair[0] is ledger
+            and consumed_pair[1] is issued_result
+        ):
+            return stopped("exact failed solver result has already consumed a retry")
+        if not ledger.can_retry:
+            return RetryResult(
+                decision=RetryDecision.BUDGET_EXHAUSTED,
+                ledger=ledger,
+                failure=classification,
+                reason="declared retry budget is exhausted",
+                route=FailureRoute.STOP,
+            )
+        # A caller-supplied failure record is diagnostic context only.  The issued
+        # result carries the complete supervisor binding; no raw evidence IDs may
+        # become part of an authority-backed ledger record.
+        evidence_ids: tuple[str, ...] = ()
+        attempt_id = getattr(effective_supervisor, "_attempt_id", None)
+        record = RetryRecord(
             failure=classification,
-            reason="declared retry budget is exhausted",
-            route=FailureRoute.STOP,
+            attempt_id=attempt_id if isinstance(attempt_id, str) else None,
+            proposal_id=proposal.proposal_id if proposal is not None else None,
+            evidence_ids=evidence_ids,
         )
-    # A caller-supplied failure record is diagnostic context only.  The issued
-    # result carries the complete supervisor binding; no raw evidence IDs may
-    # become part of an authority-backed ledger record.
-    evidence_ids: tuple[str, ...] = ()
-    attempt_id = getattr(effective_supervisor, "_attempt_id", None)
-    record = RetryRecord(
-        failure=classification,
-        attempt_id=attempt_id if isinstance(attempt_id, str) else None,
-        proposal_id=proposal.proposal_id if proposal is not None else None,
-        evidence_ids=evidence_ids,
-    )
-    next_ledger = _issue_retry_ledger(
-        authority,
-        used=ledger.used + 1,
-        records=ledger.records + (record,),
-    )
+        next_ledger = _issue_retry_ledger(
+            authority,
+            used=ledger.used + 1,
+            records=ledger.records + (record,),
+        )
+        _RETRY_CONSUMED_RESULTS[id(issued_result)] = issued_result
+        _RETRY_CONSUMED_PAIRS[pair_key] = (ledger, issued_result)
     return RetryResult(
         decision=RetryDecision.RETRY,
         ledger=next_ledger,

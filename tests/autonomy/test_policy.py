@@ -4,6 +4,7 @@ import inspect
 import json
 import pickle
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from copy import copy, deepcopy
 from dataclasses import is_dataclass, replace
 from pathlib import Path
@@ -563,12 +564,14 @@ def test_retry_ledger_accounts_only_allowed_retries(tmp_path: Path) -> None:
         result=second_result,
     )
     assert second.decision is RetryDecision.RETRY
+    third_supervisor = timeout_supervisor(tmp_path / "third", "attempt-c", case_id="case-ledger")
+    third_result = third_supervisor.run(timeout_seconds=0.1)
     exhausted = decide_retry(
         FailureClass.TIMEOUT,
         second.ledger,
         intent=state,
-        supervisor=second_supervisor,
-        result=second_result,
+        supervisor=third_supervisor,
+        result=third_result,
     )
     assert exhausted.decision is RetryDecision.BUDGET_EXHAUSTED
     assert exhausted.ledger.used == 2
@@ -880,6 +883,104 @@ def test_retry_authority_revalidates_the_snapshot_before_consuming_budget(
         result=result,
     )
     assert decision.decision is RetryDecision.STOP
+
+
+def test_retry_replay_of_parent_ledger_and_failed_result_stops_without_minting(
+    tmp_path: Path,
+) -> None:
+    state = run_transition(
+        intent_snapshot(bound_intent(retry_budget=3), tmp_path, "retry-replay-parent")
+    )
+    ledger = RetryLedger.from_authority(state)
+    supervisor = timeout_supervisor(
+        tmp_path / "retry-replay-parent-solver", case_id="case-retry-replay-parent"
+    )
+    result = supervisor.run(timeout_seconds=0.1)
+
+    first = decide_retry(
+        FailureClass.TIMEOUT,
+        ledger,
+        intent=state,
+        supervisor=supervisor,
+        result=result,
+    )
+    replay = decide_retry(
+        FailureClass.TIMEOUT,
+        ledger,
+        intent=state,
+        supervisor=supervisor,
+        result=result,
+    )
+
+    assert first.decision is RetryDecision.RETRY
+    assert first.ledger.budget == state.intent.execution_budget.retry_budget == 3
+    assert first.ledger.used == 1
+    assert len(first.ledger.records) == 1
+    assert replay.decision is RetryDecision.STOP
+    assert replay.ledger is ledger
+
+
+def test_retry_replay_of_consumed_result_with_successor_ledger_stops(
+    tmp_path: Path,
+) -> None:
+    state = run_transition(
+        intent_snapshot(bound_intent(retry_budget=3), tmp_path, "retry-replay-successor")
+    )
+    ledger = RetryLedger.from_authority(state)
+    supervisor = timeout_supervisor(
+        tmp_path / "retry-replay-successor-solver", case_id="case-retry-replay-successor"
+    )
+    result = supervisor.run(timeout_seconds=0.1)
+
+    first = decide_retry(
+        FailureClass.TIMEOUT,
+        ledger,
+        intent=state,
+        supervisor=supervisor,
+        result=result,
+    )
+    replay = decide_retry(
+        FailureClass.TIMEOUT,
+        first.ledger,
+        intent=state,
+        supervisor=supervisor,
+        result=result,
+    )
+
+    assert first.decision is RetryDecision.RETRY
+    assert first.ledger.budget == 3
+    assert first.ledger.used == 1
+    assert len(first.ledger.records) == 1
+    assert replay.decision is RetryDecision.STOP
+    assert replay.ledger is first.ledger
+
+
+def test_retry_replay_consumption_is_atomic_under_concurrent_calls(
+    tmp_path: Path,
+) -> None:
+    state = run_transition(
+        intent_snapshot(bound_intent(retry_budget=3), tmp_path, "retry-replay-concurrent")
+    )
+    ledger = RetryLedger.from_authority(state)
+    supervisor = timeout_supervisor(
+        tmp_path / "retry-replay-concurrent-solver", case_id="case-retry-replay-concurrent"
+    )
+    result = supervisor.run(timeout_seconds=0.1)
+
+    def consume() -> RetryDecision:
+        return decide_retry(
+            FailureClass.TIMEOUT,
+            ledger,
+            intent=state,
+            supervisor=supervisor,
+            result=result,
+        ).decision
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        decisions = tuple(executor.map(lambda _: consume(), range(2)))
+
+    assert decisions.count(RetryDecision.RETRY) == 1
+    assert decisions.count(RetryDecision.STOP) == 1
 
 
 def test_execution_authority_rejects_mismatched_context_and_tampered_supervisor(
