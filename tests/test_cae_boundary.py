@@ -8,6 +8,21 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 SCANNER = ROOT / "scripts" / "scan_cae_data.py"
+IGNORED_UNTRACKED_DIRECTORY_NAMES = [
+    "build",
+    "dist",
+    "venv",
+    ".venv",
+    "pytest",
+    ".pytest_cache",
+    ".pytest_tmp",
+    "mypy",
+    ".mypy_cache",
+    "ruff",
+    ".ruff_cache",
+    "cache",
+    "__pycache__",
+]
 
 
 def run_scan(root: Path) -> subprocess.CompletedProcess[str]:
@@ -63,14 +78,51 @@ def test_case_manifest_is_rejected(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("directory_name", [".venv", ".pytest_tmp", "build", "dist"])
-def test_ignored_environment_directory_is_not_scanned(tmp_path: Path, directory_name: str) -> None:
+def test_noncandidate_in_ignored_environment_directory_is_allowed(
+    tmp_path: Path, directory_name: str
+) -> None:
     environment_directory = tmp_path / directory_name
     environment_directory.mkdir()
-    (environment_directory / "fixture.feb").write_bytes(b"ignored environment data")
+    (environment_directory / "fixture.txt").write_bytes(b"synthetic environment data")
 
     completed = run_scan(tmp_path)
 
     assert completed.returncode == 0
+
+
+@pytest.mark.parametrize("directory_name", IGNORED_UNTRACKED_DIRECTORY_NAMES)
+def test_ignored_untracked_artifact_suffix_is_rejected(tmp_path: Path, directory_name: str) -> None:
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    (tmp_path / ".gitignore").write_text(f"{directory_name}/\n", encoding="utf-8")
+    ignored_directory = tmp_path / directory_name
+    ignored_directory.mkdir()
+    prohibited_file = ignored_directory / "synthetic-model.feb"
+    prohibited_file.write_bytes(b"synthetic prohibited suffix fixture")
+
+    completed = run_scan(tmp_path)
+
+    assert completed.returncode == 1
+    assert prohibited_file.relative_to(tmp_path).as_posix() in completed.stderr.replace("\\", "/")
+
+
+@pytest.mark.parametrize("directory_name", IGNORED_UNTRACKED_DIRECTORY_NAMES)
+def test_ignored_untracked_case_directory_is_rejected(tmp_path: Path, directory_name: str) -> None:
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    (tmp_path / ".gitignore").write_text(f"{directory_name}/\n", encoding="utf-8")
+    ignored_directory = tmp_path / directory_name
+    ignored_directory.mkdir()
+    prohibited_directory = ignored_directory / "02_CAE"
+    prohibited_directory.mkdir()
+    (prohibited_directory / "synthetic-case.txt").write_bytes(
+        b"synthetic prohibited case directory fixture"
+    )
+
+    completed = run_scan(tmp_path)
+
+    assert completed.returncode == 1
+    assert prohibited_directory.relative_to(tmp_path).as_posix() in completed.stderr.replace(
+        "\\", "/"
+    )
 
 
 def test_untracked_local_tool_debug_log_is_not_scanned(tmp_path: Path) -> None:

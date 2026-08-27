@@ -21,20 +21,8 @@ PROHIBITED_DIRECTORY_NAMES = frozenset(
 )
 PROHIBITED_FILE_NAMES = frozenset({"case_manifest.json"})
 PROHIBITED_SUFFIXES = frozenset({".fbs", ".feb", ".log", ".step", ".stp", ".xplt"})
-IGNORED_DIRECTORY_NAMES = frozenset(
-    {
-        ".git",
-        ".mypy_cache",
-        ".pytest_cache",
-        ".pytest_tmp",
-        ".ruff_cache",
-        ".venv",
-        "__pycache__",
-        "build",
-        "dist",
-        "venv",
-    }
-)
+# Git metadata is the only directory that cannot contain a repository artifact.
+IGNORED_DIRECTORY_NAMES = frozenset({".git"})
 IGNORED_UNTRACKED_FILE_NAMES = frozenset({"debug.log"})
 
 
