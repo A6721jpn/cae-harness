@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-import hashlib
+import json
 from pathlib import Path
 
 import pytest
 
+from febio_cae_harness.contracts import IntentContract
+from febio_cae_harness.evidence import EvidenceIntegrityError, EvidenceStore
 from febio_cae_harness.workspace import (
     AttemptWorkspace,
     CaseWorkspace,
@@ -121,30 +123,12 @@ def test_case_handles_cannot_be_forged_with_arbitrary_roots(tmp_path: Path) -> N
         AttemptWorkspace._from_manager(case, "attempt-1", workspace.cae_root)
 
 
-def test_verified_promotion_is_hash_checked_and_create_new(tmp_path: Path) -> None:
+def test_public_workspace_has_no_promotion_authority(tmp_path: Path) -> None:
     case = make_workspace(tmp_path).create_case("case-a")
-    source = case.write_text(Path("90_Temporary") / "derived.feb", "derived")
-    digest = hashlib.sha256(b"derived").hexdigest()
-
-    promoted = case.promote_verified(
-        source,
-        Path("02_Model") / "derived.feb",
-        expected_sha256=digest,
-    )
-
-    assert promoted == case.case_root / "02_Model" / "derived.feb"
-    assert promoted.read_text(encoding="utf-8") == "derived"
-    with pytest.raises(FileExistsError):
-        case.promote_verified(source, Path("02_Model") / "derived.feb", expected_sha256=digest)
-
-    mismatched_source = case.write_text(Path("90_Temporary") / "mismatched.feb", "different")
-    with pytest.raises(ValueError, match="sha256"):
-        case.promote_verified(
-            mismatched_source,
-            Path("03_Result") / "result.xplt",
-            expected_sha256=digest,
-        )
-    assert not (case.case_root / "03_Result" / "result.xplt").exists()
+    with pytest.raises(TypeError):
+        case.promote_verified("raw-source", "02_Model/output", expected_sha256="0" * 64)
+    with pytest.raises(TypeError):
+        case.promote_artifact("raw-source", "02_Model/output", expected_sha256="0" * 64)
 
 
 def test_case_ids_and_case_root_targets_are_validated(tmp_path: Path) -> None:
@@ -168,3 +152,129 @@ def test_duplicate_case_creation_does_not_modify_existing_case(tmp_path: Path) -
         workspace.create_case("case-a")
 
     assert marker.read_text(encoding="utf-8") == "keep"
+
+
+def test_manager_rejects_reparse_cae_root_alias(tmp_path: Path) -> None:
+    real_root = tmp_path / "real-02_CAE"
+    real_root.mkdir()
+    cae_alias = tmp_path / "02_CAE"
+    try:
+        cae_alias.symlink_to(real_root, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"directory symlinks are unavailable: {error}")
+
+    with pytest.raises(WorkspaceBoundaryError):
+        ValidatedCaseWorkspace(tool_root=tmp_path / "tool", cae_root=cae_alias)
+
+
+def test_open_case_rejects_case_alias_instead_of_issuing_cross_case_authority(
+    tmp_path: Path,
+) -> None:
+    workspace = make_workspace(tmp_path)
+    case_a = workspace.create_case("case-a")
+    case_b = workspace.create_case("case-b")
+    case_a_root = case_a.case_root
+    import shutil
+
+    shutil.rmtree(case_a_root)
+    try:
+        case_a_root.symlink_to(case_b.case_root, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"directory symlinks are unavailable: {error}")
+
+    with pytest.raises(WorkspaceBoundaryError):
+        workspace.open_case("case-a")
+
+
+def test_attempt_handle_rejects_reparse_alias(tmp_path: Path) -> None:
+    workspace = make_workspace(tmp_path)
+    case = workspace.create_case("case-a")
+    real_attempt = case.temporary_root / "attempts" / "real-attempt"
+    real_attempt.mkdir()
+    attempt_alias = case.temporary_root / "attempts" / "attempt-1"
+    try:
+        attempt_alias.symlink_to(real_attempt, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"directory symlinks are unavailable: {error}")
+
+    with pytest.raises(WorkspaceBoundaryError):
+        AttemptWorkspace._from_manager(case, "attempt-1", attempt_alias)
+
+
+def test_case_handle_rejects_reparse_write_alias_inside_owned_tree(tmp_path: Path) -> None:
+    workspace = make_workspace(tmp_path)
+    case = workspace.create_case("case-a")
+    real_directory = case.temporary_root / "real"
+    real_directory.mkdir()
+    alias_directory = case.temporary_root / "alias"
+    try:
+        alias_directory.symlink_to(real_directory, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"directory symlinks are unavailable: {error}")
+
+    with pytest.raises(WorkspaceBoundaryError):
+        case.write_text(Path("90_Temporary") / "alias" / "output.txt", "must reject alias")
+
+
+def test_promotion_requires_persisted_evidence_store_authorization(tmp_path: Path) -> None:
+    workspace = make_workspace(tmp_path)
+    case = workspace.create_case("case-a")
+    store = EvidenceStore(
+        case,
+        IntentContract(engineering_question="What is the displacement?"),
+    )
+    store.record_attempt("attempt-1")
+    source = case.write_text(
+        Path("90_Temporary") / "attempts" / "attempt-1" / "derived.feb",
+        "derived",
+    )
+    destination = Path("02_Model") / "derived.feb"
+
+    with pytest.raises(TypeError):
+        case.promote_verified(source, destination, expected_sha256="0" * 64)
+    with pytest.raises(TypeError):
+        case.promote_artifact(source, destination, expected_sha256="0" * 64)
+
+    with pytest.raises(EvidenceIntegrityError):
+        store.promote_verified("not-a-receipt")  # type: ignore[arg-type]
+
+    verification = store.record_verification(
+        source,
+        destination,
+        attempt_id="attempt-1",
+    )
+    assert verification is not None
+    promoted = store.promote_verified(verification)
+    assert promoted == case.case_root / destination
+    assert promoted.read_text(encoding="utf-8") == "derived"
+    assert store.reopen() is store
+
+
+def test_promotion_verification_binds_exact_destination(tmp_path: Path) -> None:
+    workspace = make_workspace(tmp_path)
+    case = workspace.create_case("case-a")
+    store = EvidenceStore(
+        case,
+        IntentContract(engineering_question="What is the displacement?"),
+    )
+    store.record_attempt("attempt-1")
+    source = case.write_text(
+        Path("90_Temporary") / "attempts" / "attempt-1" / "derived.feb",
+        "derived",
+    )
+    verification = store.record_verification(
+        source,
+        Path("02_Model") / "derived.feb",
+        attempt_id="attempt-1",
+    )
+    assert verification is not None
+
+    events_path = store.events_path
+    lines = events_path.read_text(encoding="utf-8").splitlines()
+    tampered = json.loads(lines[-1])
+    tampered["payload"]["destination"] = "03_Result/not-authorized.xplt"
+    lines[-1] = json.dumps(tampered, separators=(",", ":"), sort_keys=True)
+    events_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    with pytest.raises(EvidenceIntegrityError):
+        store.promote_verified(verification)

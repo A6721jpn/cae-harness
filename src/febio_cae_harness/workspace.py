@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import os
 import shutil
+import stat
 from collections.abc import Iterable
 from contextlib import suppress
 from dataclasses import dataclass
@@ -27,6 +28,7 @@ _TEMPORARY_ROOT = "90_Temporary"
 _PERMANENT_ROOTS = frozenset({"02_Model", "03_Result", "04_Report", "05_Verification"})
 _CONTROL_FILES = frozenset({"CASE_MANIFEST.json", "intent.json"})
 _EVENTS_FILE = f"{_TEMPORARY_ROOT}/events.jsonl"
+_REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
 
 
 class WorkspaceBoundaryError(PermissionError):
@@ -45,6 +47,51 @@ def _validate_segment(value: str, label: str) -> str:
     return value
 
 
+def _lexical_path(value: str | Path) -> Path:
+    """Return an absolute path without resolving filesystem aliases."""
+
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    return Path(os.path.abspath(os.fspath(path)))
+
+
+def _reject_reparse_alias(path: str | Path, label: str = "path") -> Path:
+    """Reject symlinks, junctions, and all other reparse-point ancestors."""
+
+    _reject_parent_segments(Path(path), label)
+    absolute = _lexical_path(path)
+    ancestors: list[Path] = []
+    current = absolute
+    while True:
+        ancestors.append(current)
+        if current == current.parent:
+            break
+        current = current.parent
+
+    for ancestor in reversed(ancestors):
+        try:
+            exists = os.path.lexists(os.fspath(ancestor))
+        except OSError as error:
+            raise WorkspaceBoundaryError(f"cannot inspect {label}: {absolute}") from error
+        if not exists:
+            continue
+        try:
+            metadata = ancestor.lstat()
+        except OSError as error:
+            raise WorkspaceBoundaryError(f"cannot inspect {label}: {absolute}") from error
+        if stat.S_ISLNK(metadata.st_mode) or bool(
+            getattr(metadata, "st_file_attributes", 0) & _REPARSE_POINT
+        ):
+            raise WorkspaceBoundaryError(f"{label} cannot contain a reparse-point alias")
+    return absolute
+
+
+def _reject_parent_segments(path: Path, label: str) -> None:
+    if ".." in path.parts:
+        raise WorkspaceBoundaryError(f"{label} cannot contain parent traversal")
+
+
 def _resolve_owned_target(
     root: Path,
     relative_path: str | Path,
@@ -52,13 +99,15 @@ def _resolve_owned_target(
     allow_absolute: bool = False,
 ) -> Path:
     relative = Path(relative_path)
+    _reject_parent_segments(relative, "write target")
+    root = _reject_reparse_alias(root, "owned root")
     if relative.is_absolute() or relative.anchor:
         if not allow_absolute:
             raise WorkspaceBoundaryError("write target must be relative to the case workspace")
-        target = relative.resolve(strict=False)
+        target = _lexical_path(relative)
     else:
-        target = (root / relative).resolve(strict=False)
-    root = root.resolve(strict=False)
+        target = _lexical_path(root / relative)
+    target = _reject_reparse_alias(target, "owned target")
     if target == root or not target.is_relative_to(root):
         raise WorkspaceBoundaryError("write target is outside the owned case workspace")
     return target
@@ -66,6 +115,7 @@ def _resolve_owned_target(
 
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
+    path = _reject_reparse_alias(path, "file")
     try:
         with path.open("rb") as stream:
             for chunk in iter(lambda: stream.read(1024 * 1024), b""):
@@ -104,10 +154,12 @@ class AttemptWorkspace:
             raise TypeError("attempt workspace requires a case workspace authority")
         _validate_segment(case_workspace.case_id, "case_id")
         _validate_segment(attempt_id, "attempt_id")
-        expected_root = (case_workspace.temporary_root / "attempts" / attempt_id).resolve(
-            strict=False
+        _reject_reparse_alias(case_workspace.case_root, "case root")
+        expected_root = _reject_reparse_alias(
+            case_workspace.temporary_root / "attempts" / attempt_id,
+            "attempt root",
         )
-        actual_root = Path(root).resolve(strict=False)
+        actual_root = _reject_reparse_alias(root, "attempt root")
         if actual_root != expected_root or not actual_root.is_dir():
             raise WorkspaceBoundaryError("attempt root is not owned by the case workspace")
 
@@ -122,7 +174,10 @@ class AttemptWorkspace:
 
     def write_bytes(self, relative_path: str | Path, data: bytes) -> Path:
         target = _resolve_owned_target(self.root, relative_path)
+        _reject_reparse_alias(target.parent, "attempt target parent")
         target.parent.mkdir(parents=True, exist_ok=True)
+        _reject_reparse_alias(target.parent, "attempt target parent")
+        _reject_reparse_alias(target, "attempt target")
         target.write_bytes(data)
         return target
 
@@ -134,7 +189,10 @@ class AttemptWorkspace:
         encoding: str = "utf-8",
     ) -> Path:
         target = _resolve_owned_target(self.root, relative_path)
+        _reject_reparse_alias(target.parent, "attempt target parent")
         target.parent.mkdir(parents=True, exist_ok=True)
+        _reject_reparse_alias(target.parent, "attempt target parent")
+        _reject_reparse_alias(target, "attempt target")
         target.write_text(text, encoding=encoding)
         return target
 
@@ -169,18 +227,19 @@ class CaseWorkspace:
         if not isinstance(manager, ValidatedCaseWorkspace):
             raise TypeError("case workspace requires a validated workspace authority")
         _validate_segment(case_id, "case_id")
-        expected_root = (manager.cae_root / case_id).resolve(strict=False)
-        actual_root = Path(case_root).resolve(strict=False)
+        _reject_reparse_alias(manager.cae_root, "cae root")
+        expected_root = _reject_reparse_alias(
+            manager.cae_root / case_id,
+            "case root",
+        )
+        actual_root = _reject_reparse_alias(case_root, "case root")
         if actual_root != expected_root or not actual_root.is_dir():
             raise WorkspaceBoundaryError("case root is not owned by the validated workspace")
 
-        input_root = (actual_root / "01_Input").resolve(strict=False)
+        input_root = _reject_reparse_alias(actual_root / "01_Input", "input root")
         normalised_originals: list[Path] = []
         for path_value in original_inputs:
-            source_path = Path(path_value)
-            if source_path.is_symlink():
-                raise WorkspaceBoundaryError("original input cannot be a symlink")
-            path = source_path.resolve(strict=False)
+            path = _reject_reparse_alias(path_value, "original input")
             if not path.is_file() or not path.is_relative_to(input_root):
                 raise WorkspaceBoundaryError("original input is outside the owned 01_Input")
             normalised_originals.append(path)
@@ -193,7 +252,7 @@ class CaseWorkspace:
         object.__setattr__(
             instance,
             "source_inputs",
-            tuple(Path(path).expanduser().resolve(strict=False) for path in source_inputs),
+            tuple(_reject_reparse_alias(path, "source input") for path in source_inputs),
         )
         return instance
 
@@ -240,9 +299,9 @@ class CaseWorkspace:
         allow_event_append: bool = False,
     ) -> Path:
         target = _resolve_owned_target(self.case_root, relative_path)
-        temporary_root = self.temporary_root.resolve(strict=False)
+        temporary_root = _reject_reparse_alias(self.temporary_root, "temporary root")
         if target == temporary_root or not target.is_relative_to(temporary_root):
-            input_root = self.input_root.resolve(strict=False)
+            input_root = _reject_reparse_alias(self.input_root, "input root")
             if target == input_root or target.is_relative_to(input_root):
                 raise ImmutableInputError("01_Input is immutable after case creation")
             raise WorkspaceBoundaryError("normal writes are restricted to 90_Temporary")
@@ -261,7 +320,10 @@ class CaseWorkspace:
 
     def write_bytes(self, relative_path: str | Path, data: bytes) -> Path:
         target = self._temporary_write_target(relative_path)
+        _reject_reparse_alias(target.parent, "case target parent")
         target.parent.mkdir(parents=True, exist_ok=True)
+        _reject_reparse_alias(target.parent, "case target parent")
+        _reject_reparse_alias(target, "case target")
         target.write_bytes(data)
         return target
 
@@ -273,7 +335,10 @@ class CaseWorkspace:
         encoding: str = "utf-8",
     ) -> Path:
         target = self._temporary_write_target(relative_path)
+        _reject_reparse_alias(target.parent, "case target parent")
         target.parent.mkdir(parents=True, exist_ok=True)
+        _reject_reparse_alias(target.parent, "case target parent")
+        _reject_reparse_alias(target, "case target")
         target.write_text(text, encoding=encoding)
         return target
 
@@ -287,6 +352,8 @@ class CaseWorkspace:
         """Write a root-level evidence control file for ``EvidenceStore``."""
 
         target = self._control_write_target(relative_path)
+        _reject_reparse_alias(target.parent, "control target parent")
+        _reject_reparse_alias(target, "control target")
         target.write_text(text, encoding=encoding)
         return target
 
@@ -305,9 +372,12 @@ class CaseWorkspace:
         """
 
         target = self._temporary_write_target(relative_path, allow_event_append=True)
+        _reject_reparse_alias(target.parent, "append target parent")
         target.parent.mkdir(parents=True, exist_ok=True)
+        _reject_reparse_alias(target.parent, "append target parent")
         data = text.encode(encoding)
         try:
+            _reject_reparse_alias(target, "append target")
             with target.open("ab") as stream:
                 stream.write(data)
                 stream.flush()
@@ -316,28 +386,26 @@ class CaseWorkspace:
             raise WorkspaceBoundaryError(f"cannot append temporary evidence: {target}") from error
         return target
 
-    def promote_verified(
+    def _copy_create_new(
         self,
         source: str | Path,
         destination: str | Path,
         *,
         expected_sha256: str,
     ) -> Path:
-        """Copy a verified temporary artifact into a permanent area once.
+        """Copy an EvidenceStore-authorized artifact into a permanent area once.
 
-        The source must be an existing regular file below ``90_Temporary``;
-        the destination must be below one of the four permanent roots.  The
-        destination is opened with create-new semantics and the copied bytes
-        are hashed before the file is fsynced.  A digest mismatch leaves no
-        destination file behind.
+        This is an internal hook for ``EvidenceStore``.  Public callers must
+        obtain a persisted verification record from that store; a digest alone
+        is not a promotion authority.
         """
 
         expected = _validate_sha256(expected_sha256)
         source_path = _resolve_owned_target(self.case_root, source, allow_absolute=True)
-        temporary_root = self.temporary_root.resolve(strict=False)
+        temporary_root = _reject_reparse_alias(self.temporary_root, "temporary root")
         if source_path == temporary_root or not source_path.is_relative_to(temporary_root):
             raise WorkspaceBoundaryError("promotion source must be inside 90_Temporary")
-        if not source_path.is_file() or source_path.is_symlink():
+        if not source_path.is_file():
             raise WorkspaceBoundaryError("promotion source must be a regular file")
 
         destination_path = _resolve_owned_target(
@@ -359,7 +427,9 @@ class CaseWorkspace:
         if _sha256_file(source_path) != expected:
             raise ValueError("promotion source sha256 does not match expected_sha256")
 
+        _reject_reparse_alias(destination_path.parent, "promotion destination parent")
         destination_path.parent.mkdir(parents=True, exist_ok=True)
+        _reject_reparse_alias(destination_path.parent, "promotion destination parent")
         created = False
         try:
             copied_digest = hashlib.sha256()
@@ -379,6 +449,23 @@ class CaseWorkspace:
             raise
         return destination_path
 
+    def promote_verified(
+        self,
+        source: str | Path,
+        destination: str | Path,
+        *,
+        expected_sha256: str,
+    ) -> Path:
+        """Reject the former raw-digest promotion API.
+
+        Promotion authority belongs to ``EvidenceStore`` and is represented by
+        a persisted, opaque verification receipt.  Keeping this guard makes
+        accidental calls fail explicitly without exposing a bypass.
+        """
+
+        del source, destination, expected_sha256
+        raise TypeError("promotion requires EvidenceStore.promote_verified receipt")
+
     def promote_artifact(
         self,
         source: str | Path,
@@ -386,17 +473,21 @@ class CaseWorkspace:
         *,
         expected_sha256: str,
     ) -> Path:
-        """Compatibility name for :meth:`promote_verified`."""
+        """Reject the legacy raw-digest promotion alias."""
 
-        return self.promote_verified(
-            source,
-            destination,
-            expected_sha256=expected_sha256,
-        )
+        del source, destination, expected_sha256
+        raise TypeError("promotion requires EvidenceStore.promote_verified receipt")
 
     def allocate_attempt(self, attempt_id: str) -> AttemptWorkspace:
         _validate_segment(attempt_id, "attempt_id")
+        _reject_reparse_alias(self.case_root, "case root")
+        _reject_reparse_alias(self.temporary_root, "temporary root")
+        _reject_reparse_alias(
+            self.temporary_root / "attempts",
+            "attempts root",
+        )
         attempt_root = self.temporary_root / "attempts" / attempt_id
+        _reject_reparse_alias(attempt_root, "attempt root")
         attempt_root.mkdir(parents=False, exist_ok=False)
         return AttemptWorkspace._from_manager(self, attempt_id, attempt_root)
 
@@ -413,8 +504,8 @@ class ValidatedCaseWorkspace:
     cae_root: Path
 
     def __post_init__(self) -> None:
-        tool_root = Path(self.tool_root).expanduser().resolve()
-        cae_root = Path(self.cae_root).expanduser().resolve()
+        tool_root = _reject_reparse_alias(self.tool_root, "tool root")
+        cae_root = _reject_reparse_alias(self.cae_root, "cae root")
         if tool_root == cae_root:
             raise ValueError("tool_root and cae_root must be different roots")
         if tool_root.is_relative_to(cae_root) or cae_root.is_relative_to(tool_root):
@@ -439,7 +530,7 @@ class ValidatedCaseWorkspace:
         sources: list[Path] = []
         names: set[str] = set()
         for candidate in candidates:
-            source = Path(candidate).expanduser().resolve(strict=True)
+            source = _reject_reparse_alias(candidate, "original input")
             if not source.is_file():
                 raise ValueError(f"original input is not a file: {source}")
             name_key = source.name.casefold()
@@ -456,9 +547,13 @@ class ValidatedCaseWorkspace:
     ) -> CaseWorkspace:
         """Create a new case and copy source inputs without modifying them."""
 
-        case_path = self._case_path(case_id)
+        _reject_reparse_alias(self.tool_root, "tool root")
+        _reject_reparse_alias(self.cae_root, "cae root")
+        case_path = _reject_reparse_alias(self._case_path(case_id), "case root")
         sources = self._normalise_inputs(original_inputs)
         self.cae_root.mkdir(parents=True, exist_ok=True)
+        _reject_reparse_alias(self.cae_root, "cae root")
+        _reject_reparse_alias(case_path, "case root")
         case_path.mkdir(parents=False, exist_ok=False)
 
         try:
@@ -486,16 +581,30 @@ class ValidatedCaseWorkspace:
     def open_case(self, case_id: str) -> CaseWorkspace:
         """Open an existing case without granting access outside its root."""
 
-        case_path = self._case_path(case_id).resolve(strict=True)
+        _reject_reparse_alias(self.tool_root, "tool root")
+        _reject_reparse_alias(self.cae_root, "cae root")
+        case_path = _reject_reparse_alias(self._case_path(case_id), "case root")
         if not case_path.is_dir() or not case_path.is_relative_to(self.cae_root):
             raise FileNotFoundError(f"case does not exist: {case_id}")
-        input_root = case_path / "01_Input"
+        _reject_reparse_alias(case_path, "case root")
+        input_root = _reject_reparse_alias(case_path / "01_Input", "input root")
         original_inputs: tuple[Path, ...]
         if input_root.is_dir():
             entries = tuple(input_root.iterdir())
-            if any(entry.is_symlink() or not entry.is_file() for entry in entries):
-                raise WorkspaceBoundaryError("original input directory contains an invalid entry")
-            original_inputs = tuple(sorted((entry.resolve() for entry in entries), key=str))
+            normalised_entries: list[Path] = []
+            for entry in entries:
+                try:
+                    normalised_entry = _reject_reparse_alias(entry, "original input")
+                except WorkspaceBoundaryError as error:
+                    raise WorkspaceBoundaryError(
+                        "original input directory contains an invalid entry"
+                    ) from error
+                if not normalised_entry.is_file():
+                    raise WorkspaceBoundaryError(
+                        "original input directory contains an invalid entry"
+                    )
+                normalised_entries.append(normalised_entry)
+            original_inputs = tuple(sorted(normalised_entries, key=str))
         else:
             original_inputs = ()
         return CaseWorkspace._from_manager(self, case_id, case_path, original_inputs)

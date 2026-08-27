@@ -2,12 +2,20 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
+import time
 from pathlib import Path
+from typing import cast
 
 import pytest
 
 from febio_cae_harness.contracts import IntentContract
-from febio_cae_harness.evidence import EvidenceIntegrityError, EvidenceStore
+from febio_cae_harness.evidence import (
+    EVENTS_FILE,
+    EvidenceIntegrityError,
+    EvidenceStore,
+    VerificationReceipt,
+)
 from febio_cae_harness.workspace import (
     CaseWorkspace,
     ValidatedCaseWorkspace,
@@ -162,3 +170,202 @@ def test_partial_persistence_and_boundary_escape_fail_closed(tmp_path: Path) -> 
     store = EvidenceStore(workspace.create_case("case-b"), intent)
     with pytest.raises(WorkspaceBoundaryError):
         store.record_artifact(workspace.cae_root / "outside.txt")
+
+
+def test_concurrent_store_event_writers_do_not_race_sequence_or_predecessor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, case, intent = make_case(tmp_path)
+    store_a = EvidenceStore(case, intent)
+    store_b = EvidenceStore.open(case)
+    original_append_text = CaseWorkspace.append_text
+    state_lock = threading.Lock()
+    started = threading.Barrier(2)
+    active_event_appends = 0
+    overlapped_event_appends = False
+
+    def delayed_append(
+        self: CaseWorkspace,
+        relative_path: str | Path,
+        text: str,
+        *,
+        encoding: str = "utf-8",
+    ) -> Path:
+        nonlocal active_event_appends, overlapped_event_appends
+        if Path(relative_path).as_posix() == EVENTS_FILE:
+            with state_lock:
+                active_event_appends += 1
+                overlapped_event_appends = overlapped_event_appends or active_event_appends > 1
+            try:
+                time.sleep(0.05)
+                return original_append_text(self, relative_path, text, encoding=encoding)
+            finally:
+                with state_lock:
+                    active_event_appends -= 1
+        return original_append_text(self, relative_path, text, encoding=encoding)
+
+    monkeypatch.setattr(CaseWorkspace, "append_text", delayed_append)
+
+    errors: list[BaseException] = []
+    events: list[dict[str, object]] = []
+
+    def append_from(store: EvidenceStore, event_type: str) -> None:
+        try:
+            started.wait(timeout=2)
+            events.append(store.append_event(event_type))
+        except BaseException as error:  # pragma: no cover - assertion reports details
+            errors.append(error)
+
+    first = threading.Thread(target=append_from, args=(store_a, "first"))
+    second = threading.Thread(target=append_from, args=(store_b, "second"))
+    first.start()
+    second.start()
+    first.join(timeout=5)
+    second.join(timeout=5)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert not errors
+    assert not overlapped_event_appends
+    assert sorted(cast(int, event["sequence"]) for event in events) == [1, 2]
+    assert store_a.reopen() is store_a
+    assert store_b.reopen() is store_b
+
+
+def test_record_verification_persists_bound_evidence_and_issues_opaque_receipt(
+    tmp_path: Path,
+) -> None:
+    _, case, intent = make_case(tmp_path)
+    store = EvidenceStore(case, intent)
+    store.record_attempt("attempt-1")
+    source = case.write_text(
+        Path("90_Temporary") / "attempts" / "attempt-1" / "derived.feb",
+        "derived",
+    )
+
+    receipt = store.record_verification(
+        source,
+        Path("02_Model") / "derived.feb",
+        attempt_id="attempt-1",
+        validator="synthetic-validator",
+        status="passed",
+    )
+
+    assert isinstance(receipt, VerificationReceipt)
+    assert repr(receipt) == "VerificationReceipt(<opaque>)"
+    with pytest.raises(EvidenceIntegrityError):
+        store.promote_verified({"evidence_digest": str(receipt)})  # type: ignore[arg-type]
+    record = json.loads(store.events_path.read_text(encoding="utf-8").splitlines()[-1])
+    assert record["event_type"] == "artifact_verified"
+    payload = record["payload"]
+    assert payload["case_id"] == case.case_id
+    assert payload["attempt_id"] == "attempt-1"
+    assert payload["source"] == "90_Temporary/attempts/attempt-1/derived.feb"
+    assert payload["sha256"] == hashlib.sha256(b"derived").hexdigest()
+    assert payload["destination"] == "02_Model/derived.feb"
+    assert payload["validator"] == "synthetic-validator"
+    assert payload["status"] == "passed"
+    assert isinstance(payload["evidence_digest"], str)
+    assert str(receipt).endswith(payload["evidence_digest"])
+
+
+def test_failed_verification_has_no_promotion_receipt(tmp_path: Path) -> None:
+    _, case, intent = make_case(tmp_path)
+    store = EvidenceStore(case, intent)
+    store.record_attempt("attempt-1")
+    source = case.write_text(
+        Path("90_Temporary") / "attempts" / "attempt-1" / "derived.feb",
+        "derived",
+    )
+
+    receipt = store.record_verification(
+        source,
+        Path("02_Model") / "derived.feb",
+        attempt_id="attempt-1",
+        status="failed",
+    )
+
+    assert receipt is None
+    with pytest.raises(EvidenceIntegrityError):
+        store.promote_verified(receipt)  # type: ignore[arg-type]
+
+
+def test_artifact_verified_cannot_be_fabricated_through_generic_event_api(
+    tmp_path: Path,
+) -> None:
+    _, case, intent = make_case(tmp_path)
+    store = EvidenceStore(case, intent)
+
+    with pytest.raises(EvidenceIntegrityError):
+        store.append_event("artifact_verified", {})
+    assert store.events_path.read_text(encoding="utf-8") == ""
+
+
+def test_verification_rejects_duplicate_and_source_mutation(tmp_path: Path) -> None:
+    _, case, intent = make_case(tmp_path)
+    store = EvidenceStore(case, intent)
+    store.record_attempt("attempt-1")
+    source = case.write_text(
+        Path("90_Temporary") / "attempts" / "attempt-1" / "derived.feb",
+        "derived",
+    )
+    receipt = store.record_verification(
+        source,
+        Path("02_Model") / "derived.feb",
+        attempt_id="attempt-1",
+    )
+    assert receipt is not None
+
+    with pytest.raises(EvidenceIntegrityError):
+        store.record_verification(
+            source,
+            Path("02_Model") / "derived.feb",
+            attempt_id="attempt-1",
+        )
+    source.write_text("mutated", encoding="utf-8")
+    with pytest.raises(EvidenceIntegrityError):
+        store.promote_verified(receipt)
+
+
+def test_receipt_is_case_bound_even_for_identical_case_ids(tmp_path: Path) -> None:
+    workspace_a = ValidatedCaseWorkspace(tmp_path / "tool-a", tmp_path / "02_CAE-a")
+    case_a = workspace_a.create_case("case-a")
+    store_a = EvidenceStore(case_a, IntentContract(engineering_question="q"))
+    store_a.record_attempt("attempt-1")
+    source_a = case_a.write_text(
+        Path("90_Temporary") / "attempts" / "attempt-1" / "derived.feb",
+        "derived",
+    )
+    receipt = store_a.record_verification(
+        source_a,
+        Path("02_Model") / "derived.feb",
+        attempt_id="attempt-1",
+    )
+    assert receipt is not None
+
+    workspace_b = ValidatedCaseWorkspace(tmp_path / "tool-b", tmp_path / "02_CAE-b")
+    case_b = workspace_b.create_case("case-a")
+    store_b = EvidenceStore(case_b, IntentContract(engineering_question="q"))
+    with pytest.raises(EvidenceIntegrityError):
+        store_b.promote_verified(receipt)
+
+
+def test_promotion_is_create_new_and_rejects_duplicate_receipt_use(tmp_path: Path) -> None:
+    _, case, intent = make_case(tmp_path)
+    store = EvidenceStore(case, intent)
+    store.record_attempt("attempt-1")
+    source = case.write_text(
+        Path("90_Temporary") / "attempts" / "attempt-1" / "derived.feb",
+        "derived",
+    )
+    receipt = store.record_verification(
+        source,
+        Path("02_Model") / "derived.feb",
+        attempt_id="attempt-1",
+    )
+    assert receipt is not None
+
+    assert store.promote_verified(receipt).read_text(encoding="utf-8") == "derived"
+    with pytest.raises(FileExistsError):
+        store.promote_verified(receipt)
