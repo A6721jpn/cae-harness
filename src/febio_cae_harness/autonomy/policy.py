@@ -1864,6 +1864,7 @@ def _retry_authority_matches(
             return False
         return (
             type(state_case_workspace) is CaseWorkspace
+            and launch_case_workspace is state_case_workspace
             and launch_case_root == state_case_root
             and launch_case_id == state_case_id == state_snapshot.case_id
             and launch_case_sha256 == state_case_sha256 == state_snapshot.case_sha256

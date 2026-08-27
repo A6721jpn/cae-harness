@@ -50,6 +50,7 @@ from febio_cae_harness.solver.supervisor import SolverSupervisor
 from febio_cae_harness.solver.types import SolverClassification
 from febio_cae_harness.workspace import (
     AttemptWorkspace,
+    CaseWorkspace,
     ValidatedCaseWorkspace,
     WorkspaceBoundaryError,
 )
@@ -114,6 +115,7 @@ def timeout_supervisor(
     *,
     intent: IntentContract | None = None,
     workspace_root: Path | None = None,
+    case_workspace: CaseWorkspace | None = None,
     record_attempt: bool = True,
 ) -> SolverSupervisor:
     workspace_temp: tempfile.TemporaryDirectory[str] | None
@@ -122,8 +124,15 @@ def timeout_supervisor(
         workspace_root = Path(workspace_temp.name)
     else:
         workspace_temp = None
-    manager = ValidatedCaseWorkspace(workspace_root / "t", workspace_root / "c")
-    case = manager.create_case(case_id) if record_attempt else manager.open_case(case_id)
+    if case_workspace is not None:
+        if type(case_workspace) is not CaseWorkspace:
+            raise TypeError("case_workspace must be an exact CaseWorkspace")
+        if record_attempt:
+            raise ValueError("case_workspace cannot be used when recording an attempt")
+        case = case_workspace
+    else:
+        manager = ValidatedCaseWorkspace(workspace_root / "t", workspace_root / "c")
+        case = manager.create_case(case_id) if record_attempt else manager.open_case(case_id)
     store_intent = IntentContract() if record_attempt and intent is None else intent
     store = EvidenceStore(case, store_intent)
     if record_attempt:
@@ -614,19 +623,21 @@ def test_proposal_authority_rejects_forgery_foreign_and_tampered_state(tmp_path:
 def test_retry_ledger_accounts_only_allowed_retries(tmp_path: Path) -> None:
     intent = bound_intent(retry_budget=2)
     _workspace_temp, workspace_root = short_workspace_root(tmp_path)
-    state, _ = retry_state_for_case(
+    state, state_snapshot = retry_state_for_case(
         workspace_root,
         "case-ledger",
         intent,
         attempt_ids=("attempt-a", "attempt-b", "attempt-c"),
     )
     ledger = RetryLedger.from_authority(state)
+    state_case = object.__getattribute__(state_snapshot, "_case_workspace")
 
     first_supervisor = timeout_supervisor(
         tmp_path / "first",
         case_id="case-ledger",
         intent=intent,
         workspace_root=workspace_root,
+        case_workspace=state_case,
         record_attempt=False,
     )
     first_result = first_supervisor.run(timeout_seconds=0.1)
@@ -646,6 +657,7 @@ def test_retry_ledger_accounts_only_allowed_retries(tmp_path: Path) -> None:
         case_id="case-ledger",
         intent=intent,
         workspace_root=workspace_root,
+        case_workspace=state_case,
         record_attempt=False,
     )
     second_result = second_supervisor.run(timeout_seconds=0.1)
@@ -663,6 +675,7 @@ def test_retry_ledger_accounts_only_allowed_retries(tmp_path: Path) -> None:
         case_id="case-ledger",
         intent=intent,
         workspace_root=workspace_root,
+        case_workspace=state_case,
         record_attempt=False,
     )
     third_result = third_supervisor.run(timeout_seconds=0.1)
@@ -719,6 +732,52 @@ def test_retry_rejects_foreign_case_root_with_same_case_and_intent_digests(
     assert decision.ledger is ledger
     assert ledger.used == 0
     del local_workspace_temp, foreign_workspace_temp
+
+
+def test_retry_rejects_distinct_case_handles_with_same_root_and_digests(
+    tmp_path: Path,
+) -> None:
+    intent = bound_intent(retry_budget=1)
+    _workspace_temp, workspace_root = short_workspace_root(tmp_path)
+    manager = ValidatedCaseWorkspace(workspace_root / "t", workspace_root / "c")
+    created_case = manager.create_case("same-case")
+    EvidenceStore(created_case, intent).record_attempt("attempt-a")
+
+    state_case = manager.open_case("same-case")
+    state_snapshot = EvidenceStore.open(state_case).issue_intent_snapshot()
+    state = run_transition(state_snapshot)
+    ledger = RetryLedger.from_authority(state)
+
+    launch_supervisor = timeout_supervisor(
+        tmp_path / "distinct-case-handles",
+        case_id="same-case",
+        intent=intent,
+        workspace_root=workspace_root,
+        record_attempt=False,
+    )
+    launch_result = launch_supervisor.run(timeout_seconds=0.1)
+    launch_capability = object.__getattribute__(launch_supervisor, "_launch_capability")
+    launch_snapshot = object.__getattribute__(launch_capability, "_intent_snapshot")
+    launch_case = object.__getattribute__(launch_snapshot, "_case_workspace")
+
+    assert type(launch_case) is type(state_case) is type(created_case)
+    assert launch_case is not state_case
+    assert launch_case.root == state_case.root == created_case.root
+    assert launch_snapshot.case_id == state_snapshot.case_id == "same-case"
+    assert launch_snapshot.case_sha256 == state_snapshot.case_sha256
+    assert launch_snapshot.intent_sha256 == state_snapshot.intent_sha256
+
+    decision = decide_retry(
+        FailureClass.TIMEOUT,
+        ledger,
+        intent=state,
+        supervisor=launch_supervisor,
+        result=launch_result,
+    )
+
+    assert decision.decision is RetryDecision.STOP
+    assert decision.ledger is ledger
+    assert ledger.used == 0
 
 
 def test_retry_rejects_mutated_capability_before_accounting(
@@ -885,17 +944,19 @@ def test_retry_does_not_turn_unresolved_non_authoritative_data_into_a_question(
         unresolved=({"condition": "contact", "authoritative": False, "source": "guess"},),
     )
     _workspace_temp, workspace_root = short_workspace_root(tmp_path)
-    state, _ = retry_state_for_case(
+    state, state_snapshot = retry_state_for_case(
         workspace_root,
         "case-non-authoritative",
         intent,
         attempt_ids=("attempt-a",),
     )
+    state_case = object.__getattribute__(state_snapshot, "_case_workspace")
     supervisor = timeout_supervisor(
         tmp_path / "non-authoritative-solver",
         case_id="case-non-authoritative",
         intent=intent,
         workspace_root=workspace_root,
+        case_workspace=state_case,
         record_attempt=False,
     )
     result = supervisor.run(timeout_seconds=0.1)
@@ -1091,17 +1152,19 @@ def test_policy_has_no_importable_intent_state_factory_bypass() -> None:
 def test_retry_authority_rejects_forged_ledger_and_result(tmp_path: Path) -> None:
     intent = bound_intent(retry_budget=1)
     _workspace_temp, workspace_root = short_workspace_root(tmp_path)
-    state, _ = retry_state_for_case(
+    state, state_snapshot = retry_state_for_case(
         workspace_root,
         "case-authority",
         intent,
         attempt_ids=("attempt-a",),
     )
+    state_case = object.__getattribute__(state_snapshot, "_case_workspace")
     supervisor = timeout_supervisor(
         tmp_path / "solver",
         case_id="case-authority",
         intent=intent,
         workspace_root=workspace_root,
+        case_workspace=state_case,
         record_attempt=False,
     )
     result = supervisor.run(timeout_seconds=0.1)
@@ -1192,18 +1255,20 @@ def test_retry_replay_of_parent_ledger_and_failed_result_stops_without_minting(
 ) -> None:
     intent = bound_intent(retry_budget=3)
     _workspace_temp, workspace_root = short_workspace_root(tmp_path)
-    state, _ = retry_state_for_case(
+    state, state_snapshot = retry_state_for_case(
         workspace_root,
         "case-retry-replay-parent",
         intent,
         attempt_ids=("attempt-a",),
     )
     ledger = RetryLedger.from_authority(state)
+    state_case = object.__getattribute__(state_snapshot, "_case_workspace")
     supervisor = timeout_supervisor(
         tmp_path / "retry-replay-parent-solver",
         case_id="case-retry-replay-parent",
         intent=intent,
         workspace_root=workspace_root,
+        case_workspace=state_case,
         record_attempt=False,
     )
     result = supervisor.run(timeout_seconds=0.1)
@@ -1236,19 +1301,21 @@ def test_retry_replay_parent_ledger_cannot_mint_with_a_different_failed_result(
 ) -> None:
     intent = bound_intent(retry_budget=3)
     _workspace_temp, workspace_root = short_workspace_root(tmp_path)
-    state, _ = retry_state_for_case(
+    state, state_snapshot = retry_state_for_case(
         workspace_root,
         "case-retry-replay-different-result",
         intent,
         attempt_ids=("attempt-first", "attempt-second"),
     )
     ledger = RetryLedger.from_authority(state)
+    state_case = object.__getattribute__(state_snapshot, "_case_workspace")
     first_supervisor = timeout_supervisor(
         tmp_path / "retry-replay-different-result-first",
         attempt_id="attempt-first",
         case_id="case-retry-replay-different-result",
         intent=intent,
         workspace_root=workspace_root,
+        case_workspace=state_case,
         record_attempt=False,
     )
     first_result = first_supervisor.run(timeout_seconds=0.1)
@@ -1258,6 +1325,7 @@ def test_retry_replay_parent_ledger_cannot_mint_with_a_different_failed_result(
         case_id="case-retry-replay-different-result",
         intent=intent,
         workspace_root=workspace_root,
+        case_workspace=state_case,
         record_attempt=False,
     )
     second_result = second_supervisor.run(timeout_seconds=0.1)
@@ -1287,18 +1355,20 @@ def test_retry_replay_of_consumed_result_with_successor_ledger_stops(
 ) -> None:
     intent = bound_intent(retry_budget=3)
     _workspace_temp, workspace_root = short_workspace_root(tmp_path)
-    state, _ = retry_state_for_case(
+    state, state_snapshot = retry_state_for_case(
         workspace_root,
         "case-retry-replay-successor",
         intent,
         attempt_ids=("attempt-a",),
     )
     ledger = RetryLedger.from_authority(state)
+    state_case = object.__getattribute__(state_snapshot, "_case_workspace")
     supervisor = timeout_supervisor(
         tmp_path / "retry-replay-successor-solver",
         case_id="case-retry-replay-successor",
         intent=intent,
         workspace_root=workspace_root,
+        case_workspace=state_case,
         record_attempt=False,
     )
     result = supervisor.run(timeout_seconds=0.1)
@@ -1331,18 +1401,20 @@ def test_retry_replay_consumption_is_atomic_under_concurrent_calls(
 ) -> None:
     intent = bound_intent(retry_budget=3)
     _workspace_temp, workspace_root = short_workspace_root(tmp_path)
-    state, _ = retry_state_for_case(
+    state, state_snapshot = retry_state_for_case(
         workspace_root,
         "case-retry-replay-concurrent",
         intent,
         attempt_ids=("attempt-a",),
     )
     ledger = RetryLedger.from_authority(state)
+    state_case = object.__getattribute__(state_snapshot, "_case_workspace")
     supervisor = timeout_supervisor(
         tmp_path / "retry-replay-concurrent-solver",
         case_id="case-retry-replay-concurrent",
         intent=intent,
         workspace_root=workspace_root,
+        case_workspace=state_case,
         record_attempt=False,
     )
     result = supervisor.run(timeout_seconds=0.1)
