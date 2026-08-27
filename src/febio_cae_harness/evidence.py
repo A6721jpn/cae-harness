@@ -16,7 +16,7 @@ from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, NoReturn, SupportsIndex
+from typing import Any, NoReturn, SupportsIndex, cast
 
 from .contracts import IntentContract
 from .workspace import (
@@ -29,6 +29,7 @@ from .workspace import (
 __all__ = [
     "EvidenceIntegrityError",
     "EvidenceStore",
+    "IntentSnapshotAuthority",
     "ValidatorAuthority",
     "ValidatorAuthorityManager",
     "ValidatorExecution",
@@ -57,6 +58,7 @@ _VERIFICATION_FIELDS = frozenset(
 )
 _RECEIPT_PREFIX = "febio-verification-v1:"
 _RECEIPT_FACTORY = object()
+_INTENT_SNAPSHOT_FACTORY = object()
 _PROMOTION_CONSUMED_EVENT = "artifact_promotion_consumed"
 
 _LOCAL_EVENT_LOCKS: dict[str, threading.RLock] = {}
@@ -90,6 +92,19 @@ _MANAGER_STATES: dict[int, _ManagerState] = {}
 _AUTHORITY_STATES: dict[int, tuple[object, _AuthorityRegistry, object]] = {}
 _PENDING_STORE_CONSTRUCTIONS: dict[int, object] = {}
 _STORE_BINDINGS: dict[int, tuple[object, ValidatorAuthorityManager, _AuthorityRegistry, bool]] = {}
+_INTENT_SNAPSHOT_STATES: dict[
+    int,
+    tuple[
+        object,
+        EvidenceStore,
+        tuple[object, ValidatorAuthorityManager, _AuthorityRegistry, bool],
+        CaseWorkspace,
+        str,
+        str,
+        str,
+        IntentContract,
+    ],
+] = {}
 
 
 class EvidenceIntegrityError(RuntimeError):
@@ -313,6 +328,145 @@ class VerificationReceipt(str):
 
     def __repr__(self) -> str:
         return "VerificationReceipt(<opaque>)"
+
+
+class IntentSnapshotAuthority:
+    """Opaque, store-owned authority for one immutable intent snapshot."""
+
+    __slots__ = (
+        "_store",
+        "_store_binding",
+        "_case_workspace",
+        "_case_id",
+        "_case_sha256",
+        "_intent_sha256",
+        "_intent",
+    )
+
+    def __new__(
+        cls,
+        *args: object,
+        _factory: object | None = None,
+        **kwargs: object,
+    ) -> IntentSnapshotAuthority:
+        del args, kwargs
+        if cls is not IntentSnapshotAuthority:
+            raise TypeError("intent snapshot authorities cannot be subclassed")
+        if _factory is not _INTENT_SNAPSHOT_FACTORY:
+            raise TypeError("intent snapshot authorities are issued by EvidenceStore")
+        return object.__new__(cls)
+
+    def __init__(
+        self,
+        *args: object,
+        _factory: object | None = None,
+        **kwargs: object,
+    ) -> None:
+        del args, kwargs
+        if _factory is not _INTENT_SNAPSHOT_FACTORY:
+            raise TypeError("intent snapshot authorities are issued by EvidenceStore")
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        del kwargs
+        raise TypeError("intent snapshot authorities cannot be subclassed")
+
+    @classmethod
+    def _issue(
+        cls,
+        store: EvidenceStore,
+    ) -> IntentSnapshotAuthority:
+        if cls is not IntentSnapshotAuthority:
+            raise TypeError("intent snapshot authorities cannot be subclassed")
+        binding = _STORE_BINDINGS.get(id(store))
+        if binding is None or binding[0] is not store:
+            raise EvidenceIntegrityError("intent snapshot requires a registered evidence store")
+        store.reopen()
+        intent = store._intent
+        case_id = store.case_workspace.case_id
+        case_sha256 = store._case_sha256
+        intent_sha256 = _digest(intent.to_dict())
+        authority = cls(_factory=_INTENT_SNAPSHOT_FACTORY)
+        object.__setattr__(authority, "_store", store)
+        object.__setattr__(authority, "_store_binding", binding)
+        object.__setattr__(authority, "_case_workspace", store.case_workspace)
+        object.__setattr__(authority, "_case_id", case_id)
+        object.__setattr__(authority, "_case_sha256", case_sha256)
+        object.__setattr__(authority, "_intent_sha256", intent_sha256)
+        object.__setattr__(authority, "_intent", intent)
+        _INTENT_SNAPSHOT_STATES[id(authority)] = (
+            authority,
+            store,
+            binding,
+            store.case_workspace,
+            case_id,
+            case_sha256,
+            intent_sha256,
+            intent,
+        )
+        return authority
+
+    def __repr__(self) -> str:
+        return "IntentSnapshotAuthority(<opaque>)"
+
+    __str__ = __repr__
+
+    def __setattr__(self, name: str, value: object) -> None:
+        del name, value
+        raise AttributeError("intent snapshot authorities are immutable")
+
+    def __delattr__(self, name: str) -> None:
+        del name
+        raise AttributeError("intent snapshot authorities are immutable")
+
+    def __copy__(self) -> IntentSnapshotAuthority:
+        raise TypeError("intent snapshot authorities cannot be copied")
+
+    def __deepcopy__(self, memo: dict[int, object]) -> IntentSnapshotAuthority:
+        del memo
+        raise TypeError("intent snapshot authorities cannot be copied")
+
+    def __reduce__(self) -> NoReturn:
+        raise TypeError("intent snapshot authorities cannot be pickled")
+
+    def __reduce_ex__(self, protocol: SupportsIndex) -> NoReturn:
+        del protocol
+        raise TypeError("intent snapshot authorities cannot be pickled")
+
+    def __getstate__(self) -> NoReturn:
+        raise TypeError("intent snapshot authorities cannot be serialized")
+
+    def _validated_intent(self) -> IntentContract:
+        try:
+            store = object.__getattribute__(self, "_store")
+        except AttributeError as error:
+            raise EvidenceIntegrityError("intent snapshot authority is invalid") from error
+        if type(store) is not EvidenceStore:
+            raise EvidenceIntegrityError("intent snapshot authority store is invalid")
+        return store._validate_intent_snapshot(self)
+
+    @property
+    def case_id(self) -> str:
+        self._validated_intent()
+        return cast(str, object.__getattribute__(self, "_case_id"))
+
+    @property
+    def case_sha256(self) -> str:
+        self._validated_intent()
+        return cast(str, object.__getattribute__(self, "_case_sha256"))
+
+    @property
+    def intent_sha256(self) -> str:
+        self._validated_intent()
+        return cast(str, object.__getattribute__(self, "_intent_sha256"))
+
+    @property
+    def intent(self) -> IntentContract:
+        self._validated_intent()
+        return cast(IntentContract, object.__getattribute__(self, "_intent"))
+
+    @property
+    def contract(self) -> IntentContract:
+        return self.intent
 
 
 def _canonical_bytes(value: object) -> bytes:
@@ -566,6 +720,75 @@ class EvidenceStore:
         with self._event_lock():
             self._load_and_validate(None)
         return self
+
+    def issue_intent_snapshot(self) -> IntentSnapshotAuthority:
+        """Issue a live, store-bound authority for the current intent."""
+
+        return IntentSnapshotAuthority._issue(self)
+
+    def _validate_intent_snapshot(
+        self,
+        authority: IntentSnapshotAuthority,
+    ) -> IntentContract:
+        """Revalidate and resolve only an authority issued by this store."""
+
+        try:
+            self.reopen()
+        except EvidenceIntegrityError:
+            raise
+        except Exception as error:
+            raise EvidenceIntegrityError("intent snapshot evidence is invalid") from error
+
+        if type(authority) is not IntentSnapshotAuthority:
+            raise EvidenceIntegrityError("intent snapshot authority is invalid")
+        state = _INTENT_SNAPSHOT_STATES.get(id(authority))
+        binding = _STORE_BINDINGS.get(id(self))
+        if state is None or state[0] is not authority or binding is None or binding[0] is not self:
+            raise EvidenceIntegrityError("intent snapshot authority is invalid")
+        (
+            _,
+            bound_store,
+            bound_binding,
+            bound_case_workspace,
+            bound_case_id,
+            bound_case_sha256,
+            bound_intent_sha256,
+            bound_intent,
+        ) = state
+        try:
+            authority_store = object.__getattribute__(authority, "_store")
+            authority_binding = object.__getattribute__(authority, "_store_binding")
+            authority_case_workspace = object.__getattribute__(authority, "_case_workspace")
+            authority_case_id = object.__getattribute__(authority, "_case_id")
+            authority_case_sha256 = object.__getattribute__(authority, "_case_sha256")
+            authority_intent_sha256 = object.__getattribute__(authority, "_intent_sha256")
+            authority_intent = object.__getattribute__(authority, "_intent")
+        except AttributeError as error:
+            raise EvidenceIntegrityError("intent snapshot authority state is invalid") from error
+        if (
+            bound_store is not self
+            or bound_binding is not binding
+            or bound_case_workspace is not self.case_workspace
+            or authority_store is not self
+            or authority_binding is not binding
+            or authority_case_workspace is not bound_case_workspace
+            or authority_case_id != bound_case_id
+            or authority_case_sha256 != bound_case_sha256
+            or authority_intent_sha256 != bound_intent_sha256
+            or authority_intent is not bound_intent
+        ):
+            raise EvidenceIntegrityError("intent snapshot authority binding changed")
+
+        current_intent = self._intent
+        current_intent_sha256 = _digest(current_intent.to_dict())
+        if (
+            self.case_workspace.case_id != bound_case_id
+            or self._case_sha256 != bound_case_sha256
+            or current_intent_sha256 != bound_intent_sha256
+            or current_intent.to_dict() != bound_intent.to_dict()
+        ):
+            raise EvidenceIntegrityError("intent snapshot is stale")
+        return cast(IntentContract, bound_intent)
 
     def append_event(
         self,

@@ -8,6 +8,7 @@ import pickle
 import threading
 import time
 from copy import copy, deepcopy
+from dataclasses import replace
 from pathlib import Path
 from typing import cast
 
@@ -50,6 +51,102 @@ def test_verification_authority_is_manager_bound() -> None:
     assert "authority" in inspect.signature(EvidenceStore.record_verification).parameters
     assert "validator" not in inspect.signature(EvidenceStore.record_verification).parameters
     assert "status" not in inspect.signature(EvidenceStore.record_verification).parameters
+
+
+def test_intent_snapshot_authority_api_is_present() -> None:
+    assert hasattr(evidence_module, "IntentSnapshotAuthority")
+    assert hasattr(EvidenceStore, "issue_intent_snapshot")
+
+
+def test_intent_snapshot_authority_binds_immutable_live_identity(tmp_path: Path) -> None:
+    _, case, intent = make_case(tmp_path)
+    store = EvidenceStore(case, intent)
+
+    snapshot = store.issue_intent_snapshot()
+
+    assert type(snapshot) is evidence_module.IntentSnapshotAuthority
+    assert snapshot.case_id == case.case_id
+    assert snapshot.case_sha256 == store.manifest["case_sha256"]
+    assert snapshot.intent_sha256 == store.manifest["intent"]["sha256"]
+    assert snapshot.intent == intent
+    assert store._validate_intent_snapshot(snapshot) == intent
+
+
+def test_intent_snapshot_authority_rejects_forgery_and_mutation(tmp_path: Path) -> None:
+    _, case, intent = make_case(tmp_path)
+    store = EvidenceStore(case, intent)
+    snapshot = store.issue_intent_snapshot()
+    authority_type = evidence_module.IntentSnapshotAuthority
+
+    with pytest.raises(TypeError):
+        authority_type()
+    with pytest.raises(EvidenceIntegrityError):
+        store._validate_intent_snapshot(object.__new__(authority_type))
+    with pytest.raises(TypeError):
+        type("ForgedIntentSnapshot", (authority_type,), {})
+    with pytest.raises(TypeError):
+        copy(snapshot)
+    with pytest.raises(TypeError):
+        deepcopy(snapshot)
+    with pytest.raises(TypeError):
+        pickle.dumps(snapshot)
+    with pytest.raises(TypeError):
+        replace(snapshot, case_id="forged")  # type: ignore[type-var]
+    with pytest.raises(AttributeError):
+        snapshot.case_id = "forged"  # type: ignore[misc]
+    with pytest.raises(AttributeError):
+        del snapshot.case_id
+
+
+def test_intent_snapshot_authority_rejects_foreign_store_and_forged_values(
+    tmp_path: Path,
+) -> None:
+    _, case, intent = make_case(tmp_path)
+    store = EvidenceStore(case, intent)
+    snapshot = store.issue_intent_snapshot()
+    foreign_workspace = ValidatedCaseWorkspace(tmp_path / "tool-b", tmp_path / "02_CAE-b")
+    foreign_store = EvidenceStore(foreign_workspace.create_case("case-a"), intent)
+
+    with pytest.raises(EvidenceIntegrityError):
+        foreign_store._validate_intent_snapshot(snapshot)
+    for forged in (True, False, {}, {"case_id": case.case_id}, {"state": "BOUND"}):
+        with pytest.raises(EvidenceIntegrityError):
+            store._validate_intent_snapshot(forged)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("tamper", ["intent", "manifest", "event", "artifact"])
+def test_intent_snapshot_authority_live_revalidation_rejects_tampering(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    _, case, intent = make_case(tmp_path)
+    store = EvidenceStore(case, intent)
+    store.append_event("intent_reviewed", {"reviewed": True})
+    store.record_attempt("attempt-1")
+    artifact = case.write_text(
+        Path("90_Temporary") / "attempts" / "attempt-1" / "result.txt",
+        "synthetic result",
+    )
+    store.record_artifact(artifact, attempt_id="attempt-1")
+    snapshot = store.issue_intent_snapshot()
+
+    if tamper == "intent":
+        payload = json.loads(store.intent_path.read_text(encoding="utf-8"))
+        payload["engineering_question"] = "tampered"
+        store.intent_path.write_text(json.dumps(payload), encoding="utf-8")
+    elif tamper == "manifest":
+        payload = json.loads(store.manifest_path.read_text(encoding="utf-8"))
+        payload["state"] = "BOUND"
+        store.manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+    elif tamper == "event":
+        lines = store.events_path.read_text(encoding="utf-8").splitlines()
+        lines[0] = lines[0].replace("intent_reviewed", "tampered")
+        store.events_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    else:
+        artifact.write_text("tampered result", encoding="utf-8")
+
+    with pytest.raises(EvidenceIntegrityError):
+        store._validate_intent_snapshot(snapshot)
 
 
 def make_authority(
