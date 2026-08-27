@@ -299,3 +299,36 @@ def test_reconnect_rejects_attempt_identity_mutated_after_input_snapshot(
     monkeypatch.setattr(SolverSupervisor, "_read_process_record", unexpected_read)
     with pytest.raises(SolverConfigurationError, match="authority|binding|live"):
         SolverSupervisor.reconnect(capability)
+
+
+def test_reconnect_revalidates_after_process_record_read_before_return(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capability = _capability(tmp_path, monkeypatch, code="import time; time.sleep(30)")
+    original = SolverSupervisor(capability).start()
+    attempt = object.__getattribute__(capability, "_attempt_workspace")
+    assert type(attempt) is AttemptWorkspace
+    original_read_process_record = SolverSupervisor._read_process_record
+
+    def racing_read_process_record(self: SolverSupervisor) -> dict[str, object]:
+        record = original_read_process_record(self)
+        object.__setattr__(attempt, "attempt_id", "attempt-b")
+        return record
+
+    monkeypatch.setattr(SolverSupervisor, "_read_process_record", racing_read_process_record)
+    reconnected: SolverSupervisor | None = None
+    try:
+        try:
+            reconnected = SolverSupervisor.reconnect(capability)
+        except SolverConfigurationError:
+            pass
+        else:
+            assert reconnected.state is not SolverState.RUNNING, (
+                "raced reconnect returned RUNNING after process-record read"
+            )
+    finally:
+        if reconnected is not None:
+            reconnected.cancel()
+        else:
+            original.cancel()

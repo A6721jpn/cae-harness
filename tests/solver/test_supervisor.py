@@ -163,3 +163,34 @@ def test_forged_fully_populated_launch_capability_is_rejected_before_mutation(
 
     assert not attempt_root.exists()
     assert not (attempt_root / "process.json").exists()
+
+
+def test_start_revalidates_after_prepare_outputs_before_popen(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capability = _capability(tmp_path, monkeypatch, code="pass")
+    attempt = object.__getattribute__(capability, "_attempt_workspace")
+    assert type(attempt) is AttemptWorkspace
+    original_prepare_outputs = SolverLaunchSpec.prepare_outputs
+
+    def racing_prepare_outputs(spec: SolverLaunchSpec) -> object:
+        outputs = original_prepare_outputs(spec)
+        object.__setattr__(attempt, "attempt_id", "attempt-b")
+        return outputs
+
+    monkeypatch.setattr(SolverLaunchSpec, "prepare_outputs", racing_prepare_outputs)
+    popen_reached = False
+
+    def unexpected_popen(*args: object, **kwargs: object) -> None:
+        nonlocal popen_reached
+        del args, kwargs
+        popen_reached = True
+        raise AssertionError("raced launch reached Popen")
+
+    monkeypatch.setattr("febio_cae_harness.solver.supervisor.subprocess.Popen", unexpected_popen)
+    supervisor = SolverSupervisor(capability)
+    with pytest.raises(SolverConfigurationError, match="authority|binding|live"):
+        supervisor.start()
+
+    assert not popen_reached

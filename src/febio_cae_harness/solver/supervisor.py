@@ -284,6 +284,25 @@ class SolverSupervisor:
         with self._lock:
             return self._result
 
+    def _revalidate_launch_binding(self) -> None:
+        """Require the supervisor's capability and authority binding to remain exact."""
+
+        (
+            capability_record,
+            case_id,
+            intent_id,
+            attempt_id,
+            _attempt_root,
+        ) = _validate_launch_capability(self._launch_capability)
+        if capability_record.spec is not self.spec:
+            raise SolverConfigurationError("supervisor launch binding is invalid")
+        if (case_id, intent_id, attempt_id) != (
+            self._case_id,
+            self._intent_id,
+            self._attempt_id,
+        ):
+            raise SolverConfigurationError("supervisor authority binding is invalid")
+
     def start(self) -> SolverSupervisor:
         """Prepare fresh outputs and launch the owned process."""
 
@@ -293,25 +312,12 @@ class SolverSupervisor:
 
             # Revalidate every authority immediately before the first mutation
             # of the attempt directory or process creation.
-            (
-                capability_record,
-                case_id,
-                intent_id,
-                attempt_id,
-                _attempt_root,
-            ) = _validate_launch_capability(self._launch_capability)
-            if capability_record.spec is not self.spec:
-                raise SolverConfigurationError("supervisor launch binding is invalid")
-            if (case_id, intent_id, attempt_id) != (
-                self._case_id,
-                self._intent_id,
-                self._attempt_id,
-            ):
-                raise SolverConfigurationError("supervisor authority binding is invalid")
+            self._revalidate_launch_binding()
 
             authority: ProcessAuthority | None = None
             try:
                 self.spec.prepare_outputs()
+                self._revalidate_launch_binding()
                 if os.path.lexists(os.fspath(self.process_record_path)):
                     raise SolverLaunchError(
                         f"process record already exists: {self.process_record_path}"
@@ -341,9 +347,12 @@ class SolverSupervisor:
                         raise ProcessAuthorityError("process attestation handle is unavailable")
                     startup_info = subprocess.STARTUPINFO()
                     startup_info.lpAttributeList = {"handle_list": [child_handle]}
+                    command = self.spec.command
+                    cwd = os.fspath(self.spec.cwd)
+                    self._revalidate_launch_binding()
                     process = subprocess.Popen(
-                        self.spec.command,
-                        cwd=os.fspath(self.spec.cwd),
+                        command,
+                        cwd=cwd,
                         env=environment,
                         shell=False,
                         stdin=subprocess.DEVNULL,
@@ -354,16 +363,20 @@ class SolverSupervisor:
                         startupinfo=startup_info,
                     )
                 else:
+                    command = self.spec.command
+                    cwd = os.fspath(self.spec.cwd)
+                    pass_fds = authority.child_pass_fds()
+                    self._revalidate_launch_binding()
                     process = subprocess.Popen(
-                        self.spec.command,
-                        cwd=os.fspath(self.spec.cwd),
+                        command,
+                        cwd=cwd,
                         env=environment,
                         shell=False,
                         stdin=subprocess.DEVNULL,
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,
                         start_new_session=True,
-                        pass_fds=authority.child_pass_fds(),
+                        pass_fds=pass_fds,
                     )
                 started_at = datetime.now(UTC)
                 metadata = _process_metadata(process.pid)
@@ -400,6 +413,8 @@ class SolverSupervisor:
                 if authority is not None:
                     authority.close()
                 self._state = SolverState.FAILED
+                if isinstance(error, SolverConfigurationError):
+                    raise
                 raise SolverLaunchError(f"unable to launch solver: {error}") from error
 
             self._state = SolverState.RUNNING
@@ -434,16 +449,22 @@ class SolverSupervisor:
             log_validator=log_validator,
         )
         record = supervisor._read_process_record()
+        supervisor._revalidate_launch_binding()
         metadata, started_at, authority = supervisor._validate_process_record(record)
-        supervisor._process_record = record
-        pid = cast(int, record["pid"])
-        supervisor._process = _ReconnectedProcess(
-            pid, metadata.executable_path, metadata.creation_identity, authority
-        )
-        supervisor._process_authority = authority
-        supervisor._started_at = started_at
-        supervisor._state = SolverState.RUNNING
-        return supervisor
+        try:
+            supervisor._revalidate_launch_binding()
+            supervisor._process_record = record
+            pid = cast(int, record["pid"])
+            supervisor._process = _ReconnectedProcess(
+                pid, metadata.executable_path, metadata.creation_identity, authority
+            )
+            supervisor._process_authority = authority
+            supervisor._started_at = started_at
+            supervisor._state = SolverState.RUNNING
+            return supervisor
+        except BaseException:
+            authority.close()
+            raise
 
     def wait(self, timeout_seconds: float | None = None) -> SolverRunResult:
         """Wait for completion, enforcing the configured timeout if present."""
