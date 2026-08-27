@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from febio_cae_harness.contracts import IntentContract
-from febio_cae_harness.evidence import EvidenceStore
+from febio_cae_harness.evidence import EvidenceStore, IntentSnapshotAuthority
 from febio_cae_harness.model import (
     ASK_AND_BLOCK,
     CompletenessResult,
@@ -52,7 +52,7 @@ def _result(
     )
 
 
-def _bound_loads(tmp_path: Path) -> CompletenessResult:
+def _bound_loads(tmp_path: Path) -> tuple[CompletenessResult, IntentSnapshotAuthority]:
     workspace = ValidatedCaseWorkspace(tmp_path / "tool", tmp_path / "02_CAE")
     case = workspace.create_case("case")
     store = EvidenceStore(
@@ -62,8 +62,9 @@ def _bound_loads(tmp_path: Path) -> CompletenessResult:
             condition_sources={"loads": {"source": "intent", "location": "intent.json"}},
         ),
     )
-    authority = issue_completeness_authority(store.issue_intent_snapshot(), ("loads",))
-    return assess_completeness(authority)
+    snapshot = store.issue_intent_snapshot()
+    authority = issue_completeness_authority(snapshot, ("loads",))
+    return assess_completeness(authority), snapshot
 
 
 def test_question_is_immutable_authoritative_and_json_shaped() -> None:
@@ -98,9 +99,9 @@ def test_structural_diagnostics_are_separate_and_never_questions(tmp_path: Path)
         </not_febio>
         """
     )
-    completeness = _bound_loads(tmp_path)
+    completeness, snapshot = _bound_loads(tmp_path)
 
-    inventory = inspect_incomplete_feb(feb, completeness)
+    inventory = inspect_incomplete_feb(feb, completeness, snapshot=snapshot)
 
     assert [item.code for item in inventory.structural_diagnostics] == [
         "INVALID_FEB_ROOT",
@@ -136,8 +137,8 @@ def test_direct_results_never_authorize_questions_even_with_authoritative_flags(
 def test_ready_requires_bound_completeness_without_required_unresolved_fields(
     tmp_path: Path,
 ) -> None:
-    complete = _bound_loads(tmp_path)
-    ready = inspect_incomplete_feb(inspect_feb_xml(VALID_FEB), complete)
+    complete, snapshot = _bound_loads(tmp_path)
+    ready = inspect_incomplete_feb(inspect_feb_xml(VALID_FEB), complete, snapshot=snapshot)
     assert ready.questions == ()
     assert ready.structural_diagnostics == ()
     assert ready.ready is True
@@ -157,13 +158,14 @@ def test_authoritative_questions_follow_required_order(tmp_path: Path) -> None:
     workspace = ValidatedCaseWorkspace(tmp_path / "tool", tmp_path / "02_CAE")
     case = workspace.create_case("case")
     store = EvidenceStore(case, IntentContract())
+    snapshot = store.issue_intent_snapshot()
     authority = issue_completeness_authority(
-        store.issue_intent_snapshot(),
+        snapshot,
         ("loads", "units", "material"),
     )
 
     completeness = assess_completeness(authority)
-    inventory = inspect_incomplete_feb(inspect_feb_xml(VALID_FEB), completeness)
+    inventory = inspect_incomplete_feb(inspect_feb_xml(VALID_FEB), completeness, snapshot=snapshot)
 
     assert [item.condition for item in inventory.questions] == ["loads", "units", "material"]
     assert all(item.action == ASK_AND_BLOCK for item in inventory.questions)

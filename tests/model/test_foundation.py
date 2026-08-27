@@ -323,17 +323,19 @@ def test_preflight_preserves_live_completeness_ready_and_missing_behavior(
         ),
     )
 
+    complete_snapshot = store.issue_intent_snapshot()
     complete = assess_completeness(
-        issue_completeness_authority(store.issue_intent_snapshot(), ("units", "material"))
+        issue_completeness_authority(complete_snapshot, ("units", "material"))
     )
-    ready = run_preflight(completeness=complete)
+    ready = run_preflight(completeness=complete, snapshot=complete_snapshot)
     assert ready.ready is True
     assert ready.diagnostics == ()
 
+    incomplete_snapshot = store.issue_intent_snapshot()
     incomplete = assess_completeness(
-        issue_completeness_authority(store.issue_intent_snapshot(), ("units", "loads"))
+        issue_completeness_authority(incomplete_snapshot, ("units", "loads"))
     )
-    blocked = run_preflight(completeness=incomplete)
+    blocked = run_preflight(completeness=incomplete, snapshot=incomplete_snapshot)
     assert blocked.ready is False
     assert any(item.code == "MISSING_PHYSICAL_CONDITION" for item in blocked.diagnostics)
     assert not any(item.code == "INVALID_COMPLETENESS_AUTHORITY" for item in blocked.diagnostics)

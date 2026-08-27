@@ -6,7 +6,8 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 
-from ..evidence import EvidenceIntegrityError
+from ..evidence import EvidenceIntegrityError, IntentSnapshotAuthority
+from ._immutability import freeze_json
 from .completeness import (
     CompletenessResult,
     _validated_authoritative_result,
@@ -86,11 +87,24 @@ class PreflightResult:
     ready: bool = field(init=False)
 
     def __post_init__(self) -> None:
-        diagnostics = tuple(self.diagnostics)
+        diagnostics = tuple(object.__getattribute__(self, "diagnostics"))
         if not all(isinstance(item, PreflightDiagnostic) for item in diagnostics):
             raise TypeError("diagnostics must contain PreflightDiagnostic records")
         object.__setattr__(self, "diagnostics", diagnostics)
-        object.__setattr__(self, "ready", not any(item.blocking for item in diagnostics))
+        object.__setattr__(
+            self,
+            "ready",
+            not any(item.blocking for item in diagnostics),
+        )
+
+    def __getattribute__(self, name: str) -> object:
+        if name == "completeness":
+            state = _safe_preflight_binding(self)
+            return None if state is None else state.completeness
+        if name == "ready":
+            state = _safe_preflight_binding(self)
+            return False if state is None else state.ready
+        return object.__getattribute__(self, name)
 
     @property
     def ok(self) -> bool:
@@ -109,12 +123,109 @@ class PreflightResult:
         return self.blocking_diagnostics
 
     def to_dict(self) -> dict[str, object]:
+        state = _safe_preflight_binding(self)
+        if state is None:
+            diagnostics = object.__getattribute__(self, "diagnostics")
+            completeness_payload: dict[str, object] | None = None
+            ready = False
+        else:
+            diagnostics = state.diagnostics
+            ready = state.ready
+            completeness_payload = None
+            try:
+                if state.completeness is not None:
+                    completeness_payload = state.completeness.to_dict()
+                # Serialization is another consumer boundary.  Do not return
+                # an actionable projection if the live authority went stale
+                # while its payload was being read.
+                _validated_preflight_binding(self)
+            except Exception:
+                diagnostics = object.__getattribute__(self, "diagnostics")
+                completeness_payload = None
+                ready = False
         return {
-            "diagnostics": [item.to_dict() for item in self.diagnostics],
-            "ready": self.ready,
-            "status": self.status,
-            "completeness": None if self.completeness is None else self.completeness.to_dict(),
+            "diagnostics": [item.to_dict() for item in diagnostics],
+            "ready": ready,
+            "status": "READY" if ready else "BLOCKED",
+            "completeness": completeness_payload,
         }
+
+
+@dataclass(frozen=True, slots=True)
+class _PreflightResultBinding:
+    result: PreflightResult
+    diagnostics: tuple[PreflightDiagnostic, ...]
+    completeness: CompletenessResult | None
+    snapshot: IntentSnapshotAuthority | None
+    ready: bool
+    projection: object
+
+
+_PREFLIGHT_RESULT_STATES: dict[int, _PreflightResultBinding] = {}
+
+
+def _preflight_projection(result: PreflightResult) -> object:
+    try:
+        return freeze_json(
+            {
+                "diagnostics": [
+                    item.to_dict() for item in object.__getattribute__(result, "diagnostics")
+                ],
+                "completeness": (
+                    None
+                    if object.__getattribute__(result, "completeness") is None
+                    else object.__getattribute__(result, "completeness").to_dict()
+                ),
+                "ready": object.__getattribute__(result, "ready"),
+            }
+        )
+    except Exception as error:
+        raise EvidenceIntegrityError("preflight result projection is invalid") from error
+
+
+def _validated_preflight_binding(result: PreflightResult) -> _PreflightResultBinding:
+    state = _PREFLIGHT_RESULT_STATES.get(id(result))
+    if state is None or state.result is not result:
+        raise EvidenceIntegrityError("preflight result is not authority-issued")
+    if state.completeness is not None:
+        if state.snapshot is None:
+            raise EvidenceIntegrityError("preflight result snapshot binding is invalid")
+        _validated_authoritative_result(state.completeness, state.snapshot)
+    if _preflight_projection(result) != state.projection:
+        raise EvidenceIntegrityError("preflight result projection changed")
+    if state.completeness is not None:
+        if state.snapshot is None:  # pragma: no cover - guarded above
+            raise EvidenceIntegrityError("preflight result snapshot binding is invalid")
+        _validated_authoritative_result(state.completeness, state.snapshot)
+        # Keep one final live check after the complete result projection was
+        # consumed, including serialization consumers.
+        _validated_authoritative_result(state.completeness, state.snapshot)
+    return state
+
+
+def _safe_preflight_binding(result: PreflightResult) -> _PreflightResultBinding | None:
+    try:
+        return _validated_preflight_binding(result)
+    except Exception:
+        return None
+
+
+def _issue_preflight_result(
+    diagnostics: tuple[PreflightDiagnostic, ...],
+    completeness: CompletenessResult | None,
+    snapshot: IntentSnapshotAuthority | None,
+) -> PreflightResult:
+    result = PreflightResult(diagnostics=diagnostics, completeness=completeness)
+    projection = _preflight_projection(result)
+    _PREFLIGHT_RESULT_STATES[id(result)] = _PreflightResultBinding(
+        result=result,
+        diagnostics=tuple(diagnostics),
+        completeness=completeness,
+        snapshot=snapshot,
+        ready=not any(item.blocking for item in diagnostics),
+        projection=projection,
+    )
+    return result
 
 
 def run_preflight(
@@ -124,6 +235,8 @@ def run_preflight(
     completeness: CompletenessResult | None = None,
     required_conditions: Iterable[str | PhysicalConditionName] | Mapping[str, object] | None = None,
     evidence: Mapping[str, object] | None = None,
+    *,
+    snapshot: IntentSnapshotAuthority | None = None,
 ) -> PreflightResult:
     """Run structural and evidence checks without invoking a solver."""
 
@@ -141,13 +254,13 @@ def run_preflight(
     ) = None
     if completeness is not None:
         try:
-            _validated_authoritative_result(completeness)
+            _validated_authoritative_result(completeness, snapshot)
             resolved_values = tuple(completeness.resolved)
             missing_values = tuple(completeness.missing)
             unresolved_values = tuple(completeness.unresolved)
             state_value = completeness.state
             # Revalidate after consuming every result field used for action.
-            _validated_authoritative_result(completeness)
+            _validated_authoritative_result(completeness, snapshot)
             completeness_fields = (
                 resolved_values,
                 missing_values,
@@ -282,9 +395,10 @@ def run_preflight(
                 ),
             )
         )
-    return PreflightResult(
-        diagnostics=tuple(diagnostics),
-        completeness=completeness if completeness_fields is not None else None,
+    return _issue_preflight_result(
+        tuple(diagnostics),
+        completeness if completeness_fields is not None else None,
+        snapshot if completeness_fields is not None else None,
     )
 
 

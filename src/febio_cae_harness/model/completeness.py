@@ -266,11 +266,16 @@ def _register_authoritative_result(
 
 def _validated_authoritative_result(
     result: CompletenessResult,
+    expected_snapshot: IntentSnapshotAuthority | None = None,
 ) -> _CompletenessResultBinding:
-    """Validate result provenance, projection, and its live authority."""
+    """Validate a result against one exact live intent snapshot."""
 
     if type(result) is not CompletenessResult:
         raise EvidenceIntegrityError("completeness result is not authority-issued")
+    if type(expected_snapshot) is not IntentSnapshotAuthority:
+        raise EvidenceIntegrityError(
+            "completeness result requires an exact expected intent snapshot"
+        )
     state = _COMPLETENESS_RESULT_STATES.get(id(result))
     if state is None or state.result is not result:
         raise EvidenceIntegrityError("completeness result is not authority-issued")
@@ -280,11 +285,11 @@ def _validated_authoritative_result(
         current_projection = _result_projection(result)
         if current_projection != state.projection:
             raise EvidenceIntegrityError("completeness result projection changed")
-        state.authority._validated_binding()
+        state.authority._validated_for(expected_snapshot)
         final_projection = _result_projection(result)
         if final_projection != state.projection:
             raise EvidenceIntegrityError("completeness result projection changed")
-        state.authority._validated_binding()
+        state.authority._validated_for(expected_snapshot)
     except EvidenceIntegrityError:
         raise
     except Exception as error:

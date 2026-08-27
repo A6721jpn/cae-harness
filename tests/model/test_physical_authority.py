@@ -128,6 +128,130 @@ def test_direct_completeness_result_cannot_authorize_questions_or_ready() -> Non
     assert inventory.ready is False
 
 
+def test_completeness_consumers_require_the_exact_expected_snapshot(tmp_path: Path) -> None:
+    store_a = _store(tmp_path, suffix="case-a")
+    snapshot_a = store_a.issue_intent_snapshot()
+    authority_a = model.issue_completeness_authority(snapshot_a, ("units",))
+    result_a = assess_completeness(authority_a)
+
+    store_b = _store(tmp_path, suffix="case-b")
+    snapshot_b = store_b.issue_intent_snapshot()
+    feb = inspect_feb_xml(b"<febio_spec/>")
+    no_units = model.inspect_step(
+        b"ISO-10303-21;HEADER;ENDSEC;DATA;"
+        b"#1 = CARTESIAN_POINT('',(0.,0.,0.));ENDSEC;"
+        b"END-ISO-10303-21;"
+    )
+
+    omitted_inventory = inspect_incomplete_feb(feb, result_a)
+    foreign_inventory = inspect_incomplete_feb(feb, result_a, snapshot=snapshot_b)
+    exact_inventory = inspect_incomplete_feb(feb, result_a, snapshot=snapshot_a)
+
+    assert omitted_inventory.questions == ()
+    assert omitted_inventory.ready is False
+    assert foreign_inventory.questions == ()
+    assert foreign_inventory.ready is False
+    assert exact_inventory.questions == ()
+    assert exact_inventory.ready is True
+
+    omitted_preflight = model.run_preflight(step=no_units, completeness=result_a)
+    foreign_preflight = model.run_preflight(
+        step=no_units,
+        completeness=result_a,
+        snapshot=snapshot_b,
+    )
+    exact_preflight = model.run_preflight(
+        step=no_units,
+        completeness=result_a,
+        snapshot=snapshot_a,
+    )
+
+    for invalid in (omitted_preflight, foreign_preflight):
+        codes = {diagnostic.code for diagnostic in invalid.diagnostics}
+        assert invalid.ready is False
+        assert "INVALID_COMPLETENESS_AUTHORITY" in codes
+        assert "UNRESOLVED_UNITS" in codes
+        assert invalid.to_dict()["completeness"] is None
+    assert exact_preflight.ready is True
+    assert not any(item.code == "UNRESOLVED_UNITS" for item in exact_preflight.diagnostics)
+
+
+def _stale_after_fourth_authority_validation(
+    monkeypatch: pytest.MonkeyPatch,
+    store: EvidenceStore,
+) -> None:
+    original = model.CompletenessAuthority._validated_binding
+    calls = 0
+
+    def hooked(authority: model.CompletenessAuthority) -> object:
+        nonlocal calls
+        binding = original(authority)
+        calls += 1
+        if calls == 4:
+            payload = store.intent_path.read_text(encoding="utf-8")
+            store.intent_path.write_text(
+                payload.replace("neo-Hookean", "tampered"),
+                encoding="utf-8",
+            )
+        return binding
+
+    monkeypatch.setattr(model.CompletenessAuthority, "_validated_binding", hooked)
+
+
+def test_incomplete_inventory_receipt_revalidates_at_consumption(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    snapshot = store.issue_intent_snapshot()
+    result = assess_completeness(model.issue_completeness_authority(snapshot, ("material",)))
+    _stale_after_fourth_authority_validation(monkeypatch, store)
+
+    inventory = inspect_incomplete_feb(
+        inspect_feb_xml(b"<febio_spec/>"),
+        result,
+        snapshot=snapshot,
+    )
+
+    assert inventory.ready is False
+    assert inventory.questions == ()
+    assert inventory.to_dict()["ready"] is False
+    assert inventory.to_dict()["questions"] == []
+
+
+def test_preflight_receipt_revalidates_at_consumption(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    snapshot = store.issue_intent_snapshot()
+    result = assess_completeness(model.issue_completeness_authority(snapshot, ("material",)))
+    _stale_after_fourth_authority_validation(monkeypatch, store)
+
+    preflight = model.run_preflight(completeness=result, snapshot=snapshot)
+
+    assert preflight.ready is False
+    assert preflight.to_dict()["ready"] is False
+    assert preflight.to_dict()["status"] == "BLOCKED"
+
+
+def test_direct_consumer_construction_has_no_action_receipt() -> None:
+    question = model.MissingConditionQuestion(
+        condition="loads",
+        reason="caller supplied a question",
+        evidence=(EvidenceProvenance("caller", "chat", authoritative=True),),
+    )
+    inventory = model.IncompleteFebInventory((), (question,), True)
+    preflight = model.PreflightResult()
+
+    assert inventory.questions == ()
+    assert inventory.ready is False
+    assert inventory.to_dict()["questions"] == []
+    assert inventory.to_dict()["ready"] is False
+    assert preflight.ready is False
+    assert preflight.to_dict()["ready"] is False
+
+
 def test_result_binding_rejects_copies(tmp_path: Path) -> None:
     store = _store(tmp_path)
     snapshot = store.issue_intent_snapshot()
@@ -135,48 +259,44 @@ def test_result_binding_rejects_copies(tmp_path: Path) -> None:
     result = assess_completeness(authority)
     feb = inspect_feb_xml(b"<febio_spec/>")
 
-    assert inspect_incomplete_feb(feb, result).ready is True
+    assert inspect_incomplete_feb(feb, result, snapshot=snapshot).ready is True
 
     copied = copy.copy(result)
-    copied_inventory = inspect_incomplete_feb(feb, copied)
+    copied_inventory = inspect_incomplete_feb(feb, copied, snapshot=snapshot)
     assert copied_inventory.questions == ()
     assert copied_inventory.ready is False
 
 
 def test_result_binding_rejects_mutations(tmp_path: Path) -> None:
     store = _store(tmp_path)
-    authority = model.issue_completeness_authority(
-        store.issue_intent_snapshot(),
-        ("material",),
-    )
+    snapshot = store.issue_intent_snapshot()
+    authority = model.issue_completeness_authority(snapshot, ("material",))
     result = assess_completeness(authority)
     feb = inspect_feb_xml(b"<febio_spec/>")
-    assert inspect_incomplete_feb(feb, result).ready is True
+    assert inspect_incomplete_feb(feb, result, snapshot=snapshot).ready is True
 
     object.__setattr__(
         result,
         "missing",
         (model.MissingConditionFact("material", "late forged fact"),),
     )
-    mutated_inventory = inspect_incomplete_feb(feb, result)
+    mutated_inventory = inspect_incomplete_feb(feb, result, snapshot=snapshot)
     assert mutated_inventory.questions == ()
     assert mutated_inventory.ready is False
 
 
 def test_result_binding_rejects_stale_authority(tmp_path: Path) -> None:
     store = _store(tmp_path)
-    fresh_authority = model.issue_completeness_authority(
-        store.issue_intent_snapshot(),
-        ("material",),
-    )
+    fresh_snapshot = store.issue_intent_snapshot()
+    fresh_authority = model.issue_completeness_authority(fresh_snapshot, ("material",))
     fresh_result = assess_completeness(fresh_authority)
     feb = inspect_feb_xml(b"<febio_spec/>")
-    assert inspect_incomplete_feb(feb, fresh_result).ready is True
+    assert inspect_incomplete_feb(feb, fresh_result, snapshot=fresh_snapshot).ready is True
 
     payload = store.intent_path.read_text(encoding="utf-8")
     store.intent_path.write_text(payload.replace("neo-Hookean", "tampered"), encoding="utf-8")
 
-    stale_inventory = inspect_incomplete_feb(feb, fresh_result)
+    stale_inventory = inspect_incomplete_feb(feb, fresh_result, snapshot=fresh_snapshot)
     assert stale_inventory.questions == ()
     assert stale_inventory.ready is False
 
