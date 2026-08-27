@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -21,6 +22,16 @@ def make_workspace(tmp_path: Path) -> ValidatedCaseWorkspace:
     cae_root = tmp_path / "02_CAE"
     tool_root.mkdir()
     return ValidatedCaseWorkspace(tool_root=tool_root, cae_root=cae_root)
+
+
+def make_directory_junction(link: Path, target: Path) -> None:
+    subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert link.is_dir()
 
 
 def test_create_case_copies_inputs_and_creates_canonical_layout(tmp_path: Path) -> None:
@@ -158,10 +169,7 @@ def test_manager_rejects_reparse_cae_root_alias(tmp_path: Path) -> None:
     real_root = tmp_path / "real-02_CAE"
     real_root.mkdir()
     cae_alias = tmp_path / "02_CAE"
-    try:
-        cae_alias.symlink_to(real_root, target_is_directory=True)
-    except OSError as error:
-        pytest.skip(f"directory symlinks are unavailable: {error}")
+    make_directory_junction(cae_alias, real_root)
 
     with pytest.raises(WorkspaceBoundaryError):
         ValidatedCaseWorkspace(tool_root=tmp_path / "tool", cae_root=cae_alias)
@@ -177,10 +185,7 @@ def test_open_case_rejects_case_alias_instead_of_issuing_cross_case_authority(
     import shutil
 
     shutil.rmtree(case_a_root)
-    try:
-        case_a_root.symlink_to(case_b.case_root, target_is_directory=True)
-    except OSError as error:
-        pytest.skip(f"directory symlinks are unavailable: {error}")
+    make_directory_junction(case_a_root, case_b.case_root)
 
     with pytest.raises(WorkspaceBoundaryError):
         workspace.open_case("case-a")
@@ -192,10 +197,7 @@ def test_attempt_handle_rejects_reparse_alias(tmp_path: Path) -> None:
     real_attempt = case.temporary_root / "attempts" / "real-attempt"
     real_attempt.mkdir()
     attempt_alias = case.temporary_root / "attempts" / "attempt-1"
-    try:
-        attempt_alias.symlink_to(real_attempt, target_is_directory=True)
-    except OSError as error:
-        pytest.skip(f"directory symlinks are unavailable: {error}")
+    make_directory_junction(attempt_alias, real_attempt)
 
     with pytest.raises(WorkspaceBoundaryError):
         AttemptWorkspace._from_manager(case, "attempt-1", attempt_alias)
@@ -207,10 +209,7 @@ def test_case_handle_rejects_reparse_write_alias_inside_owned_tree(tmp_path: Pat
     real_directory = case.temporary_root / "real"
     real_directory.mkdir()
     alias_directory = case.temporary_root / "alias"
-    try:
-        alias_directory.symlink_to(real_directory, target_is_directory=True)
-    except OSError as error:
-        pytest.skip(f"directory symlinks are unavailable: {error}")
+    make_directory_junction(alias_directory, real_directory)
 
     with pytest.raises(WorkspaceBoundaryError):
         case.write_text(Path("90_Temporary") / "alias" / "output.txt", "must reject alias")
