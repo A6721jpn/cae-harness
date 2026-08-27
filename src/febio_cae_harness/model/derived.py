@@ -6,10 +6,19 @@ import os
 import re
 import stat
 import xml.etree.ElementTree as ET
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
+from ..autonomy.policy import (
+    IntentState,
+    IntentStateAuthority,
+    Proposal,
+    ProposalAction,
+    ProposalAuthority,
+    decide_proposal,
+)
+from ..evidence import EvidenceIntegrityError
 from .plan import OriginalModel
 from .types import EvidenceProvenance, IntentImpact, normalise_provenance
 
@@ -106,20 +115,115 @@ def _path_index(root: ET.Element) -> dict[str, ET.Element]:
     return paths
 
 
+_PATCH_CHANGE_KEYS = frozenset({"target", "mode", "value", "attribute_name"})
+
+
+def _proposal_patch_records(proposal: Proposal) -> tuple[Mapping[str, object], ...]:
+    """Return the explicit FEB patch records declared by a mesh proposal.
+
+    Policy declarations remain evidence-shaped JSON, so the mesh change may
+    describe one patch directly or carry an ordered ``patches`` sequence.  No
+    fields outside the FEB patch contract are accepted here; in particular,
+    proposal metadata cannot silently become a model edit.
+    """
+
+    changes = proposal.changes
+    if not isinstance(changes, Mapping) or set(changes) != {"mesh"}:
+        raise EvidenceIntegrityError("proposal must declare only mesh patch changes")
+    mesh_changes = changes["mesh"]
+    if isinstance(mesh_changes, Mapping):
+        if set(mesh_changes) == {"patches"}:
+            raw_records = mesh_changes["patches"]
+        elif {"target", "mode", "value"}.issubset(mesh_changes):
+            raw_records = (mesh_changes,)
+        else:
+            raise EvidenceIntegrityError("proposal mesh changes do not declare FEB patches")
+    else:
+        raw_records = mesh_changes
+    if not isinstance(raw_records, tuple) or not raw_records:
+        raise EvidenceIntegrityError("proposal mesh patches must be a non-empty sequence")
+    records: list[Mapping[str, object]] = []
+    for raw_record in raw_records:
+        if not isinstance(raw_record, Mapping):
+            raise EvidenceIntegrityError("proposal mesh patches must be mappings")
+        if not set(raw_record).issubset(_PATCH_CHANGE_KEYS):
+            raise EvidenceIntegrityError("proposal mesh patch has unexpected fields")
+        if not {"target", "mode", "value"}.issubset(raw_record):
+            raise EvidenceIntegrityError("proposal mesh patch omits a required field")
+        mode = raw_record["mode"]
+        if mode == "TEXT":
+            if "attribute_name" in raw_record:
+                raise EvidenceIntegrityError("TEXT proposal patches cannot name an attribute")
+        elif mode == "ATTRIBUTE":
+            if "attribute_name" not in raw_record:
+                raise EvidenceIntegrityError("ATTRIBUTE proposal patches require an attribute name")
+        else:
+            raise EvidenceIntegrityError("proposal mesh patch mode is invalid")
+        records.append(raw_record)
+    return tuple(records)
+
+
+def _scalar_exactly_matches(left: object, right: object) -> bool:
+    """Compare patch values without allowing bool/int equality to collapse."""
+
+    return type(left) is type(right) and left == right
+
+
+def _patch_exactly_matches(patch: FebPatch, declared: Mapping[str, object]) -> bool:
+    """Return whether every executable patch field matches its declaration."""
+
+    target = declared.get("target")
+    mode = declared.get("mode")
+    value = declared.get("value")
+    if type(target) is not str or type(mode) is not str:
+        return False
+    if patch.target != target or patch.mode != mode:
+        return False
+    if not _scalar_exactly_matches(patch.value, value):
+        return False
+    if patch.mode == "TEXT":
+        return patch.attribute_name is None and "attribute_name" not in declared
+    attribute_name = declared.get("attribute_name")
+    return (
+        isinstance(attribute_name, str)
+        and bool(attribute_name.strip())
+        and patch.attribute_name == attribute_name
+    )
+
+
+def _require_authorized_patch_set(
+    state_authority: IntentStateAuthority,
+    proposal: Proposal,
+    proposal_authority: ProposalAuthority,
+    patches: tuple[FebPatch, ...],
+) -> None:
+    """Require live policy authorization and an exact executable patch set."""
+
+    if type(state_authority) is not IntentStateAuthority:
+        raise TypeError("state_authority must be an exact IntentStateAuthority")
+    if type(proposal) is not Proposal:
+        raise TypeError("proposal must be an exact Proposal")
+    if type(proposal_authority) is not ProposalAuthority:
+        raise TypeError("proposal_authority must be an exact ProposalAuthority")
+    if state_authority.current is not IntentState.BOUND:
+        raise EvidenceIntegrityError("derived FEB writes require a BOUND state authority")
+    decision = decide_proposal(state_authority, proposal, proposal_authority)
+    if decision.action is not ProposalAction.AUTO_APPLY:
+        raise EvidenceIntegrityError("derived FEB write requires an AUTO_APPLY proposal decision")
+    declared = _proposal_patch_records(proposal)
+    if len(declared) != len(patches) or any(
+        not isinstance(record, FebPatch) or not _patch_exactly_matches(record, change)
+        for record, change in zip(patches, declared, strict=True)
+    ):
+        raise EvidenceIntegrityError("derived FEB patches do not exactly match the proposal")
+
+
 def _apply_patches(root: ET.Element, patches: tuple[FebPatch, ...]) -> tuple[str, ...]:
     paths = _path_index(root)
     applied: list[str] = []
     for patch in patches:
         if not isinstance(patch, FebPatch):
             raise TypeError("patches must contain FebPatch records")
-        impact = patch.intent_impact
-        if impact is IntentImpact.INTENT_CHANGING:
-            raise ValueError("INTENT_CHANGING patches require a block")
-        if not patch.provenance or (
-            impact is IntentImpact.INTENT_SENSITIVE
-            and not any(item.authoritative for item in patch.provenance)
-        ):
-            raise ValueError("patch provenance is missing or not authoritative")
         target = paths.get(patch.target)
         if target is None:
             raise ValueError(f"patch target must match exactly one element: {patch.target}")
@@ -190,6 +294,10 @@ def write_derived_feb(
     patches: Iterable[FebPatch],
     destination: str | Path,
     attempt_root: str | Path,
+    *,
+    state_authority: IntentStateAuthority,
+    proposal: Proposal,
+    proposal_authority: ProposalAuthority,
 ) -> DerivedFebReceipt:
     if not isinstance(original, OriginalModel):
         raise TypeError("original must be an OriginalModel")
@@ -198,8 +306,14 @@ def write_derived_feb(
     payload = original.read_bytes()
     if hashlib.sha256(payload).hexdigest() != original.sha256:
         raise ValueError("original model digest changed before derivation")
-    target = _validate_destination(destination, attempt_root)
     patch_records = tuple(patches)
+    _require_authorized_patch_set(
+        state_authority,
+        proposal,
+        proposal_authority,
+        patch_records,
+    )
+    target = _validate_destination(destination, attempt_root)
     root = _parse_feb(payload)
     applied = _apply_patches(root, patch_records)
     output = ET.tostring(root, encoding="utf-8", xml_declaration=True, short_empty_elements=True)
@@ -228,6 +342,12 @@ def write_derived_feb(
         derived_sha256 = hashlib.sha256(written).hexdigest()
         if not original.verify():
             raise ValueError("original model digest changed after derivation")
+        _require_authorized_patch_set(
+            state_authority,
+            proposal,
+            proposal_authority,
+            patch_records,
+        )
         return DerivedFebReceipt(original.sha256, derived_sha256, target, applied)
     except BaseException:
         if fd is not None:
