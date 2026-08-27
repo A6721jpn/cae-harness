@@ -6,9 +6,11 @@ not inspect or infer the physical meaning of any input, model, or result.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 from collections.abc import Iterable
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -19,6 +21,12 @@ __all__ = [
     "ValidatedCaseWorkspace",
     "WorkspaceBoundaryError",
 ]
+
+
+_TEMPORARY_ROOT = "90_Temporary"
+_PERMANENT_ROOTS = frozenset({"02_Model", "03_Result", "04_Report", "05_Verification"})
+_CONTROL_FILES = frozenset({"CASE_MANIFEST.json", "intent.json"})
+_EVENTS_FILE = f"{_TEMPORARY_ROOT}/events.jsonl"
 
 
 class WorkspaceBoundaryError(PermissionError):
@@ -37,18 +45,45 @@ def _validate_segment(value: str, label: str) -> str:
     return value
 
 
-def _resolve_owned_target(root: Path, relative_path: str | Path) -> Path:
+def _resolve_owned_target(
+    root: Path,
+    relative_path: str | Path,
+    *,
+    allow_absolute: bool = False,
+) -> Path:
     relative = Path(relative_path)
     if relative.is_absolute() or relative.anchor:
-        raise WorkspaceBoundaryError("write target must be relative to the case workspace")
-
-    target = (root / relative).resolve(strict=False)
+        if not allow_absolute:
+            raise WorkspaceBoundaryError("write target must be relative to the case workspace")
+        target = relative.resolve(strict=False)
+    else:
+        target = (root / relative).resolve(strict=False)
+    root = root.resolve(strict=False)
     if target == root or not target.is_relative_to(root):
         raise WorkspaceBoundaryError("write target is outside the owned case workspace")
     return target
 
 
-@dataclass(frozen=True, slots=True)
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError as error:
+        raise WorkspaceBoundaryError(f"cannot read promotion source: {path}") from error
+    return digest.hexdigest()
+
+
+def _validate_sha256(value: str) -> str:
+    if not isinstance(value, str) or len(value) != hashlib.sha256().digest_size * 2:
+        raise ValueError("expected_sha256 must be a SHA-256 digest")
+    if any(character not in "0123456789abcdefABCDEF" for character in value):
+        raise ValueError("expected_sha256 must be a SHA-256 digest")
+    return value.casefold()
+
+
+@dataclass(frozen=True, slots=True, init=False)
 class AttemptWorkspace:
     """A bounded writer for one case-owned temporary attempt directory."""
 
@@ -56,10 +91,31 @@ class AttemptWorkspace:
     attempt_id: str
     root: Path
 
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "root", Path(self.root).resolve())
-        _validate_segment(self.case_id, "case_id")
-        _validate_segment(self.attempt_id, "attempt_id")
+    @classmethod
+    def _from_manager(
+        cls,
+        case_workspace: CaseWorkspace,
+        attempt_id: str,
+        root: Path,
+    ) -> AttemptWorkspace:
+        """Construct a handle only for the manager-owned attempt path."""
+
+        if not isinstance(case_workspace, CaseWorkspace):
+            raise TypeError("attempt workspace requires a case workspace authority")
+        _validate_segment(case_workspace.case_id, "case_id")
+        _validate_segment(attempt_id, "attempt_id")
+        expected_root = (case_workspace.temporary_root / "attempts" / attempt_id).resolve(
+            strict=False
+        )
+        actual_root = Path(root).resolve(strict=False)
+        if actual_root != expected_root or not actual_root.is_dir():
+            raise WorkspaceBoundaryError("attempt root is not owned by the case workspace")
+
+        instance = object.__new__(cls)
+        object.__setattr__(instance, "case_id", case_workspace.case_id)
+        object.__setattr__(instance, "attempt_id", attempt_id)
+        object.__setattr__(instance, "root", actual_root)
+        return instance
 
     def __fspath__(self) -> str:
         return os.fspath(self.root)
@@ -83,9 +139,9 @@ class AttemptWorkspace:
         return target
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class CaseWorkspace:
-    """A handle whose writes are restricted to one validated case."""
+    """A manager-issued handle with temporary-only normal writes."""
 
     _manager: ValidatedCaseWorkspace
     case_id: str
@@ -93,19 +149,53 @@ class CaseWorkspace:
     original_inputs: tuple[Path, ...] = ()
     source_inputs: tuple[Path, ...] = ()
 
-    def __post_init__(self) -> None:
-        _validate_segment(self.case_id, "case_id")
-        object.__setattr__(self, "case_root", Path(self.case_root).resolve())
+    @classmethod
+    def _from_manager(
+        cls,
+        manager: ValidatedCaseWorkspace,
+        case_id: str,
+        case_root: Path,
+        original_inputs: Iterable[str | Path] = (),
+        source_inputs: Iterable[str | Path] = (),
+    ) -> CaseWorkspace:
+        """Construct a handle only for a path issued by its manager.
+
+        The public dataclass constructor is disabled.  In addition to making
+        accidental construction fail, this factory checks that the supplied
+        root is exactly the manager's case path and that original inputs remain
+        inside ``01_Input``.
+        """
+
+        if not isinstance(manager, ValidatedCaseWorkspace):
+            raise TypeError("case workspace requires a validated workspace authority")
+        _validate_segment(case_id, "case_id")
+        expected_root = (manager.cae_root / case_id).resolve(strict=False)
+        actual_root = Path(case_root).resolve(strict=False)
+        if actual_root != expected_root or not actual_root.is_dir():
+            raise WorkspaceBoundaryError("case root is not owned by the validated workspace")
+
+        input_root = (actual_root / "01_Input").resolve(strict=False)
+        normalised_originals: list[Path] = []
+        for path_value in original_inputs:
+            source_path = Path(path_value)
+            if source_path.is_symlink():
+                raise WorkspaceBoundaryError("original input cannot be a symlink")
+            path = source_path.resolve(strict=False)
+            if not path.is_file() or not path.is_relative_to(input_root):
+                raise WorkspaceBoundaryError("original input is outside the owned 01_Input")
+            normalised_originals.append(path)
+
+        instance = object.__new__(cls)
+        object.__setattr__(instance, "_manager", manager)
+        object.__setattr__(instance, "case_id", case_id)
+        object.__setattr__(instance, "case_root", actual_root)
+        object.__setattr__(instance, "original_inputs", tuple(normalised_originals))
         object.__setattr__(
-            self,
-            "original_inputs",
-            tuple(Path(path).resolve() for path in self.original_inputs),
-        )
-        object.__setattr__(
-            self,
+            instance,
             "source_inputs",
-            tuple(Path(path).resolve() for path in self.source_inputs),
+            tuple(Path(path).expanduser().resolve(strict=False) for path in source_inputs),
         )
+        return instance
 
     @property
     def root(self) -> Path:
@@ -128,18 +218,49 @@ class CaseWorkspace:
         return self.case_root / "02_Model"
 
     @property
-    def temporary_root(self) -> Path:
-        return self.case_root / "90_Temporary"
+    def result_root(self) -> Path:
+        return self.case_root / "03_Result"
 
-    def _write_target(self, relative_path: str | Path) -> Path:
+    @property
+    def report_root(self) -> Path:
+        return self.case_root / "04_Report"
+
+    @property
+    def verification_root(self) -> Path:
+        return self.case_root / "05_Verification"
+
+    @property
+    def temporary_root(self) -> Path:
+        return self.case_root / _TEMPORARY_ROOT
+
+    def _temporary_write_target(
+        self,
+        relative_path: str | Path,
+        *,
+        allow_event_append: bool = False,
+    ) -> Path:
         target = _resolve_owned_target(self.case_root, relative_path)
-        input_root = (self.case_root / "01_Input").resolve(strict=False)
-        if target == input_root or target.is_relative_to(input_root):
-            raise ImmutableInputError("01_Input is immutable after case creation")
+        temporary_root = self.temporary_root.resolve(strict=False)
+        if target == temporary_root or not target.is_relative_to(temporary_root):
+            input_root = self.input_root.resolve(strict=False)
+            if target == input_root or target.is_relative_to(input_root):
+                raise ImmutableInputError("01_Input is immutable after case creation")
+            raise WorkspaceBoundaryError("normal writes are restricted to 90_Temporary")
+
+        relative = target.relative_to(self.case_root).as_posix()
+        if relative == _EVENTS_FILE and not allow_event_append:
+            raise WorkspaceBoundaryError("events.jsonl is append-only")
+        return target
+
+    def _control_write_target(self, relative_path: str | Path) -> Path:
+        target = _resolve_owned_target(self.case_root, relative_path)
+        relative = target.relative_to(self.case_root).as_posix()
+        if relative not in _CONTROL_FILES:
+            raise WorkspaceBoundaryError("only evidence control files may use an internal write")
         return target
 
     def write_bytes(self, relative_path: str | Path, data: bytes) -> Path:
-        target = self._write_target(relative_path)
+        target = self._temporary_write_target(relative_path)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(data)
         return target
@@ -151,16 +272,133 @@ class CaseWorkspace:
         *,
         encoding: str = "utf-8",
     ) -> Path:
-        target = self._write_target(relative_path)
+        target = self._temporary_write_target(relative_path)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(text, encoding=encoding)
         return target
+
+    def _write_control_text(
+        self,
+        relative_path: str | Path,
+        text: str,
+        *,
+        encoding: str = "utf-8",
+    ) -> Path:
+        """Write a root-level evidence control file for ``EvidenceStore``."""
+
+        target = self._control_write_target(relative_path)
+        target.write_text(text, encoding=encoding)
+        return target
+
+    def append_text(
+        self,
+        relative_path: str | Path,
+        text: str,
+        *,
+        encoding: str = "utf-8",
+    ) -> Path:
+        """Durably append text to a file in the temporary area.
+
+        The file is opened with append semantics, flushed, and fsynced before
+        returning.  ``events.jsonl`` is intentionally excluded from normal
+        ``write_text`` so callers cannot accidentally replace the chain.
+        """
+
+        target = self._temporary_write_target(relative_path, allow_event_append=True)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        data = text.encode(encoding)
+        try:
+            with target.open("ab") as stream:
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+        except OSError as error:
+            raise WorkspaceBoundaryError(f"cannot append temporary evidence: {target}") from error
+        return target
+
+    def promote_verified(
+        self,
+        source: str | Path,
+        destination: str | Path,
+        *,
+        expected_sha256: str,
+    ) -> Path:
+        """Copy a verified temporary artifact into a permanent area once.
+
+        The source must be an existing regular file below ``90_Temporary``;
+        the destination must be below one of the four permanent roots.  The
+        destination is opened with create-new semantics and the copied bytes
+        are hashed before the file is fsynced.  A digest mismatch leaves no
+        destination file behind.
+        """
+
+        expected = _validate_sha256(expected_sha256)
+        source_path = _resolve_owned_target(self.case_root, source, allow_absolute=True)
+        temporary_root = self.temporary_root.resolve(strict=False)
+        if source_path == temporary_root or not source_path.is_relative_to(temporary_root):
+            raise WorkspaceBoundaryError("promotion source must be inside 90_Temporary")
+        if not source_path.is_file() or source_path.is_symlink():
+            raise WorkspaceBoundaryError("promotion source must be a regular file")
+
+        destination_path = _resolve_owned_target(
+            self.case_root,
+            destination,
+            allow_absolute=True,
+        )
+        relative_destination = destination_path.relative_to(self.case_root)
+        if (
+            len(relative_destination.parts) < 2
+            or relative_destination.parts[0] not in _PERMANENT_ROOTS
+        ):
+            raise WorkspaceBoundaryError(
+                "promotion destination must be inside a permanent case directory"
+            )
+        if destination_path.exists() or destination_path.is_symlink():
+            raise FileExistsError(destination_path)
+
+        if _sha256_file(source_path) != expected:
+            raise ValueError("promotion source sha256 does not match expected_sha256")
+
+        destination_path.parent.mkdir(parents=True, exist_ok=True)
+        created = False
+        try:
+            copied_digest = hashlib.sha256()
+            with source_path.open("rb") as source_stream, destination_path.open("xb") as target:
+                created = True
+                for chunk in iter(lambda: source_stream.read(1024 * 1024), b""):
+                    target.write(chunk)
+                    copied_digest.update(chunk)
+                target.flush()
+                os.fsync(target.fileno())
+            if copied_digest.hexdigest() != expected:
+                raise ValueError("promotion source changed during copy")
+        except Exception:
+            if created:
+                with suppress(OSError):
+                    destination_path.unlink()
+            raise
+        return destination_path
+
+    def promote_artifact(
+        self,
+        source: str | Path,
+        destination: str | Path,
+        *,
+        expected_sha256: str,
+    ) -> Path:
+        """Compatibility name for :meth:`promote_verified`."""
+
+        return self.promote_verified(
+            source,
+            destination,
+            expected_sha256=expected_sha256,
+        )
 
     def allocate_attempt(self, attempt_id: str) -> AttemptWorkspace:
         _validate_segment(attempt_id, "attempt_id")
         attempt_root = self.temporary_root / "attempts" / attempt_id
         attempt_root.mkdir(parents=False, exist_ok=False)
-        return AttemptWorkspace(self.case_id, attempt_id, attempt_root)
+        return AttemptWorkspace._from_manager(self, attempt_id, attempt_root)
 
 
 @dataclass(frozen=True, slots=True)
@@ -243,7 +481,7 @@ class ValidatedCaseWorkspace:
             shutil.rmtree(case_path)
             raise
 
-        return CaseWorkspace(self, case_id, case_path, tuple(copied_inputs), sources)
+        return CaseWorkspace._from_manager(self, case_id, case_path, copied_inputs, sources)
 
     def open_case(self, case_id: str) -> CaseWorkspace:
         """Open an existing case without granting access outside its root."""
@@ -252,12 +490,15 @@ class ValidatedCaseWorkspace:
         if not case_path.is_dir() or not case_path.is_relative_to(self.cae_root):
             raise FileNotFoundError(f"case does not exist: {case_id}")
         input_root = case_path / "01_Input"
-        original_inputs = (
-            tuple(sorted(path.resolve() for path in input_root.iterdir() if path.is_file()))
-            if input_root.is_dir()
-            else ()
-        )
-        return CaseWorkspace(self, case_id, case_path, original_inputs)
+        original_inputs: tuple[Path, ...]
+        if input_root.is_dir():
+            entries = tuple(input_root.iterdir())
+            if any(entry.is_symlink() or not entry.is_file() for entry in entries):
+                raise WorkspaceBoundaryError("original input directory contains an invalid entry")
+            original_inputs = tuple(sorted((entry.resolve() for entry in entries), key=str))
+        else:
+            original_inputs = ()
+        return CaseWorkspace._from_manager(self, case_id, case_path, original_inputs)
 
     def write_bytes(self, case_id: str, relative_path: str | Path, data: bytes) -> Path:
         return self.open_case(case_id).write_bytes(relative_path, data)

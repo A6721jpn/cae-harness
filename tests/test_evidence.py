@@ -49,7 +49,26 @@ def test_events_are_chained_and_append_only(tmp_path: Path) -> None:
     store = EvidenceStore(case, intent)
 
     first = store.append_event("input_collected", {"source": "synthetic"})
-    second = store.append_event("intent_reviewed", {"reviewed": True})
+
+    original_write_text = CaseWorkspace.write_text
+
+    def reject_event_rewrite(
+        self: CaseWorkspace,
+        relative_path: str | Path,
+        text: str,
+        *,
+        encoding: str = "utf-8",
+    ) -> Path:
+        if Path(relative_path).as_posix() == "90_Temporary/events.jsonl":
+            raise AssertionError("events.jsonl must be appended, not rewritten")
+        return original_write_text(self, relative_path, text, encoding=encoding)
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(CaseWorkspace, "write_text", reject_event_rewrite)
+    try:
+        second = store.append_event("intent_reviewed", {"reviewed": True})
+    finally:
+        monkeypatch.undo()
 
     lines = (
         case.case_root.joinpath("90_Temporary", "events.jsonl")
@@ -135,7 +154,7 @@ def test_reopen_fails_closed_on_tampering(tmp_path: Path, tamper: str) -> None:
 
 def test_partial_persistence_and_boundary_escape_fail_closed(tmp_path: Path) -> None:
     workspace, case, intent = make_case(tmp_path)
-    case.write_text("intent.json", "{}")
+    case.case_root.joinpath("intent.json").write_text("{}", encoding="utf-8")
 
     with pytest.raises(EvidenceIntegrityError):
         EvidenceStore(case, intent)

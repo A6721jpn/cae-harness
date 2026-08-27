@@ -256,8 +256,8 @@ class EvidenceStore:
         self._intent = intent
         self._artifacts = {}
         intent_payload = intent.to_dict()
-        self.case_workspace.write_text(INTENT_FILE, _json_text(intent_payload))
-        self.case_workspace.write_text(EVENTS_FILE, "")
+        self.case_workspace._write_control_text(INTENT_FILE, _json_text(intent_payload))
+        self.case_workspace.append_text(EVENTS_FILE, "")
         self._refresh_manifest()
 
     def _load_and_validate(self, supplied_intent: IntentContract | None) -> None:
@@ -526,10 +526,9 @@ class EvidenceStore:
         event = dict(body)
         event["sha256"] = _digest(body)
         try:
-            existing = self.events_path.read_text(encoding="utf-8")
+            self.case_workspace.append_text(EVENTS_FILE, _json_text(event))
         except OSError as error:
             raise EvidenceIntegrityError("event log is missing or unreadable") from error
-        self.case_workspace.write_text(EVENTS_FILE, existing + _json_text(event))
         self._refresh_manifest()
         return event
 
@@ -546,4 +545,4 @@ class EvidenceStore:
             attempts,
         )
         self._case_sha256 = str(manifest["case_sha256"])
-        self.case_workspace.write_text(MANIFEST_FILE, _json_text(manifest))
+        self.case_workspace._write_control_text(MANIFEST_FILE, _json_text(manifest))

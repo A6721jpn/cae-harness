@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import FrozenInstanceError
+from math import inf, nan
 from typing import Any
 
 import pytest
@@ -120,6 +121,12 @@ def test_execution_budget_is_immutable_and_validates_limits() -> None:
         ExecutionBudget(cpu_budget_seconds=-1.0)
     with pytest.raises(ValueError, match="memory_budget_mb"):
         ExecutionBudget(memory_budget_mb=-1)
+
+
+@pytest.mark.parametrize("value", [nan, inf, -inf, {"nested": [nan]}])
+def test_intent_rejects_non_finite_float_values(value: Any) -> None:
+    with pytest.raises(ValueError, match="finite"):
+        IntentContract(material=value)
 
 
 def test_intent_rejects_unknown_states() -> None:

@@ -66,7 +66,11 @@ class ExecutionBudget:
 def _freeze(value: Any) -> JSONValue:
     """Return a recursively immutable representation of JSON-compatible data."""
 
-    if value is None or isinstance(value, (bool, int, float, str)):
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+    if isinstance(value, float):
+        if not isfinite(value):
+            raise ValueError("intent values must contain only finite floats")
         return value
     if isinstance(value, Mapping):
         frozen: dict[str, JSONValue] = {}
