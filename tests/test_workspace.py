@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+import febio_cae_harness.workspace as workspace_module
 from febio_cae_harness.contracts import IntentContract
 from febio_cae_harness.evidence import EvidenceIntegrityError, EvidenceStore
 from febio_cae_harness.workspace import (
@@ -491,3 +492,162 @@ def test_workspace_authorities_reject_forged_cloned_and_rebound_objects(
     object.__setattr__(attempt, "attempt_id", "swapped-attempt")
     with pytest.raises(WorkspaceBoundaryError):
         attempt.write_text("swapped.txt", "must reject")
+
+
+def test_issued_case_handle_rejects_renamed_case_substitution(tmp_path: Path) -> None:
+    workspace = make_workspace(tmp_path)
+    case_a = workspace.create_case("case-a")
+    case_b = workspace.create_case("case-b")
+    displaced = tmp_path / "case-a-displaced"
+
+    case_a.case_root.rename(displaced)
+    case_b.case_root.rename(case_a.case_root)
+
+    with pytest.raises(WorkspaceBoundaryError):
+        case_a.write_text(Path("90_Temporary") / "substitution.txt", "must reject")
+    assert not (case_b.case_root / "90_Temporary" / "substitution.txt").exists()
+    assert not (case_a.case_root / "90_Temporary" / "substitution.txt").exists()
+
+
+def test_issued_attempt_handle_rejects_renamed_attempt_substitution(
+    tmp_path: Path,
+) -> None:
+    workspace = make_workspace(tmp_path)
+    case = workspace.create_case("case-a")
+    attempt_a = case.allocate_attempt("attempt-a")
+    attempt_b = case.allocate_attempt("attempt-b")
+    displaced = case.temporary_root / "attempts" / "attempt-a-displaced"
+
+    attempt_a.root.rename(displaced)
+    attempt_b.root.rename(attempt_a.root)
+
+    with pytest.raises(WorkspaceBoundaryError):
+        attempt_a.write_text("substitution.txt", "must reject")
+    assert not (attempt_b.root / "substitution.txt").exists()
+    assert not (attempt_a.root / "substitution.txt").exists()
+
+
+@pytest.mark.parametrize("root_name", ["tool_root", "cae_root"])
+def test_manager_rejects_replaced_root_after_authority_issuance(
+    tmp_path: Path,
+    root_name: str,
+) -> None:
+    workspace = make_workspace(tmp_path)
+    workspace.create_case("case-a")
+    root = getattr(workspace, root_name)
+    displaced = tmp_path / f"{root_name}-displaced"
+
+    root.rename(displaced)
+    root.mkdir()
+
+    with pytest.raises(WorkspaceBoundaryError):
+        workspace.create_case("case-b")
+    assert not (root / "case-b").exists()
+
+
+def _substitute_case_roots(case_a: CaseWorkspace, case_b: CaseWorkspace, tmp_path: Path) -> None:
+    case_a.case_root.rename(tmp_path / "case-a-open-displaced")
+    case_b.case_root.rename(case_a.case_root)
+
+
+def _substitute_temporary_roots(
+    case_a: CaseWorkspace,
+    case_b: CaseWorkspace,
+    tmp_path: Path,
+) -> None:
+    case_a.temporary_root.rename(tmp_path / "case-a-temporary-displaced")
+    case_b.temporary_root.rename(case_a.temporary_root)
+
+
+def test_write_rejects_case_substitution_at_temporary_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = make_workspace(tmp_path)
+    case_a = workspace.create_case("case-a")
+    case_b = workspace.create_case("case-b")
+    original_open_directory = workspace_module._open_directory
+    swapped = False
+
+    def swap_before_open(path: Path, label: str) -> int:
+        nonlocal swapped
+        if not swapped and path == case_a.case_root:
+            swapped = True
+            _substitute_case_roots(case_a, case_b, tmp_path)
+        return original_open_directory(path, label)
+
+    monkeypatch.setattr(workspace_module, "_open_directory", swap_before_open)
+    with pytest.raises(WorkspaceBoundaryError):
+        case_a.write_text(Path("90_Temporary") / "open-race.txt", "must reject")
+
+    assert swapped
+    assert not (case_b.case_root / "90_Temporary" / "open-race.txt").exists()
+    assert not (case_a.case_root / "90_Temporary" / "open-race.txt").exists()
+
+
+def test_write_rejects_case_substitution_at_atomic_replace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = make_workspace(tmp_path)
+    case_a = workspace.create_case("case-a")
+    case_b = workspace.create_case("case-b")
+    original_replace = os.replace
+    swapped = False
+
+    def swap_before_replace(source: str | Path, target: str | Path) -> None:
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            _substitute_temporary_roots(case_a, case_b, tmp_path)
+        original_replace(source, target)
+
+    monkeypatch.setattr(os, "replace", swap_before_replace)
+    with pytest.raises(WorkspaceBoundaryError):
+        case_a.write_text(Path("90_Temporary") / "replace-race.txt", "must reject")
+
+    assert swapped
+    assert not (case_b.case_root / "90_Temporary" / "replace-race.txt").exists()
+
+
+def test_failed_promotion_removes_destination_after_source_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = make_workspace(tmp_path)
+    case = workspace.create_case("case-a")
+    source = case.write_bytes(Path("90_Temporary") / "derived.feb", b"original")
+    expected = workspace_module._sha256_file(source)
+
+    def change_after_digest(path: Path) -> str:
+        path.write_bytes(b"changed")
+        return expected
+
+    monkeypatch.setattr(workspace_module, "_sha256_file", change_after_digest)
+    destination = Path("02_Model") / "derived.feb"
+    with pytest.raises(ValueError, match="changed during copy"):
+        case._copy_create_new(source, destination, expected_sha256=expected)
+    assert not (case.case_root / destination).exists()
+
+
+@pytest.mark.parametrize("failure", ["copy", "handle"])
+def test_failed_case_creation_removes_partial_tree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    source = tmp_path / "input.feb"
+    source.write_bytes(b"input")
+    workspace = make_workspace(tmp_path)
+
+    def fail(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("creation failed")
+
+    if failure == "copy":
+        monkeypatch.setattr("febio_cae_harness.workspace.shutil.copyfileobj", fail)
+    else:
+        monkeypatch.setattr(CaseWorkspace, "_from_manager", fail)
+
+    with pytest.raises(RuntimeError, match="creation failed"):
+        workspace.create_case("case-a", [source])
+    assert not (workspace.cae_root / "case-a").exists()
