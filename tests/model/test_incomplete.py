@@ -114,10 +114,12 @@ def test_questions_follow_required_order_deduplicate_and_filter_authority() -> N
 
     inventory = inspect_incomplete_feb(inspect_feb_xml(VALID_FEB), completeness)
 
-    assert [item.condition for item in inventory.questions] == ["loads", "material"]
+    assert [item.condition for item in inventory.questions] == ["loads", "units", "material"]
     assert inventory.questions[0].reason == "loads are absent"
     assert inventory.questions[0].evidence == (AUTH_A, AUTH_B)
-    assert inventory.questions[1].evidence == (AUTH_B,)
+    assert inventory.questions[1].reason == "units are absent"
+    assert inventory.questions[1].evidence == ()
+    assert inventory.questions[2].evidence == (AUTH_B,)
     assert inventory.ready is False
 
 
@@ -139,4 +141,4 @@ def test_ready_requires_bound_completeness_without_required_unresolved_fields() 
     )
     blocked = inspect_incomplete_feb(inspect_feb_xml(VALID_FEB), incomplete)
     assert blocked.ready is False
-    assert blocked.questions == ()
+    assert blocked.questions == (MissingConditionQuestion("loads", "still unresolved"),)

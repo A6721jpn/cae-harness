@@ -128,6 +128,7 @@ def _authoritative_evidence(
 def _questions(completeness: CompletenessResult) -> tuple[MissingConditionQuestion, ...]:
     missing: dict[str, list[MissingConditionFact]] = {}
     unresolved: dict[str, list[UnresolvedEvidenceField]] = {}
+    resolved = {_condition_name(item) for item in completeness.resolved}
     for fact in completeness.missing:
         missing.setdefault(fact.condition, []).append(fact)
     for field in completeness.unresolved:
@@ -141,17 +142,19 @@ def _questions(completeness: CompletenessResult) -> tuple[MissingConditionQuesti
         if condition in seen:
             continue
         seen.add(condition)
+        if condition in resolved:
+            continue
         facts = tuple(missing.get(condition, ()))
         fields = tuple(unresolved.get(condition, ()))
         authoritative_fact = next((item for item in facts if item.authoritative), None)
         evidence = _authoritative_evidence(facts, fields)
-        if authoritative_fact is None and not evidence:
-            continue
         reason_source = authoritative_fact or next(
             (item for item in fields if any(source.authoritative for source in item.evidence)),
             None,
         )
-        if reason_source is None:  # pragma: no cover - guarded by the condition above
+        if reason_source is None:
+            reason_source = facts[0] if facts else (fields[0] if fields else None)
+        if reason_source is None:
             continue
         reason = reason_source.reason
         questions.append(MissingConditionQuestion(condition, reason, evidence))
