@@ -8,7 +8,6 @@ import os
 import re
 import stat
 import subprocess
-from collections.abc import Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,6 +21,7 @@ __all__ = [
     "RuntimeProbeError",
     "probe_febio",
     "probe_runtime",
+    "validate_runtime_diagnostic",
 ]
 
 _DEFAULT_TIMEOUT_SECONDS: Final[float] = 5.0
@@ -35,7 +35,7 @@ class RuntimeProbeError(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class FebioRuntimeDiagnostic:
-    """Immutable identity evidence from one read-only FEBio probe."""
+    """Immutable identity evidence; launch accepts only probe-issued instances."""
 
     path: Path
     sha256: str
@@ -75,6 +75,20 @@ class _FileSnapshot:
     nlink: int
     size: int
     sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class _RuntimeIssuance:
+    diagnostic: FebioRuntimeDiagnostic
+    path: Path
+    sha256: str
+    size: int
+    version: str
+    before: _FileSnapshot
+    after: _FileSnapshot
+
+
+_RUNTIME_REGISTRY: dict[int, _RuntimeIssuance] = {}
 
 
 def _absolute_path(value: str | Path) -> Path:
@@ -160,8 +174,8 @@ def _parse_version(stdout: bytes, stderr: bytes, path: Path) -> str:
     return versions[0]
 
 
-def _run_process(path: Path, arguments: tuple[str, ...], timeout: float) -> tuple[bytes, bytes]:
-    command = [os.fspath(path), *arguments]
+def _run_process(path: Path, timeout: float) -> tuple[bytes, bytes]:
+    command = [os.fspath(path)]
     try:
         process = subprocess.Popen(
             command,
@@ -191,19 +205,16 @@ def probe_febio(
     executable: str | Path,
     *,
     timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
-    runner_arguments: Sequence[str] = (),
 ) -> FebioRuntimeDiagnostic:
     """Probe one exact executable without shell or filesystem writes."""
 
     path = _absolute_path(executable)
-    if any(not isinstance(argument, str) or not argument for argument in runner_arguments):
-        raise ValueError("runtime probe runner arguments must be non-empty strings")
     timeout = _validate_timeout(timeout_seconds)
     before = _snapshot(path)
     run_error: RuntimeProbeError | None = None
     stdout = stderr = b""
     try:
-        stdout, stderr = _run_process(path, tuple(runner_arguments), timeout)
+        stdout, stderr = _run_process(path, timeout)
     except RuntimeProbeError as error:
         run_error = error
     after = _snapshot(path)
@@ -212,7 +223,56 @@ def probe_febio(
     if run_error is not None:
         raise run_error
     version = _parse_version(stdout, stderr, path)
-    return FebioRuntimeDiagnostic(path, after.sha256, after.size, version)
+    diagnostic = FebioRuntimeDiagnostic(
+        path,
+        after.sha256,
+        after.size,
+        version,
+    )
+    _RUNTIME_REGISTRY[id(diagnostic)] = _RuntimeIssuance(
+        diagnostic,
+        path,
+        after.sha256,
+        after.size,
+        version,
+        before,
+        after,
+    )
+    return diagnostic
+
+
+def validate_runtime_diagnostic(value: object) -> FebioRuntimeDiagnostic:
+    """Fail closed unless ``value`` is the live result of an unchanged probe."""
+
+    if type(value) is not FebioRuntimeDiagnostic:
+        raise RuntimeProbeError("runtime diagnostic must be an exact probe-issued capability")
+    issuance = _RUNTIME_REGISTRY.get(id(value))
+    if issuance is None or issuance.diagnostic is not value:
+        raise RuntimeProbeError("runtime diagnostic was not issued by probe_febio")
+
+    diagnostic = value
+    try:
+        fields_match = (
+            diagnostic.path == issuance.path
+            and diagnostic.sha256 == issuance.sha256
+            and diagnostic.size == issuance.size
+            and diagnostic.version == issuance.version
+        )
+    except Exception as error:
+        raise RuntimeProbeError("runtime diagnostic state is invalid") from error
+    if not fields_match:
+        raise RuntimeProbeError("runtime diagnostic state was modified")
+    if issuance.before != issuance.after:
+        raise RuntimeProbeError("runtime executable changed during probe")
+    try:
+        current = _snapshot(issuance.path)
+    except RuntimeProbeError:
+        raise
+    except Exception as error:
+        raise RuntimeProbeError("runtime executable identity is invalid") from error
+    if current != issuance.after:
+        raise RuntimeProbeError("runtime executable changed after probe")
+    return diagnostic
 
 
 probe_runtime = probe_febio

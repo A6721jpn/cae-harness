@@ -8,8 +8,10 @@ from .fbs import (
     validate_requested_fields,
 )
 from .headless import (
+    HeadlessConfigurationError,
     HeadlessRunDiagnostic,
     headless_exit_code,
+    reconnect_headless_febio,
     run_headless_febio,
 )
 from .log import LogValidation, LogValidator, validate_log, validate_solver_log
@@ -21,6 +23,7 @@ from .runtime import (
     RuntimeProbeError,
     probe_febio,
     probe_runtime,
+    validate_runtime_diagnostic,
 )
 from .supervisor import SolverSupervisor
 from .types import (
@@ -40,6 +43,7 @@ from .types import (
 
 __all__ = [
     "FailureClassification",
+    "HeadlessConfigurationError",
     "HeadlessRunDiagnostic",
     "FbsAdapterAuthority",
     "FbsAdapterManager",
@@ -67,8 +71,10 @@ __all__ = [
     "RuntimeProbeError",
     "probe_febio",
     "probe_runtime",
+    "reconnect_headless_febio",
     "run_headless_febio",
     "validate_log",
     "validate_requested_fields",
+    "validate_runtime_diagnostic",
     "validate_solver_log",
 ]

@@ -1,147 +1,165 @@
 from __future__ import annotations
 
+import inspect
+import os
+import stat
 import sys
 from pathlib import Path
 
 import pytest
 
-from febio_cae_harness.solver.headless import HeadlessRunDiagnostic, run_headless_febio
-from febio_cae_harness.solver.runtime import FebioRuntimeDiagnostic, RuntimeProbeError
-from febio_cae_harness.solver.types import SolverClassification, SolverState
+from febio_cae_harness.contracts import IntentContract
+from febio_cae_harness.evidence import EvidenceStore, IntentSnapshotAuthority
+from febio_cae_harness.solver import headless as headless_module
+from febio_cae_harness.solver.headless import (
+    HeadlessConfigurationError,
+    headless_exit_code,
+    run_headless_febio,
+)
+from febio_cae_harness.solver.runtime import (
+    FebioRuntimeDiagnostic,
+    RuntimeProbeError,
+    probe_febio,
+)
+from febio_cae_harness.solver.types import (
+    SolverClassification,
+    SolverLaunchSpec,
+    SolverRunResult,
+    SolverState,
+)
+from febio_cae_harness.workspace import AttemptWorkspace, ValidatedCaseWorkspace
 
 
-def _context(tmp_path: Path) -> tuple[Path, Path]:
-    attempt_root = tmp_path / "attempt"
-    attempt_root.mkdir()
-    input_path = attempt_root / "model.feb"
-    input_path.write_text("synthetic completed FEB", encoding="utf-8")
-    return attempt_root, input_path
+def _authority_context(
+    tmp_path: Path, *, case_id: str
+) -> tuple[AttemptWorkspace, IntentSnapshotAuthority, Path]:
+    manager = ValidatedCaseWorkspace(tmp_path / "tool", tmp_path / "cae")
+    case = manager.create_case(case_id)
+    store = EvidenceStore(case, IntentContract())
+    store.record_attempt("attempt-a")
+    attempt = AttemptWorkspace._from_manager(
+        case,
+        "attempt-a",
+        case.temporary_root / "attempts" / "attempt-a",
+    )
+    intent = store.issue_intent_snapshot()
+    input_path = attempt.write_text("model.feb", "synthetic completed FEB")
+    return attempt, intent, input_path
 
 
-def test_missing_runtime_command_is_a_probe_failure(tmp_path: Path) -> None:
-    attempt_root, input_path = _context(tmp_path)
-
-    with pytest.raises(RuntimeProbeError):
-        run_headless_febio(
-            tmp_path / "missing-febio.exe",
-            input_path,
-            attempt_root,
-            case_id="case",
-            intent_id="intent",
-            attempt_id="attempt",
-        )
+def _forged_runtime() -> FebioRuntimeDiagnostic:
+    return FebioRuntimeDiagnostic(Path(sys.executable).absolute(), "a" * 64, 1, "4.12.0")
 
 
-def test_input_must_be_physically_inside_attempt_root(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    attempt_root, _ = _context(tmp_path)
-    outside_input = tmp_path / "outside.feb"
-    outside_input.write_text("synthetic completed FEB", encoding="utf-8")
+def _issued_runtime(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FebioRuntimeDiagnostic:
+    executable = tmp_path / "fake-febio"
+    executable.write_bytes(b"synthetic FEBio executable")
+    executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
+
+    class CompletedProcess:
+        returncode = 0
+
+        def communicate(self, input: bytes, timeout: float) -> tuple[bytes, bytes]:
+            assert input == b"quit\n"
+            return b"version 4.12.0\n", b""
 
     monkeypatch.setattr(
-        "febio_cae_harness.solver.headless.probe_febio",
-        lambda executable: FebioRuntimeDiagnostic(
-            Path("C:/synthetic/febio.exe"), "a" * 64, 1, "4.12.0"
-        ),
+        "febio_cae_harness.solver.runtime.subprocess.Popen",
+        lambda command, **kwargs: CompletedProcess(),
     )
-
-    with pytest.raises(ValueError, match="inside the attempt root"):
-        run_headless_febio(
-            Path("C:/synthetic/febio.exe"),
-            outside_input,
-            attempt_root,
-            case_id="case",
-            intent_id="intent",
-            attempt_id="attempt",
-        )
+    return probe_febio(executable)
 
 
-def _synthetic_probe_script(tmp_path: Path) -> Path:
-    script = tmp_path / "probe_runtime.py"
-    script.write_text(
-        "import sys\n"
-        "print('version 4.12.0', flush=True)\n"
-        "assert sys.stdin.readline().strip() == 'quit'\n",
-        encoding="utf-8",
-    )
-    return script
+def test_headless_rejects_forged_runtime_diagnostic(tmp_path: Path) -> None:
+    attempt, intent, input_path = _authority_context(tmp_path, case_id="case-a")
+
+    with pytest.raises(RuntimeProbeError, match="issued"):
+        run_headless_febio(attempt, intent, _forged_runtime(), input_path)
 
 
-def _synthetic_run(
-    tmp_path: Path, *, solver_code: str, timeout_seconds: float | None = 5.0
-) -> HeadlessRunDiagnostic:
-    attempt_root, input_path = _context(tmp_path)
-    probe_script = _synthetic_probe_script(tmp_path)
-    return run_headless_febio(
-        sys.executable,
-        input_path,
-        attempt_root,
-        case_id="case-a",
-        intent_id="intent-a",
-        attempt_id="attempt-a",
-        expected_steps=1,
-        expected_final_time=1.0,
-        timeout_seconds=timeout_seconds,
-        arguments=("-c", solver_code),
-        probe_arguments=(str(probe_script),),
-    )
+def test_headless_rejects_raw_attempt_root(tmp_path: Path) -> None:
+    attempt, intent, input_path = _authority_context(tmp_path, case_id="case-a")
+
+    with pytest.raises(HeadlessConfigurationError, match="AttemptWorkspace"):
+        run_headless_febio(attempt.root, intent, _forged_runtime(), input_path)  # type: ignore[arg-type]
 
 
-def test_synthetic_normal_engine_path_is_fbs_unverified_and_immutable(tmp_path: Path) -> None:
-    log = "time step 1\ntime = 1.0\nnormal termination\n"
-    code = (
-        "import os; from pathlib import Path; "
-        "Path(os.environ['FEBIO_CAE_HARNESS_LOG']).write_text(" + repr(log) + "); "
-        "Path(os.environ['FEBIO_CAE_HARNESS_XPLT']).write_bytes(b'synthetic xplt')"
-    )
-    diagnostic = _synthetic_run(tmp_path, solver_code=code)
+def test_headless_rejects_foreign_attempt_and_intent(tmp_path: Path) -> None:
+    attempt_a, intent_a, input_a = _authority_context(tmp_path / "a", case_id="case-a")
+    attempt_b, intent_b, input_b = _authority_context(tmp_path / "b", case_id="case-b")
 
-    assert diagnostic.state is SolverState.NORMAL_EXIT
+    with pytest.raises(HeadlessConfigurationError, match="case"):
+        run_headless_febio(attempt_b, intent_a, _forged_runtime(), input_b)
+    with pytest.raises(HeadlessConfigurationError, match="case"):
+        run_headless_febio(attempt_a, intent_b, _forged_runtime(), input_a)
+
+
+def test_headless_has_no_caller_supplied_context_labels_or_arguments() -> None:
+    parameters = inspect.signature(run_headless_febio).parameters
+
+    assert not {
+        "executable",
+        "attempt_root",
+        "case_id",
+        "intent_id",
+        "attempt_id",
+        "arguments",
+        "probe_arguments",
+    }.intersection(parameters)
+
+
+def test_headless_requires_input_inside_issued_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    attempt, intent, _ = _authority_context(tmp_path, case_id="case-a")
+    outside = tmp_path / "outside.feb"
+    outside.write_text("synthetic completed FEB", encoding="utf-8")
+    runtime = _issued_runtime(tmp_path, monkeypatch)
+
+    with pytest.raises(HeadlessConfigurationError, match="inside the attempt root"):
+        run_headless_febio(attempt, intent, runtime, outside)
+
+
+def test_headless_derives_context_and_preserves_fbs_unverified(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    attempt, intent, input_path = _authority_context(tmp_path, case_id="case-a")
+    runtime = _issued_runtime(tmp_path, monkeypatch)
+    observed: dict[str, object] = {}
+    captured_spec: SolverLaunchSpec | None = None
+
+    class FakeSupervisor:
+        def __init__(self, spec: SolverLaunchSpec, **context: object) -> None:
+            nonlocal captured_spec
+            captured_spec = spec
+            observed.update(context)
+
+        def run(self) -> SolverRunResult:
+            assert captured_spec is not None
+            spec = captured_spec
+            outputs = spec.expected_outputs
+            return SolverRunResult(
+                state=SolverState.NORMAL_EXIT,
+                classification=SolverClassification.FBS_UNVERIFIED,
+                return_code=0,
+                pid=123,
+                command=spec.command,
+                log_path=outputs.log_path,
+                xplt_path=outputs.xplt_path,
+            )
+
+    monkeypatch.setattr(headless_module, "SolverSupervisor", FakeSupervisor)
+    diagnostic = run_headless_febio(attempt, intent, runtime, input_path)
+
+    assert captured_spec is not None
+    spec = captured_spec
+    assert observed["case_id"] == attempt.case_id
+    assert observed["intent_id"] == intent.intent_sha256
+    assert observed["attempt_id"] == attempt.attempt_id
+    assert spec.attempt_root == attempt.root
+    assert spec.input_path == input_path
+    assert spec.command == (os.fspath(runtime.path), "-i", os.fspath(input_path))
+    assert diagnostic.runtime_identity is runtime
     assert diagnostic.classification is SolverClassification.FBS_UNVERIFIED
-    assert diagnostic.return_code == 0
-    assert diagnostic.pid is not None
-    assert diagnostic.runtime_identity.version == "4.12.0"
-    assert diagnostic.official_fbs is False
     assert diagnostic.success is False
-    assert diagnostic.to_dict() == {
-        "classification": "FBS_UNVERIFIED",
-        "log": str(tmp_path / "attempt" / "model.log"),
-        "official_fbs": False,
-        "pid": diagnostic.pid,
-        "return_code": 0,
-        "runtime": {
-            "path": str(Path(sys.executable).absolute()),
-            "sha256": diagnostic.runtime_identity.sha256,
-            "size": diagnostic.runtime_identity.size,
-            "version": "4.12.0",
-        },
-        "state": "NORMAL_EXIT",
-        "success": False,
-        "xplt": str(tmp_path / "attempt" / "model.xplt"),
-    }
-    with pytest.raises(AttributeError):
-        diagnostic.success = True  # type: ignore[misc]
-    with pytest.raises(AttributeError):
-        diagnostic.runtime_identity.version = "4.13.0"  # type: ignore[misc]
-
-
-def test_nonzero_synthetic_engine_exit_is_a_terminal_failure(tmp_path: Path) -> None:
-    diagnostic = _synthetic_run(tmp_path, solver_code="raise SystemExit(7)")
-
-    assert diagnostic.state is SolverState.FAILED
-    assert diagnostic.classification is SolverClassification.MISSING_OUTPUT
-    assert diagnostic.return_code == 7
-    assert diagnostic.success is False
-
-
-def test_synthetic_timeout_is_a_terminal_failure(tmp_path: Path) -> None:
-    diagnostic = _synthetic_run(
-        tmp_path,
-        solver_code="import time; time.sleep(30)",
-        timeout_seconds=0.05,
-    )
-
-    assert diagnostic.state is SolverState.TIMED_OUT
-    assert diagnostic.classification is SolverClassification.TIMEOUT
-    assert diagnostic.success is False
+    assert headless_exit_code(diagnostic) == 5

@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import os
 import stat
-from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
-from .runtime import FebioRuntimeDiagnostic, probe_febio
+from ..evidence import IntentSnapshotAuthority
+from ..workspace import AttemptWorkspace
+from .runtime import (
+    FebioRuntimeDiagnostic,
+    validate_runtime_diagnostic,
+)
 from .supervisor import SolverSupervisor
 from .types import (
     SolverClassification,
@@ -19,12 +23,13 @@ from .types import (
 )
 
 __all__ = [
+    "HeadlessConfigurationError",
     "HeadlessRunDiagnostic",
     "headless_exit_code",
+    "reconnect_headless_febio",
     "run_headless_febio",
 ]
 
-_DEFAULT_PROBE_TIMEOUT_SECONDS: Final[float] = 5.0
 _REPARSE_POINT: Final[int] = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
 
 
@@ -54,6 +59,8 @@ def _reject_alias(path: Path, label: str) -> None:
 
 
 def _validate_input(input_value: str | Path, attempt_root: Path) -> Path:
+    if not isinstance(input_value, (str, Path)):
+        raise HeadlessConfigurationError("input path must be a string or Path")
     supplied = Path(input_value).expanduser()
     if not supplied.is_absolute():
         raise HeadlessConfigurationError("input path must be absolute")
@@ -121,39 +128,27 @@ class HeadlessRunDiagnostic:
 
 
 def run_headless_febio(
-    executable: str | Path,
+    attempt_workspace: AttemptWorkspace,
+    intent_snapshot: IntentSnapshotAuthority,
+    runtime_diagnostic: FebioRuntimeDiagnostic,
     input_path: str | Path,
-    attempt_root: str | Path,
     *,
-    case_id: str,
-    intent_id: str,
-    attempt_id: str,
     expected_steps: int | None = None,
     expected_final_time: float | None = None,
     timeout_seconds: float | None = None,
-    arguments: Sequence[str] = (),
-    probe_arguments: Sequence[str] = (),
-    probe_timeout_seconds: float = _DEFAULT_PROBE_TIMEOUT_SECONDS,
 ) -> HeadlessRunDiagnostic:
-    """Probe, validate, and run one already-placed FEB without a shell."""
+    """Run one attempt using only live, manager-issued context capabilities."""
 
-    if probe_arguments:
-        runtime = probe_febio(
-            executable,
-            timeout_seconds=probe_timeout_seconds,
-            runner_arguments=probe_arguments,
-        )
-    elif probe_timeout_seconds != _DEFAULT_PROBE_TIMEOUT_SECONDS:
-        runtime = probe_febio(executable, timeout_seconds=probe_timeout_seconds)
-    else:
-        runtime = probe_febio(executable)
-    root = Path(os.path.abspath(os.fspath(Path(attempt_root).expanduser())))
+    case_id, intent_id, attempt_id, root = _validate_context(
+        attempt_workspace,
+        intent_snapshot,
+    )
+    runtime = validate_runtime_diagnostic(runtime_diagnostic)
     input_file = _validate_input(input_path, root)
     spec = SolverLaunchSpec(
         executable=runtime.path,
         input_path=input_file,
         attempt_root=root,
-        arguments=tuple(arguments),
         timeout_seconds=timeout_seconds,
         expected_steps=expected_steps,
         expected_final_time=expected_final_time,
@@ -174,6 +169,66 @@ def run_headless_febio(
         xplt_path=result.xplt_path,
         success=result.success is True,
     )
+
+
+def reconnect_headless_febio(
+    attempt_workspace: AttemptWorkspace,
+    intent_snapshot: IntentSnapshotAuthority,
+    runtime_diagnostic: FebioRuntimeDiagnostic,
+    input_path: str | Path,
+    *,
+    expected_steps: int | None = None,
+    expected_final_time: float | None = None,
+    timeout_seconds: float | None = None,
+) -> SolverSupervisor:
+    """Reconnect to one attempt using the same authority-bound launch contract."""
+
+    case_id, intent_id, attempt_id, root = _validate_context(
+        attempt_workspace,
+        intent_snapshot,
+    )
+    runtime = validate_runtime_diagnostic(runtime_diagnostic)
+    input_file = _validate_input(input_path, root)
+    spec = SolverLaunchSpec(
+        executable=runtime.path,
+        input_path=input_file,
+        attempt_root=root,
+        timeout_seconds=timeout_seconds,
+        expected_steps=expected_steps,
+        expected_final_time=expected_final_time,
+    )
+    return SolverSupervisor.reconnect(
+        spec,
+        case_id=case_id,
+        intent_id=intent_id,
+        attempt_id=attempt_id,
+    )
+
+
+def _validate_context(
+    attempt_workspace: AttemptWorkspace,
+    intent_snapshot: IntentSnapshotAuthority,
+) -> tuple[str, str, str, Path]:
+    if type(attempt_workspace) is not AttemptWorkspace:
+        raise HeadlessConfigurationError(
+            "headless launch requires an exact AttemptWorkspace capability"
+        )
+    if type(intent_snapshot) is not IntentSnapshotAuthority:
+        raise HeadlessConfigurationError(
+            "headless launch requires an exact IntentSnapshotAuthority capability"
+        )
+    try:
+        case_id = attempt_workspace.case_id
+        attempt_id = attempt_workspace.attempt_id
+        root = attempt_workspace.root
+        intent_case_id = intent_snapshot.case_id
+        intent_id = intent_snapshot.intent_sha256
+        intent_case_root = object.__getattribute__(intent_snapshot, "_case_workspace").root
+    except Exception as error:
+        raise HeadlessConfigurationError("headless launch requires live authorities") from error
+    if case_id != intent_case_id or intent_case_root != root.parents[2]:
+        raise HeadlessConfigurationError("attempt and intent authorities must refer to one case")
+    return case_id, intent_id, attempt_id, root
 
 
 def headless_exit_code(diagnostic: HeadlessRunDiagnostic) -> int:

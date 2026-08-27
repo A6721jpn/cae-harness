@@ -14,6 +14,15 @@ from febio_cae_harness.solver.runtime import FebioRuntimeDiagnostic, RuntimeProb
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def _synthetic_diagnostic() -> FebioRuntimeDiagnostic:
+    diagnostic = object.__new__(FebioRuntimeDiagnostic)
+    object.__setattr__(diagnostic, "path", Path("C:/synthetic/febio.exe"))
+    object.__setattr__(diagnostic, "sha256", "a" * 64)
+    object.__setattr__(diagnostic, "size", 123)
+    object.__setattr__(diagnostic, "version", "4.2.0")
+    return diagnostic
+
+
 def _run_cli(*arguments: str) -> subprocess.CompletedProcess[str]:
     environment = os.environ.copy()
     environment["PYTHONPATH"] = str(ROOT / "src")
@@ -237,7 +246,7 @@ def test_probe_febio_emits_identity_json(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     executable = Path("C:/synthetic/febio.exe")
-    diagnostic = FebioRuntimeDiagnostic(executable, "a" * 64, 123, "4.2.0")
+    diagnostic = _synthetic_diagnostic()
     monkeypatch.setattr(cli_module, "probe_febio", lambda path: diagnostic)
 
     assert cli_module.main(["probe-febio", str(executable)]) == 0
@@ -265,85 +274,34 @@ def test_probe_febio_failure_is_concise_stderr(
     assert captured.err == "febio-cae: synthetic probe failure\n"
 
 
-def test_run_febio_missing_executable_is_genuine_exit_one(tmp_path: Path) -> None:
-    attempt_root = tmp_path / "attempt"
-    attempt_root.mkdir()
-    input_path = attempt_root / "model.feb"
-    input_path.write_text("synthetic completed FEB", encoding="utf-8")
-
-    completed = _run_cli(
-        "run-febio",
-        "--executable",
-        str(tmp_path / "missing-febio.exe"),
-        "--input",
-        str(input_path),
-        "--attempt-root",
-        str(attempt_root),
-        "--case-id",
-        "case-a",
-        "--intent-id",
-        "intent-a",
-        "--attempt-id",
-        "attempt-a",
-    )
-
-    assert completed.returncode == 1
-    assert completed.stdout == ""
-    assert completed.stderr.startswith("febio-cae: ")
-    assert "does not exist" in completed.stderr
-    assert "Traceback" not in completed.stderr
+def test_raw_run_febio_flags_cannot_be_parsed_as_a_launch(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(SystemExit) as raised:
+        cli_module.build_parser().parse_args(
+            [
+                "run-febio",
+                "--executable",
+                str(tmp_path / "febio"),
+                "--input",
+                str(tmp_path / "model.feb"),
+                "--attempt-root",
+                str(tmp_path / "attempt"),
+                "--case-id",
+                "caller-case",
+                "--intent-id",
+                "caller-intent",
+                "--attempt-id",
+                "caller-attempt",
+            ]
+        )
+    assert raised.value.code != 0
 
 
-def test_run_febio_reports_fbs_unverified_as_exit_five(tmp_path: Path) -> None:
-    attempt_root = tmp_path / "attempt"
-    attempt_root.mkdir()
-    input_path = attempt_root / "model.feb"
-    input_path.write_text("synthetic completed FEB", encoding="utf-8")
-    probe_script = tmp_path / "probe_runtime.py"
-    probe_script.write_text(
-        "import sys\n"
-        "print('version 4.12.0', flush=True)\n"
-        "assert sys.stdin.readline().strip() == 'quit'\n",
-        encoding="utf-8",
-    )
-    log = "time step 1\ntime = 1.0\nnormal termination\n"
-    solver_code = (
-        "import os; from pathlib import Path; "
-        "Path(os.environ['FEBIO_CAE_HARNESS_LOG']).write_text(" + repr(log) + "); "
-        "Path(os.environ['FEBIO_CAE_HARNESS_XPLT']).write_bytes(b'synthetic xplt')"
-    )
-
-    completed = _run_cli(
-        "run-febio",
-        "--executable",
-        sys.executable,
-        "--input",
-        str(input_path),
-        "--attempt-root",
-        str(attempt_root),
-        "--case-id",
-        "case-a",
-        "--intent-id",
-        "intent-a",
-        "--attempt-id",
-        "attempt-a",
-        "--expected-steps",
-        "1",
-        "--expected-final-time",
-        "1.0",
-        "--timeout-seconds",
-        "5",
-        "--probe-argument=" + str(probe_script),
-        "--argument=-c",
-        "--argument=" + solver_code,
-    )
-
-    assert completed.returncode == 5
-    assert completed.stderr == ""
-    payload = json.loads(completed.stdout)
-    assert payload["classification"] == "FBS_UNVERIFIED"
-    assert payload["official_fbs"] is False
-    assert payload["success"] is False
-    assert payload["state"] == "NORMAL_EXIT"
-    assert payload["return_code"] == 0
-    assert payload["runtime"]["version"] == "4.12.0"
+def test_run_febio_is_disabled_until_case_context_is_available(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert cli_module.main(["run-febio"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "disabled" in captured.err

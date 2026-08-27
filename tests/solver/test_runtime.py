@@ -4,7 +4,6 @@ import hashlib
 import os
 import stat
 import subprocess
-import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -14,6 +13,7 @@ from febio_cae_harness.solver.runtime import (
     FebioRuntimeDiagnostic,
     RuntimeProbeError,
     probe_febio,
+    validate_runtime_diagnostic,
 )
 
 
@@ -63,7 +63,7 @@ def test_probe_fake_executable_returns_immutable_identity(
         lambda command, **kwargs: CompletedProcess(),
     )
 
-    diagnostic = probe_febio(executable, runner_arguments=("--synthetic-banner",))
+    diagnostic = probe_febio(executable)
 
     assert isinstance(diagnostic, FebioRuntimeDiagnostic)
     assert diagnostic.path == executable.absolute()
@@ -72,6 +72,9 @@ def test_probe_fake_executable_returns_immutable_identity(
     assert diagnostic.version == "4.2.0"
     with pytest.raises(AttributeError):
         diagnostic.version = "4.3.0"  # type: ignore[misc]
+    object.__setattr__(diagnostic, "sha256", "b" * 64)
+    with pytest.raises(RuntimeProbeError, match="modified"):
+        validate_runtime_diagnostic(diagnostic)
     assert diagnostic.to_dict() == {
         "path": str(executable.absolute()),
         "sha256": diagnostic.sha256,
@@ -257,30 +260,30 @@ def test_probe_rejects_missing_or_nonexecutable_target(tmp_path: Path) -> None:
             probe_febio(candidate)
 
 
-def test_probe_accepts_synthetic_python_runner_argument(tmp_path: Path) -> None:
-    script = tmp_path / "fake_febio.py"
-    script.write_text(
-        "import sys\n"
-        "print('version 4.2.0', flush=True)\n"
-        "assert sys.stdin.readline().strip() == 'quit'\n",
-        encoding="utf-8",
-    )
-    executable = Path(sys.executable)
+def test_probe_requires_exact_executable_arguments(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executable = _fake_file(tmp_path)
+    observed: dict[str, object] = {}
 
-    diagnostic = probe_febio(executable, runner_arguments=(str(script),))
+    class CompletedProcess:
+        returncode = 0
+
+        def communicate(self, input: bytes, timeout: float) -> tuple[bytes, bytes]:
+            observed["input"] = input
+            return b"version 4.2.0\n", b""
+
+    def fake_popen(command: object, **kwargs: object) -> CompletedProcess:
+        observed["command"] = command
+        return CompletedProcess()
+
+    monkeypatch.setattr("febio_cae_harness.solver.runtime.subprocess.Popen", fake_popen)
+    diagnostic = probe_febio(executable)
 
     assert diagnostic.version == "4.2.0"
+    assert observed["command"] == [str(executable.absolute())]
 
 
-def test_probe_accepts_trimmed_runtime_banner_fixture(tmp_path: Path) -> None:
-    script = tmp_path / "fake_febio_runtime.py"
-    script.write_text(
-        "import sys\n"
-        "print('version 4.12.0', flush=True)\n"
-        "assert sys.stdin.readline().strip() == 'quit'\n",
-        encoding="utf-8",
-    )
-
-    diagnostic = probe_febio(Path(sys.executable), runner_arguments=(str(script),))
-
-    assert diagnostic.version == "4.12.0"
+def test_probe_rejects_arbitrary_runner_arguments(tmp_path: Path) -> None:
+    with pytest.raises(TypeError):
+        probe_febio(tmp_path / "missing", runner_arguments=("--arbitrary",))  # type: ignore[call-arg]
