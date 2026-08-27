@@ -195,21 +195,34 @@ def test_non_authoritative_unknowns_do_not_trigger_ask_and_block(tmp_path: Path)
     intent = bound_intent(
         unresolved=({"condition": "contact", "authoritative": False, "source": "guess"},),
     )
-    assert unresolved_authoritative_conditions(intent) == ()
-    assert run_transition(intent_snapshot(intent, tmp_path)).current is IntentState.BOUND
+    snapshot = intent_snapshot(intent, tmp_path)
+    assert unresolved_authoritative_conditions(snapshot) == ()
+    assert run_transition(snapshot).current is IntentState.BOUND
 
 
 def test_condition_source_mapping_can_authorize_a_named_unresolved_condition(
     tmp_path: Path,
 ) -> None:
     intent = bound_intent(
+        unresolved=({"condition": "contact", "authoritative": True, "source": "user"},),
+        condition_sources={"contact": {"authoritative": True, "source": "user"}},
+    )
+    snapshot = intent_snapshot(intent, tmp_path)
+    conditions = unresolved_authoritative_conditions(snapshot)
+    assert len(conditions) == 1
+    assert conditions[0].condition == "contact"
+    assert run_transition(snapshot).current is IntentState.ASK_AND_BLOCK
+
+
+def test_source_labels_cannot_authorize_a_missing_condition(tmp_path: Path) -> None:
+    intent = bound_intent(
         unresolved=("contact",),
         condition_sources={"contact": "user"},
     )
-    conditions = unresolved_authoritative_conditions(intent)
-    assert len(conditions) == 1
-    assert conditions[0].condition == "contact"
-    assert run_transition(intent_snapshot(intent, tmp_path)).current is IntentState.ASK_AND_BLOCK
+    snapshot = intent_snapshot(intent, tmp_path, "source-label")
+
+    assert unresolved_authoritative_conditions(snapshot) == ()
+    assert run_transition(snapshot).current is IntentState.GATHERING
 
 
 def test_conditions_complete_flag_cannot_bind_empty_or_stale_intent(tmp_path: Path) -> None:
@@ -373,6 +386,7 @@ def test_proposal_policy_respects_debug_class_and_physical_boundary(tmp_path: Pa
     assert decide_proposal(state_authority, changing).action is ProposalAction.REJECT
     unresolved = bound_intent(
         unresolved=({"condition": "load", "authoritative": True, "source": "user"},),
+        condition_sources={"load": {"authoritative": True, "source": "user"}},
     )
     unresolved_state = run_transition(intent_snapshot(unresolved, tmp_path, "proposal-blocked"))
     assert decide_proposal(unresolved_state, changing).action is ProposalAction.ASK_AND_BLOCK
@@ -733,6 +747,55 @@ def test_stale_ask_and_block_state_fails_closed_without_emitting_a_new_question(
         decide_retry(FailureClass.TIMEOUT, RetryLedger(budget=1), intent=intent).decision
         is RetryDecision.STOP
     )
+
+
+def test_raw_intent_cannot_emit_a_physical_question() -> None:
+    intent = bound_intent(
+        unresolved=({"condition": "load", "authoritative": True, "source": "user"},),
+    )
+    proposal = Proposal(
+        proposal_id="raw-physical",
+        proposal_class=ProposalClass.INTENT_CHANGING,
+        evidence_ids=("log-raw-physical",),
+        requires_physical_decision=True,
+    )
+
+    decision = decide_proposal(intent, proposal)
+
+    assert decision.action is ProposalAction.REJECT
+    assert decision.blocking_conditions == ()
+
+
+def test_raw_intent_cannot_route_a_physical_question() -> None:
+    intent = bound_intent(
+        unresolved=({"condition": "load", "authoritative": True, "source": "user"},),
+        condition_sources={"load": {"authoritative": True, "source": "user"}},
+    )
+
+    route = route_failure(
+        FailureEvidence(timeout=True, requires_physical_decision=True),
+        intent=intent,
+    )
+
+    assert route.route is FailureRoute.STOP
+    assert route.blocking_conditions == ()
+
+
+def test_live_authority_can_route_only_its_current_physical_question(tmp_path: Path) -> None:
+    intent = bound_intent(
+        state=IntentState.ASK_AND_BLOCK,
+        unresolved=({"condition": "load", "authoritative": True, "source": "user"},),
+        condition_sources={"load": {"authoritative": True, "source": "user"}},
+    )
+    snapshot = intent_snapshot(intent, tmp_path, "route-authority")
+
+    route = route_failure(
+        FailureEvidence(timeout=True, requires_physical_decision=True),
+        intent=snapshot,
+    )
+
+    assert route.route is FailureRoute.ASK_AND_BLOCK
+    assert tuple(condition.condition for condition in route.blocking_conditions) == ("load",)
 
 
 def test_execution_policy_handles_timeout_cancel_and_disconnect_resume(tmp_path: Path) -> None:

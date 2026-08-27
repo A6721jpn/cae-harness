@@ -1,7 +1,7 @@
 """Pure, evidence-driven policy for the CAE case agent.
 
-The policy layer consumes :class:`~febio_cae_harness.contracts.IntentContract`
-and immutable evidence-shaped values.  It returns decisions only: it does not
+The policy layer consumes registry-issued intent authorities and immutable
+evidence-shaped values.  It returns decisions only: it does not
 start a process, modify a case, inspect geometry, or infer physical meaning.
 Those boundaries make the functions deterministic and keep execution authority
 in the solver and workspace phases.
@@ -354,34 +354,9 @@ def _condition_name(record: Mapping[str, object]) -> str | None:
 
 
 def _source_is_authoritative(value: object) -> bool:
-    if isinstance(value, Mapping):
-        if "authoritative" in value:
-            return _as_bool(value["authoritative"])
-        if "value" in value and _source_is_authoritative(value["value"]):
-            return True
-        for key in ("authority", "source_type", "kind"):
-            if _normalise_token(value.get(key)) in {
-                "authoritative",
-                "user",
-                "user_provided",
-                "case_manifest",
-                "input",
-                "specification",
-                "contract",
-            }:
-                return True
-        return False
-    if isinstance(value, (list, tuple)):
-        return any(_source_is_authoritative(item) for item in value)
-    return _normalise_token(value) in {
-        "authoritative",
-        "user",
-        "user_provided",
-        "case_manifest",
-        "input",
-        "specification",
-        "contract",
-    }
+    # A source label is descriptive metadata, never an authority grant.  Only
+    # the canonical record's explicit boolean marker can authorize a fact.
+    return isinstance(value, Mapping) and _as_bool(value.get("authoritative"))
 
 
 def _evidence_is_current(value: object) -> bool:
@@ -457,18 +432,13 @@ def _intent_has_current_authoritative_completeness(intent: IntentContract) -> bo
     return True
 
 
-def unresolved_authoritative_conditions(
+def _unresolved_authoritative_conditions_from_intent(
     intent: IntentContract,
-    additional: Iterable[PhysicalConditionEvidence] = (),
 ) -> tuple[PhysicalConditionEvidence, ...]:
-    """Return only explicit, unresolved, authoritative physical conditions.
+    """Project the current canonical intent's authoritative missing records."""
 
-    The ``unresolved`` field remains opaque in the canonical contract.  This
-    adapter recognizes only explicit authority markers on a condition record or
-    its matching ``condition_sources`` entry.  Bare names and guessed sources
-    therefore remain ``GATHERING`` and can never trigger ``ASK_AND_BLOCK``.
-    """
-
+    if type(intent) is not IntentContract:
+        return ()
     source_records = _condition_records(intent.condition_sources)
     sources: dict[str, object] = {}
     for source_record in source_records:
@@ -486,39 +456,102 @@ def unresolved_authoritative_conditions(
         status = _normalise_token(record.get("status"))
         if _as_bool(record.get("resolved")) or status in {"resolved", "known", "specified"}:
             continue
-        explicitly_false = "authoritative" in record and record["authoritative"] is False
-        authoritative = not explicitly_false and (
-            _as_bool(record.get("authoritative"))
-            or _source_is_authoritative(record.get("source"))
-            or _source_is_authoritative(sources.get(name.casefold()))
+        if not _evidence_is_current(record):
+            continue
+        # The missing-condition record itself must carry the authority bit.
+        # Matching source labels may corroborate it, but can never mint it.
+        if not _as_bool(record.get("authoritative")):
+            continue
+        matching_source = sources.get(name.casefold())
+        if matching_source is None or not _evidence_is_current(matching_source):
+            continue
+        if not _source_is_authoritative(matching_source):
+            continue
+        source_value = record.get("source")
+        source = source_value if isinstance(source_value, str) else None
+        matching_source_value = (
+            matching_source.get("source") if isinstance(matching_source, Mapping) else None
         )
-        if authoritative:
-            source_value = record.get("source")
-            source = source_value if isinstance(source_value, str) else None
-            matching_source = sources.get(name.casefold())
-            if source is None and isinstance(matching_source, Mapping):
-                candidate = matching_source.get("source")
-                source = candidate if isinstance(candidate, str) else None
-            detail_value = record.get("detail")
-            detail = detail_value if isinstance(detail_value, str) else None
-            result.append(
-                PhysicalConditionEvidence(
-                    condition=name,
-                    source=source,
-                    authoritative=True,
-                    detail=detail,
-                )
+        if (
+            source is not None
+            and isinstance(matching_source_value, str)
+            and source.strip() != matching_source_value.strip()
+        ):
+            continue
+        if source is None and isinstance(matching_source, Mapping):
+            candidate = matching_source.get("source")
+            source = candidate if isinstance(candidate, str) else None
+        detail_value = record.get("detail")
+        detail = detail_value if isinstance(detail_value, str) else None
+        result.append(
+            PhysicalConditionEvidence(
+                condition=name,
+                source=source,
+                authoritative=True,
+                detail=detail,
             )
-    for condition in additional:
-        if condition.authoritative and condition.unresolved:
-            result.append(condition)
+        )
     return tuple(result)
 
 
-def has_authoritative_unresolved(intent: IntentContract) -> bool:
-    """Return whether the intent contains an explicit blocking condition."""
+def _live_authority_intents(
+    value: object,
+) -> tuple[IntentSnapshotAuthority, IntentContract, IntentContract] | None:
+    """Return persisted/effective intents only from a live registry authority."""
 
-    return bool(unresolved_authoritative_conditions(intent))
+    if type(value) is IntentSnapshotAuthority:
+        try:
+            intent = value.intent
+        except (AttributeError, EvidenceIntegrityError, TypeError, ValueError):
+            return None
+        if type(intent) is not IntentContract:
+            return None
+        return value, intent, intent
+
+    if type(value) is not IntentStateAuthority:
+        return None
+    try:
+        state_record = value._validated_record()
+        snapshot = state_record[1]
+        if type(snapshot) is not IntentSnapshotAuthority:
+            return None
+        persisted_intent = snapshot.intent
+        if persisted_intent is not state_record[2]:
+            return None
+        effective_intent = state_record[3]
+    except (AttributeError, EvidenceIntegrityError, TypeError, ValueError, IndexError):
+        return None
+    if type(persisted_intent) is not IntentContract or type(effective_intent) is not IntentContract:
+        return None
+    return snapshot, persisted_intent, effective_intent
+
+
+def unresolved_authoritative_conditions(
+    authority: IntentSnapshotAuthority | IntentStateAuthority | object,
+) -> tuple[PhysicalConditionEvidence, ...]:
+    """Return current authoritative missing records from a live authority only."""
+
+    authority_intents = _live_authority_intents(authority)
+    if authority_intents is None:
+        return ()
+    result = _unresolved_authoritative_conditions_from_intent(authority_intents[1])
+    refreshed = _live_authority_intents(authority)
+    if (
+        refreshed is None
+        or refreshed[0] is not authority_intents[0]
+        or refreshed[1] is not authority_intents[1]
+        or _unresolved_authoritative_conditions_from_intent(refreshed[1]) != result
+    ):
+        return ()
+    return result
+
+
+def has_authoritative_unresolved(
+    authority: IntentSnapshotAuthority | IntentStateAuthority | object,
+) -> bool:
+    """Return whether a live registry authority has an explicit blocker."""
+
+    return bool(unresolved_authoritative_conditions(authority))
 
 
 _IntentStateRecord = tuple[
@@ -570,7 +603,9 @@ class IntentStateAuthority:
             raise TypeError("intent state authority requires an IntentSnapshotAuthority")
         persisted_intent = snapshot.intent
         complete = _intent_has_current_authoritative_completeness(persisted_intent)
-        blocking = unresolved_authoritative_conditions(persisted_intent)
+        blocking = _unresolved_authoritative_conditions_from_intent(persisted_intent)
+        if snapshot.intent is not persisted_intent:
+            raise EvidenceIntegrityError("intent snapshot changed during state authorization")
         previous = persisted_intent.state
         if blocking:
             current = IntentState.ASK_AND_BLOCK
@@ -662,7 +697,11 @@ class IntentStateAuthority:
 
     @property
     def blocking_conditions(self) -> tuple[PhysicalConditionEvidence, ...]:
-        return self._validated_record()[7]
+        record = self._validated_record()
+        current = _unresolved_authoritative_conditions_from_intent(record[2])
+        if current != record[7]:
+            raise EvidenceIntegrityError("intent blocking-condition authority is stale")
+        return current
 
     @property
     def changed(self) -> bool:
@@ -875,22 +914,48 @@ def _physical_request(evidence: FailureEvidence | Mapping[str, object] | object)
 def route_failure(
     evidence: FailureEvidence | Mapping[str, object] | FailureClass | str | None,
     *,
-    intent: IntentContract | None = None,
+    intent: IntentSnapshotAuthority | IntentStateAuthority | IntentContract | None = None,
 ) -> FailureRouting:
     """Route an evidence-backed failure to mesh, nonlinear, retry, or stop.
 
     An ``ASK_AND_BLOCK`` route is possible only when the evidence explicitly
-    requests a physical decision *and* the intent has an unresolved
-    authoritative condition.  Negative Jacobian and nonlinear evidence retain
-    their dedicated diagnostic routes otherwise.
+    requests a physical decision *and* a live registry authority has an
+    unresolved authoritative condition.  Raw contracts are diagnostic input
+    only and fail closed before any physical question can be emitted.
     """
 
     classification = classify_failure(evidence)
+    physical_request = _physical_request(evidence)
+    authority_intents = _live_authority_intents(intent) if intent is not None else None
+    if intent is not None and authority_intents is None:
+        return FailureRouting(
+            classification=classification,
+            route=FailureRoute.STOP,
+            rationale="failure routing requires the current registry-issued live authority",
+            retryable=False,
+        )
+    canonical_intent = authority_intents[1] if authority_intents is not None else None
     blocking = (
         unresolved_authoritative_conditions(intent)
-        if intent is not None and _physical_request(evidence)
+        if canonical_intent is not None and physical_request
         else ()
     )
+    if authority_intents is not None and physical_request:
+        refreshed = _live_authority_intents(intent)
+        if (
+            refreshed is None
+            or refreshed[0] is not authority_intents[0]
+            or refreshed[1] is not authority_intents[1]
+        ):
+            return FailureRouting(
+                classification=classification,
+                route=FailureRoute.STOP,
+                rationale="physical-condition authority changed during failure routing",
+                retryable=False,
+            )
+        canonical_intent = refreshed[2]
+        if canonical_intent.state is not IntentState.ASK_AND_BLOCK:
+            blocking = ()
     if blocking:
         return FailureRouting(
             classification=classification,
@@ -899,7 +964,7 @@ def route_failure(
             retryable=False,
             blocking_conditions=blocking,
         )
-    if _physical_request(evidence):
+    if physical_request:
         return FailureRouting(
             classification=classification,
             route=FailureRoute.STOP,
@@ -1154,7 +1219,13 @@ def validate_attempt_workspace(
     # ``__fspath__`` performs the workspace registry, case, attempt, and live
     # directory identity checks.  Keep that validation before reading any
     # state from the handle so forged or stale handles fail closed.
+    attempt_id = attempt_workspace.attempt_id
     attempt_root = Path(os.fspath(attempt_workspace))
+    if attempt_workspace.attempt_id != attempt_id:
+        raise EvidenceIntegrityError("attempt workspace changed during validation")
+    refreshed_state = _state_authority_record(state_authority, bound=True)
+    if refreshed_state[1] is not snapshot:
+        raise EvidenceIntegrityError("intent state authority changed during workspace validation")
 
     try:
         snapshot_case_workspace = object.__getattribute__(snapshot, "_case_workspace")
@@ -1163,9 +1234,7 @@ def validate_attempt_workspace(
     if type(snapshot_case_workspace) is not CaseWorkspace:
         raise EvidenceIntegrityError("intent snapshot case binding is invalid")
 
-    expected_attempt_root = (
-        Path(snapshot_case_workspace.temporary_root) / "attempts" / attempt_workspace.attempt_id
-    )
+    expected_attempt_root = Path(snapshot_case_workspace.temporary_root) / "attempts" / attempt_id
     if attempt_root != expected_attempt_root:
         raise EvidenceIntegrityError("attempt workspace is not inside the intent snapshot case")
 
@@ -1273,7 +1342,7 @@ class ProposalDecision:
 
 
 def decide_proposal(
-    state_authority: IntentStateAuthority | IntentContract,
+    state_authority: IntentStateAuthority | IntentContract | object,
     proposal: Proposal,
     proposal_authority: ProposalAuthority | ProposalValidationReceipt | None = None,
     *,
@@ -1283,14 +1352,22 @@ def decide_proposal(
 ) -> ProposalDecision:
     """Decide a proposal; only a live manager authority can produce AUTO_APPLY."""
 
-    legacy = isinstance(state_authority, IntentContract)
-    if legacy:
-        intent = cast(IntentContract, state_authority)
-    else:
-        state_record = _state_authority_record(state_authority)
-        intent = state_record[3]
     if not isinstance(proposal, Proposal):
         raise TypeError("proposal must be a Proposal")
+
+    # A raw contract, state enum, boolean, or forged object may describe a
+    # proposal but cannot authorize consuming its action fields.  Return a
+    # deterministic rejection so this path cannot fabricate a question.
+    if type(state_authority) is not IntentStateAuthority:
+        return ProposalDecision(
+            proposal=proposal,
+            action=ProposalAction.REJECT,
+            reason="proposal requires a registry-issued live intent state authority",
+            next_state=IntentState.GATHERING,
+        )
+
+    state_record = _state_authority_record(state_authority)
+    intent = state_record[3]
 
     supplied = tuple(
         token for token in (proposal_authority, validation_receipt, authority) if token is not None
@@ -1299,15 +1376,14 @@ def decide_proposal(
         raise TypeError("supply only one proposal authority or validation receipt")
     token_record: _ProposalTokenRecord | None = None
     if supplied:
-        if legacy:
-            raise TypeError("proposal authorization requires an IntentStateAuthority")
         token_record = _proposal_token_record(
             supplied[0],
             manager=cast(ProposalAuthorityManager, _proposal_token_record_for(supplied[0])[1]),
-            state_authority=cast(IntentStateAuthority, state_authority),
+            state_authority=state_authority,
             proposal=proposal,
         )
-        intent = token_record[2].intent
+        state_record = _state_authority_record(state_authority)
+        intent = state_record[3]
 
     def result(
         action: ProposalAction,
@@ -1323,7 +1399,12 @@ def decide_proposal(
             blocking_conditions=blocking_conditions,
         )
 
-    blocking = unresolved_authoritative_conditions(intent)
+    # Re-read the canonical persisted intent through the live snapshot before
+    # consuming any proposal action field.  The state authority's cached
+    # transition is only valid while that exact snapshot remains current.
+    state_record = _state_authority_record(state_authority)
+    intent = state_record[3]
+    blocking = _unresolved_authoritative_conditions_from_intent(state_record[2])
     if intent.state is IntentState.ASK_AND_BLOCK and not blocking:
         return result(
             ProposalAction.REJECT,
@@ -1332,6 +1413,28 @@ def decide_proposal(
     scope = _proposal_scope(intent, proposal)
     if scope == "physical":
         if blocking:
+            try:
+                refreshed_record = _state_authority_record(state_authority)
+                refreshed_blocking = _unresolved_authoritative_conditions_from_intent(
+                    refreshed_record[2]
+                )
+            except (EvidenceIntegrityError, TypeError):
+                return result(
+                    ProposalAction.REJECT,
+                    "proposal physical-condition authority is stale",
+                )
+            if (
+                refreshed_record[1] is not state_record[1]
+                or refreshed_record[5] is not IntentState.ASK_AND_BLOCK
+                or not refreshed_blocking
+            ):
+                return result(
+                    ProposalAction.REJECT,
+                    "proposal physical-condition authority changed",
+                )
+            state_record = refreshed_record
+            intent = refreshed_record[3]
+            blocking = refreshed_blocking
             return result(
                 ProposalAction.ASK_AND_BLOCK,
                 "authoritative physical condition requires a user decision",
@@ -1362,6 +1465,24 @@ def decide_proposal(
         return result(
             ProposalAction.REQUIRE_VALIDATION,
             "manager-issued proposal authority is required before APPLY",
+        )
+
+    # Validate the exact proposal token and live state again immediately before
+    # returning an APPLY decision.  Frozen dataclasses can still be tampered
+    # with by a caller using object-level mutation, so no earlier projection is
+    # sufficient for authorization.
+    try:
+        _state_authority_record(state_authority)
+        _proposal_token_record(
+            token_record[0],
+            manager=cast(ProposalAuthorityManager, token_record[1]),
+            state_authority=state_authority,
+            proposal=proposal,
+        )
+    except (EvidenceIntegrityError, TypeError):
+        return result(
+            ProposalAction.REJECT,
+            "proposal authority or live intent state is stale",
         )
     return result(ProposalAction.AUTO_APPLY, "declared mesh change has manager authority")
 
@@ -1689,16 +1810,20 @@ def decide_retry(
         and state_authority is not intent
     ):
         raise TypeError("intent and state_authority must identify the same authority")
+    if type(intent) is IntentContract and state_authority is not None:
+        raise TypeError("raw IntentContract cannot be combined with a state authority")
 
     authority = state_authority
+    raw_intent_supplied = type(intent) is IntentContract
     if authority is None and type(intent) is IntentStateAuthority:
         authority = intent
-    route_intent: IntentContract | None = intent if type(intent) is IntentContract else None
+    # Raw contracts are never routed as an authority-bearing intent.  They
+    # remain diagnostic input only and cannot mint an ASK_AND_BLOCK decision.
+    route_intent: IntentStateAuthority | None = authority
     authority_record: _IntentStateRecord | None = None
     if authority is not None:
         try:
             authority_record = _state_authority_record(authority, bound=True)
-            route_intent = authority_record[3]
         except (EvidenceIntegrityError, TypeError):
             authority_record = None
 
@@ -1729,13 +1854,35 @@ def decide_retry(
     if failure_mismatch:
         return stopped("failure evidence does not match the exact issued solver result")
 
+    # Refresh after failure classification/routing and before any proposal or
+    # retry action field is consumed.  This closes the mutable snapshot window.
+    if authority is not None:
+        try:
+            refreshed_record = _state_authority_record(authority, bound=True)
+        except (EvidenceIntegrityError, TypeError):
+            return stopped("intent state authority is stale or invalid")
+        if authority_record is None or refreshed_record[1] is not authority_record[1]:
+            return stopped("intent state authority changed during failure routing")
+        authority_record = refreshed_record
+
+    current_blocking = (
+        _unresolved_authoritative_conditions_from_intent(authority_record[2])
+        if authority_record is not None
+        else ()
+    )
     ask_and_block = (
         authority_record is not None and authority_record[5] is IntentState.ASK_AND_BLOCK
-    ) or (route_intent is not None and route_intent.state is IntentState.ASK_AND_BLOCK)
+    )
     if ask_and_block and not routing.blocking_conditions:
         return stopped("ASK_AND_BLOCK state lacks a current authoritative condition record")
     if authority is not None and authority_record is None:
         return stopped("intent state authority is stale or invalid")
+    if (
+        authority_record is not None
+        and routing.route is FailureRoute.ASK_AND_BLOCK
+        and routing.blocking_conditions != current_blocking
+    ):
+        return stopped("physical-condition authority changed during failure routing")
     if routing.route is FailureRoute.ASK_AND_BLOCK:
         return RetryResult(
             decision=RetryDecision.ASK_AND_BLOCK,
@@ -1744,6 +1891,8 @@ def decide_retry(
             reason=routing.rationale,
             route=routing.route,
         )
+    if raw_intent_supplied and authority is None:
+        return stopped("retry requires a registry-issued live intent state authority")
     if classification is FailureClass.DISCONNECTED:
         return RetryResult(
             decision=RetryDecision.WAIT_FOR_RECONNECT,
@@ -1753,10 +1902,10 @@ def decide_retry(
             route=routing.route,
         )
     if proposal is not None:
-        if route_intent is None:
-            raise ValueError("intent is required when evaluating a proposal")
+        if raw_intent_supplied or authority is None or authority_record is None:
+            return stopped("proposal evaluation requires a live BOUND intent state authority")
         proposal_decision = decide_proposal(
-            authority if authority is not None else route_intent,
+            authority,
             proposal,
             validation_passed=validation_passed,
         )
@@ -1790,6 +1939,18 @@ def decide_retry(
         return stopped("solver result is not correlated to the live intent case")
     issued_result = cast(SolverRunResult, effective_result)
     with _RETRY_CONSUMPTION_LOCK:
+        # Revalidate all authority-bearing inputs immediately before mutating
+        # the accounting registry.  Classification above is diagnostic only;
+        # this second pass is the authorization boundary.
+        try:
+            refreshed_record = _state_authority_record(authority, bound=True)
+            _validated_retry_ledger(ledger, authority)
+        except (EvidenceIntegrityError, TypeError):
+            return stopped("intent or retry ledger authority became stale")
+        if authority_record is None or refreshed_record[1] is not authority_record[1]:
+            return stopped("intent state authority changed before retry accounting")
+        if not _solver_result_is_authoritative(effective_supervisor, issued_result):
+            return stopped("retry result authority became stale before accounting")
         consumed_ledger = _RETRY_CONSUMED_LEDGERS.get(id(ledger))
         pair_key = (id(ledger), id(issued_result))
         consumed_pair = _RETRY_CONSUMED_PAIRS.get(pair_key)

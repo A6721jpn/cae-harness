@@ -7,6 +7,7 @@ from math import isfinite
 from types import MappingProxyType
 from typing import cast
 
+from ..autonomy.policy import PhysicalConditionEvidence, unresolved_authoritative_conditions
 from ..contracts import IntentContract, IntentState
 from ..evidence import IntentSnapshotAuthority
 
@@ -80,8 +81,8 @@ class WorkflowState:
         object.__setattr__(self, "state", normalized_state)
         object.__setattr__(self, "evidence_ids", _normalise_evidence_ids(self.evidence_ids))
         if normalized_state is WorkflowPhase.ASK_AND_BLOCK:
-            snapshot, intent = _require_live_snapshot(self.identity, self.reason)
-            projection = _reason_projection(intent)
+            snapshot, _, blocking = _require_live_snapshot(self.identity, self.reason)
+            projection = _reason_projection(blocking)
             object.__setattr__(self, "_intent_snapshot", snapshot)
             object.__setattr__(self, "reason", projection)
             _BLOCKED_BINDINGS[id(self)] = (
@@ -189,7 +190,7 @@ def _normalise_evidence_ids(values: Iterable[str]) -> tuple[str, ...]:
 def _require_live_snapshot(
     identity: WorkflowIdentity,
     value: object | None,
-) -> tuple[IntentSnapshotAuthority, IntentContract]:
+) -> tuple[IntentSnapshotAuthority, IntentContract, tuple[PhysicalConditionEvidence, ...]]:
     if type(value) is not IntentSnapshotAuthority:
         raise ValueError("ASK_AND_BLOCK requires an EvidenceStore-issued intent snapshot")
     snapshot = value
@@ -200,24 +201,33 @@ def _require_live_snapshot(
         raise ValueError("ASK_AND_BLOCK snapshot must resolve to an IntentContract")
     if intent.state is not IntentState.ASK_AND_BLOCK:
         raise ValueError("ASK_AND_BLOCK snapshot intent must be in ASK_AND_BLOCK state")
-    if not _nonempty(intent.unresolved):
-        raise ValueError("ASK_AND_BLOCK snapshot intent must contain unresolved conditions")
-    if not _nonempty(intent.condition_sources):
-        raise ValueError("ASK_AND_BLOCK snapshot intent must contain condition sources")
-    return snapshot, intent
+    blocking = unresolved_authoritative_conditions(snapshot)
+    if snapshot.intent is not intent:
+        raise ValueError("ASK_AND_BLOCK snapshot changed during authority validation")
+    if not blocking:
+        raise ValueError(
+            "ASK_AND_BLOCK snapshot must contain a current authoritative missing-condition record"
+        )
+    return snapshot, intent, blocking
 
 
-def _nonempty(value: object) -> bool:
-    if isinstance(value, str):
-        return bool(value.strip())
-    return value is not None and bool(value)
-
-
-def _reason_projection(intent: IntentContract) -> _FrozenValue:
+def _reason_projection(
+    blocking: tuple[PhysicalConditionEvidence, ...],
+) -> _FrozenValue:
+    records = tuple(
+        {
+            "condition": condition.condition,
+            "source": condition.source,
+            "authoritative": True,
+            "resolved": False,
+            **({"detail": condition.detail} if condition.detail is not None else {}),
+        }
+        for condition in blocking
+    )
     return _freeze(
         {
-            "condition_sources": intent.condition_sources,
-            "unresolved": intent.unresolved,
+            "condition_sources": records,
+            "unresolved": records,
         }
     )
 
@@ -246,8 +256,8 @@ def _validate_state_binding(state: WorkflowState) -> None:
         or type(snapshot) is not IntentSnapshotAuthority
     ):
         raise ValueError("ASK_AND_BLOCK state binding was changed")
-    _, intent = _require_live_snapshot(state.identity, snapshot)
-    if state.reason != _reason_projection(intent):
+    _, _, blocking = _require_live_snapshot(state.identity, snapshot)
+    if state.reason != _reason_projection(blocking):
         raise ValueError("ASK_AND_BLOCK reason projection was changed")
 
 

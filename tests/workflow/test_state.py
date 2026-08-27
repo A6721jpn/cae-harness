@@ -4,6 +4,7 @@ import json
 from copy import copy, deepcopy
 from dataclasses import FrozenInstanceError, dataclass
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -154,10 +155,14 @@ def _ask_store(
     tmp_path: Path,
     case_id: str = "case-a",
     *,
-    unresolved: tuple[str, ...] = ("material",),
-    condition_sources: tuple[str, ...] = ("requirements",),
+    unresolved: Any = ({"condition": "material", "authoritative": True, "source": "user"},),
+    condition_sources: Any | None = None,
     state: IntentState = IntentState.ASK_AND_BLOCK,
 ) -> EvidenceStore:
+    if condition_sources is None:
+        condition_sources = {
+            "material": {"authoritative": True, "source": "user"},
+        }
     manager = ValidatedCaseWorkspace(tmp_path / "tool", tmp_path / "cae")
     case = manager.create_case(case_id)
     intent = IntentContract(
@@ -191,8 +196,22 @@ def test_ask_and_block_requires_live_snapshot_and_projects_canonical_fields(
     )
 
     assert blocked.to_dict()["reason"] == {
-        "condition_sources": ["requirements"],
-        "unresolved": ["material"],
+        "condition_sources": [
+            {
+                "authoritative": True,
+                "condition": "material",
+                "resolved": False,
+                "source": "user",
+            }
+        ],
+        "unresolved": [
+            {
+                "authoritative": True,
+                "condition": "material",
+                "resolved": False,
+                "source": "user",
+            }
+        ],
     }
 
     invalid_snapshots = (
@@ -208,6 +227,41 @@ def test_ask_and_block_requires_live_snapshot_and_projects_canonical_fields(
                 identity=IDENTITY,
                 reason=invalid_snapshot,
             )
+
+
+def test_ask_and_block_rejects_non_authoritative_missing_condition_record(
+    tmp_path: Path,
+) -> None:
+    store = _ask_store(
+        tmp_path,
+        unresolved=({"condition": "material", "authoritative": False, "source": "guess"},),
+    )
+
+    with pytest.raises(ValueError):
+        transition(
+            WorkflowState(IDENTITY),
+            WorkflowPhase.ASK_AND_BLOCK,
+            identity=IDENTITY,
+            reason=store.issue_intent_snapshot(),
+        )
+
+
+def test_ask_and_block_rejects_source_label_without_authority_record(
+    tmp_path: Path,
+) -> None:
+    store = _ask_store(
+        tmp_path,
+        unresolved=("material",),
+        condition_sources={"material": "user"},
+    )
+
+    with pytest.raises(ValueError):
+        transition(
+            WorkflowState(IDENTITY),
+            WorkflowPhase.ASK_AND_BLOCK,
+            identity=IDENTITY,
+            reason=store.issue_intent_snapshot(),
+        )
 
 
 def test_ask_and_block_rejects_copied_forged_and_foreign_snapshots(tmp_path: Path) -> None:
