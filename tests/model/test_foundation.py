@@ -6,6 +6,8 @@ from types import MappingProxyType
 
 import pytest
 
+from febio_cae_harness.contracts import IntentContract
+from febio_cae_harness.evidence import EvidenceStore
 from febio_cae_harness.model import (
     ASK_AND_BLOCK,
     ConditionEvidence,
@@ -21,8 +23,10 @@ from febio_cae_harness.model import (
     assess_completeness,
     inspect_feb_xml,
     inspect_step,
+    issue_completeness_authority,
     run_preflight,
 )
+from febio_cae_harness.workspace import ValidatedCaseWorkspace
 
 FEB_FIXTURE = b"""<?xml version='1.0' encoding='UTF-8'?>
 <febio_spec version='4.0'>
@@ -138,21 +142,25 @@ def test_feb_domain_namespaces_and_named_material_references_are_structural() ->
     assert duplicate_inspection.duplicate_keys == (("domain", "body"),)
 
 
-def test_completeness_reports_only_explicit_authoritative_conditions() -> None:
-    authoritative = EvidenceProvenance(
-        source="synthetic-intent",
-        location="intent.json",
-        authoritative=True,
+def test_completeness_reports_only_explicit_authoritative_conditions(tmp_path: Path) -> None:
+    workspace = ValidatedCaseWorkspace(tmp_path / "tool", tmp_path / "02_CAE")
+    case = workspace.create_case("case")
+    store = EvidenceStore(
+        case,
+        IntentContract(
+            units={"length": "mm"},
+            material="neo-Hookean",
+            condition_sources={
+                "units": {"source": "synthetic-intent", "location": "intent.json"},
+                "material": {"source": "synthetic-intent", "location": "intent.json"},
+            },
+        ),
     )
-    result = assess_completeness(
-        required_conditions=("units", "material", "loads"),
-        evidence={
-            "units": ConditionEvidence("units", {"length": "mm"}, (authoritative,)),
-            "material": ConditionEvidence("material", "neo-Hookean", (authoritative,)),
-            # A geometry string is intentionally not physical-condition evidence.
-            "geometry": ConditionEvidence("geometry", "tetrahedron", (authoritative,)),
-        },
+    authority = issue_completeness_authority(
+        store.issue_intent_snapshot(),
+        ("units", "material", "loads"),
     )
+    result = assess_completeness(authority)
 
     assert result.complete is False
     assert result.state == ASK_AND_BLOCK

@@ -8,7 +8,9 @@ or FEBio Studio success.
 from .completeness import (
     DEFAULT_REQUIRED_CONDITIONS,
     Completeness,
+    CompletenessAuthority,
     CompletenessResult,
+    assess_authoritative_completeness,
     assess_completeness,
     assess_intent_completeness,
     check_completeness,
@@ -16,6 +18,9 @@ from .completeness import (
     completeness_from_intent,
     completeness_result,
     evaluate_completeness,
+    issue_completeness_authority,
+    issue_condition_authority,
+    issue_physical_condition_authority,
 )
 from .derived import DerivedFebReceipt, FebPatch, write_derived_feb
 from .descriptors import (
@@ -95,6 +100,7 @@ from .step_plan import StepMeshingPlan, StepMeshingRequest, plan_step_meshing
 from .synthetic import SyntheticFebReceipt, generate_synthetic_feb
 from .types import (
     ASK_AND_BLOCK,
+    ConditionAuthority,
     ConditionEvidence,
     ConditionFact,
     ConditionName,
@@ -103,6 +109,7 @@ from .types import (
     MissingCondition,
     MissingConditionFact,
     PhysicalCondition,
+    PhysicalConditionAuthority,
     PhysicalConditionName,
     UnresolvedCondition,
     UnresolvedEvidenceField,
@@ -113,7 +120,9 @@ __all__ = [
     "ASK_AND_BLOCK",
     "ChangeProposal",
     "Completeness",
+    "CompletenessAuthority",
     "CompletenessResult",
+    "ConditionAuthority",
     "ConditionEvidence",
     "ConditionFact",
     "ConditionName",
@@ -149,6 +158,7 @@ __all__ = [
     "OriginalModel",
     "PhysicalConditionName",
     "PhysicalCondition",
+    "PhysicalConditionAuthority",
     "PreflightDiagnostic",
     "PreflightResult",
     "PreflightSeverity",
@@ -175,6 +185,7 @@ __all__ = [
     "XmlNodeFact",
     "XmlReference",
     "assess_completeness",
+    "assess_authoritative_completeness",
     "assess_intent_completeness",
     "check_completeness",
     "check_intent_completeness",
@@ -184,6 +195,9 @@ __all__ = [
     "create_derived_model_plan",
     "derive_model_plan",
     "evaluate_completeness",
+    "issue_completeness_authority",
+    "issue_condition_authority",
+    "issue_physical_condition_authority",
     "inspect_feb",
     "inspect_feb_file",
     "inspect_feb_xml",

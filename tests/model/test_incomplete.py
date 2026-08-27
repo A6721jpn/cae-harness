@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import json
 from dataclasses import FrozenInstanceError
+from pathlib import Path
 
 import pytest
 
+from febio_cae_harness.contracts import IntentContract
+from febio_cae_harness.evidence import EvidenceStore
 from febio_cae_harness.model import (
     ASK_AND_BLOCK,
     CompletenessResult,
-    ConditionEvidence,
     EvidenceProvenance,
     MissingConditionFact,
     MissingConditionQuestion,
@@ -16,7 +18,9 @@ from febio_cae_harness.model import (
     assess_completeness,
     inspect_feb_xml,
     inspect_incomplete_feb,
+    issue_completeness_authority,
 )
+from febio_cae_harness.workspace import ValidatedCaseWorkspace
 
 AUTH_A = EvidenceProvenance("intent", "intent.loads", authoritative=True)
 AUTH_B = EvidenceProvenance("case", "case/requirements", authoritative=True)
@@ -48,6 +52,20 @@ def _result(
     )
 
 
+def _bound_loads(tmp_path: Path) -> CompletenessResult:
+    workspace = ValidatedCaseWorkspace(tmp_path / "tool", tmp_path / "02_CAE")
+    case = workspace.create_case("case")
+    store = EvidenceStore(
+        case,
+        IntentContract(
+            loads="traction",
+            condition_sources={"loads": {"source": "intent", "location": "intent.json"}},
+        ),
+    )
+    authority = issue_completeness_authority(store.issue_intent_snapshot(), ("loads",))
+    return assess_completeness(authority)
+
+
 def test_question_is_immutable_authoritative_and_json_shaped() -> None:
     question = MissingConditionQuestion(
         condition="loads",
@@ -71,7 +89,7 @@ def test_question_is_immutable_authoritative_and_json_shaped() -> None:
         MissingConditionQuestion("loads", "reason", (), action="EDIT")
 
 
-def test_structural_diagnostics_are_separate_and_never_questions() -> None:
+def test_structural_diagnostics_are_separate_and_never_questions(tmp_path: Path) -> None:
     feb = inspect_feb_xml(
         b"""
         <not_febio>
@@ -80,10 +98,7 @@ def test_structural_diagnostics_are_separate_and_never_questions() -> None:
         </not_febio>
         """
     )
-    completeness = assess_completeness(
-        ("loads",),
-        {"loads": ConditionEvidence("loads", "traction", (AUTH_A,))},
-    )
+    completeness = _bound_loads(tmp_path)
 
     inventory = inspect_incomplete_feb(feb, completeness)
 
@@ -123,11 +138,10 @@ def test_questions_follow_required_order_deduplicate_and_filter_authority() -> N
     assert inventory.ready is False
 
 
-def test_ready_requires_bound_completeness_without_required_unresolved_fields() -> None:
-    complete = assess_completeness(
-        ("loads",),
-        {"loads": ConditionEvidence("loads", "traction", (AUTH_A,))},
-    )
+def test_ready_requires_bound_completeness_without_required_unresolved_fields(
+    tmp_path: Path,
+) -> None:
+    complete = _bound_loads(tmp_path)
     ready = inspect_incomplete_feb(inspect_feb_xml(VALID_FEB), complete)
     assert ready.questions == ()
     assert ready.structural_diagnostics == ()
