@@ -9,13 +9,14 @@ from pathlib import Path
 import pytest
 
 from febio_cae_harness.solver import (
-    OfficialFbsAdapterBoundary,
+    FbsAdapterManager,
     OutputFreshnessError,
     SolverClassification,
     SolverLaunchSpec,
     SolverState,
     SolverSupervisor,
     validate_log,
+    validate_requested_fields,
 )
 
 NORMAL_LOG = """
@@ -52,9 +53,7 @@ def make_spec(
     )
 
 
-class OfficialFixtureAdapter:
-    official = True
-
+class SyntheticVectorFixtureAdapter:
     def read_fields(self, xplt_path: Path, fields: Sequence[str]) -> dict[str, object]:
         assert xplt_path.is_file()
         return {field: [1.0, -2.0] for field in fields}
@@ -112,25 +111,29 @@ def test_supervisor_reports_missing_outputs_after_normal_exit(tmp_path: Path) ->
     assert not result.success
 
 
-def test_supervisor_validates_log_xplt_and_official_fbs_fields(tmp_path: Path) -> None:
+def test_supervisor_validates_log_xplt_and_synthetic_fbs_fields(tmp_path: Path) -> None:
     code = (
         "from pathlib import Path; "
         f"Path({str(tmp_path / 'attempt.log')!r}).write_text({NORMAL_LOG!r}); "
         f"Path({str(tmp_path / 'attempt.xplt')!r}).write_bytes(b'xplt')"
     )
     spec = make_spec(tmp_path, code=code, requested_fields=("displacement",))
+    authority = FbsAdapterManager(
+        SyntheticVectorFixtureAdapter(), "synthetic-fixture", tmp_path
+    ).issue_authority()
 
     result = SolverSupervisor(
         spec,
-        fbs_adapter=OfficialFbsAdapterBoundary(OfficialFixtureAdapter()),
+        fbs_adapter=authority,
     ).run()
 
     assert result.state is SolverState.NORMAL_EXIT
-    assert result.classification is SolverClassification.SUCCESS
-    assert result.success
+    assert result.classification is SolverClassification.FBS_UNVERIFIED
+    assert not result.success
     assert result.fbs_validation is not None
-    assert result.fbs_validation.official
-    assert result.fbs_validation.all_requested_fields_finite
+    assert result.fbs_validation.provenance == "synthetic-unverified"
+    assert not result.fbs_validation.missing_fields
+    assert not result.fbs_validation.non_finite_fields
 
 
 def test_synthetic_fbs_adapter_is_not_reported_as_official(tmp_path: Path) -> None:
@@ -140,15 +143,17 @@ def test_synthetic_fbs_adapter_is_not_reported_as_official(tmp_path: Path) -> No
         f"Path({str(tmp_path / 'attempt.xplt')!r}).write_bytes(b'xplt')"
     )
     spec = make_spec(tmp_path, code=code, requested_fields=("displacement",))
+    authority = FbsAdapterManager(
+        SyntheticFixtureAdapter(), "synthetic-fixture", tmp_path
+    ).issue_authority()
 
     result = SolverSupervisor(
         spec,
-        fbs_adapter=OfficialFbsAdapterBoundary(SyntheticFixtureAdapter()),
+        fbs_adapter=authority,
     ).run()
 
     assert result.fbs_validation is not None
-    assert not result.fbs_validation.official
-    assert result.fbs_validation.provenance == "synthetic-adapter"
+    assert result.fbs_validation.provenance == "synthetic-unverified"
     assert result.classification is SolverClassification.FBS_UNVERIFIED
     assert not result.success
 
@@ -158,19 +163,20 @@ def test_fbs_boundary_rejects_non_finite_requested_field(tmp_path: Path) -> None
     xplt_path.write_bytes(b"synthetic xplt")
 
     class NonFiniteAdapter:
-        official = True
-
         def read_fields(self, path: Path, fields: Sequence[str]) -> dict[str, object]:
             del path
             return {fields[0]: math.nan}
 
-    result = OfficialFbsAdapterBoundary(NonFiniteAdapter()).validate(
+    authority = FbsAdapterManager(
+        NonFiniteAdapter(), "synthetic-fixture", tmp_path
+    ).issue_authority()
+    result = validate_requested_fields(
+        authority,
         xplt_path,
         ("stress",),
     )
 
     assert not result.valid
-    assert not result.all_requested_fields_finite
     assert result.non_finite_fields == ("stress",)
 
 

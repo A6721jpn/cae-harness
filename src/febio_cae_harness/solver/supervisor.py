@@ -17,7 +17,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 
-from .fbs import FbsAdapterBoundary, FbsValidation, OfficialFbsAdapterBoundary
+from .fbs import (
+    FbsAdapterAuthority,
+    FbsValidation,
+    _authority_record,
+    _invalid_validation,
+    validate_requested_fields,
+)
 from .log import LogValidation, LogValidator, validate_log
 from .types import (
     OutputFreshnessError,
@@ -155,7 +161,7 @@ class SolverSupervisor:
         case_id: str | None = None,
         intent_id: str | None = None,
         attempt_id: str | None = None,
-        fbs_adapter: OfficialFbsAdapterBoundary | object | None = None,
+        fbs_adapter: FbsAdapterAuthority | None = None,
         requested_fields: Iterable[str] | None = None,
         log_validator: LogValidator | None = None,
     ) -> None:
@@ -168,10 +174,14 @@ class SolverSupervisor:
         self._case_id = case_id or ""
         self._intent_id = intent_id or ""
         self._attempt_id = attempt_id or spec.attempt_root.name
-        if fbs_adapter is None or isinstance(fbs_adapter, OfficialFbsAdapterBoundary):
-            self._fbs_adapter = fbs_adapter
-        else:
-            self._fbs_adapter = FbsAdapterBoundary(fbs_adapter)
+        if fbs_adapter is not None:
+            try:
+                _authority_record(fbs_adapter)
+            except TypeError as error:
+                raise SolverConfigurationError(
+                    "fbs_adapter must be issued by FbsAdapterManager"
+                ) from error
+        self._fbs_adapter = fbs_adapter
         self._requested_fields = (
             tuple(requested_fields) if requested_fields is not None else spec.requested_fields
         )
@@ -302,7 +312,7 @@ class SolverSupervisor:
         case_id: str | None = None,
         intent_id: str | None = None,
         attempt_id: str | None = None,
-        fbs_adapter: OfficialFbsAdapterBoundary | object | None = None,
+        fbs_adapter: FbsAdapterAuthority | None = None,
         requested_fields: Iterable[str] | None = None,
         log_validator: LogValidator | None = None,
     ) -> SolverSupervisor:
@@ -571,22 +581,23 @@ class SolverSupervisor:
                     classification = SolverClassification.FBS_UNVERIFIED
                 else:
                     try:
-                        fbs_validation = self._fbs_adapter.validate(
+                        fbs_validation = validate_requested_fields(
+                            self._fbs_adapter,
                             self.spec.expected_outputs.xplt_path,
                             self._requested_fields,
+                            attempt_root=self.spec.attempt_root,
                         )
                     except Exception as error:
-                        fbs_validation = FbsValidation.invalid(
+                        fbs_validation = _invalid_validation(
+                            self._fbs_adapter,
                             self.spec.expected_outputs.xplt_path,
                             self._requested_fields,
                             str(error),
                         )
                     if not fbs_validation.valid:
                         classification = SolverClassification.FBS_INVALID
-                    elif not fbs_validation.official:
-                        classification = SolverClassification.FBS_UNVERIFIED
                     else:
-                        classification = SolverClassification.SUCCESS
+                        classification = SolverClassification.FBS_UNVERIFIED
 
             finished_at = datetime.now(UTC)
             result = SolverRunResult(

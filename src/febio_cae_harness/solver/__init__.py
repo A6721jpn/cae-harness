@@ -1,18 +1,10 @@
-"""Headless FEBio solver and official-FBS adapter boundary."""
+"""Headless FEBio solver and synthetic FBS authority boundary."""
 
 from .fbs import (
-    FBSAdapter,
-    FbsAdapterBoundary,
-    FbsAdapterError,
+    FbsAdapterAuthority,
+    FbsAdapterManager,
     FbsAdapterProtocol,
-    FbsResultValidation,
-    FBSValidation,
     FbsValidation,
-    OfficialFBSAdapter,
-    OfficialFbsAdapter,
-    OfficialFBSAdapterBoundary,
-    OfficialFbsAdapterBoundary,
-    validate_fbs_fields,
     validate_requested_fields,
 )
 from .log import LogValidation, LogValidator, validate_log, validate_solver_log
@@ -34,19 +26,12 @@ from .types import (
 
 __all__ = [
     "FailureClassification",
-    "FBSAdapter",
-    "FBSValidation",
-    "FbsAdapterBoundary",
-    "FbsAdapterError",
+    "FbsAdapterAuthority",
+    "FbsAdapterManager",
     "FbsAdapterProtocol",
-    "FbsResultValidation",
     "FbsValidation",
     "LogValidation",
     "LogValidator",
-    "OfficialFbsAdapter",
-    "OfficialFBSAdapter",
-    "OfficialFbsAdapterBoundary",
-    "OfficialFBSAdapterBoundary",
     "OutputExpectation",
     "OutputFreshnessError",
     "ProcessState",
@@ -59,7 +44,6 @@ __all__ = [
     "SolverRunResult",
     "SolverState",
     "SolverSupervisor",
-    "validate_fbs_fields",
     "validate_log",
     "validate_requested_fields",
     "validate_solver_log",
