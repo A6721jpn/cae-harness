@@ -91,10 +91,6 @@ def _has_evidence(value: object | None) -> bool:
     return value is not None and (not isinstance(value, (str, Mapping)) or bool(value))
 
 
-def _has_explicit_authority(value: object | None) -> bool:
-    return isinstance(value, Mapping) and value.get("authoritative") is True
-
-
 @dataclass(frozen=True, slots=True)
 class NegativeJacobianObservation:
     attempt_id: str
@@ -206,8 +202,10 @@ def diagnose_negative_jacobian(
         value = getattr(observation, name)
         if _has_evidence(value):
             observed[name] = value
-        if not _has_explicit_authority(value):
-            authority_missing.append(name)
+        # Raw caller mappings are observed diagnostics, not canonical relation
+        # authority.  This phase has no closed relation validator, so every
+        # physical relation remains conservatively unresolved.
+        authority_missing.append(name)
     return NegativeJacobianDiagnostic(
         observation=observation,
         observed_fields=observed,

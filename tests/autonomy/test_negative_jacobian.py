@@ -101,6 +101,45 @@ def test_diagnosis_separates_observed_technical_and_authority_evidence() -> None
     assert "constraint_relation_evidence" not in diagnostic.observed_fields
     assert diagnostic.missing_technical_evidence == ("surrounding_mesh_metrics",)
     assert diagnostic.missing_physical_authority_evidence == (
+        "roi_relation_evidence",
+        "contact_relation_evidence",
+        "constraint_relation_evidence",
+    )
+
+
+@pytest.mark.parametrize(
+    "marker",
+    [
+        {"authoritative": True},
+        {"official": True},
+        {"validated": True},
+        {"source": "user"},
+        {"is_authoritative": True},
+        {"authority": "canonical"},
+    ],
+    ids=(
+        "authoritative",
+        "official",
+        "validated",
+        "user-source",
+        "equivalent-boolean",
+        "equivalent-label",
+    ),
+)
+def test_diagnosis_never_treats_caller_markers_as_physical_authority(
+    marker: dict[str, object],
+) -> None:
+    relation = {"relation": "caller supplied", **marker}
+    diagnostic = diagnose_negative_jacobian(
+        make_observation(
+            roi_relation_evidence=relation,
+            contact_relation_evidence=relation,
+            constraint_relation_evidence=relation,
+        )
+    )
+
+    assert diagnostic.missing_physical_authority_evidence == (
+        "roi_relation_evidence",
         "contact_relation_evidence",
         "constraint_relation_evidence",
     )
