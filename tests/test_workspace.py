@@ -365,10 +365,10 @@ def test_promotion_requires_persisted_evidence_store_authorization(tmp_path: Pat
         destination,
         attempt_id="attempt-1",
     )
-    assert verification is not None
-    promoted = store.promote_verified(verification)
-    assert promoted == case.case_root / destination
-    assert promoted.read_text(encoding="utf-8") == "derived"
+    assert verification is None
+    with pytest.raises(EvidenceIntegrityError):
+        store.promote_verified(verification)  # type: ignore[arg-type]
+    assert not (case.case_root / destination).exists()
     assert store.reopen() is store
 
 
@@ -391,15 +391,15 @@ def test_verified_promotion_cannot_mutate_outside_file_through_hard_link(
         destination,
         attempt_id="attempt-1",
     )
-    assert verification is not None
+    assert verification is None
 
     outside = tmp_path / "outside-promoted.feb"
     outside.write_bytes(b"outside")
     target = case.case_root / destination
     make_file_hard_link(target, outside)
 
-    with pytest.raises(FileExistsError):
-        store.promote_verified(verification)
+    with pytest.raises(EvidenceIntegrityError):
+        store.promote_verified(verification)  # type: ignore[arg-type]
 
     assert outside.read_bytes() == b"outside"
     assert target.read_bytes() == b"outside"
@@ -422,7 +422,7 @@ def test_promotion_verification_binds_exact_destination(tmp_path: Path) -> None:
         Path("02_Model") / "derived.feb",
         attempt_id="attempt-1",
     )
-    assert verification is not None
+    assert verification is None
 
     events_path = store.events_path
     lines = events_path.read_text(encoding="utf-8").splitlines()
@@ -432,7 +432,8 @@ def test_promotion_verification_binds_exact_destination(tmp_path: Path) -> None:
     events_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     with pytest.raises(EvidenceIntegrityError):
-        store.promote_verified(verification)
+        store.reopen()
+    assert not (case.case_root / "02_Model" / "derived.feb").exists()
 
 
 def test_workspace_authorities_reject_forged_cloned_and_rebound_objects(
