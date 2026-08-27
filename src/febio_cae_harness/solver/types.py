@@ -583,6 +583,31 @@ def _validate_launch_capability(
             raise SolverConfigurationError("launch capability attempt identity is invalid")
         if not isinstance(intent_id, str) or not intent_id.strip():
             raise SolverConfigurationError("launch capability intent identity is invalid")
+
+        # The workspace registry check performed by ``AttemptWorkspace``'s
+        # ``__fspath__`` is an authority read, not a lock.  Revalidate the
+        # exact workspace and intent after all identity reads and require the
+        # values observed on both sides of the reads to agree.  This closes a
+        # deterministic mutation window between the first registry check and
+        # the supervisor's process-record or launch side effects.
+        final_root = Path(os.fspath(attempt))
+        final_case_id = attempt.case_id
+        final_attempt_id = attempt.attempt_id
+        final_intent_case_id = intent.case_id
+        final_intent_id = intent.intent_sha256
+        final_intent_case_root = object.__getattribute__(intent, "_case_workspace").root
+        if (
+            final_root != root
+            or final_case_id != case_id
+            or final_attempt_id != attempt_id
+            or final_intent_case_id != intent_case_id
+            or final_intent_id != intent_id
+            or final_intent_case_root != intent_case_root
+        ):
+            raise SolverConfigurationError(
+                "launch capability authorities changed during validation"
+            )
+
         validated_runtime = validate_runtime_diagnostic(runtime)
         input_path = spec.input_path
         if input_path != record.input_path:

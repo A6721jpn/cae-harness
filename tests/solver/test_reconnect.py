@@ -10,6 +10,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from febio_cae_harness import workspace as workspace_module
 from febio_cae_harness.contracts import IntentContract
 from febio_cae_harness.evidence import EvidenceStore
 from febio_cae_harness.solver import headless as headless_module
@@ -247,3 +248,28 @@ def test_reconnect_rejects_raw_launch_spec_before_record_read_or_file_creation(
 
     assert not attempt_root.exists()
     assert not (attempt_root / "process.json").exists()
+
+
+def test_reconnect_rejects_attempt_identity_mutated_after_registry_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capability = _capability(tmp_path, monkeypatch, code="pass")
+    attempt = object.__getattribute__(capability, "_attempt_workspace")
+    assert type(attempt) is AttemptWorkspace
+    original_validate = workspace_module._require_registered_attempt
+
+    def racing_validate(value: object) -> AttemptWorkspace:
+        validated = original_validate(value)
+        object.__setattr__(attempt, "attempt_id", "attempt-b")
+        return validated
+
+    monkeypatch.setattr(workspace_module, "_require_registered_attempt", racing_validate)
+
+    def unexpected_read(self: SolverSupervisor) -> dict[str, object]:
+        del self
+        raise AssertionError("raced reconnect reached process-record read")
+
+    monkeypatch.setattr(SolverSupervisor, "_read_process_record", unexpected_read)
+    with pytest.raises(SolverConfigurationError, match="authority|binding|live"):
+        SolverSupervisor.reconnect(capability)
