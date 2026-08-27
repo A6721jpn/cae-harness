@@ -39,6 +39,7 @@ from .types import (
 __all__ = ["SolverSupervisor"]
 
 _PROCESS_RECORD_NAME = "process.json"
+_CREATE_SUSPENDED = 0x00000004
 _RESULT_FIELDS = (
     "state",
     "classification",
@@ -310,8 +311,11 @@ class SolverSupervisor:
                 environment.update(authority.child_environment())
 
                 process: subprocess.Popen[bytes] | None = None
+                bound = False
                 if os.name == "nt":
-                    creation_flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                    creation_flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | (
+                        _CREATE_SUSPENDED
+                    )
                     child_handle = authority.child_handle()
                     if child_handle is None:
                         raise ProcessAuthorityError("process attestation handle is unavailable")
@@ -344,6 +348,9 @@ class SolverSupervisor:
                 started_at = datetime.now(UTC)
                 metadata = _process_metadata(process.pid)
                 authority.bind(process.pid)
+                bound = True
+                if os.name == "nt":
+                    authority.resume(process.pid)
                 self._process = process
                 self._started_at = started_at
                 self._process_authority = authority
@@ -353,13 +360,15 @@ class SolverSupervisor:
                 self._write_process_record(self._process_record)
             except (OSError, OutputFreshnessError, ValueError) as error:
                 process = locals().get("process")
-                if isinstance(process, subprocess.Popen):
+                if process is not None:
                     try:
                         if authority is not None and self._process_authority is authority:
                             self._terminate_owned_process(process)
+                        elif authority is not None and bound and os.name == "nt":
+                            authority.terminate(process.pid, force=True)
                         else:
                             process.kill()
-                            process.wait(timeout=2.0)
+                        process.wait(timeout=2.0)
                     except (
                         OSError,
                         ProcessLookupError,

@@ -49,6 +49,8 @@ class ProcessAuthority:
 
     def bind(self, pid: int) -> None: ...
 
+    def resume(self, pid: int) -> None: ...
+
     def verify(self, pid: int) -> None: ...
 
     def terminate(self, pid: int, *, force: bool = False) -> None: ...
@@ -156,6 +158,10 @@ class _WindowsProcessAuthority(ProcessAuthority):
     _JOB_ACCESS = 0x000C
     _PROCESS_ACCESS = 0x1101
     _PROCESS_QUERY = 0x1000
+    _THREAD_SUSPEND_RESUME = 0x0002
+    _THREAD_QUERY_LIMITED_INFORMATION = 0x0800
+    _TH32CS_SNAPTHREAD = 0x00000004
+    _STILL_SUSPENDED = 0xFFFFFFFF
 
     class _SecurityAttributes(ctypes.Structure):
         _fields_ = [
@@ -164,9 +170,21 @@ class _WindowsProcessAuthority(ProcessAuthority):
             ("bInheritHandle", ctypes.c_int),
         ]
 
+    class _ThreadEntry32(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", ctypes.c_uint32),
+            ("cntUsage", ctypes.c_uint32),
+            ("th32ThreadID", ctypes.c_uint32),
+            ("th32OwnerProcessID", ctypes.c_uint32),
+            ("tpBasePri", ctypes.c_int32),
+            ("tpDeltaPri", ctypes.c_int32),
+            ("dwFlags", ctypes.c_uint32),
+        ]
+
     def __init__(self, attempt_root: Path, *, name: str, handle: Any) -> None:
         self._binding = _attempt_binding(attempt_root)
         self._handle = handle
+        self._bound_pid: int | None = None
         self._claim = {"kind": "windows-job", "attempt_binding": self._binding, "name": name}
 
     @staticmethod
@@ -184,6 +202,24 @@ class _WindowsProcessAuthority(ProcessAuthority):
         k.TerminateJobObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
         k.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
         k.OpenProcess.restype = ctypes.c_void_p
+        k.CreateToolhelp32Snapshot.argtypes = [ctypes.c_uint32, ctypes.c_uint32]
+        k.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+        k.Thread32First.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(_WindowsProcessAuthority._ThreadEntry32),
+        ]
+        k.Thread32First.restype = ctypes.c_int
+        k.Thread32Next.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(_WindowsProcessAuthority._ThreadEntry32),
+        ]
+        k.Thread32Next.restype = ctypes.c_int
+        k.OpenThread.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+        k.OpenThread.restype = ctypes.c_void_p
+        k.GetProcessIdOfThread.argtypes = [ctypes.c_void_p]
+        k.GetProcessIdOfThread.restype = ctypes.c_uint32
+        k.ResumeThread.argtypes = [ctypes.c_void_p]
+        k.ResumeThread.restype = ctypes.c_uint32
         k.CloseHandle.argtypes = [ctypes.c_void_p]
         return k
 
@@ -230,9 +266,78 @@ class _WindowsProcessAuthority(ProcessAuthority):
         try:
             if not k.AssignProcessToJobObject(self._handle, process):
                 raise ProcessAuthorityError("unable to bind launched process to attestation")
+            self._bound_pid = pid
         finally:
             k.CloseHandle(process)
-        self.verify(pid)
+        try:
+            self.verify(pid)
+        except ProcessAuthorityError:
+            with contextlib.suppress(ProcessAuthorityError):
+                self._terminate_job()
+            raise
+
+    def resume(self, pid: int) -> None:
+        """Resume only threads belonging to the already-attested process."""
+
+        try:
+            self.verify(pid)
+        except ProcessAuthorityError:
+            self._fail_closed(pid, "unable to verify attested process before resume")
+        k = self._kernel32()
+        snapshot = k.CreateToolhelp32Snapshot(self._TH32CS_SNAPTHREAD, 0)
+        invalid_handle = ctypes.c_void_p(-1).value
+        if not snapshot or snapshot == invalid_handle:
+            self._fail_closed(pid, "unable to enumerate attested process threads")
+        thread_ids: list[int] = []
+        try:
+            entry = self._ThreadEntry32()
+            entry.dwSize = ctypes.sizeof(entry)
+            if k.Thread32First(snapshot, ctypes.byref(entry)):
+                while True:
+                    if entry.th32OwnerProcessID == pid:
+                        thread_ids.append(entry.th32ThreadID)
+                    entry.dwSize = ctypes.sizeof(entry)
+                    if not k.Thread32Next(snapshot, ctypes.byref(entry)):
+                        break
+        finally:
+            k.CloseHandle(snapshot)
+        if not thread_ids:
+            self._fail_closed(pid, "attested process has no resumable primary thread")
+
+        try:
+            for thread_id in thread_ids:
+                thread = k.OpenThread(
+                    self._THREAD_SUSPEND_RESUME | self._THREAD_QUERY_LIMITED_INFORMATION,
+                    False,
+                    thread_id,
+                )
+                if not thread:
+                    raise ProcessAuthorityError("unable to open attested process primary thread")
+                try:
+                    if k.GetProcessIdOfThread(thread) != pid:
+                        raise ProcessAuthorityError(
+                            "attested process primary thread identity changed"
+                        )
+                    previous_count = k.ResumeThread(thread)
+                    if previous_count == self._STILL_SUSPENDED or previous_count != 1:
+                        raise ProcessAuthorityError(
+                            "attested process primary thread was not suspended exactly once"
+                        )
+                finally:
+                    k.CloseHandle(thread)
+        except ProcessAuthorityError:
+            self._fail_closed(pid, "unable to resume attested process primary thread")
+
+    def _fail_closed(self, pid: int, message: str) -> None:
+        try:
+            self._terminate_job()
+        except ProcessAuthorityError as error:
+            raise ProcessAuthorityError(f"{message}; unable to terminate attested job") from error
+        raise ProcessAuthorityError(message)
+
+    def _terminate_job(self) -> None:
+        if not self._handle or not self._kernel32().TerminateJobObject(self._handle, 1):
+            raise ProcessAuthorityError("unable to terminate attested process tree")
 
     def verify(self, pid: int) -> None:
         k = self._kernel32()
@@ -250,12 +355,12 @@ class _WindowsProcessAuthority(ProcessAuthority):
 
     def terminate(self, pid: int, *, force: bool = False) -> None:
         self.verify(pid)
-        if not self._kernel32().TerminateJobObject(self._handle, 1):
-            raise ProcessAuthorityError("unable to terminate attested process tree")
+        self._terminate_job()
 
     def close(self) -> None:
         if self._handle:
             handle, self._handle = self._handle, None
+            self._bound_pid = None
             self._kernel32().CloseHandle(handle)
 
 
