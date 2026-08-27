@@ -1396,6 +1396,7 @@ type _RetryLedgerRecord = tuple[
 ]
 _RETRY_LEDGER_RECORDS: dict[int, _RetryLedgerRecord] = {}
 _RETRY_CONSUMPTION_LOCK = Lock()
+_RETRY_CONSUMED_LEDGERS: dict[int, RetryLedger] = {}
 _RETRY_CONSUMED_RESULTS: dict[int, SolverRunResult] = {}
 _RETRY_CONSUMED_PAIRS: dict[tuple[int, int], tuple[RetryLedger, SolverRunResult]] = {}
 
@@ -1789,9 +1790,12 @@ def decide_retry(
         return stopped("solver result is not correlated to the live intent case")
     issued_result = cast(SolverRunResult, effective_result)
     with _RETRY_CONSUMPTION_LOCK:
+        consumed_ledger = _RETRY_CONSUMED_LEDGERS.get(id(ledger))
         pair_key = (id(ledger), id(issued_result))
         consumed_pair = _RETRY_CONSUMED_PAIRS.get(pair_key)
         consumed_result = _RETRY_CONSUMED_RESULTS.get(id(issued_result))
+        if consumed_ledger is ledger:
+            return stopped("retry ledger has already minted a successor")
         if consumed_result is issued_result or (
             consumed_pair is not None
             and consumed_pair[0] is ledger
@@ -1822,6 +1826,7 @@ def decide_retry(
             used=ledger.used + 1,
             records=ledger.records + (record,),
         )
+        _RETRY_CONSUMED_LEDGERS[id(ledger)] = ledger
         _RETRY_CONSUMED_RESULTS[id(issued_result)] = issued_result
         _RETRY_CONSUMED_PAIRS[pair_key] = (ledger, issued_result)
     return RetryResult(

@@ -920,6 +920,46 @@ def test_retry_replay_of_parent_ledger_and_failed_result_stops_without_minting(
     assert replay.ledger is ledger
 
 
+def test_retry_replay_parent_ledger_cannot_mint_with_a_different_failed_result(
+    tmp_path: Path,
+) -> None:
+    state = run_transition(
+        intent_snapshot(bound_intent(retry_budget=3), tmp_path, "retry-replay-different-result")
+    )
+    ledger = RetryLedger.from_authority(state)
+    first_supervisor = timeout_supervisor(
+        tmp_path / "retry-replay-different-result-first",
+        attempt_id="attempt-first",
+        case_id="case-retry-replay-different-result",
+    )
+    first_result = first_supervisor.run(timeout_seconds=0.1)
+    second_supervisor = timeout_supervisor(
+        tmp_path / "retry-replay-different-result-second",
+        attempt_id="attempt-second",
+        case_id="case-retry-replay-different-result",
+    )
+    second_result = second_supervisor.run(timeout_seconds=0.1)
+
+    first = decide_retry(
+        FailureClass.TIMEOUT,
+        ledger,
+        intent=state,
+        supervisor=first_supervisor,
+        result=first_result,
+    )
+    replay = decide_retry(
+        FailureClass.TIMEOUT,
+        ledger,
+        intent=state,
+        supervisor=second_supervisor,
+        result=second_result,
+    )
+
+    assert first.decision is RetryDecision.RETRY
+    assert replay.decision is RetryDecision.STOP
+    assert replay.ledger is ledger
+
+
 def test_retry_replay_of_consumed_result_with_successor_ledger_stops(
     tmp_path: Path,
 ) -> None:
