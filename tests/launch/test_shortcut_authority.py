@@ -4,11 +4,16 @@ import copy
 import json
 import os
 import pickle
+import subprocess
+import tempfile
+from contextlib import suppress
 from pathlib import Path
 
 import pytest
 
+import febio_cae_harness.launch.shortcut as shortcut_module
 from febio_cae_harness.launch.deployment import (
+    PRODUCT_DIRECTORY_NAME,
     BuildIdentity,
     DeploymentError,
     DeploymentLayout,
@@ -27,7 +32,9 @@ from febio_cae_harness.launch.shortcut import (
 def _published(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> tuple[DeploymentLayout, ShortcutDescriptorManager]:
-    monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
+    programs = tmp_path / "programs"
+    programs.mkdir(parents=True)
+    monkeypatch.setattr(shortcut_module, "_known_folder_programs", lambda: programs)
     source = tmp_path / "source"
     source.mkdir(parents=True)
     (source / "febio-cae.exe").write_bytes(b"synthetic launcher")
@@ -71,7 +78,10 @@ def test_manager_issues_only_the_fixed_live_descriptor_and_writes_it(
     layout, manager = _published(tmp_path, monkeypatch)
     descriptor = manager.issue_descriptor(("--headless",), metadata={"origin": "test"})
     assert type(descriptor) is ShortcutDescriptor
-    assert descriptor.path == default_start_menu_root() / SHORTCUT_DESCRIPTOR_NAME
+    assert (
+        descriptor.path
+        == default_start_menu_root() / PRODUCT_DIRECTORY_NAME / SHORTCUT_DESCRIPTOR_NAME
+    )
     assert descriptor.target == layout.launcher
     assert descriptor.working_directory == layout.latest
     assert descriptor.fixed_target and descriptor.arguments == ("--headless",)
@@ -84,6 +94,17 @@ def test_manager_issues_only_the_fixed_live_descriptor_and_writes_it(
     assert manager.verify(descriptor) == path
     assert write_shortcut_descriptor(descriptor) == path
     assert manager.verify(descriptor) == path
+
+
+def test_caller_environment_cannot_choose_start_menu_programs_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    layout, _manager = _published(tmp_path, monkeypatch)
+    attacker_root = tmp_path / "attacker"
+    attacker_root.mkdir()
+
+    with pytest.raises(DeploymentError):
+        ShortcutDescriptorManager(layout, environ={"APPDATA": str(attacker_root)})
 
 
 def test_foreign_manager_and_arbitrary_output_root_are_rejected(
@@ -152,3 +173,59 @@ def test_changed_persisted_descriptor_is_rejected(
     descriptor.path.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(DeploymentError):
         manager.verify(descriptor)
+
+
+def test_write_holds_product_directory_authority_before_temp_creation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    layout, manager = _published(tmp_path, monkeypatch)
+    descriptor = manager.issue_descriptor()
+    programs = default_start_menu_root()
+    product = programs / PRODUCT_DIRECTORY_NAME
+    product.mkdir()
+    displaced = tmp_path / "displaced-product"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    writer_called = False
+    swap_succeeded = False
+
+    def swap_then_write(path: Path, payload: dict[str, object]) -> None:
+        nonlocal swap_succeeded, writer_called
+        writer_called = True
+        try:
+            os.replace(product, displaced)
+            subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(product), str(outside)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            swap_succeeded = True
+            descriptor_fd, temporary_name = tempfile.mkstemp(
+                prefix=f".{path.name}.", dir=os.fspath(path.parent)
+            )
+            temporary = Path(temporary_name)
+            try:
+                with os.fdopen(descriptor_fd, "w", encoding="utf-8", newline="\n") as stream:
+                    json.dump(payload, stream, sort_keys=True, separators=(",", ":"))
+                    stream.write("\n")
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary, path)
+            finally:
+                temporary.unlink(missing_ok=True)
+        except OSError:
+            manager_writer(descriptor.path, payload)
+        finally:
+            if swap_succeeded:
+                subprocess.run(["cmd", "/c", "rmdir", str(product)], check=True)
+                os.replace(displaced, product)
+
+    manager_writer = shortcut_module._write_json_atomic  # type: ignore[attr-defined]
+    monkeypatch.setattr(shortcut_module, "_write_json_atomic", swap_then_write)
+
+    with suppress(DeploymentError):
+        manager.write(descriptor)
+    assert writer_called
+    assert not swap_succeeded
+    assert not any(outside.iterdir())
