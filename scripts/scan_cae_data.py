@@ -2,20 +2,32 @@ from __future__ import annotations
 
 import argparse
 import os
+import subprocess
 import sys
 from collections.abc import Callable
 from pathlib import Path
 from typing import NoReturn
 
-PROHIBITED_DIRECTORY_NAMES = frozenset({"02_cae"})
-PROHIBITED_SUFFIXES = frozenset({".fbs", ".feb", ".xplt"})
+PROHIBITED_DIRECTORY_NAMES = frozenset(
+    {
+        "01_input",
+        "02_cae",
+        "02_model",
+        "03_result",
+        "04_report",
+        "05_verification",
+        "90_temporary",
+    }
+)
+PROHIBITED_FILE_NAMES = frozenset({"case_manifest.json"})
+PROHIBITED_SUFFIXES = frozenset({".fbs", ".feb", ".log", ".step", ".stp", ".xplt"})
 IGNORED_DIRECTORY_NAMES = frozenset(
     {
         ".git",
         ".mypy_cache",
         ".pytest_cache",
+        ".pytest_tmp",
         ".ruff_cache",
-        ".tmp",
         ".venv",
         "__pycache__",
         "build",
@@ -23,17 +35,72 @@ IGNORED_DIRECTORY_NAMES = frozenset(
         "venv",
     }
 )
+IGNORED_UNTRACKED_FILE_NAMES = frozenset({"debug.log"})
+
+
+class GitInspectionError(RuntimeError):
+    """Raised when a repository index cannot be inspected reliably."""
 
 
 def raise_walk_error(error: OSError) -> NoReturn:
     raise error
 
 
+def is_prohibited_path(path: Path) -> bool:
+    normalized_parts = tuple(part.casefold() for part in path.parts)
+    return (
+        any(part in PROHIBITED_DIRECTORY_NAMES for part in normalized_parts)
+        or path.name.casefold() in PROHIBITED_FILE_NAMES
+        or path.suffix.casefold() in PROHIBITED_SUFFIXES
+    )
+
+
+def git_index_paths(root: Path) -> tuple[Path, ...]:
+    git_marker = root / ".git"
+    try:
+        top_level = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "--show-toplevel"],
+            check=False,
+            capture_output=True,
+            encoding="utf-8",
+            errors="surrogateescape",
+            text=True,
+        )
+    except FileNotFoundError as error:
+        if git_marker.exists():
+            raise GitInspectionError("git executable is unavailable") from error
+        return ()
+
+    if top_level.returncode != 0:
+        if git_marker.exists():
+            detail = top_level.stderr.strip() or "git rev-parse failed"
+            raise GitInspectionError(detail)
+        return ()
+
+    discovered_root = Path(top_level.stdout.strip()).resolve(strict=True)
+    if discovered_root != root:
+        return ()
+
+    tracked = subprocess.run(
+        ["git", "-C", str(root), "ls-files", "-z", "--cached"],
+        check=False,
+        capture_output=True,
+        encoding="utf-8",
+        errors="surrogateescape",
+        text=True,
+    )
+    if tracked.returncode != 0:
+        detail = tracked.stderr.strip() or "git ls-files failed"
+        raise GitInspectionError(detail)
+
+    return tuple(Path(item) for item in tracked.stdout.split("\0") if item)
+
+
 def find_violations(
     root: Path, *, on_error: Callable[[OSError], object] = raise_walk_error
 ) -> tuple[Path, ...]:
     resolved_root = root.resolve(strict=True)
-    violations: list[Path] = []
+    violations: set[Path] = set()
 
     for current_root, directory_names, file_names in os.walk(resolved_root, onerror=on_error):
         current_path = Path(current_root)
@@ -43,7 +110,7 @@ def find_violations(
             normalized_name = directory_name.casefold()
             candidate = current_path / directory_name
             if normalized_name in PROHIBITED_DIRECTORY_NAMES:
-                violations.append(candidate.relative_to(resolved_root))
+                violations.add(candidate.relative_to(resolved_root))
             elif normalized_name not in IGNORED_DIRECTORY_NAMES:
                 retained_directories.append(directory_name)
 
@@ -51,8 +118,15 @@ def find_violations(
 
         for file_name in file_names:
             candidate = current_path / file_name
-            if candidate.suffix.casefold() in PROHIBITED_SUFFIXES:
-                violations.append(candidate.relative_to(resolved_root))
+            relative_candidate = candidate.relative_to(resolved_root)
+            if file_name.casefold() not in IGNORED_UNTRACKED_FILE_NAMES and is_prohibited_path(
+                relative_candidate
+            ):
+                violations.add(relative_candidate)
+
+    for tracked_path in git_index_paths(resolved_root):
+        if is_prohibited_path(tracked_path):
+            violations.add(tracked_path)
 
     return tuple(sorted(violations, key=lambda path: path.as_posix().casefold()))
 
@@ -73,6 +147,9 @@ def main(argv: list[str] | None = None) -> int:
             f"CAE boundary scan failed: cannot inspect {location}: {error.strerror}",
             file=sys.stderr,
         )
+        return 2
+    except GitInspectionError as error:
+        print(f"CAE boundary scan failed: cannot inspect Git index: {error}", file=sys.stderr)
         return 2
 
     if violations:

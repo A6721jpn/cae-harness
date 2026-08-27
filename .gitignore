@@ -17,11 +17,20 @@ dist/
 htmlcov/
 
 # Local tooling output
-debug.log
+*.[lL][oO][gG]
 
 # Real CAE data must remain outside the tool repository
 02_CAE/
 **/02_CAE/
-*.feb
-*.xplt
-*.fbs
+**/01_Input/
+**/02_Model/
+**/03_Result/
+**/04_Report/
+**/05_Verification/
+**/90_Temporary/
+CASE_MANIFEST.json
+*.[fF][eE][bB]
+*.[fF][bB][sS]
+*.[sS][tT][eE][pP]
+*.[sS][tT][pP]
+*.[xX][pP][lL][tT]
