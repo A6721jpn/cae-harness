@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 import json
 import pickle
+import sys
 from copy import copy, deepcopy
 from dataclasses import is_dataclass, replace
 from pathlib import Path
@@ -39,6 +40,8 @@ from febio_cae_harness.evidence import (
     EvidenceStore,
     IntentSnapshotAuthority,
 )
+from febio_cae_harness.solver.supervisor import SolverSupervisor
+from febio_cae_harness.solver.types import SolverLaunchSpec
 from febio_cae_harness.workspace import ValidatedCaseWorkspace
 
 
@@ -91,6 +94,28 @@ def run_transition(snapshot: IntentSnapshotAuthority) -> StateTransition:
         return transition_intent(snapshot)
     except Exception as error:
         raise AssertionError("transition requires a live intent snapshot") from error
+
+
+def timeout_supervisor(
+    tmp_path: Path,
+    attempt_id: str = "attempt-a",
+    case_id: str = "case-a",
+) -> SolverSupervisor:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    input_path = tmp_path / "input.feb"
+    input_path.write_text("synthetic", encoding="utf-8")
+    spec = SolverLaunchSpec(
+        executable=Path(sys.executable),
+        input_path=input_path,
+        attempt_root=tmp_path / attempt_id,
+        arguments=("-c", "import time; time.sleep(30)"),
+    )
+    return SolverSupervisor(
+        spec,
+        case_id=case_id,
+        intent_id="intent-a",
+        attempt_id=attempt_id,
+    )
 
 
 def test_transition_binds_only_when_complete_and_blocks_authoritative_unknowns(
@@ -445,24 +470,62 @@ def test_proposal_authority_rejects_forgery_foreign_and_tampered_state(tmp_path:
         )
 
 
-def test_retry_ledger_accounts_only_allowed_retries() -> None:
-    ledger = RetryLedger(budget=2)
-    first = decide_retry(FailureClass.NONLINEAR_CONVERGENCE, ledger)
+def test_retry_ledger_accounts_only_allowed_retries(tmp_path: Path) -> None:
+    intent = bound_intent(retry_budget=2)
+    state = run_transition(intent_snapshot(intent, tmp_path, "ledger"))
+    ledger = RetryLedger.from_intent(state)
+
+    first_supervisor = timeout_supervisor(tmp_path / "first", case_id="case-ledger")
+    first_result = first_supervisor.run(timeout_seconds=0.1)
+    first = decide_retry(
+        FailureClass.TIMEOUT,
+        ledger,
+        intent=state,
+        solver_supervisor=first_supervisor,
+        solver_result=first_result,
+    )
     assert first.decision is RetryDecision.RETRY
     assert first.ledger.used == 1
-    second = decide_retry(FailureClass.TIMEOUT, first.ledger)
+
+    second_supervisor = timeout_supervisor(tmp_path / "second", "attempt-b", case_id="case-ledger")
+    second_result = second_supervisor.run(timeout_seconds=0.1)
+    second = decide_retry(
+        FailureClass.TIMEOUT,
+        first.ledger,
+        intent=state,
+        supervisor=second_supervisor,
+        result=second_result,
+    )
     assert second.decision is RetryDecision.RETRY
-    exhausted = decide_retry(FailureClass.TIMEOUT, second.ledger)
+    exhausted = decide_retry(
+        FailureClass.TIMEOUT,
+        second.ledger,
+        intent=state,
+        supervisor=second_supervisor,
+        result=second_result,
+    )
     assert exhausted.decision is RetryDecision.BUDGET_EXHAUSTED
     assert exhausted.ledger.used == 2
 
 
-def test_retry_does_not_turn_unresolved_non_authoritative_data_into_a_question() -> None:
+def test_retry_does_not_turn_unresolved_non_authoritative_data_into_a_question(
+    tmp_path: Path,
+) -> None:
     intent = bound_intent(
+        retry_budget=1,
         unresolved=({"condition": "contact", "authoritative": False, "source": "guess"},),
     )
+    state = run_transition(intent_snapshot(intent, tmp_path, "non-authoritative"))
+    supervisor = timeout_supervisor(
+        tmp_path / "non-authoritative-solver", case_id="case-non-authoritative"
+    )
+    result = supervisor.run(timeout_seconds=0.1)
     decision = decide_retry(
-        FailureClass.NONLINEAR_CONVERGENCE, RetryLedger(budget=1), intent=intent
+        FailureClass.TIMEOUT,
+        RetryLedger.from_intent(state),
+        intent=state,
+        supervisor=supervisor,
+        result=result,
     )
     assert decision.decision is RetryDecision.RETRY
 
@@ -508,24 +571,36 @@ def test_stale_ask_and_block_state_fails_closed_without_emitting_a_new_question(
     )
 
 
-def test_execution_policy_handles_timeout_cancel_and_disconnect_resume() -> None:
-    running = ExecutionContext(process_owned=True, process_running=True)
-    assert (
-        decide_execution(ExecutionSignal.TIMEOUT, running).action
-        is ExecutionAction.CANCEL_OWNED_PROCESS
+def test_execution_policy_handles_timeout_cancel_and_disconnect_resume(tmp_path: Path) -> None:
+    supervisor = timeout_supervisor(tmp_path / "execution")
+    supervisor.start()
+    running = ExecutionContext(
+        case_id="case-a",
+        intent_id="intent-a",
+        attempt_id="attempt-a",
+        process_owned=True,
+        process_running=True,
+        supervisor=supervisor,
     )
-    assert (
-        decide_execution(ExecutionSignal.CANCEL_REQUESTED, running).action
-        is ExecutionAction.CANCEL_OWNED_PROCESS
-    )
-    assert (
-        decide_execution(ExecutionSignal.DISCONNECTED, running).action
-        is ExecutionAction.HOLD_NO_NEW_WORK
-    )
-    assert (
-        decide_execution(ExecutionSignal.RECONNECTED, running).action
-        is ExecutionAction.RESUME_MONITORING
-    )
+    try:
+        assert (
+            decide_execution(ExecutionSignal.TIMEOUT, running).action
+            is ExecutionAction.CANCEL_OWNED_PROCESS
+        )
+        assert (
+            decide_execution(ExecutionSignal.CANCEL_REQUESTED, running).action
+            is ExecutionAction.CANCEL_OWNED_PROCESS
+        )
+        assert (
+            decide_execution(ExecutionSignal.DISCONNECTED, running).action
+            is ExecutionAction.HOLD_NO_NEW_WORK
+        )
+        assert (
+            decide_execution(ExecutionSignal.RECONNECTED, running).action
+            is ExecutionAction.RESUME_MONITORING
+        )
+    finally:
+        supervisor.cancel()
     uncorrelated = ExecutionContext(
         process_owned=True,
         process_running=True,
@@ -554,3 +629,135 @@ def test_execution_terminal_signals_are_deterministic(
     action: ExecutionAction,
 ) -> None:
     assert decide_execution(signal, ExecutionContext()).action is action
+
+
+def test_raw_retry_inputs_never_authorize_retry(tmp_path: Path) -> None:
+    intent = bound_intent(retry_budget=1)
+    state = run_transition(intent_snapshot(intent, tmp_path, "raw-retry"))
+
+    for failure, ledger, supplied_intent in (
+        (FailureClass.TIMEOUT, RetryLedger(budget=1), None),
+        (FailureEvidence(timeout=True, source="LOG"), RetryLedger.from_budget(1), intent),
+        (FailureClass.TIMEOUT, RetryLedger(budget=1), state),
+    ):
+        decision = decide_retry(failure, ledger, intent=supplied_intent)
+        assert decision.decision is not RetryDecision.RETRY
+
+
+def test_execution_actions_require_live_correlated_supervisor() -> None:
+    context = ExecutionContext(process_owned=True, process_running=True)
+    assert decide_execution(ExecutionSignal.TIMEOUT, context).action is ExecutionAction.STOP
+    assert (
+        decide_execution(ExecutionSignal.CANCEL_REQUESTED, context).action is ExecutionAction.STOP
+    )
+    assert decide_execution(ExecutionSignal.RECONNECTED, context).action is ExecutionAction.STOP
+
+
+def test_policy_has_no_importable_intent_state_factory_bypass() -> None:
+    import febio_cae_harness.autonomy.policy as policy
+
+    assert not hasattr(policy, "_INTENT_STATE_FACTORY")
+    assert not hasattr(policy, "_PROPOSAL_AUTHORITY_FACTORY")
+
+
+def test_retry_authority_rejects_forged_ledger_and_result(tmp_path: Path) -> None:
+    intent = bound_intent(retry_budget=1)
+    state = run_transition(intent_snapshot(intent, tmp_path, "authority"))
+    supervisor = timeout_supervisor(tmp_path / "solver", case_id="case-authority")
+    result = supervisor.run(timeout_seconds=0.1)
+    try:
+        ledger = RetryLedger.from_intent(state)
+        accepted = decide_retry(
+            FailureClass.TIMEOUT,
+            ledger,
+            intent=state,
+            supervisor=supervisor,
+            result=result,
+        )
+        assert accepted.decision is RetryDecision.RETRY
+
+        assert (
+            decide_retry(
+                FailureClass.TIMEOUT,
+                RetryLedger(budget=1),
+                intent=state,
+                supervisor=supervisor,
+                result=result,
+            ).decision
+            is RetryDecision.STOP
+        )
+        forged_result = replace(result)
+        assert (
+            decide_retry(
+                FailureClass.TIMEOUT,
+                ledger,
+                intent=state,
+                supervisor=supervisor,
+                result=forged_result,
+            ).decision
+            is RetryDecision.STOP
+        )
+
+        tampered = RetryLedger.from_intent(state)
+        object.__setattr__(tampered, "budget", 99)
+        assert (
+            decide_retry(
+                FailureClass.TIMEOUT,
+                tampered,
+                intent=state,
+                supervisor=supervisor,
+                result=result,
+            ).decision
+            is RetryDecision.STOP
+        )
+    finally:
+        # ``run`` has already released the process authority; this is a safe
+        # idempotent cleanup if a future supervisor implementation changes that.
+        if supervisor.result is None:
+            supervisor.cancel()
+
+
+def test_retry_authority_revalidates_the_snapshot_before_consuming_budget(
+    tmp_path: Path,
+) -> None:
+    snapshot = intent_snapshot(bound_intent(retry_budget=1), tmp_path, "stale-ledger")
+    state = run_transition(snapshot)
+    ledger = RetryLedger.from_intent(state)
+    supervisor = timeout_supervisor(tmp_path / "stale-solver", case_id="case-stale-ledger")
+    result = supervisor.run(timeout_seconds=0.1)
+    store = object.__getattribute__(snapshot, "_store")
+    payload = json.loads(store.intent_path.read_text(encoding="utf-8"))
+    payload["retry_budget"] = 99
+    store.intent_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    decision = decide_retry(
+        FailureClass.TIMEOUT,
+        ledger,
+        intent=state,
+        supervisor=supervisor,
+        result=result,
+    )
+    assert decision.decision is RetryDecision.STOP
+
+
+def test_execution_authority_rejects_mismatched_context_and_tampered_supervisor(
+    tmp_path: Path,
+) -> None:
+    supervisor = timeout_supervisor(tmp_path / "execution-authority")
+    supervisor.start()
+    context = ExecutionContext(
+        case_id="case-a",
+        intent_id="intent-a",
+        attempt_id="attempt-a",
+        process_owned=True,
+        process_running=True,
+        supervisor=supervisor,
+    )
+    try:
+        mismatch = replace(context, case_id="case-b")
+        assert decide_execution(ExecutionSignal.TIMEOUT, mismatch).action is ExecutionAction.STOP
+        object.__setattr__(supervisor, "_case_id", "case-b")
+        assert decide_execution(ExecutionSignal.TIMEOUT, context).action is ExecutionAction.STOP
+    finally:
+        object.__setattr__(supervisor, "_case_id", "case-a")
+        supervisor.cancel()

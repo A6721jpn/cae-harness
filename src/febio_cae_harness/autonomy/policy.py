@@ -18,6 +18,8 @@ from typing import Any, NoReturn, Self, cast
 
 from ..contracts import IntentContract, IntentState, JSONValue
 from ..evidence import EvidenceIntegrityError, IntentSnapshotAuthority
+from ..solver.supervisor import SolverSupervisor
+from ..solver.types import SolverRunResult, SolverState
 
 __all__ = [
     "ExecutionAction",
@@ -514,9 +516,6 @@ def has_authoritative_unresolved(intent: IntentContract) -> bool:
     return bool(unresolved_authoritative_conditions(intent))
 
 
-_INTENT_STATE_FACTORY = object()
-
-
 _IntentStateRecord = tuple[
     object,
     IntentSnapshotAuthority,
@@ -538,25 +537,18 @@ class IntentStateAuthority:
     def __new__(
         cls,
         *args: object,
-        _factory: object | None = None,
         **kwargs: object,
     ) -> IntentStateAuthority:
         del args, kwargs
-        if cls is not IntentStateAuthority:
-            raise TypeError("intent state authorities cannot be subclassed")
-        if _factory is not _INTENT_STATE_FACTORY:
-            raise TypeError("intent state authorities are issued by transition_intent")
-        return object.__new__(cls)
+        raise TypeError("intent state authorities are issued by transition_intent")
 
     def __init__(
         self,
         *args: object,
-        _factory: object | None = None,
         **kwargs: object,
     ) -> None:
         del args, kwargs
-        if _factory is not _INTENT_STATE_FACTORY:
-            raise TypeError("intent state authorities are issued by transition_intent")
+        raise TypeError("intent state authorities are issued by transition_intent")
 
     def __init_subclass__(cls, **kwargs: object) -> None:
         del kwargs
@@ -590,7 +582,7 @@ class IntentStateAuthority:
         intent = (
             persisted_intent if current is previous else replace(persisted_intent, state=current)
         )
-        authority = cls(_factory=_INTENT_STATE_FACTORY)
+        authority = object.__new__(cls)
         _INTENT_STATE_RECORDS[id(authority)] = (
             authority,
             snapshot,
@@ -1084,10 +1076,9 @@ class _Opaque:
 class ProposalAuthority(_Opaque):
     __slots__ = ()
 
-    def __new__(cls, *, _factory: object | None = None) -> ProposalAuthority:
-        if cls is not ProposalAuthority or _factory is not _PROPOSAL_AUTHORITY_FACTORY:
-            raise TypeError("proposal tokens are manager-issued")
-        return object.__new__(cls)
+    def __new__(cls, *args: object, **kwargs: object) -> ProposalAuthority:
+        del args, kwargs
+        raise TypeError("proposal tokens are manager-issued")
 
     def __init_subclass__(cls, **kwargs: object) -> NoReturn:
         raise TypeError("proposal authorities cannot be subclassed")
@@ -1122,7 +1113,6 @@ class ProposalAuthorityManager(_Opaque):
         )
 
 
-_PROPOSAL_AUTHORITY_FACTORY = object()
 ProposalValidationReceipt = ProposalAuthority
 type _ProposalManagerRecord = tuple[Any, ...]
 type _ProposalTokenRecord = tuple[Any, ...]
@@ -1353,6 +1343,19 @@ class RetryBudgetExceeded(RuntimeError):
     """Raised when a caller tries to consume an exhausted retry budget."""
 
 
+type _RetryLedgerRecord = tuple[
+    RetryLedger,
+    IntentStateAuthority,
+    IntentSnapshotAuthority,
+    str,
+    str,
+    str,
+    int | None,
+    tuple[object, ...],
+]
+_RETRY_LEDGER_RECORDS: dict[int, _RetryLedgerRecord] = {}
+
+
 @dataclass(frozen=True, slots=True)
 class RetryLedger:
     """Immutable retry accounting derived from ``IntentContract.execution_budget``."""
@@ -1373,10 +1376,10 @@ class RetryLedger:
         object.__setattr__(self, "records", tuple(self.records))
 
     @classmethod
-    def from_intent(cls, intent: IntentContract) -> Self:
-        if not isinstance(intent, IntentContract):
-            raise TypeError("intent must be an IntentContract")
-        return cls(budget=intent.execution_budget.retry_budget)
+    def from_intent(cls, intent: IntentStateAuthority) -> Self:
+        """Issue an empty ledger from a live, bound intent authority."""
+
+        return cast(Self, _issue_retry_ledger(intent))
 
     @classmethod
     def from_budget(cls, budget: int | None) -> Self:
@@ -1448,6 +1451,83 @@ class RetryLedger:
         )
 
 
+def _retry_record_projection(record: RetryRecord) -> tuple[object, ...]:
+    if type(record) is not RetryRecord:
+        raise EvidenceIntegrityError("retry ledger contains a non-canonical record")
+    failure = record.failure
+    if type(failure) is not FailureClass:
+        raise EvidenceIntegrityError("retry ledger failure classification is invalid")
+    for value, label in (
+        (record.attempt_id, "attempt identifier"),
+        (record.proposal_id, "proposal identifier"),
+    ):
+        if value is not None and (not isinstance(value, str) or not value.strip()):
+            raise EvidenceIntegrityError(f"retry ledger {label} is invalid")
+    evidence_ids = tuple(record.evidence_ids)
+    if any(not isinstance(value, str) or not value.strip() for value in evidence_ids):
+        raise EvidenceIntegrityError("retry ledger evidence identifiers are invalid")
+    return (failure, record.attempt_id, record.proposal_id, evidence_ids)
+
+
+def _retry_ledger_projection(ledger: RetryLedger) -> tuple[object, ...]:
+    if type(ledger) is not RetryLedger:
+        raise EvidenceIntegrityError("retry ledger must be an exact RetryLedger")
+    records = tuple(_retry_record_projection(record) for record in ledger.records)
+    if ledger.used != len(records):
+        raise EvidenceIntegrityError("retry ledger used count does not match its records")
+    return (ledger.budget, ledger.used, records)
+
+
+def _issue_retry_ledger(
+    state_authority: IntentStateAuthority,
+    *,
+    used: int = 0,
+    records: Iterable[RetryRecord] = (),
+) -> RetryLedger:
+    state_record = _state_authority_record(state_authority, bound=True)
+    snapshot = state_record[1]
+    intent = state_record[3]
+    budget = intent.execution_budget.retry_budget
+    ledger = RetryLedger(budget=budget, used=used, records=tuple(records))
+    projection = _retry_ledger_projection(ledger)
+    _RETRY_LEDGER_RECORDS[id(ledger)] = (
+        ledger,
+        state_authority,
+        snapshot,
+        snapshot.case_id,
+        snapshot.case_sha256,
+        snapshot.intent_sha256,
+        budget,
+        projection,
+    )
+    return ledger
+
+
+def _validated_retry_ledger(
+    ledger: RetryLedger,
+    state_authority: IntentStateAuthority,
+) -> _RetryLedgerRecord:
+    if type(ledger) is not RetryLedger:
+        raise TypeError("retry ledger must be an exact RetryLedger")
+    record = _RETRY_LEDGER_RECORDS.get(id(ledger))
+    if record is None or record[0] is not ledger:
+        raise EvidenceIntegrityError("retry ledger is not registry-issued")
+    state_record = _state_authority_record(state_authority, bound=True)
+    snapshot = state_record[1]
+    if (
+        record[1] is not state_authority
+        or record[2] is not snapshot
+        or (snapshot.case_id, snapshot.case_sha256, snapshot.intent_sha256) != record[3:6]
+    ):
+        raise EvidenceIntegrityError("retry ledger authority or snapshot is stale")
+    canonical_budget = state_record[3].execution_budget.retry_budget
+    if record[6] != canonical_budget or ledger.budget != canonical_budget:
+        raise EvidenceIntegrityError("retry ledger budget does not match the live intent")
+    if _retry_ledger_projection(ledger) != record[7]:
+        raise EvidenceIntegrityError("retry ledger projection was modified")
+    return record
+
+
 @dataclass(frozen=True, slots=True)
 class RetryResult:
     """Retry decision and the resulting immutable ledger."""
@@ -1471,32 +1551,98 @@ class RetryResult:
         return self.decision is RetryDecision.RETRY
 
 
+def _solver_result_is_authoritative(
+    supervisor: object,
+    result: object,
+) -> bool:
+    if type(supervisor) is not SolverSupervisor or type(result) is not SolverRunResult:
+        return False
+    try:
+        validated = SolverSupervisor._validate_result(supervisor, result)
+    except Exception:
+        return False
+    if validated is not result:
+        return False
+    return not (
+        result.success
+        or (
+            result.state is SolverState.NORMAL_EXIT
+            and result.classification.value == "FBS_UNVERIFIED"
+        )
+    )
+
+
 def decide_retry(
     failure: FailureEvidence | Mapping[str, object] | FailureClass | str | None,
     ledger: RetryLedger,
     *,
-    intent: IntentContract | None = None,
+    intent: IntentStateAuthority | IntentContract | None = None,
+    state_authority: IntentStateAuthority | None = None,
     proposal: Proposal | None = None,
     validation_passed: bool = False,
+    result: SolverRunResult | None = None,
+    solver_result: SolverRunResult | None = None,
+    supervisor: SolverSupervisor | None = None,
+    solver_supervisor: SolverSupervisor | None = None,
 ) -> RetryResult:
-    """Classify a failure and account for exactly one permitted retry."""
+    """Classify a failure and account for one authority-backed retry."""
 
     if not isinstance(ledger, RetryLedger):
         raise TypeError("ledger must be a RetryLedger")
-    routing = route_failure(failure, intent=intent)
-    classification = routing.classification
+
+    if result is not None and solver_result is not None and result is not solver_result:
+        raise TypeError("supply only one solver result")
     if (
-        intent is not None
-        and intent.state is IntentState.ASK_AND_BLOCK
-        and not routing.blocking_conditions
+        supervisor is not None
+        and solver_supervisor is not None
+        and supervisor is not solver_supervisor
     ):
+        raise TypeError("supply only one solver supervisor")
+    effective_result = result if result is not None else solver_result
+    effective_supervisor = supervisor if supervisor is not None else solver_supervisor
+
+    if intent is not None and type(intent) not in {IntentContract, IntentStateAuthority}:
+        raise TypeError("intent must be an IntentContract or IntentStateAuthority")
+    if state_authority is not None and type(state_authority) is not IntentStateAuthority:
+        raise TypeError("state_authority must be an exact IntentStateAuthority")
+    if (
+        state_authority is not None
+        and type(intent) is IntentStateAuthority
+        and state_authority is not intent
+    ):
+        raise TypeError("intent and state_authority must identify the same authority")
+
+    authority = state_authority
+    if authority is None and type(intent) is IntentStateAuthority:
+        authority = intent
+    route_intent: IntentContract | None = intent if type(intent) is IntentContract else None
+    authority_record: _IntentStateRecord | None = None
+    if authority is not None:
+        try:
+            authority_record = _state_authority_record(authority, bound=True)
+            route_intent = authority_record[3]
+        except (EvidenceIntegrityError, TypeError):
+            authority_record = None
+
+    routing = route_failure(failure, intent=route_intent)
+    classification = routing.classification
+
+    def stopped(reason: str) -> RetryResult:
         return RetryResult(
             decision=RetryDecision.STOP,
             ledger=ledger,
             failure=classification,
-            reason="ASK_AND_BLOCK state lacks a current authoritative condition record",
+            reason=reason,
             route=FailureRoute.STOP,
         )
+
+    ask_and_block = (
+        authority_record is not None and authority_record[5] is IntentState.ASK_AND_BLOCK
+    ) or (route_intent is not None and route_intent.state is IntentState.ASK_AND_BLOCK)
+    if ask_and_block and not routing.blocking_conditions:
+        return stopped("ASK_AND_BLOCK state lacks a current authoritative condition record")
+    if authority is not None and authority_record is None:
+        return stopped("intent state authority is stale or invalid")
     if routing.route is FailureRoute.ASK_AND_BLOCK:
         return RetryResult(
             decision=RetryDecision.ASK_AND_BLOCK,
@@ -1514,10 +1660,10 @@ def decide_retry(
             route=routing.route,
         )
     if proposal is not None:
-        if intent is None:
+        if route_intent is None:
             raise ValueError("intent is required when evaluating a proposal")
         proposal_decision = decide_proposal(
-            intent,
+            authority if authority is not None else route_intent,
             proposal,
             validation_passed=validation_passed,
         )
@@ -1538,13 +1684,17 @@ def decide_retry(
                 route=FailureRoute.STOP,
             )
     if not routing.retryable:
-        return RetryResult(
-            decision=RetryDecision.STOP,
-            ledger=ledger,
-            failure=classification,
-            reason=routing.rationale,
-            route=FailureRoute.STOP,
-        )
+        return stopped(routing.rationale)
+    if authority is None or authority_record is None:
+        return stopped("retry requires a live BOUND intent state authority")
+    try:
+        _validated_retry_ledger(ledger, authority)
+    except (EvidenceIntegrityError, TypeError):
+        return stopped("retry requires a registry-issued ledger bound to the live intent")
+    if not _solver_result_is_authoritative(effective_supervisor, effective_result):
+        return stopped("retry requires the exact failed result issued by its solver supervisor")
+    if object.__getattribute__(effective_supervisor, "_case_id") != authority_record[1].case_id:
+        return stopped("solver result is not correlated to the live intent case")
     if not ledger.can_retry:
         return RetryResult(
             decision=RetryDecision.BUDGET_EXHAUSTED,
@@ -1565,10 +1715,17 @@ def decide_retry(
         raw_id = failure.get("evidence_id")
         if isinstance(raw_id, str):
             evidence_ids = evidence_ids + (raw_id,)
-    next_ledger = ledger.consume(
+    attempt_id = getattr(effective_supervisor, "_attempt_id", None)
+    record = RetryRecord(
         failure=classification,
+        attempt_id=attempt_id if isinstance(attempt_id, str) else None,
         proposal_id=proposal.proposal_id if proposal is not None else None,
         evidence_ids=evidence_ids,
+    )
+    next_ledger = _issue_retry_ledger(
+        authority,
+        used=ledger.used + 1,
+        records=ledger.records + (record,),
     )
     return RetryResult(
         decision=RetryDecision.RETRY,
@@ -1590,6 +1747,9 @@ class ExecutionContext:
     client_connected: bool = True
     correlation_verified: bool = True
     exit_code: int | None = None
+    intent_id: str | None = None
+    supervisor: SolverSupervisor | None = None
+    solver_supervisor: SolverSupervisor | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1633,9 +1793,71 @@ def _execution_signal(value: ExecutionSignal | str) -> ExecutionSignal:
         raise ValueError(f"unsupported execution signal: {value!r}") from error
 
 
+def _live_correlated_supervisor(
+    context: ExecutionContext,
+    supervisor: object,
+) -> bool:
+    if type(supervisor) is not SolverSupervisor:
+        return False
+    context_supervisors = tuple(
+        value for value in (context.supervisor, context.solver_supervisor) if value is not None
+    )
+    if any(value is not supervisor for value in context_supervisors):
+        return False
+    if (
+        context.process_owned is not True
+        or context.process_running is not True
+        or context.correlation_verified is not True
+    ):
+        return False
+    try:
+        if supervisor.state is not SolverState.RUNNING:
+            return False
+        process = object.__getattribute__(supervisor, "_process")
+        process_authority = object.__getattribute__(supervisor, "_process_authority")
+        internal_record = object.__getattribute__(supervisor, "_process_record")
+        if process is None or process_authority is None or not isinstance(internal_record, dict):
+            return False
+        pid = getattr(process, "pid", None)
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+            return False
+        record = SolverSupervisor._read_process_record(supervisor)
+        if record != internal_record:
+            return False
+        metadata, _, authority = SolverSupervisor._validate_process_record(supervisor, record)
+        try:
+            if (
+                not metadata.alive
+                or metadata.return_code is not None
+                or metadata.creation_identity == ""
+            ):
+                return False
+            if metadata.creation_identity != record.get("process_creation_identity"):
+                return False
+            if record.get("pid") != pid:
+                return False
+            for field_name in ("case_id", "intent_id", "attempt_id"):
+                expected = object.__getattribute__(supervisor, f"_{field_name}")
+                if not isinstance(expected, str) or not expected.strip():
+                    return False
+                if record.get(field_name) != expected:
+                    return False
+                context_value = getattr(context, field_name)
+                if context_value is not None and context_value != expected:
+                    return False
+            return True
+        finally:
+            authority.close()
+    except Exception:
+        return False
+
+
 def decide_execution(
     signal: ExecutionSignal | str,
     context: ExecutionContext | None = None,
+    *,
+    supervisor: SolverSupervisor | None = None,
+    solver_supervisor: SolverSupervisor | None = None,
 ) -> ExecutionDecision:
     """Decide timeout, cancel, disconnect, and resume behavior.
 
@@ -1648,6 +1870,22 @@ def decide_execution(
     context = context or ExecutionContext()
     if not isinstance(context, ExecutionContext):
         raise TypeError("context must be an ExecutionContext")
+    if (
+        supervisor is not None
+        and solver_supervisor is not None
+        and supervisor is not solver_supervisor
+    ):
+        raise TypeError("supply only one solver supervisor")
+    effective_supervisor = supervisor if supervisor is not None else solver_supervisor
+    context_supervisor = context.supervisor or context.solver_supervisor
+    if (
+        effective_supervisor is not None
+        and context_supervisor is not None
+        and effective_supervisor is not context_supervisor
+    ):
+        raise TypeError("context and argument supervisors must identify the same authority")
+    if effective_supervisor is None:
+        effective_supervisor = context_supervisor
     normalized_signal = _execution_signal(signal)
     if normalized_signal in {ExecutionSignal.STARTED, ExecutionSignal.RUNNING}:
         return ExecutionDecision(
@@ -1680,7 +1918,7 @@ def decide_execution(
             process_owned=context.process_owned,
         )
     if normalized_signal in {ExecutionSignal.TIMEOUT, ExecutionSignal.CANCEL_REQUESTED}:
-        if context.process_owned and context.process_running:
+        if _live_correlated_supervisor(context, effective_supervisor):
             return ExecutionDecision(
                 signal=normalized_signal,
                 action=ExecutionAction.CANCEL_OWNED_PROCESS,
@@ -1701,7 +1939,7 @@ def decide_execution(
             process_owned=context.process_owned,
         )
     if normalized_signal is ExecutionSignal.RECONNECTED:
-        if context.correlation_verified and context.process_owned:
+        if _live_correlated_supervisor(context, effective_supervisor):
             return ExecutionDecision(
                 signal=normalized_signal,
                 action=ExecutionAction.RESUME_MONITORING,
