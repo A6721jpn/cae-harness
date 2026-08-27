@@ -137,11 +137,11 @@ def _close_handle(handle: int) -> None:
         os.close(handle)
 
 
-def _delete_open_directory(handle: int, label: str) -> None:
-    """Mark an open Windows directory handle for deletion."""
+def _delete_open_handle(handle: int, label: str) -> None:
+    """Mark an open Windows filesystem handle for deletion."""
 
     if os.name != "nt":
-        raise WorkspaceBoundaryError(f"handle-bound directory deletion is unavailable for {label}")
+        raise WorkspaceBoundaryError(f"handle-bound deletion is unavailable for {label}")
 
     import ctypes
 
@@ -166,6 +166,18 @@ def _delete_open_directory(handle: int, label: str) -> None:
     ):
         error = ctypes.get_last_error()
         raise WorkspaceBoundaryError(f"cannot remove {label} by handle ({error})")
+
+
+def _delete_open_directory(handle: int, label: str) -> None:
+    """Mark an open Windows directory handle for deletion."""
+
+    _delete_open_handle(handle, label)
+
+
+def _delete_open_file(handle: int, label: str) -> None:
+    """Mark an open Windows regular-file handle for deletion."""
+
+    _delete_open_handle(handle, label)
 
 
 def _open_directory(path: Path, label: str) -> int:
@@ -195,6 +207,21 @@ def _open_cleanup_directory(path: Path, label: str) -> int:
     )
 
 
+def _open_cleanup_file(path: Path, label: str) -> int:
+    """Open a Windows regular file for cleanup without sharing deletion."""
+
+    if os.name != "nt":
+        raise WorkspaceBoundaryError(f"handle-bound file deletion is unavailable for {label}")
+    return _windows_create(
+        path,
+        0x00010000 | 0x00000080,
+        0x0001 | 0x0002,
+        3,
+        0x00200000,
+        label,
+    )
+
+
 def _open_append_file(path: Path, label: str) -> int:
     if os.name != "nt":
         flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
@@ -211,6 +238,85 @@ def _open_append_file(path: Path, label: str) -> int:
     except OSError as error:
         _close_handle(handle_value)
         raise WorkspaceBoundaryError(f"cannot open {label}: {path}") from error
+
+
+def _windows_file_identity(handle: int, label: str) -> tuple[_IdentityStamp, bool, int]:
+    """Read identity, type, and link count from an open Windows file handle."""
+
+    if os.name != "nt":
+        raise WorkspaceBoundaryError(f"Windows file identity is unavailable for {label}")
+
+    import ctypes
+
+    class FileTime(ctypes.Structure):
+        _fields_ = [
+            ("dwLowDateTime", ctypes.c_uint32),
+            ("dwHighDateTime", ctypes.c_uint32),
+        ]
+
+    class ByHandleFileInformation(ctypes.Structure):
+        _fields_ = [
+            ("dwFileAttributes", ctypes.c_uint32),
+            ("ftCreationTime", FileTime),
+            ("ftLastAccessTime", FileTime),
+            ("ftLastWriteTime", FileTime),
+            ("dwVolumeSerialNumber", ctypes.c_uint32),
+            ("nFileSizeHigh", ctypes.c_uint32),
+            ("nFileSizeLow", ctypes.c_uint32),
+            ("nNumberOfLinks", ctypes.c_uint32),
+            ("nFileIndexHigh", ctypes.c_uint32),
+            ("nFileIndexLow", ctypes.c_uint32),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    get_file_information = kernel32.GetFileInformationByHandle
+    get_file_information.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ByHandleFileInformation),
+    ]
+    get_file_information.restype = ctypes.c_int
+    information = ByHandleFileInformation()
+    if not get_file_information(ctypes.c_void_p(handle), ctypes.byref(information)):
+        error = ctypes.get_last_error()
+        raise WorkspaceBoundaryError(f"cannot inspect {label} handle ({error})")
+    file_index = (int(information.nFileIndexHigh) << 32) | int(information.nFileIndexLow)
+    stamp = (int(information.dwVolumeSerialNumber), file_index)
+    return (
+        stamp,
+        bool(information.dwFileAttributes & 0x10),
+        int(information.nNumberOfLinks),
+    )
+
+
+def _delete_checked_file(path: Path, metadata: os.stat_result, label: str) -> None:
+    """Delete the exact checked regular file through a Windows handle."""
+
+    if os.name != "nt":
+        raise WorkspaceBoundaryError(
+            f"cannot remove {label}: exact-object cleanup is unavailable on this platform"
+        )
+
+    expected_stamp = (int(metadata.st_dev) & 0xFFFFFFFF, int(metadata.st_ino))
+    handle: int | None = None
+    try:
+        handle = _open_cleanup_file(path, label)
+        actual_stamp, is_directory, link_count = _windows_file_identity(handle, label)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or int(metadata.st_nlink) != 1
+            or is_directory
+            or actual_stamp != expected_stamp
+            or link_count != int(metadata.st_nlink)
+        ):
+            raise WorkspaceBoundaryError(f"cannot remove unowned {label}: {path}")
+        _delete_open_file(handle, label)
+    except WorkspaceBoundaryError:
+        raise
+    except OSError as error:
+        raise WorkspaceBoundaryError(f"cannot remove {label}: {path}") from error
+    finally:
+        if handle is not None:
+            _close_handle(handle)
 
 
 @contextmanager
@@ -263,6 +369,11 @@ def _remove_created_tree_contents(
 ) -> None:
     """Remove only the guarded contents of a newly-created directory tree."""
 
+    if os.name != "nt":
+        raise WorkspaceBoundaryError(
+            f"cannot remove {label}: exact-object cleanup is unavailable on this platform"
+        )
+
     checked = _reject_reparse_alias(path, label)
     handle: int | None = None
     if not already_guarded:
@@ -286,45 +397,23 @@ def _remove_created_tree_contents(
 
             if stat.S_ISDIR(metadata.st_mode):
                 child_stamp = (int(metadata.st_dev), int(metadata.st_ino))
-                if os.name == "nt":
-                    child_handle = _open_cleanup_directory(child, child_label)
-                    try:
-                        _remove_created_tree_contents(
-                            child,
-                            child_stamp,
-                            child_label,
-                            already_guarded=True,
-                        )
-                        _identity_stamp(child, child_label, child_stamp)
-                        _delete_open_directory(child_handle, child_label)
-                    finally:
-                        _close_handle(child_handle)
-                else:
-                    _remove_created_tree_contents(child, child_stamp, child_label)
+                child_handle = _open_cleanup_directory(child, child_label)
+                try:
+                    _remove_created_tree_contents(
+                        child,
+                        child_stamp,
+                        child_label,
+                        already_guarded=True,
+                    )
                     _identity_stamp(child, child_label, child_stamp)
-                    try:
-                        child.rmdir()
-                    except OSError as error:
-                        raise WorkspaceBoundaryError(
-                            f"cannot remove {child_label}: {child}"
-                        ) from error
+                    _delete_open_directory(child_handle, child_label)
+                finally:
+                    _close_handle(child_handle)
                 continue
 
             if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
                 raise WorkspaceBoundaryError(f"cannot remove unowned {child_label}: {child}")
-            try:
-                current = os.lstat(os.fspath(child))
-            except OSError as error:
-                raise WorkspaceBoundaryError(f"cannot inspect {child_label}: {child}") from error
-            if (int(current.st_dev), int(current.st_ino)) != (
-                int(metadata.st_dev),
-                int(metadata.st_ino),
-            ):
-                raise WorkspaceBoundaryError(f"{child_label} was replaced or renamed")
-            try:
-                child.unlink()
-            except OSError as error:
-                raise WorkspaceBoundaryError(f"cannot remove {child_label}: {child}") from error
+            _delete_checked_file(child, metadata, child_label)
 
         _identity_stamp(checked, label, expected)
     finally:
@@ -362,10 +451,9 @@ def _case_creation_guard(
                 finally:
                     _close_handle(cleanup_handle)
             else:
-                try:
-                    checked.rmdir()
-                except OSError as error:
-                    raise WorkspaceBoundaryError(f"cannot remove case root: {checked}") from error
+                raise WorkspaceBoundaryError(
+                    "cannot remove case root: exact-object cleanup is unavailable on this platform"
+                ) from None
             raise
         else:
             _identity_stamp(checked, "case root", case_stamp)

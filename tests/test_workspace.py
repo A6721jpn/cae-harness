@@ -693,6 +693,213 @@ def test_nested_cleanup_blocks_foreign_replacement_before_exact_delete(
     assert not child.exists(), "authoritative child directory must be deleted"
 
 
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows regular-file cleanup")
+def test_regular_file_cleanup_substitution_never_deletes_foreign_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = tmp_path / "parent"
+    child = parent / "nested.txt"
+    displaced = tmp_path / "displaced-nested.txt"
+    parent.mkdir()
+    child.write_text("authoritative", encoding="utf-8")
+    parent_stamp = workspace_module._identity_stamp(parent, "parent")
+    original_unlink = Path.unlink
+    pathname_unlink_calls: list[Path] = []
+    foreign_replacement_deleted = False
+
+    def substitute_before_unlink(path: Path, *, missing_ok: bool = False) -> None:
+        nonlocal foreign_replacement_deleted
+        if path == child:
+            path.rename(displaced)
+            path.write_text("foreign replacement", encoding="utf-8")
+        pathname_unlink_calls.append(path)
+        original_unlink(path, missing_ok=missing_ok)
+        if path == child:
+            foreign_replacement_deleted = not path.exists()
+
+    monkeypatch.setattr(Path, "unlink", substitute_before_unlink)
+    workspace_module._remove_created_tree_contents(parent, parent_stamp, "parent")
+
+    assert (
+        pathname_unlink_calls,
+        foreign_replacement_deleted,
+        displaced.exists(),
+        child.exists(),
+    ) == ([], False, False, False)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows regular-file cleanup")
+def test_regular_file_cleanup_never_calls_pathname_unlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = tmp_path / "parent"
+    child = parent / "nested.txt"
+    parent.mkdir()
+    child.write_text("authoritative", encoding="utf-8")
+    parent_stamp = workspace_module._identity_stamp(parent, "parent")
+    pathname_unlink_calls: list[Path] = []
+
+    def record_unlink(path: Path, *args: object, **kwargs: object) -> None:
+        del args, kwargs
+        pathname_unlink_calls.append(path)
+
+    monkeypatch.setattr(Path, "unlink", record_unlink)
+    workspace_module._remove_created_tree_contents(parent, parent_stamp, "parent")
+
+    assert pathname_unlink_calls == []
+    assert not child.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows regular-file cleanup")
+def test_regular_file_cleanup_handle_blocks_rename_and_closes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = tmp_path / "parent"
+    child = parent / "nested.txt"
+    displaced = tmp_path / "displaced-nested.txt"
+    parent.mkdir()
+    child.write_text("authoritative", encoding="utf-8")
+    parent_stamp = workspace_module._identity_stamp(parent, "parent")
+    original_open = workspace_module._open_cleanup_file
+    original_delete = workspace_module._delete_open_file
+    original_close = workspace_module._close_handle
+    cleanup_handles: dict[int, Path] = {}
+    closed_handles: list[int] = []
+    blocked = False
+
+    def track_open(path: Path, label: str) -> int:
+        handle = original_open(path, label)
+        cleanup_handles[handle] = path
+        return handle
+
+    def replace_before_delete(handle: int, label: str) -> None:
+        nonlocal blocked
+        if cleanup_handles.get(handle) == child:
+            with pytest.raises(OSError):
+                child.rename(displaced)
+            blocked = True
+        original_delete(handle, label)
+
+    def track_close(handle: int) -> None:
+        if handle in cleanup_handles:
+            closed_handles.append(handle)
+        original_close(handle)
+
+    monkeypatch.setattr(workspace_module, "_open_cleanup_file", track_open)
+    monkeypatch.setattr(workspace_module, "_delete_open_file", replace_before_delete)
+    monkeypatch.setattr(workspace_module, "_close_handle", track_close)
+
+    workspace_module._remove_created_tree_contents(parent, parent_stamp, "parent")
+
+    assert blocked
+    assert len(cleanup_handles) == 1
+    assert closed_handles == list(cleanup_handles)
+    assert not displaced.exists()
+    assert not child.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows regular-file cleanup")
+def test_open_cleanup_file_uses_delete_only_access_without_delete_sharing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    child = tmp_path / "nested.txt"
+    child.write_text("authoritative", encoding="utf-8")
+    calls: list[tuple[Path, int, int, int, int, str]] = []
+
+    def record_create(
+        path: Path,
+        access: int,
+        share: int,
+        disposition: int,
+        flags: int,
+        label: str,
+    ) -> int:
+        calls.append((path, access, share, disposition, flags, label))
+        return 123
+
+    monkeypatch.setattr(workspace_module, "_windows_create", record_create)
+    assert workspace_module._open_cleanup_file(child, "file") == 123
+
+    assert calls == [(child, 0x00010000 | 0x00000080, 0x0001 | 0x0002, 3, 0x00200000, "file")]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows regular-file cleanup")
+def test_regular_file_cleanup_closes_handle_when_delete_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = tmp_path / "parent"
+    child = parent / "nested.txt"
+    parent.mkdir()
+    child.write_text("authoritative", encoding="utf-8")
+    parent_stamp = workspace_module._identity_stamp(parent, "parent")
+    original_open = workspace_module._open_cleanup_file
+    original_close = workspace_module._close_handle
+    opened_handles: list[int] = []
+    closed_handles: list[int] = []
+
+    def track_open(path: Path, label: str) -> int:
+        handle = original_open(path, label)
+        opened_handles.append(handle)
+        return handle
+
+    def fail_delete(handle: int, label: str) -> None:
+        del handle, label
+        raise WorkspaceBoundaryError("injected exact-file deletion failure")
+
+    def track_close(handle: int) -> None:
+        if handle in opened_handles:
+            closed_handles.append(handle)
+        original_close(handle)
+
+    monkeypatch.setattr(workspace_module, "_open_cleanup_file", track_open)
+    monkeypatch.setattr(workspace_module, "_delete_open_file", fail_delete)
+    monkeypatch.setattr(workspace_module, "_close_handle", track_close)
+
+    with pytest.raises(WorkspaceBoundaryError, match="injected exact-file deletion failure"):
+        workspace_module._remove_created_tree_contents(parent, parent_stamp, "parent")
+
+    assert len(opened_handles) == 1
+    assert closed_handles == opened_handles
+    assert child.exists()
+
+
+def test_cleanup_fails_closed_without_exact_object_deletion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = tmp_path / "parent"
+    child = parent / "nested.txt"
+    parent.mkdir()
+    child.write_text("authoritative", encoding="utf-8")
+    parent_stamp = workspace_module._identity_stamp(parent, "parent")
+    pathname_unlink_calls: list[Path] = []
+    pathname_rmdir_calls: list[Path] = []
+
+    def record_unlink(path: Path, *args: object, **kwargs: object) -> None:
+        del args, kwargs
+        pathname_unlink_calls.append(path)
+
+    def record_rmdir(path: Path) -> None:
+        pathname_rmdir_calls.append(path)
+
+    monkeypatch.setattr(os, "name", "posix")
+    monkeypatch.setattr(Path, "unlink", record_unlink)
+    monkeypatch.setattr(Path, "rmdir", record_rmdir)
+
+    with pytest.raises(WorkspaceBoundaryError, match="exact-object cleanup is unavailable"):
+        workspace_module._remove_created_tree_contents(parent, parent_stamp, "parent")
+
+    assert pathname_unlink_calls == []
+    assert pathname_rmdir_calls == []
+    assert parent.exists()
+    assert child.read_text(encoding="utf-8") == "authoritative"
+
+
 def test_failed_promotion_removes_destination_after_source_changes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -731,9 +938,14 @@ def test_failed_case_creation_removes_partial_tree(
     else:
         monkeypatch.setattr(CaseWorkspace, "_from_manager", fail)
 
-    with pytest.raises(RuntimeError, match="creation failed"):
-        workspace.create_case("case-a", [source])
-    assert not (workspace.cae_root / "case-a").exists()
+    if os.name == "nt":
+        with pytest.raises(RuntimeError, match="creation failed"):
+            workspace.create_case("case-a", [source])
+        assert not (workspace.cae_root / "case-a").exists()
+    else:
+        with pytest.raises(WorkspaceBoundaryError, match="exact-object cleanup is unavailable"):
+            workspace.create_case("case-a", [source])
+        assert (workspace.cae_root / "case-a").exists()
 
 
 def test_failed_case_creation_never_recursively_deletes_replaced_case(
@@ -800,7 +1012,10 @@ def test_failed_case_creation_never_recursively_deletes_replaced_case(
     assert not recursive_delete_paths
     assert not recursive_delete_after_close
     assert not foreign_marker_deleted
-    assert not case_path.exists()
+    if os.name == "nt":
+        assert not case_path.exists()
+    else:
+        assert case_path.exists()
 
 
 def test_failed_case_creation_final_removal_fails_closed_on_replacement(
@@ -835,10 +1050,10 @@ def test_failed_case_creation_final_removal_fails_closed_on_replacement(
             workspace.create_case("case-a", [source])
         assert foreign_marker is None
     else:
-        with pytest.raises(WorkspaceBoundaryError, match="cannot remove case root"):
+        with pytest.raises(WorkspaceBoundaryError, match="exact-object cleanup is unavailable"):
             workspace.create_case("case-a", [source])
-        assert foreign_marker is not None
-        assert foreign_marker.read_text(encoding="utf-8") == "foreign"
+        assert foreign_marker is None
+        assert case_path.exists()
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires Windows handle-bound deletion")
