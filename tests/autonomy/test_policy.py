@@ -41,7 +41,7 @@ from febio_cae_harness.evidence import (
     IntentSnapshotAuthority,
 )
 from febio_cae_harness.solver.supervisor import SolverSupervisor
-from febio_cae_harness.solver.types import SolverLaunchSpec
+from febio_cae_harness.solver.types import SolverClassification, SolverLaunchSpec
 from febio_cae_harness.workspace import ValidatedCaseWorkspace
 
 
@@ -100,22 +100,45 @@ def timeout_supervisor(
     tmp_path: Path,
     attempt_id: str = "attempt-a",
     case_id: str = "case-a",
+    classification: SolverClassification | None = None,
 ) -> SolverSupervisor:
     tmp_path.mkdir(parents=True, exist_ok=True)
     input_path = tmp_path / "input.feb"
+    attempt_root = tmp_path / attempt_id
     input_path.write_text("synthetic", encoding="utf-8")
+    arguments = ("-c", "import time; time.sleep(30)")
+    if classification is not None:
+        log_path = attempt_root / "input.log"
+        xplt_path = attempt_root / "input.xplt"
+        arguments = (
+            "-c",
+            "from pathlib import Path; "
+            f"Path({str(log_path)!r}).write_text('synthetic'); "
+            f"Path({str(xplt_path)!r}).write_bytes(b'synthetic-xplt')",
+        )
     spec = SolverLaunchSpec(
         executable=Path(sys.executable),
         input_path=input_path,
-        attempt_root=tmp_path / attempt_id,
-        arguments=("-c", "import time; time.sleep(30)"),
+        attempt_root=attempt_root,
+        arguments=arguments,
     )
-    return SolverSupervisor(
+    supervisor = SolverSupervisor(
         spec,
         case_id=case_id,
         intent_id="intent-a",
         attempt_id=attempt_id,
     )
+    if classification is not None:
+
+        class SyntheticLogValidator:
+            def validate(self, path: Path) -> SyntheticLogValidator:
+                del path
+                return self
+
+        validator = SyntheticLogValidator()
+        object.__setattr__(validator, "classification", classification)
+        object.__setattr__(supervisor, "_log_validator", validator)
+    return supervisor
 
 
 def test_transition_binds_only_when_complete_and_blocks_authoritative_unknowns(
@@ -473,7 +496,7 @@ def test_proposal_authority_rejects_forgery_foreign_and_tampered_state(tmp_path:
 def test_retry_ledger_accounts_only_allowed_retries(tmp_path: Path) -> None:
     intent = bound_intent(retry_budget=2)
     state = run_transition(intent_snapshot(intent, tmp_path, "ledger"))
-    ledger = RetryLedger.from_intent(state)
+    ledger = RetryLedger.from_authority(state)
 
     first_supervisor = timeout_supervisor(tmp_path / "first", case_id="case-ledger")
     first_result = first_supervisor.run(timeout_seconds=0.1)
@@ -508,6 +531,75 @@ def test_retry_ledger_accounts_only_allowed_retries(tmp_path: Path) -> None:
     assert exhausted.ledger.used == 2
 
 
+@pytest.mark.parametrize(
+    ("solver_classification", "failure", "expected_failure"),
+    [
+        (SolverClassification.INIT_ONLY, FailureClass.TIMEOUT, FailureClass.UNKNOWN),
+        (SolverClassification.MISSING_OUTPUT, FailureClass.TIMEOUT, FailureClass.MISSING_OUTPUT),
+        (SolverClassification.FATAL, FailureClass.TIMEOUT, FailureClass.FATAL),
+        (
+            SolverClassification.NEGATIVE_JACOBIAN,
+            FailureClass.TIMEOUT,
+            FailureClass.NEGATIVE_JACOBIAN,
+        ),
+        (SolverClassification.INVALID_LOG, FailureClass.TIMEOUT, FailureClass.UNKNOWN),
+        (SolverClassification.FBS_INVALID, FailureClass.TIMEOUT, FailureClass.UNKNOWN),
+        (SolverClassification.TIMEOUT, FailureClass.NEGATIVE_JACOBIAN, FailureClass.TIMEOUT),
+        (SolverClassification.CANCELLED, FailureClass.TIMEOUT, FailureClass.CANCELLED),
+        (SolverClassification.CANCELLED, FailureClass.NEGATIVE_JACOBIAN, FailureClass.CANCELLED),
+    ],
+)
+def test_mismatched_failure_cannot_promote_an_issued_solver_result(
+    tmp_path: Path,
+    solver_classification: SolverClassification,
+    failure: FailureClass,
+    expected_failure: FailureClass,
+) -> None:
+    state = run_transition(intent_snapshot(bound_intent(retry_budget=1), tmp_path, "mismatch"))
+    if solver_classification is SolverClassification.TIMEOUT:
+        supervisor = timeout_supervisor(tmp_path / "solver", case_id="case-mismatch")
+        result = supervisor.run(timeout_seconds=0.1)
+    elif solver_classification is SolverClassification.CANCELLED:
+        supervisor = timeout_supervisor(tmp_path / "solver", case_id="case-mismatch")
+        supervisor.start()
+        result = supervisor.cancel()
+    else:
+        supervisor = timeout_supervisor(
+            tmp_path / "solver",
+            case_id="case-mismatch",
+            classification=solver_classification,
+        )
+        result = supervisor.run()
+    decision = decide_retry(
+        failure,
+        RetryLedger.from_authority(state),
+        intent=state,
+        supervisor=supervisor,
+        result=result,
+    )
+    assert decision.decision is not RetryDecision.RETRY
+    assert decision.failure is expected_failure
+
+
+def test_mismatched_failure_evidence_cannot_promote_same_supervisor_result(
+    tmp_path: Path,
+) -> None:
+    state = run_transition(
+        intent_snapshot(bound_intent(retry_budget=1), tmp_path, "evidence-mismatch")
+    )
+    supervisor = timeout_supervisor(tmp_path / "solver", case_id="case-evidence-mismatch")
+    result = supervisor.run(timeout_seconds=0.1)
+    decision = decide_retry(
+        FailureEvidence(negative_jacobian=True, source="LOG"),
+        RetryLedger.from_authority(state),
+        intent=state,
+        supervisor=supervisor,
+        result=result,
+    )
+    assert decision.decision is not RetryDecision.RETRY
+    assert decision.failure is FailureClass.TIMEOUT
+
+
 def test_retry_does_not_turn_unresolved_non_authoritative_data_into_a_question(
     tmp_path: Path,
 ) -> None:
@@ -522,7 +614,7 @@ def test_retry_does_not_turn_unresolved_non_authoritative_data_into_a_question(
     result = supervisor.run(timeout_seconds=0.1)
     decision = decide_retry(
         FailureClass.TIMEOUT,
-        RetryLedger.from_intent(state),
+        RetryLedger.from_authority(state),
         intent=state,
         supervisor=supervisor,
         result=result,
@@ -666,7 +758,7 @@ def test_retry_authority_rejects_forged_ledger_and_result(tmp_path: Path) -> Non
     supervisor = timeout_supervisor(tmp_path / "solver", case_id="case-authority")
     result = supervisor.run(timeout_seconds=0.1)
     try:
-        ledger = RetryLedger.from_intent(state)
+        ledger = RetryLedger.from_authority(state)
         accepted = decide_retry(
             FailureClass.TIMEOUT,
             ledger,
@@ -676,16 +768,23 @@ def test_retry_authority_rejects_forged_ledger_and_result(tmp_path: Path) -> Non
         )
         assert accepted.decision is RetryDecision.RETRY
 
-        assert (
-            decide_retry(
-                FailureClass.TIMEOUT,
-                RetryLedger(budget=1),
-                intent=state,
-                supervisor=supervisor,
-                result=result,
-            ).decision
-            is RetryDecision.STOP
-        )
+        for diagnostic in (
+            RetryLedger(budget=1),
+            RetryLedger.from_intent(intent),
+            RetryLedger.from_budget(1),
+            RetryLedger(budget=1).consume(failure=FailureClass.TIMEOUT),
+            RetryLedger(budget=1).record_retry(FailureClass.TIMEOUT),
+        ):
+            assert (
+                decide_retry(
+                    FailureClass.TIMEOUT,
+                    diagnostic,
+                    intent=state,
+                    supervisor=supervisor,
+                    result=result,
+                ).decision
+                is RetryDecision.STOP
+            )
         forged_result = replace(result)
         assert (
             decide_retry(
@@ -698,7 +797,7 @@ def test_retry_authority_rejects_forged_ledger_and_result(tmp_path: Path) -> Non
             is RetryDecision.STOP
         )
 
-        tampered = RetryLedger.from_intent(state)
+        tampered = RetryLedger.from_authority(state)
         object.__setattr__(tampered, "budget", 99)
         assert (
             decide_retry(
@@ -722,7 +821,7 @@ def test_retry_authority_revalidates_the_snapshot_before_consuming_budget(
 ) -> None:
     snapshot = intent_snapshot(bound_intent(retry_budget=1), tmp_path, "stale-ledger")
     state = run_transition(snapshot)
-    ledger = RetryLedger.from_intent(state)
+    ledger = RetryLedger.from_authority(state)
     supervisor = timeout_supervisor(tmp_path / "stale-solver", case_id="case-stale-ledger")
     result = supervisor.run(timeout_seconds=0.1)
     store = object.__getattribute__(snapshot, "_store")

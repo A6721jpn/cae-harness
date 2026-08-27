@@ -19,7 +19,7 @@ from typing import Any, NoReturn, Self, cast
 from ..contracts import IntentContract, IntentState, JSONValue
 from ..evidence import EvidenceIntegrityError, IntentSnapshotAuthority
 from ..solver.supervisor import SolverSupervisor
-from ..solver.types import SolverRunResult, SolverState
+from ..solver.types import SolverClassification, SolverRunResult, SolverState
 
 __all__ = [
     "ExecutionAction",
@@ -1376,10 +1376,20 @@ class RetryLedger:
         object.__setattr__(self, "records", tuple(self.records))
 
     @classmethod
-    def from_intent(cls, intent: IntentStateAuthority) -> Self:
-        """Issue an empty ledger from a live, bound intent authority."""
+    def from_authority(cls, authority: IntentStateAuthority) -> Self:
+        """Issue an authorized empty ledger from a live, bound state authority."""
 
-        return cast(Self, _issue_retry_ledger(intent))
+        if type(authority) is not IntentStateAuthority:
+            raise TypeError("authority must be an exact IntentStateAuthority")
+        return cast(Self, _issue_retry_ledger(authority))
+
+    @classmethod
+    def from_intent(cls, intent: IntentContract) -> Self:
+        """Create an unregistered diagnostic ledger from a raw intent contract."""
+
+        if type(intent) is not IntentContract:
+            raise TypeError("intent must be an exact IntentContract")
+        return cls(budget=intent.execution_budget.retry_budget)
 
     @classmethod
     def from_budget(cls, budget: int | None) -> Self:
@@ -1572,6 +1582,29 @@ def _solver_result_is_authoritative(
     )
 
 
+_SOLVER_FAILURE_CLASSIFICATIONS: Mapping[SolverClassification, FailureClass] = MappingProxyType(
+    {
+        SolverClassification.SUCCESS: FailureClass.NONE,
+        SolverClassification.INIT_ONLY: FailureClass.UNKNOWN,
+        SolverClassification.MISSING_OUTPUT: FailureClass.MISSING_OUTPUT,
+        SolverClassification.FATAL: FailureClass.FATAL,
+        SolverClassification.NEGATIVE_JACOBIAN: FailureClass.NEGATIVE_JACOBIAN,
+        SolverClassification.INVALID_LOG: FailureClass.UNKNOWN,
+        SolverClassification.FBS_UNVERIFIED: FailureClass.UNKNOWN,
+        SolverClassification.FBS_INVALID: FailureClass.UNKNOWN,
+        SolverClassification.TIMEOUT: FailureClass.TIMEOUT,
+        SolverClassification.CANCELLED: FailureClass.CANCELLED,
+        SolverClassification.NONZERO_EXIT: FailureClass.UNKNOWN,
+    }
+)
+
+
+def _solver_result_failure(result: SolverRunResult) -> FailureClass:
+    """Map issued solver evidence to the only retry classification it permits."""
+
+    return _SOLVER_FAILURE_CLASSIFICATIONS.get(result.classification, FailureClass.UNKNOWN)
+
+
 def decide_retry(
     failure: FailureEvidence | Mapping[str, object] | FailureClass | str | None,
     ledger: RetryLedger,
@@ -1624,8 +1657,20 @@ def decide_retry(
         except (EvidenceIntegrityError, TypeError):
             authority_record = None
 
-    routing = route_failure(failure, intent=route_intent)
-    classification = routing.classification
+    issued_result_failure: FailureClass | None = None
+    if _solver_result_is_authoritative(effective_supervisor, effective_result):
+        issued_result_failure = _solver_result_failure(cast(SolverRunResult, effective_result))
+
+    if issued_result_failure is not None:
+        classification = issued_result_failure
+        routing = route_failure(issued_result_failure, intent=route_intent)
+        failure_mismatch = (
+            failure is not None and classify_failure(failure) is not issued_result_failure
+        )
+    else:
+        routing = route_failure(failure, intent=route_intent)
+        classification = routing.classification
+        failure_mismatch = False
 
     def stopped(reason: str) -> RetryResult:
         return RetryResult(
@@ -1635,6 +1680,9 @@ def decide_retry(
             reason=reason,
             route=FailureRoute.STOP,
         )
+
+    if failure_mismatch:
+        return stopped("failure evidence does not match the exact issued solver result")
 
     ask_and_block = (
         authority_record is not None and authority_record[5] is IntentState.ASK_AND_BLOCK
@@ -1703,18 +1751,10 @@ def decide_retry(
             reason="declared retry budget is exhausted",
             route=FailureRoute.STOP,
         )
+    # A caller-supplied failure record is diagnostic context only.  The issued
+    # result carries the complete supervisor binding; no raw evidence IDs may
+    # become part of an authority-backed ledger record.
     evidence_ids: tuple[str, ...] = ()
-    if isinstance(failure, FailureEvidence):
-        evidence_ids = failure.evidence_ids
-        if failure.evidence_id is not None:
-            evidence_ids = evidence_ids + (failure.evidence_id,)
-    elif isinstance(failure, Mapping):
-        raw_ids = failure.get("evidence_ids", ())
-        if isinstance(raw_ids, (list, tuple)):
-            evidence_ids = tuple(item for item in raw_ids if isinstance(item, str))
-        raw_id = failure.get("evidence_id")
-        if isinstance(raw_id, str):
-            evidence_ids = evidence_ids + (raw_id,)
     attempt_id = getattr(effective_supervisor, "_attempt_id", None)
     record = RetryRecord(
         failure=classification,
