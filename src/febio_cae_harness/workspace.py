@@ -208,18 +208,101 @@ def _parent_guard(
         yield
 
 
+def _remove_created_tree_contents(
+    path: Path,
+    expected: _IdentityStamp,
+    label: str,
+    *,
+    already_guarded: bool = False,
+) -> None:
+    """Remove only the guarded contents of a newly-created directory tree."""
+
+    checked = _reject_reparse_alias(path, label)
+    handle: int | None = None
+    if not already_guarded:
+        handle = _open_directory(checked, label)
+    try:
+        _identity_stamp(checked, label, expected)
+        try:
+            entries = tuple(os.scandir(os.fspath(checked)))
+        except OSError as error:
+            raise WorkspaceBoundaryError(f"cannot inspect {label}: {checked}") from error
+
+        for entry in entries:
+            _identity_stamp(checked, label, expected)
+            child = Path(entry.path)
+            child_label = f"{label} child"
+            _reject_reparse_alias(child, child_label)
+            try:
+                metadata = os.lstat(os.fspath(child))
+            except OSError as error:
+                raise WorkspaceBoundaryError(f"cannot inspect {child_label}: {child}") from error
+
+            if stat.S_ISDIR(metadata.st_mode):
+                child_stamp = (int(metadata.st_dev), int(metadata.st_ino))
+                _remove_created_tree_contents(child, child_stamp, child_label)
+                _identity_stamp(child, child_label, child_stamp)
+                try:
+                    child.rmdir()
+                except OSError as error:
+                    raise WorkspaceBoundaryError(f"cannot remove {child_label}: {child}") from error
+                continue
+
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                raise WorkspaceBoundaryError(f"cannot remove unowned {child_label}: {child}")
+            try:
+                current = os.lstat(os.fspath(child))
+            except OSError as error:
+                raise WorkspaceBoundaryError(f"cannot inspect {child_label}: {child}") from error
+            if (int(current.st_dev), int(current.st_ino)) != (
+                int(metadata.st_dev),
+                int(metadata.st_ino),
+            ):
+                raise WorkspaceBoundaryError(f"{child_label} was replaced or renamed")
+            try:
+                child.unlink()
+            except OSError as error:
+                raise WorkspaceBoundaryError(f"cannot remove {child_label}: {child}") from error
+
+        _identity_stamp(checked, label, expected)
+    finally:
+        if handle is not None:
+            _close_handle(handle)
+
+
 @contextmanager
 def _case_creation_guard(
     manager: ValidatedCaseWorkspace, case_path: Path, case_stamp: _IdentityStamp
 ) -> Iterator[None]:
+    checked = _reject_reparse_alias(case_path, "case root")
+    handle = _open_directory(checked, "case root")
     try:
-        with _directory_guard(case_path, case_stamp, "case root"):
+        _identity_stamp(checked, "case root", case_stamp)
+        try:
             yield
-    except Exception:
-        _require_registered_manager(manager)
-        _identity_stamp(case_path, "case root", case_stamp)
-        shutil.rmtree(case_path)
-        raise
+        except BaseException:
+            _require_registered_manager(manager)
+            _identity_stamp(checked, "case root", case_stamp)
+            _remove_created_tree_contents(
+                checked,
+                case_stamp,
+                "case root",
+                already_guarded=True,
+            )
+            _identity_stamp(checked, "case root", case_stamp)
+            _close_handle(handle)
+            handle = -1
+            _identity_stamp(checked, "case root", case_stamp)
+            try:
+                checked.rmdir()
+            except OSError as error:
+                raise WorkspaceBoundaryError(f"cannot remove case root: {checked}") from error
+            raise
+        else:
+            _identity_stamp(checked, "case root", case_stamp)
+    finally:
+        if handle != -1:
+            _close_handle(handle)
 
 
 def _registered_case_stamp(case: CaseWorkspace) -> _IdentityStamp:

@@ -5,6 +5,7 @@ import dataclasses
 import json
 import os
 import pickle
+import shutil
 import subprocess
 from collections.abc import Callable
 from pathlib import Path
@@ -651,3 +652,104 @@ def test_failed_case_creation_removes_partial_tree(
     with pytest.raises(RuntimeError, match="creation failed"):
         workspace.create_case("case-a", [source])
     assert not (workspace.cae_root / "case-a").exists()
+
+
+def test_failed_case_creation_never_recursively_deletes_replaced_case(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "input.feb"
+    source.write_bytes(b"input")
+    workspace = make_workspace(tmp_path)
+    case_path = workspace.cae_root / "case-a"
+    original_open_directory = workspace_module._open_directory
+    original_close_handle = workspace_module._close_handle
+    open_handles: dict[int, Path] = {}
+    case_guard_closed = False
+
+    def track_open(path: Path, label: str) -> int:
+        handle = original_open_directory(path, label)
+        open_handles[handle] = path
+        return handle
+
+    def track_close(handle: int) -> None:
+        nonlocal case_guard_closed
+        if open_handles.pop(handle, None) == case_path:
+            case_guard_closed = True
+        original_close_handle(handle)
+
+    monkeypatch.setattr(workspace_module, "_open_directory", track_open)
+    monkeypatch.setattr(workspace_module, "_close_handle", track_close)
+
+    original_rmtree = shutil.rmtree
+    recursive_delete_paths: list[Path] = []
+    foreign_marker_deleted = False
+    recursive_delete_after_close = False
+
+    def replace_before_recursive_delete(path: str | Path) -> None:
+        nonlocal foreign_marker_deleted, recursive_delete_after_close
+        if Path(path) == case_path:
+            recursive_delete_paths.append(Path(path))
+            recursive_delete_after_close = case_guard_closed
+            displaced = tmp_path / "displaced-case"
+            case_path.rename(displaced)
+            case_path.mkdir()
+            foreign_marker = case_path / "foreign-marker.txt"
+            foreign_marker.write_text("foreign", encoding="utf-8")
+            original_rmtree(path)
+            foreign_marker_deleted = not foreign_marker.exists()
+            return
+        original_rmtree(path)
+
+    monkeypatch.setattr(
+        shutil,
+        "rmtree",
+        replace_before_recursive_delete,
+    )
+
+    def fail(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("creation failed")
+
+    monkeypatch.setattr("febio_cae_harness.workspace.shutil.copyfileobj", fail)
+
+    with pytest.raises(RuntimeError, match="creation failed"):
+        workspace.create_case("case-a", [source])
+
+    assert not recursive_delete_paths
+    assert not recursive_delete_after_close
+    assert not foreign_marker_deleted
+    assert not case_path.exists()
+
+
+def test_failed_case_creation_final_removal_fails_closed_on_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "input.feb"
+    source.write_bytes(b"input")
+    workspace = make_workspace(tmp_path)
+    case_path = workspace.cae_root / "case-a"
+    original_rmdir = Path.rmdir
+    foreign_marker: Path | None = None
+
+    def replace_before_final_rmdir(path: Path) -> None:
+        nonlocal foreign_marker
+        if path == case_path:
+            path.rename(tmp_path / "displaced-case")
+            path.mkdir()
+            foreign_marker = path / "foreign-marker.txt"
+            foreign_marker.write_text("foreign", encoding="utf-8")
+        original_rmdir(path)
+
+    monkeypatch.setattr(Path, "rmdir", replace_before_final_rmdir)
+
+    def fail(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("creation failed")
+
+    monkeypatch.setattr("febio_cae_harness.workspace.shutil.copyfileobj", fail)
+
+    with pytest.raises(WorkspaceBoundaryError, match="cannot remove case root"):
+        workspace.create_case("case-a", [source])
+
+    assert foreign_marker is not None
+    assert foreign_marker.read_text(encoding="utf-8") == "foreign"
