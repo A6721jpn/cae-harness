@@ -50,6 +50,11 @@ from .feb import (
     inventory_feb_xml,
     reference_closure,
 )
+from .incomplete import (
+    IncompleteFebInventory,
+    MissingConditionQuestion,
+    inspect_incomplete_feb,
+)
 from .plan import (
     ChangeProposal,
     DerivedModel,
@@ -128,9 +133,11 @@ __all__ = [
     "FEBXmlInspection",
     "FEBStructuralInventory",
     "IntentImpact",
+    "IncompleteFebInventory",
     "MeshDescriptor",
     "MeshIntent",
     "MissingConditionFact",
+    "MissingConditionQuestion",
     "MissingCondition",
     "ModelChange",
     "OriginalInput",
@@ -172,6 +179,7 @@ __all__ = [
     "inspect_feb",
     "inspect_feb_file",
     "inspect_feb_xml",
+    "inspect_incomplete_feb",
     "inspect_preflight",
     "inspect_step",
     "inspect_step_file",
