@@ -6,7 +6,6 @@ import contextlib
 import json
 import math
 import os
-import signal
 import subprocess
 import threading
 import time
@@ -25,6 +24,7 @@ from .fbs import (
     validate_requested_fields,
 )
 from .log import LogValidation, LogValidator, validate_log
+from .process_authority import ProcessAuthority, ProcessAuthorityError
 from .types import (
     OutputFreshnessError,
     SolverClassification,
@@ -157,20 +157,38 @@ def _process_action(process: subprocess.Popen[bytes] | _ReconnectedProcess, acti
 class _ReconnectedProcess:
     """Small process handle for a process that is not this client's child."""
 
-    def __init__(self, pid: int, executable_path: str, creation_identity: str) -> None:
+    def __init__(
+        self,
+        pid: int,
+        executable_path: str,
+        creation_identity: str,
+        authority: ProcessAuthority,
+    ) -> None:
         self.pid = pid
         self._executable_path = executable_path
         self._creation_identity = creation_identity
+        self._authority = authority
 
     def poll(self) -> int | None:
-        metadata = _process_metadata(self.pid)
+        try:
+            metadata = _process_metadata(self.pid)
+        except ProcessLookupError:
+            return 1
+        if not metadata.alive:
+            return metadata.return_code
         if metadata.alive and (
             _normalise_executable(metadata.executable_path)
             != _normalise_executable(self._executable_path)
             or metadata.creation_identity != self._creation_identity
         ):
             raise SolverOwnershipError("reconnected process identity no longer matches")
-        return None if metadata.alive else metadata.return_code
+        try:
+            self._authority.verify(self.pid)
+        except ProcessAuthorityError as error:
+            raise SolverOwnershipError(
+                "reconnected process authority is no longer valid"
+            ) from error
+        return None
 
     def wait(self, timeout: float | None = None) -> int | None:
         deadline = None if timeout is None else time.monotonic() + timeout
@@ -227,6 +245,7 @@ class SolverSupervisor:
         self._lock = threading.RLock()
         self._state = SolverState.NOT_STARTED
         self._process: subprocess.Popen[bytes] | _ReconnectedProcess | None = None
+        self._process_authority: ProcessAuthority | None = None
         self._started_at: datetime | None = None
         self._result: SolverRunResult | None = None
         self._process_record: dict[str, object] | None = None
@@ -269,6 +288,7 @@ class SolverSupervisor:
             if self._state is not SolverState.NOT_STARTED:
                 raise RuntimeError(f"solver cannot start from state {self._state}")
 
+            authority: ProcessAuthority | None = None
             try:
                 self.spec.prepare_outputs()
                 if os.path.lexists(os.fspath(self.process_record_path)):
@@ -277,6 +297,7 @@ class SolverSupervisor:
                     )
                 if not self.spec.input_path.is_file():
                     raise FileNotFoundError(f"solver input does not exist: {self.spec.input_path}")
+                authority = ProcessAuthority.create(self.spec.attempt_root)
                 environment = os.environ.copy()
                 environment.update(self.spec.environment)
                 # These markers let a child process discover its owned attempt
@@ -286,10 +307,16 @@ class SolverSupervisor:
                 outputs = self.spec.expected_outputs
                 environment["FEBIO_CAE_HARNESS_LOG"] = os.fspath(outputs.log_path)
                 environment["FEBIO_CAE_HARNESS_XPLT"] = os.fspath(outputs.xplt_path)
+                environment.update(authority.child_environment())
 
                 process: subprocess.Popen[bytes] | None = None
                 if os.name == "nt":
                     creation_flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                    child_handle = authority.child_handle()
+                    if child_handle is None:
+                        raise ProcessAuthorityError("process attestation handle is unavailable")
+                    startup_info = subprocess.STARTUPINFO()
+                    startup_info.lpAttributeList = {"handle_list": [child_handle]}
                     process = subprocess.Popen(
                         self.spec.command,
                         cwd=os.fspath(self.spec.cwd),
@@ -299,6 +326,8 @@ class SolverSupervisor:
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,
                         creationflags=creation_flags,
+                        close_fds=True,
+                        startupinfo=startup_info,
                     )
                 else:
                     process = subprocess.Popen(
@@ -310,20 +339,37 @@ class SolverSupervisor:
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,
                         start_new_session=True,
+                        pass_fds=authority.child_pass_fds(),
                     )
                 started_at = datetime.now(UTC)
                 metadata = _process_metadata(process.pid)
+                authority.bind(process.pid)
                 self._process = process
                 self._started_at = started_at
-                self._process_record = self._make_process_record(process.pid, metadata, started_at)
+                self._process_authority = authority
+                self._process_record = self._make_process_record(
+                    process.pid, metadata, started_at, authority
+                )
                 self._write_process_record(self._process_record)
             except (OSError, OutputFreshnessError, ValueError) as error:
                 process = locals().get("process")
                 if isinstance(process, subprocess.Popen):
                     try:
-                        self._terminate_owned_process(process)
-                    except (OSError, ProcessLookupError, subprocess.TimeoutExpired):
-                        _process_action(process, "kill")
+                        if authority is not None and self._process_authority is authority:
+                            self._terminate_owned_process(process)
+                        else:
+                            process.kill()
+                            process.wait(timeout=2.0)
+                    except (
+                        OSError,
+                        ProcessLookupError,
+                        SolverOwnershipError,
+                        subprocess.TimeoutExpired,
+                    ):
+                        with contextlib.suppress(OSError):
+                            process.kill()
+                if authority is not None:
+                    authority.close()
                 self._state = SolverState.FAILED
                 raise SolverLaunchError(f"unable to launch solver: {error}") from error
 
@@ -365,12 +411,13 @@ class SolverSupervisor:
             log_validator=log_validator,
         )
         record = supervisor._read_process_record()
-        metadata, started_at = supervisor._validate_process_record(record)
+        metadata, started_at, authority = supervisor._validate_process_record(record)
         supervisor._process_record = record
         pid = cast(int, record["pid"])
         supervisor._process = _ReconnectedProcess(
-            pid, metadata.executable_path, metadata.creation_identity
+            pid, metadata.executable_path, metadata.creation_identity, authority
         )
+        supervisor._process_authority = authority
         supervisor._started_at = started_at
         supervisor._state = SolverState.RUNNING
         return supervisor
@@ -437,7 +484,11 @@ class SolverSupervisor:
         return self._complete(SolverState.CANCELLED, process.poll())
 
     def _make_process_record(
-        self, pid: int, metadata: _ProcessMetadata, started_at: datetime
+        self,
+        pid: int,
+        metadata: _ProcessMetadata,
+        started_at: datetime,
+        authority: ProcessAuthority,
     ) -> dict[str, object]:
         outputs = self.spec.expected_outputs
         return {
@@ -452,6 +503,7 @@ class SolverSupervisor:
                 "log": str(outputs.log_path),
                 "xplt": str(outputs.xplt_path),
             },
+            "process_authority": authority.claim,
         }
 
     def _write_process_record(self, record: dict[str, object]) -> None:
@@ -494,7 +546,7 @@ class SolverSupervisor:
 
     def _validate_process_record(
         self, record: dict[str, object]
-    ) -> tuple[_ProcessMetadata, datetime]:
+    ) -> tuple[_ProcessMetadata, datetime, ProcessAuthority]:
         expected_ids = {
             "case_id": self._case_id,
             "intent_id": self._intent_id,
@@ -542,7 +594,19 @@ class SolverSupervisor:
             raise SolverOwnershipError("current process executable does not match")
         if metadata.creation_identity != identity:
             raise SolverOwnershipError("current process creation identity does not match")
-        return metadata, started_at
+        authority: ProcessAuthority | None = None
+        try:
+            authority = ProcessAuthority.from_claim(
+                self.spec.attempt_root, record.get("process_authority")
+            )
+            authority.verify(pid)
+        except ProcessAuthorityError as error:
+            if authority is not None:
+                authority.close()
+            raise SolverOwnershipError("recorded process authority is invalid") from error
+        if authority is None:  # pragma: no cover - defensive type/state guard
+            raise SolverOwnershipError("recorded process authority is unavailable")
+        return metadata, started_at, authority
 
     def _terminate_owned_process(
         self, process: subprocess.Popen[bytes] | _ReconnectedProcess
@@ -551,45 +615,22 @@ class SolverSupervisor:
 
         if process.poll() is not None:
             return
-        if os.name == "nt":
-            try:
-                subprocess.run(
-                    ["taskkill", "/PID", str(process.pid), "/T", "/F"],
-                    check=False,
-                    capture_output=True,
-                    text=True,
-                )
-            except OSError:
-                _process_action(process, "terminate")
-        else:
-            try:
-                if not self._kill_process_group(process.pid, "SIGTERM"):
-                    _process_action(process, "terminate")
-            except (OSError, ProcessLookupError):
-                _process_action(process, "terminate")
+        authority = self._process_authority
+        if authority is None:
+            raise SolverOwnershipError("process authority is unavailable")
+        try:
+            authority.terminate(process.pid)
+        except ProcessAuthorityError as error:
+            raise SolverOwnershipError("process authority could not be verified") from error
 
         try:
             process.wait(timeout=2.0)
         except subprocess.TimeoutExpired:
-            if os.name == "nt":
-                _process_action(process, "kill")
-            else:
-                try:
-                    if not self._kill_process_group(process.pid, "SIGKILL"):
-                        _process_action(process, "kill")
-                except (OSError, ProcessLookupError):
-                    _process_action(process, "kill")
+            try:
+                authority.terminate(process.pid, force=True)
+            except ProcessAuthorityError as error:
+                raise SolverOwnershipError("process authority could not be verified") from error
             process.wait(timeout=2.0)
-
-    @staticmethod
-    def _kill_process_group(pid: int, signal_name: str) -> bool:
-        kill_group = getattr(os, "killpg", None)
-        get_group = getattr(os, "getpgid", None)
-        signal_value = getattr(signal, signal_name, None)
-        if not callable(kill_group) or not callable(get_group) or signal_value is None:
-            return False
-        kill_group(get_group(pid), signal_value)
-        return True
 
     def _register_result(self, result: SolverRunResult) -> None:
         if type(result) is not SolverRunResult:
