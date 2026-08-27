@@ -91,6 +91,7 @@ from .step import (
     inspect_step_file,
     inspect_step_text,
 )
+from .step_plan import StepMeshingPlan, StepMeshingRequest, plan_step_meshing
 from .types import (
     ASK_AND_BLOCK,
     ConditionEvidence,
@@ -160,6 +161,8 @@ __all__ = [
     "StepEntity",
     "StepInspection",
     "StepInspectionError",
+    "StepMeshingPlan",
+    "StepMeshingRequest",
     "StepUnitFact",
     "UnresolvedEvidenceField",
     "UnresolvedCondition",
@@ -189,6 +192,7 @@ __all__ = [
     "inspect_step_text",
     "inventory_feb_xml",
     "plan_derived_model",
+    "plan_step_meshing",
     "preflight",
     "preflight_model",
     "reference_closure",
