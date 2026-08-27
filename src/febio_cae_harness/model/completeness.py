@@ -8,6 +8,7 @@ from types import MappingProxyType
 from typing import Any, cast
 
 from ..evidence import EvidenceIntegrityError, IntentSnapshotAuthority
+from ._immutability import freeze_json
 from .types import (
     ASK_AND_BLOCK,
     CompletenessAuthority,
@@ -173,6 +174,122 @@ class CompletenessResult:
             "complete": self.complete,
             "state": self.state,
         }
+
+
+@dataclass(frozen=True, slots=True)
+class _CompletenessResultBinding:
+    """Private capability binding for one authority-issued result."""
+
+    result: CompletenessResult
+    authority: CompletenessAuthority
+    projection: object
+
+
+_COMPLETENESS_RESULT_STATES: dict[int, _CompletenessResultBinding] = {}
+
+
+def _qualified_type(value: object) -> str:
+    value_type = type(value)
+    return f"{value_type.__module__}.{value_type.__qualname__}"
+
+
+def _field_projection(value: object) -> object:
+    """Capture result fields without retaining mutable caller aliases."""
+
+    if isinstance(value, tuple):
+        return {
+            "kind": "tuple",
+            "items": [_field_projection(item) for item in value],
+        }
+    if isinstance(value, list):
+        return {
+            "kind": "list",
+            "items": [_field_projection(item) for item in value],
+        }
+    if isinstance(value, Mapping):
+        return {
+            "kind": "mapping",
+            "items": {key: _field_projection(item) for key, item in value.items()},
+        }
+    projector = getattr(value, "to_dict", None)
+    if callable(projector):
+        return {
+            "kind": "record",
+            "type": _qualified_type(value),
+            "identity": id(value),
+            "value": projector(),
+        }
+    return {
+        "kind": "value",
+        "type": _qualified_type(value),
+        "value": value,
+    }
+
+
+def _result_projection(result: CompletenessResult) -> object:
+    """Return a detached, immutable projection of every result field."""
+
+    try:
+        projection = {
+            "fields": {
+                "required": _field_projection(result.required),
+                "resolved": _field_projection(result.resolved),
+                "missing": _field_projection(result.missing),
+                "unresolved": _field_projection(result.unresolved),
+                "evidence": _field_projection(result.evidence),
+                "state": _field_projection(result.state),
+            },
+            "to_dict": result.to_dict(),
+        }
+        return freeze_json(projection)
+    except EvidenceIntegrityError:
+        raise
+    except Exception as error:
+        raise EvidenceIntegrityError("completeness result projection is invalid") from error
+
+
+def _register_authoritative_result(
+    result: CompletenessResult,
+    authority: CompletenessAuthority,
+    projection: object,
+) -> CompletenessResult:
+    """Register an exact result only after its authority was finally checked."""
+
+    if type(result) is not CompletenessResult:
+        raise EvidenceIntegrityError("completeness result is invalid")
+    if type(authority) is not CompletenessAuthority:
+        raise EvidenceIntegrityError("completeness result authority is invalid")
+    state = _CompletenessResultBinding(result, authority, projection)
+    _COMPLETENESS_RESULT_STATES[id(result)] = state
+    return result
+
+
+def _validated_authoritative_result(
+    result: CompletenessResult,
+) -> _CompletenessResultBinding:
+    """Validate result provenance, projection, and its live authority."""
+
+    if type(result) is not CompletenessResult:
+        raise EvidenceIntegrityError("completeness result is not authority-issued")
+    state = _COMPLETENESS_RESULT_STATES.get(id(result))
+    if state is None or state.result is not result:
+        raise EvidenceIntegrityError("completeness result is not authority-issued")
+    if type(state.authority) is not CompletenessAuthority:
+        raise EvidenceIntegrityError("completeness result authority is invalid")
+    try:
+        current_projection = _result_projection(result)
+        if current_projection != state.projection:
+            raise EvidenceIntegrityError("completeness result projection changed")
+        state.authority._validated_binding()
+        final_projection = _result_projection(result)
+        if final_projection != state.projection:
+            raise EvidenceIntegrityError("completeness result projection changed")
+        state.authority._validated_binding()
+    except EvidenceIntegrityError:
+        raise
+    except Exception as error:
+        raise EvidenceIntegrityError("completeness result authority is invalid") from error
+    return state
 
 
 def _required_names(
@@ -362,7 +479,7 @@ def _authority_completeness(authority: CompletenessAuthority) -> CompletenessRes
         )
 
     state = "BOUND" if not missing else ASK_AND_BLOCK
-    return CompletenessResult(
+    result = CompletenessResult(
         required=required,
         resolved=tuple(resolved),
         missing=tuple(missing),
@@ -370,6 +487,13 @@ def _authority_completeness(authority: CompletenessAuthority) -> CompletenessRes
         evidence=tuple(records),
         state=state,
     )
+    projection = _result_projection(result)
+    if _result_projection(result) != projection:
+        raise EvidenceIntegrityError("completeness result changed during authority evaluation")
+    # This is intentionally the final authority read: all values, sources, and
+    # result fields above have already been consumed before registration.
+    authority._validated_binding()
+    return _register_authoritative_result(result, authority, projection)
 
 
 def _exact_value_equal(left: object, right: object) -> bool:

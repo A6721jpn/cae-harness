@@ -107,6 +107,89 @@ def test_diagnostic_completeness_cannot_become_a_physical_question() -> None:
     assert inventory.ready is False
 
 
+def test_direct_completeness_result_cannot_authorize_questions_or_ready() -> None:
+    direct = model.CompletenessResult(
+        required=("loads",),
+        resolved=(),
+        missing=(
+            model.MissingConditionFact(
+                "loads",
+                "caller supplied an authoritative-looking fact",
+                (EvidenceProvenance("caller", "chat", authoritative=True),),
+            ),
+        ),
+        unresolved=(),
+        state=ASK_AND_BLOCK,
+    )
+
+    inventory = inspect_incomplete_feb(inspect_feb_xml(b"<febio_spec/>"), direct)
+
+    assert inventory.questions == ()
+    assert inventory.ready is False
+
+
+def test_result_binding_rejects_copies(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    snapshot = store.issue_intent_snapshot()
+    authority = model.issue_completeness_authority(snapshot, ("material",))
+    result = assess_completeness(authority)
+    feb = inspect_feb_xml(b"<febio_spec/>")
+
+    assert inspect_incomplete_feb(feb, result).ready is True
+
+    copied = copy.copy(result)
+    copied_inventory = inspect_incomplete_feb(feb, copied)
+    assert copied_inventory.questions == ()
+    assert copied_inventory.ready is False
+
+
+def test_result_binding_rejects_mutations(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    authority = model.issue_completeness_authority(
+        store.issue_intent_snapshot(),
+        ("material",),
+    )
+    result = assess_completeness(authority)
+    feb = inspect_feb_xml(b"<febio_spec/>")
+    assert inspect_incomplete_feb(feb, result).ready is True
+
+    object.__setattr__(
+        result,
+        "missing",
+        (model.MissingConditionFact("material", "late forged fact"),),
+    )
+    mutated_inventory = inspect_incomplete_feb(feb, result)
+    assert mutated_inventory.questions == ()
+    assert mutated_inventory.ready is False
+
+
+def test_result_binding_rejects_stale_authority(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    fresh_authority = model.issue_completeness_authority(
+        store.issue_intent_snapshot(),
+        ("material",),
+    )
+    fresh_result = assess_completeness(fresh_authority)
+    feb = inspect_feb_xml(b"<febio_spec/>")
+    assert inspect_incomplete_feb(feb, fresh_result).ready is True
+
+    payload = store.intent_path.read_text(encoding="utf-8")
+    store.intent_path.write_text(payload.replace("neo-Hookean", "tampered"), encoding="utf-8")
+
+    stale_inventory = inspect_incomplete_feb(feb, fresh_result)
+    assert stale_inventory.questions == ()
+    assert stale_inventory.ready is False
+
+
+def test_forged_result_fails_closed_before_action() -> None:
+    forged = object.__new__(model.CompletenessResult)
+
+    inventory = inspect_incomplete_feb(inspect_feb_xml(b"<febio_spec/>"), forged)
+
+    assert inventory.questions == ()
+    assert inventory.ready is False
+
+
 def test_only_a_live_snapshot_can_issue_a_completeness_authority(tmp_path: Path) -> None:
     store = _store(tmp_path)
     snapshot = store.issue_intent_snapshot()

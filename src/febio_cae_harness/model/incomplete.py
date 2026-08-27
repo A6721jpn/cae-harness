@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .completeness import CompletenessResult
+from ..evidence import EvidenceIntegrityError
+from .completeness import CompletenessResult, _validated_authoritative_result
 from .feb import FEBInspection
 from .preflight import PreflightDiagnostic
 from .types import (
@@ -125,19 +126,24 @@ def _authoritative_evidence(
     return tuple(evidence)
 
 
-def _questions(completeness: CompletenessResult) -> tuple[MissingConditionQuestion, ...]:
+def _questions(
+    required: tuple[str, ...],
+    resolved_values: tuple[str, ...],
+    missing_values: tuple[MissingConditionFact, ...],
+    unresolved_values: tuple[UnresolvedEvidenceField, ...],
+) -> tuple[MissingConditionQuestion, ...]:
     missing: dict[str, list[MissingConditionFact]] = {}
     unresolved: dict[str, list[UnresolvedEvidenceField]] = {}
-    resolved = {_condition_name(item) for item in completeness.resolved}
-    for fact in completeness.missing:
+    resolved = {_condition_name(item) for item in resolved_values}
+    for fact in missing_values:
         missing.setdefault(fact.condition, []).append(fact)
-    for field in completeness.unresolved:
+    for field in unresolved_values:
         if field.required:
             unresolved.setdefault(field.field_name, []).append(field)
 
     questions: list[MissingConditionQuestion] = []
     seen: set[str] = set()
-    for raw_name in completeness.required:
+    for raw_name in required:
         condition = _condition_name(raw_name)
         if condition in seen:
             continue
@@ -169,17 +175,24 @@ def inspect_incomplete_feb(
     if not isinstance(completeness, CompletenessResult):
         raise TypeError("completeness must be a CompletenessResult")
     diagnostics = _structural_diagnostics(feb)
-    questions = _questions(completeness)
-    unresolved_required = any(
-        item.required and item.field_name in completeness.required
-        for item in completeness.unresolved
-    )
-    ready = (
-        not diagnostics
-        and completeness.state == "BOUND"
-        and not questions
-        and not unresolved_required
-    )
+    try:
+        _validated_authoritative_result(completeness)
+        required = tuple(completeness.required)
+        resolved = tuple(completeness.resolved)
+        missing = tuple(completeness.missing)
+        unresolved = tuple(completeness.unresolved)
+        state = completeness.state
+        questions = _questions(required, resolved, missing, unresolved)
+        unresolved_required = any(
+            item.required and item.field_name in required for item in unresolved
+        )
+        # Revalidate after consuming every result field used for action.
+        _validated_authoritative_result(completeness)
+    except EvidenceIntegrityError:
+        return IncompleteFebInventory(diagnostics, (), False)
+    except Exception:
+        return IncompleteFebInventory(diagnostics, (), False)
+    ready = not diagnostics and state == "BOUND" and not questions and not unresolved_required
     return IncompleteFebInventory(diagnostics, questions, ready)
 
 

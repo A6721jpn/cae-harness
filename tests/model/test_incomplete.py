@@ -111,7 +111,7 @@ def test_structural_diagnostics_are_separate_and_never_questions(tmp_path: Path)
     assert inventory.ready is False
 
 
-def test_questions_follow_required_order_deduplicate_and_filter_authority() -> None:
+def test_direct_results_never_authorize_questions_even_with_authoritative_flags() -> None:
     completeness = _result(
         ("loads", "units", "material"),
         missing=(
@@ -129,12 +129,7 @@ def test_questions_follow_required_order_deduplicate_and_filter_authority() -> N
 
     inventory = inspect_incomplete_feb(inspect_feb_xml(VALID_FEB), completeness)
 
-    assert [item.condition for item in inventory.questions] == ["loads", "units", "material"]
-    assert inventory.questions[0].reason == "loads are absent"
-    assert inventory.questions[0].evidence == (AUTH_A, AUTH_B)
-    assert inventory.questions[1].reason == "units are absent"
-    assert inventory.questions[1].evidence == ()
-    assert inventory.questions[2].evidence == (AUTH_B,)
+    assert inventory.questions == ()
     assert inventory.ready is False
 
 
@@ -155,4 +150,21 @@ def test_ready_requires_bound_completeness_without_required_unresolved_fields(
     )
     blocked = inspect_incomplete_feb(inspect_feb_xml(VALID_FEB), incomplete)
     assert blocked.ready is False
-    assert blocked.questions == (MissingConditionQuestion("loads", "still unresolved"),)
+    assert blocked.questions == ()
+
+
+def test_authoritative_questions_follow_required_order(tmp_path: Path) -> None:
+    workspace = ValidatedCaseWorkspace(tmp_path / "tool", tmp_path / "02_CAE")
+    case = workspace.create_case("case")
+    store = EvidenceStore(case, IntentContract())
+    authority = issue_completeness_authority(
+        store.issue_intent_snapshot(),
+        ("loads", "units", "material"),
+    )
+
+    completeness = assess_completeness(authority)
+    inventory = inspect_incomplete_feb(inspect_feb_xml(VALID_FEB), completeness)
+
+    assert [item.condition for item in inventory.questions] == ["loads", "units", "material"]
+    assert all(item.action == ASK_AND_BLOCK for item in inventory.questions)
+    assert inventory.ready is False
