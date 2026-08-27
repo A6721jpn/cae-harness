@@ -10,6 +10,7 @@ from febio_cae_harness import __version__
 from febio_cae_harness.model.feb import inspect_feb_file
 from febio_cae_harness.model.preflight import PreflightResult, run_preflight
 from febio_cae_harness.model.step import inspect_step_file
+from febio_cae_harness.solver.runtime import RuntimeProbeError, probe_febio
 
 _PREFLIGHT_EXIT_CODES = {
     "INVALID_FEB_ROOT": 2,
@@ -37,6 +38,11 @@ def build_parser() -> argparse.ArgumentParser:
         "inspect-step", help="inspect STEP structure and explicit unit evidence"
     )
     inspect_step.add_argument("path", type=Path, metavar="PATH")
+
+    probe_febio_command = commands.add_parser(
+        "probe-febio", help="read-only probe of one exact FEBio executable"
+    )
+    probe_febio_command.add_argument("path", type=Path, metavar="PATH")
     return parser
 
 
@@ -73,10 +79,21 @@ def _emit_preflight(path: Path) -> int:
     return _preflight_exit_code(result)
 
 
+def _emit_probe(path: Path) -> int:
+    try:
+        diagnostic = probe_febio(path)
+    except (OSError, RuntimeProbeError, ValueError) as error:
+        return _error(str(error))
+    print(json.dumps(diagnostic.to_dict(), sort_keys=True))
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = build_parser().parse_args(argv)
     if arguments.command in {"inspect-feb", "inspect-step"}:
         return _emit_inspection(arguments.path, arguments.command)
     if arguments.command == "preflight-feb":
         return _emit_preflight(arguments.path)
+    if arguments.command == "probe-febio":
+        return _emit_probe(arguments.path)
     return 0

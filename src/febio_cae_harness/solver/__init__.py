@@ -8,6 +8,15 @@ from .fbs import (
     validate_requested_fields,
 )
 from .log import LogValidation, LogValidator, validate_log, validate_solver_log
+from .runtime import (
+    FebioRuntimeDiagnostic,
+    RuntimeDiagnostic,
+    RuntimeIdentity,
+    RuntimeProbeDiagnostic,
+    RuntimeProbeError,
+    probe_febio,
+    probe_runtime,
+)
 from .supervisor import SolverSupervisor
 from .types import (
     FailureClassification,
@@ -32,6 +41,7 @@ __all__ = [
     "FbsValidation",
     "LogValidation",
     "LogValidator",
+    "FebioRuntimeDiagnostic",
     "OutputExpectation",
     "OutputFreshnessError",
     "ProcessState",
@@ -44,6 +54,12 @@ __all__ = [
     "SolverRunResult",
     "SolverState",
     "SolverSupervisor",
+    "RuntimeDiagnostic",
+    "RuntimeIdentity",
+    "RuntimeProbeDiagnostic",
+    "RuntimeProbeError",
+    "probe_febio",
+    "probe_runtime",
     "validate_log",
     "validate_requested_fields",
     "validate_solver_log",

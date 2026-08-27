@@ -6,6 +6,11 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
+from febio_cae_harness import cli as cli_module
+from febio_cae_harness.solver.runtime import FebioRuntimeDiagnostic, RuntimeProbeError
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -226,3 +231,35 @@ def test_preflight_feb_missing_input_is_concise_stderr(tmp_path: Path) -> None:
     assert completed.stderr.startswith("febio-cae: ")
     assert "missing.feb" in completed.stderr
     assert "Traceback" not in completed.stderr
+
+
+def test_probe_febio_emits_identity_json(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    executable = Path("C:/synthetic/febio.exe")
+    diagnostic = FebioRuntimeDiagnostic(executable, "a" * 64, 123, "4.2.0")
+    monkeypatch.setattr(cli_module, "probe_febio", lambda path: diagnostic)
+
+    assert cli_module.main(["probe-febio", str(executable)]) == 0
+
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert json.loads(captured.out) == diagnostic.to_dict()
+    assert "official" not in captured.out
+    assert "signed" not in captured.out
+    assert "success" not in captured.out
+
+
+def test_probe_febio_failure_is_concise_stderr(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def fail(path: Path) -> FebioRuntimeDiagnostic:
+        raise RuntimeProbeError("synthetic probe failure")
+
+    monkeypatch.setattr(cli_module, "probe_febio", fail)
+
+    assert cli_module.main(["probe-febio", "missing-febio.exe"]) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "febio-cae: synthetic probe failure\n"
