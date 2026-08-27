@@ -9,12 +9,14 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 import threading
 import time
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn, SupportsIndex
 
 from .contracts import IntentContract
 from .workspace import (
@@ -24,7 +26,14 @@ from .workspace import (
     _reject_reparse_alias,
 )
 
-__all__ = ["EvidenceIntegrityError", "EvidenceStore", "VerificationReceipt"]
+__all__ = [
+    "EvidenceIntegrityError",
+    "EvidenceStore",
+    "ValidatorAuthority",
+    "ValidatorAuthorityManager",
+    "ValidatorExecution",
+    "VerificationReceipt",
+]
 
 
 MANIFEST_FILE = "CASE_MANIFEST.json"
@@ -41,11 +50,11 @@ _VERIFICATION_FIELDS = frozenset(
         "sha256",
         "destination",
         "validator",
-        "status",
+        "runtime",
+        "result",
         "evidence_digest",
     }
 )
-_VERIFICATION_STATUSES = frozenset({"failed", "passed"})
 _RECEIPT_PREFIX = "febio-verification-v1:"
 _RECEIPT_FACTORY = object()
 _PROMOTION_CONSUMED_EVENT = "artifact_promotion_consumed"
@@ -54,8 +63,225 @@ _LOCAL_EVENT_LOCKS: dict[str, threading.RLock] = {}
 _LOCAL_EVENT_LOCKS_GUARD = threading.Lock()
 
 
+class _AuthorityRegistry:
+    __slots__ = ()
+
+
+@dataclass(slots=True)
+class _ValidatorRegistration:
+    authority: ValidatorAuthority
+    validator: Callable[[Path], object]
+    identity: str
+    runtime: str
+    registry: _AuthorityRegistry
+    capability: object
+
+
+@dataclass(slots=True)
+class _ManagerState:
+    owner: ValidatorAuthorityManager
+    registry: _AuthorityRegistry
+    construction_token: object
+    registrations: dict[str, _ValidatorRegistration]
+
+
+_PENDING_MANAGER_CONSTRUCTIONS: dict[int, object] = {}
+_MANAGER_STATES: dict[int, _ManagerState] = {}
+_AUTHORITY_STATES: dict[int, tuple[object, _AuthorityRegistry, object]] = {}
+_PENDING_STORE_CONSTRUCTIONS: dict[int, object] = {}
+_STORE_BINDINGS: dict[int, tuple[object, ValidatorAuthorityManager, _AuthorityRegistry, bool]] = {}
+
+
 class EvidenceIntegrityError(RuntimeError):
     """Raised when persisted evidence is missing, changed, or inconsistent."""
+
+
+@dataclass(frozen=True, slots=True)
+class ValidatorExecution:
+    validator: str
+    runtime: str
+    result: object
+
+
+class ValidatorAuthority:
+    """Opaque capability issued for one registered validator."""
+
+    __slots__ = ("_registry", "_capability")
+
+    def __new__(cls, *args: object, **kwargs: object) -> ValidatorAuthority:
+        del args, kwargs
+        raise TypeError("validator authorities are issued by ValidatorAuthorityManager")
+
+    @classmethod
+    def _create(cls, registry: _AuthorityRegistry) -> ValidatorAuthority:
+        authority = object.__new__(cls)
+        capability = object()
+        object.__setattr__(authority, "_registry", registry)
+        object.__setattr__(authority, "_capability", capability)
+        _AUTHORITY_STATES[id(authority)] = (authority, registry, capability)
+        return authority
+
+    def __repr__(self) -> str:
+        return "ValidatorAuthority(<opaque>)"
+
+    __str__ = __repr__
+
+    def __setattr__(self, name: str, value: object) -> None:
+        del name, value
+        raise AttributeError("validator authorities are immutable")
+
+    def __copy__(self) -> ValidatorAuthority:
+        raise TypeError("validator authorities cannot be copied")
+
+    def __deepcopy__(self, memo: dict[int, object]) -> ValidatorAuthority:
+        del memo
+        raise TypeError("validator authorities cannot be copied")
+
+    def __reduce_ex__(self, protocol: SupportsIndex) -> NoReturn:
+        del protocol
+        raise TypeError("validator authorities cannot be pickled")
+
+
+class ValidatorAuthorityManager:
+    """Own validator registrations and issue exact, store-bound authorities."""
+
+    __slots__ = ("_registry", "_construction_token", "_default_authority")
+
+    def __new__(cls, *args: object, **kwargs: object) -> ValidatorAuthorityManager:
+        del args, kwargs
+        if cls is not ValidatorAuthorityManager:
+            raise TypeError("validator authority managers cannot be subclassed")
+        manager = object.__new__(cls)
+        _PENDING_MANAGER_CONSTRUCTIONS[id(manager)] = manager
+        return manager
+
+    def __init__(self, *, _default: bool = False) -> None:
+        if _PENDING_MANAGER_CONSTRUCTIONS.pop(id(self), None) is not self:
+            raise TypeError("invalid validator authority manager construction")
+        registry = _AuthorityRegistry()
+        construction_token = object()
+        _MANAGER_STATES[id(self)] = _ManagerState(
+            owner=self,
+            registry=registry,
+            construction_token=construction_token,
+            registrations={},
+        )
+        object.__setattr__(self, "_registry", registry)
+        object.__setattr__(self, "_construction_token", construction_token)
+        if _default:
+            object.__setattr__(
+                self,
+                "_default_authority",
+                self.register_validator(
+                    "sha256", lambda path: bool(_file_digest(path)), runtime="builtin-digest"
+                ),
+            )
+
+    def register_validator(
+        self,
+        identity: str,
+        validator: Callable[[Path], object],
+        *,
+        runtime: str = "python",
+    ) -> ValidatorAuthority:
+        """Register one executable validator and issue its authority."""
+
+        state = self._state()
+        identity = self._validate_label(identity, "validator identity")
+        runtime = self._validate_label(runtime, "validator runtime")
+        if not callable(validator):
+            raise TypeError("validator must be callable")
+        if identity in state.registrations:
+            raise ValueError(f"validator identity is already registered: {identity}")
+        authority = ValidatorAuthority._create(state.registry)
+        capability = object.__getattribute__(authority, "_capability")
+        state.registrations[identity] = _ValidatorRegistration(
+            authority=authority,
+            validator=validator,
+            identity=identity,
+            runtime=runtime,
+            registry=state.registry,
+            capability=capability,
+        )
+        return authority
+
+    def __setattr__(self, name: str, value: object) -> None:
+        del name, value
+        raise AttributeError("validator authority managers are immutable")
+
+    def __copy__(self) -> ValidatorAuthorityManager:
+        raise TypeError("validator authority managers cannot be copied")
+
+    def __deepcopy__(self, memo: dict[int, object]) -> ValidatorAuthorityManager:
+        del memo
+        raise TypeError("validator authority managers cannot be copied")
+
+    def __reduce_ex__(self, protocol: SupportsIndex) -> NoReturn:
+        del protocol
+        raise TypeError("validator authority managers cannot be pickled")
+
+    @staticmethod
+    def _validate_label(value: str, label: str) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{label} must be a non-empty string")
+        if value != value.strip():
+            raise ValueError(f"{label} must not have surrounding whitespace")
+        return value
+
+    def _state(self) -> _ManagerState:
+        if type(self) is not ValidatorAuthorityManager:
+            raise EvidenceIntegrityError("validator authority manager identity is invalid")
+        state = _MANAGER_STATES.get(id(self))
+        if state is None or state.owner is not self:
+            raise EvidenceIntegrityError("validator authority manager identity is invalid")
+        try:
+            registry = object.__getattribute__(self, "_registry")
+            token = object.__getattribute__(self, "_construction_token")
+        except AttributeError as error:
+            raise EvidenceIntegrityError("validator authority manager state is invalid") from error
+        if registry is not state.registry or token is not state.construction_token:
+            raise EvidenceIntegrityError("validator authority manager state is invalid")
+        return state
+
+    def _execute(
+        self,
+        authority: ValidatorAuthority,
+        source: Path,
+    ) -> ValidatorExecution:
+        state = self._state()
+        if type(authority) is not ValidatorAuthority:
+            raise EvidenceIntegrityError("verification requires a manager-issued authority")
+        try:
+            authority_state = _AUTHORITY_STATES[id(authority)]
+            authority_owner, authority_registry, authority_capability = authority_state
+            authority_registry_value = object.__getattribute__(authority, "_registry")
+            authority_capability_value = object.__getattribute__(authority, "_capability")
+        except (AttributeError, KeyError) as error:
+            raise EvidenceIntegrityError("verification authority is invalid") from error
+        if authority_owner is not authority:
+            raise EvidenceIntegrityError("verification authority is invalid")
+        if (
+            authority_registry is not state.registry
+            or authority_registry_value is not state.registry
+        ):
+            raise EvidenceIntegrityError("verification authority belongs to another manager")
+        if authority_capability_value is not authority_capability:
+            raise EvidenceIntegrityError("verification authority state is invalid")
+        registration = next(
+            (
+                item
+                for item in state.registrations.values()
+                if item.authority is authority and item.capability is authority_capability
+            ),
+            None,
+        )
+        if registration is None or registration.registry is not state.registry:
+            raise EvidenceIntegrityError("verification authority is not registered")
+        try:
+            result = registration.validator(source)
+        except Exception as error:
+            raise EvidenceIntegrityError("validator execution failed") from error
+        return ValidatorExecution(registration.identity, registration.runtime, result)
 
 
 class VerificationReceipt(str):
@@ -119,12 +345,25 @@ def _file_digest(path: Path) -> str:
     digest = hashlib.sha256()
     try:
         path = _reject_reparse_alias(path, "evidence file")
+        if not stat.S_ISREG(path.stat().st_mode):
+            raise EvidenceIntegrityError(f"evidence file is not regular: {path}")
         with path.open("rb") as stream:
             for chunk in iter(lambda: stream.read(1024 * 1024), b""):
                 digest.update(chunk)
-    except (OSError, WorkspaceBoundaryError) as error:
+    except (OSError, WorkspaceBoundaryError, EvidenceIntegrityError) as error:
         raise EvidenceIntegrityError(f"cannot read evidence file: {path}") from error
     return digest.hexdigest()
+
+
+def _file_identity(path: Path) -> tuple[int, int, int, int]:
+    try:
+        path = _reject_reparse_alias(path, "evidence file")
+        metadata = path.stat()
+    except (OSError, WorkspaceBoundaryError) as error:
+        raise EvidenceIntegrityError(f"cannot stat evidence file: {path}") from error
+    if not stat.S_ISREG(metadata.st_mode):
+        raise EvidenceIntegrityError(f"evidence file is not regular: {path}")
+    return (metadata.st_dev, metadata.st_ino, metadata.st_size, metadata.st_mtime_ns)
 
 
 def _json_text(value: object) -> str:
@@ -216,7 +455,45 @@ def _exclusive_event_lock(lock_path: Path) -> Iterator[None]:
 class EvidenceStore:
     """Persist intent, events, attempts, artifacts, and a manifest projection."""
 
-    def __init__(self, case_workspace: CaseWorkspace, intent: IntentContract | None = None) -> None:
+    __slots__ = (
+        "case_workspace",
+        "_intent",
+        "_artifacts",
+        "_case_sha256",
+        "_authority_manager",
+        "_authority_registry",
+    )
+
+    def __new__(cls, *args: object, **kwargs: object) -> EvidenceStore:
+        del args, kwargs
+        if cls is not EvidenceStore:
+            raise TypeError("evidence stores cannot be subclassed")
+        store = object.__new__(cls)
+        _PENDING_STORE_CONSTRUCTIONS[id(store)] = store
+        return store
+
+    def __init__(
+        self,
+        case_workspace: CaseWorkspace,
+        intent: IntentContract | None = None,
+        authority_manager: ValidatorAuthorityManager | None = None,
+    ) -> None:
+        if _PENDING_STORE_CONSTRUCTIONS.pop(id(self), None) is not self:
+            raise TypeError("invalid evidence store construction")
+        supplied_manager = authority_manager is not None
+        if authority_manager is None:
+            authority_manager = ValidatorAuthorityManager(_default=True)
+        if type(authority_manager) is not ValidatorAuthorityManager:
+            raise TypeError("evidence store requires ValidatorAuthorityManager")
+        manager_state = authority_manager._state()
+        object.__setattr__(self, "_authority_manager", authority_manager)
+        object.__setattr__(self, "_authority_registry", manager_state.registry)
+        _STORE_BINDINGS[id(self)] = (
+            self,
+            authority_manager,
+            manager_state.registry,
+            supplied_manager,
+        )
         self.case_workspace = case_workspace
         self._intent: IntentContract
         self._artifacts: dict[str, dict[str, object]] = {}
@@ -231,10 +508,30 @@ class EvidenceStore:
                 self._initialize(intent)
 
     @classmethod
-    def open(cls, case_workspace: CaseWorkspace) -> EvidenceStore:
+    def open(
+        cls,
+        case_workspace: CaseWorkspace,
+        authority_manager: ValidatorAuthorityManager | None = None,
+    ) -> EvidenceStore:
         """Open and validate an existing store without changing it."""
 
-        return cls(case_workspace)
+        return cls(case_workspace, authority_manager=authority_manager)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if name in {"_authority_manager", "_authority_registry"} and id(self) in _STORE_BINDINGS:
+            raise AttributeError("evidence store authority binding is immutable")
+        object.__setattr__(self, name, value)
+
+    def __copy__(self) -> EvidenceStore:
+        raise TypeError("evidence stores cannot be copied")
+
+    def __deepcopy__(self, memo: dict[int, object]) -> EvidenceStore:
+        del memo
+        raise TypeError("evidence stores cannot be copied")
+
+    def __reduce_ex__(self, protocol: SupportsIndex) -> NoReturn:
+        del protocol
+        raise TypeError("evidence stores cannot be pickled")
 
     @property
     def manifest_path(self) -> Path:
@@ -360,19 +657,16 @@ class EvidenceStore:
         destination: str | Path,
         *,
         attempt_id: str,
-        validator: str = "sha256",
-        status: str = "passed",
+        authority: ValidatorAuthority | None = None,
     ) -> VerificationReceipt | None:
         """Persist one artifact verification and issue a receipt only on pass.
 
-        ``source`` is measured at call time and stored as a canonical path
-        relative to this case.  The destination is canonicalised but is not
-        written here; promotion remains a separate create-new operation.
+        The manager executes the registered validator against a live regular
+        source.  The source digest and identity are checked before and after
+        execution; promotion remains a separate create-new operation.
         """
 
         _validate_segment(attempt_id, "attempt_id")
-        validator = self._validate_validator(validator)
-        status = self._validate_verification_status(status)
         with self._event_lock():
             self._load_and_validate(None)
             if not any(record.get("attempt_id") == attempt_id for record in self._read_attempts()):
@@ -380,46 +674,40 @@ class EvidenceStore:
 
             source_path, source_relative = self._verification_source(source, attempt_id)
             _, destination_relative = self._verification_destination(destination)
+            source_identity = _file_identity(source_path)
             source_sha256 = _file_digest(source_path)
+            manager = self._bound_authority_manager()
+            if authority is None:
+                if _STORE_BINDINGS[id(self)][3]:
+                    raise EvidenceIntegrityError("verification requires a manager-issued authority")
+                authority = object.__getattribute__(manager, "_default_authority")
+            execution = manager._execute(authority, source_path)
+            after_identity = _file_identity(source_path)
+            after_sha256 = _file_digest(source_path)
+            if source_identity != after_identity or source_sha256 != after_sha256:
+                raise EvidenceIntegrityError("verification source mutated during validation")
+            if type(execution.result) is not bool:
+                raise EvidenceIntegrityError("validator result must be an actual bool")
             body: dict[str, object] = {
                 "case_id": self.case_workspace.case_id,
                 "attempt_id": attempt_id,
                 "source": source_relative,
                 "sha256": source_sha256,
                 "destination": destination_relative,
-                "validator": validator,
-                "status": status,
+                "validator": execution.validator,
+                "runtime": execution.runtime,
+                "result": execution.result,
             }
             payload = dict(body)
             payload["evidence_digest"] = _digest(body)
             self._reject_duplicate_verification(payload)
-            event = self._append_event("artifact_verified", payload)
-            if status != "passed":
+            self._append_event("artifact_verified", payload)
+            if execution.result is not True:
                 return None
-            event_digest = event.get("sha256")
             evidence_digest = payload["evidence_digest"]
-            if not isinstance(event_digest, str) or not isinstance(evidence_digest, str):
-                raise EvidenceIntegrityError("verification event digest is invalid")
+            if not isinstance(evidence_digest, str):
+                raise EvidenceIntegrityError("verification digest is invalid")
             return VerificationReceipt._issue(self._receipt_case_token(), evidence_digest)
-
-    def verify_for_promotion(
-        self,
-        source: str | Path,
-        destination: str | Path,
-        *,
-        attempt_id: str,
-        validator: str = "sha256",
-        status: str = "passed",
-    ) -> VerificationReceipt | None:
-        """Compatibility alias for :meth:`record_verification`."""
-
-        return self.record_verification(
-            source,
-            destination,
-            attempt_id=attempt_id,
-            validator=validator,
-            status=status,
-        )
 
     def promote_verified(self, receipt: VerificationReceipt) -> Path:
         """Promote only the exact artifact authorised by a persisted receipt."""
@@ -430,7 +718,7 @@ class EvidenceStore:
             verification = self._find_verification(evidence_digest)
             if verification is None:
                 raise EvidenceIntegrityError("verification receipt is not valid for this case")
-            if verification["status"] != "passed":
+            if verification["result"] is not True:
                 raise EvidenceIntegrityError("failed verification cannot be promoted")
 
             attempt_id = verification["attempt_id"]
@@ -467,6 +755,19 @@ class EvidenceStore:
                 expected_sha256=expected_sha256,
             )
 
+    def _bound_authority_manager(self) -> ValidatorAuthorityManager:
+        binding = _STORE_BINDINGS.get(id(self))
+        if binding is None or binding[0] is not self:
+            raise EvidenceIntegrityError("evidence store authority binding is invalid")
+        manager = object.__getattribute__(self, "_authority_manager")
+        registry = object.__getattribute__(self, "_authority_registry")
+        if manager is not binding[1] or registry is not binding[2]:
+            raise EvidenceIntegrityError("evidence store authority binding changed")
+        state = manager._state()
+        if state.registry is not registry:
+            raise EvidenceIntegrityError("evidence store authority registry changed")
+        return manager
+
     def _event_lock(self) -> Any:
         return _exclusive_event_lock(self._safe_case_path(EVENT_LOCK_FILE))
 
@@ -477,12 +778,6 @@ class EvidenceStore:
         if validator != validator.strip():
             raise ValueError("validator must not have surrounding whitespace")
         return validator
-
-    @staticmethod
-    def _validate_verification_status(status: str) -> str:
-        if not isinstance(status, str) or status.casefold() not in _VERIFICATION_STATUSES:
-            raise ValueError("status must be passed or failed")
-        return status.casefold()
 
     def _receipt_digest(self, receipt: VerificationReceipt) -> str:
         if type(receipt) is not VerificationReceipt:
@@ -722,7 +1017,7 @@ class EvidenceStore:
 
     def _validate_promotion_consumed_payload(self, value: object) -> dict[str, object]:
         payload = self._validate_verification_payload(value)
-        if payload["status"] != "passed":
+        if payload["result"] is not True:
             raise EvidenceIntegrityError("failed verification cannot be consumed")
         return payload
 
@@ -736,7 +1031,8 @@ class EvidenceStore:
         source_sha256 = payload["sha256"]
         destination = payload["destination"]
         validator = payload["validator"]
-        status = payload["status"]
+        runtime = payload["runtime"]
+        result = payload["result"]
         evidence_digest = payload["evidence_digest"]
         if not isinstance(case_id, str) or case_id != self.case_workspace.case_id:
             raise EvidenceIntegrityError("artifact verification case identity mismatch")
@@ -757,8 +1053,10 @@ class EvidenceStore:
         source_sha256 = _validate_digest(source_sha256, "artifact verification source digest")
         if not isinstance(validator, str) or not validator or validator != validator.strip():
             raise EvidenceIntegrityError("artifact verification validator is invalid")
-        if not isinstance(status, str) or status not in _VERIFICATION_STATUSES:
-            raise EvidenceIntegrityError("artifact verification status is invalid")
+        if not isinstance(runtime, str) or not runtime or runtime != runtime.strip():
+            raise EvidenceIntegrityError("artifact verification runtime is invalid")
+        if type(result) is not bool:
+            raise EvidenceIntegrityError("artifact verification result is invalid")
         if not isinstance(evidence_digest, str) or evidence_digest != evidence_digest.casefold():
             raise EvidenceIntegrityError("artifact verification digest is not canonical")
         evidence_digest = _validate_digest(evidence_digest, "artifact verification digest")
@@ -769,7 +1067,8 @@ class EvidenceStore:
             "sha256": source_sha256,
             "destination": destination,
             "validator": validator,
-            "status": status,
+            "runtime": runtime,
+            "result": result,
         }
         if _digest(body) != evidence_digest:
             raise EvidenceIntegrityError("artifact verification digest mismatch")
@@ -790,7 +1089,8 @@ class EvidenceStore:
             "sha256": source_sha256,
             "destination": destination,
             "validator": validator,
-            "status": status,
+            "runtime": runtime,
+            "result": result,
             "evidence_digest": evidence_digest,
         }
 

@@ -1,20 +1,26 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import os
+import pickle
 import threading
 import time
+from copy import copy, deepcopy
 from pathlib import Path
 from typing import cast
 
 import pytest
 
+import febio_cae_harness.evidence as evidence_module
 from febio_cae_harness.contracts import IntentContract
 from febio_cae_harness.evidence import (
     EVENTS_FILE,
     EvidenceIntegrityError,
     EvidenceStore,
+    ValidatorAuthority,
+    ValidatorAuthorityManager,
     VerificationReceipt,
 )
 from febio_cae_harness.workspace import (
@@ -35,6 +41,78 @@ def make_case(tmp_path: Path) -> tuple[ValidatedCaseWorkspace, CaseWorkspace, In
         units={"length": "mm", "force": "N"},
     )
     return workspace, case, intent
+
+
+def test_verification_authority_is_manager_bound() -> None:
+    assert hasattr(evidence_module, "ValidatorAuthorityManager")
+    assert hasattr(evidence_module, "ValidatorAuthority")
+    assert hasattr(evidence_module, "ValidatorExecution")
+    assert "authority" in inspect.signature(EvidenceStore.record_verification).parameters
+    assert "validator" not in inspect.signature(EvidenceStore.record_verification).parameters
+    assert "status" not in inspect.signature(EvidenceStore.record_verification).parameters
+
+
+def make_authority(
+    result: object = True,
+    *,
+    validator: object | None = None,
+) -> tuple[ValidatorAuthorityManager, ValidatorAuthority]:
+    manager = ValidatorAuthorityManager()
+    executable = validator if validator is not None else lambda source: result
+    authority = manager.register_validator(
+        "synthetic-validator",
+        executable,  # type: ignore[arg-type]
+        runtime="synthetic",
+    )
+    return manager, authority
+
+
+def test_authority_forgery_and_state_copies_are_rejected(tmp_path: Path) -> None:
+    _, case, intent = make_case(tmp_path)
+    manager, authority = make_authority()
+    store = EvidenceStore(case, intent, manager)
+    store.record_attempt("attempt-1")
+    source = case.write_text(
+        Path("90_Temporary") / "attempts" / "attempt-1" / "derived.feb",
+        "derived",
+    )
+
+    with pytest.raises(EvidenceIntegrityError):
+        store.record_verification(
+            source,
+            Path("02_Model") / "derived.feb",
+            attempt_id="attempt-1",
+        )
+    forged = object.__new__(ValidatorAuthority)
+    object.__setattr__(forged, "_registry", manager._registry)  # type: ignore[attr-defined]
+    object.__setattr__(forged, "_capability", object())
+    attempts = [forged, object.__new__(type("ForgedAuthority", (ValidatorAuthority,), {}))]
+    for candidate in attempts:
+        with pytest.raises(EvidenceIntegrityError):
+            store.record_verification(
+                source,
+                Path("02_Model") / "derived.feb",
+                attempt_id="attempt-1",
+                authority=candidate,
+            )
+    for operation in (lambda: ValidatorAuthority(), lambda: pickle.dumps(authority)):
+        with pytest.raises(TypeError):
+            operation()
+    with pytest.raises(TypeError):
+        copy(authority)
+    with pytest.raises(TypeError):
+        deepcopy(authority)
+    with pytest.raises(AttributeError):
+        authority._registry = object()
+
+    _, foreign_authority = make_authority()
+    with pytest.raises(EvidenceIntegrityError):
+        store.record_verification(
+            source,
+            Path("02_Model") / "foreign.feb",
+            attempt_id="attempt-1",
+            authority=foreign_authority,
+        )
 
 
 def test_store_persists_intent_and_manifest_projection(tmp_path: Path) -> None:
@@ -253,7 +331,8 @@ def test_record_verification_persists_bound_evidence_and_issues_opaque_receipt(
     tmp_path: Path,
 ) -> None:
     _, case, intent = make_case(tmp_path)
-    store = EvidenceStore(case, intent)
+    manager, authority = make_authority()
+    store = EvidenceStore(case, intent, manager)
     store.record_attempt("attempt-1")
     source = case.write_text(
         Path("90_Temporary") / "attempts" / "attempt-1" / "derived.feb",
@@ -264,8 +343,7 @@ def test_record_verification_persists_bound_evidence_and_issues_opaque_receipt(
         source,
         Path("02_Model") / "derived.feb",
         attempt_id="attempt-1",
-        validator="synthetic-validator",
-        status="passed",
+        authority=authority,
     )
 
     assert isinstance(receipt, VerificationReceipt)
@@ -281,14 +359,16 @@ def test_record_verification_persists_bound_evidence_and_issues_opaque_receipt(
     assert payload["sha256"] == hashlib.sha256(b"derived").hexdigest()
     assert payload["destination"] == "02_Model/derived.feb"
     assert payload["validator"] == "synthetic-validator"
-    assert payload["status"] == "passed"
+    assert payload["runtime"] == "synthetic"
+    assert payload["result"] is True
     assert isinstance(payload["evidence_digest"], str)
     assert str(receipt).endswith(payload["evidence_digest"])
 
 
 def test_failed_verification_has_no_promotion_receipt(tmp_path: Path) -> None:
     _, case, intent = make_case(tmp_path)
-    store = EvidenceStore(case, intent)
+    manager, authority = make_authority(False)
+    store = EvidenceStore(case, intent, manager)
     store.record_attempt("attempt-1")
     source = case.write_text(
         Path("90_Temporary") / "attempts" / "attempt-1" / "derived.feb",
@@ -299,12 +379,64 @@ def test_failed_verification_has_no_promotion_receipt(tmp_path: Path) -> None:
         source,
         Path("02_Model") / "derived.feb",
         attempt_id="attempt-1",
-        status="failed",
+        authority=authority,
     )
 
     assert receipt is None
     with pytest.raises(EvidenceIntegrityError):
         store.promote_verified(receipt)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("result", [1, "passed", None])
+def test_verification_requires_actual_bool_result(tmp_path: Path, result: object) -> None:
+    _, case, intent = make_case(tmp_path)
+    manager, authority = make_authority(result)
+    store = EvidenceStore(case, intent, manager)
+    store.record_attempt("attempt-1")
+    source = case.write_text(
+        Path("90_Temporary") / "attempts" / "attempt-1" / "derived.feb",
+        "derived",
+    )
+
+    with pytest.raises(EvidenceIntegrityError, match="actual bool"):
+        store.record_verification(
+            source,
+            Path("02_Model") / "derived.feb",
+            attempt_id="attempt-1",
+            authority=authority,
+        )
+    assert not any(
+        json.loads(line)["event_type"] == "artifact_verified"
+        for line in store.events_path.read_text(encoding="utf-8").splitlines()
+    )
+
+
+def test_validator_source_mutation_never_issues_receipt(tmp_path: Path) -> None:
+    _, case, intent = make_case(tmp_path)
+
+    def mutate(source: Path) -> bool:
+        source.write_text("changed", encoding="utf-8")
+        return True
+
+    manager, authority = make_authority(validator=mutate)
+    store = EvidenceStore(case, intent, manager)
+    store.record_attempt("attempt-1")
+    source = case.write_text(
+        Path("90_Temporary") / "attempts" / "attempt-1" / "derived.feb",
+        "derived",
+    )
+
+    with pytest.raises(EvidenceIntegrityError, match="mutated"):
+        store.record_verification(
+            source,
+            Path("02_Model") / "derived.feb",
+            attempt_id="attempt-1",
+            authority=authority,
+        )
+    assert not any(
+        json.loads(line)["event_type"] == "artifact_verified"
+        for line in store.events_path.read_text(encoding="utf-8").splitlines()
+    )
 
 
 def test_artifact_verified_cannot_be_fabricated_through_generic_event_api(
@@ -320,7 +452,8 @@ def test_artifact_verified_cannot_be_fabricated_through_generic_event_api(
 
 def test_verification_rejects_duplicate_and_source_mutation(tmp_path: Path) -> None:
     _, case, intent = make_case(tmp_path)
-    store = EvidenceStore(case, intent)
+    manager, authority = make_authority()
+    store = EvidenceStore(case, intent, manager)
     store.record_attempt("attempt-1")
     source = case.write_text(
         Path("90_Temporary") / "attempts" / "attempt-1" / "derived.feb",
@@ -330,6 +463,7 @@ def test_verification_rejects_duplicate_and_source_mutation(tmp_path: Path) -> N
         source,
         Path("02_Model") / "derived.feb",
         attempt_id="attempt-1",
+        authority=authority,
     )
     assert receipt is not None
 
@@ -338,6 +472,7 @@ def test_verification_rejects_duplicate_and_source_mutation(tmp_path: Path) -> N
             source,
             Path("02_Model") / "derived.feb",
             attempt_id="attempt-1",
+            authority=authority,
         )
     source.write_text("mutated", encoding="utf-8")
     with pytest.raises(EvidenceIntegrityError):
@@ -347,7 +482,8 @@ def test_verification_rejects_duplicate_and_source_mutation(tmp_path: Path) -> N
 def test_receipt_is_case_bound_even_for_identical_case_ids(tmp_path: Path) -> None:
     workspace_a = ValidatedCaseWorkspace(tmp_path / "tool-a", tmp_path / "02_CAE-a")
     case_a = workspace_a.create_case("case-a")
-    store_a = EvidenceStore(case_a, IntentContract(engineering_question="q"))
+    manager, authority = make_authority()
+    store_a = EvidenceStore(case_a, IntentContract(engineering_question="q"), manager)
     store_a.record_attempt("attempt-1")
     source_a = case_a.write_text(
         Path("90_Temporary") / "attempts" / "attempt-1" / "derived.feb",
@@ -357,6 +493,7 @@ def test_receipt_is_case_bound_even_for_identical_case_ids(tmp_path: Path) -> No
         source_a,
         Path("02_Model") / "derived.feb",
         attempt_id="attempt-1",
+        authority=authority,
     )
     assert receipt is not None
 
@@ -369,7 +506,8 @@ def test_receipt_is_case_bound_even_for_identical_case_ids(tmp_path: Path) -> No
 
 def test_promotion_is_create_new_and_rejects_duplicate_receipt_use(tmp_path: Path) -> None:
     _, case, intent = make_case(tmp_path)
-    store = EvidenceStore(case, intent)
+    manager, authority = make_authority()
+    store = EvidenceStore(case, intent, manager)
     store.record_attempt("attempt-1")
     source = case.write_text(
         Path("90_Temporary") / "attempts" / "attempt-1" / "derived.feb",
@@ -379,6 +517,7 @@ def test_promotion_is_create_new_and_rejects_duplicate_receipt_use(tmp_path: Pat
         source,
         Path("02_Model") / "derived.feb",
         attempt_id="attempt-1",
+        authority=authority,
     )
     assert receipt is not None
 
@@ -392,7 +531,8 @@ def test_promotion_consumes_receipt_before_copy_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _, case, intent = make_case(tmp_path)
-    store = EvidenceStore(case, intent)
+    manager, authority = make_authority()
+    store = EvidenceStore(case, intent, manager)
     store.record_attempt("attempt-1")
     source = case.write_text(
         Path("90_Temporary") / "attempts" / "attempt-1" / "derived.feb",
@@ -402,6 +542,7 @@ def test_promotion_consumes_receipt_before_copy_failure(
         source,
         Path("02_Model") / "derived.feb",
         attempt_id="attempt-1",
+        authority=authority,
     )
     assert receipt is not None
 
@@ -428,7 +569,8 @@ def test_promotion_consumes_receipt_before_copy_failure(
 
 def test_consumed_receipt_cannot_replay_after_destination_is_removed(tmp_path: Path) -> None:
     _, case, intent = make_case(tmp_path)
-    store = EvidenceStore(case, intent)
+    manager, authority = make_authority()
+    store = EvidenceStore(case, intent, manager)
     store.record_attempt("attempt-1")
     source = case.write_text(
         Path("90_Temporary") / "attempts" / "attempt-1" / "derived.feb",
@@ -439,6 +581,7 @@ def test_consumed_receipt_cannot_replay_after_destination_is_removed(tmp_path: P
         source,
         destination,
         attempt_id="attempt-1",
+        authority=authority,
     )
     assert receipt is not None
 
