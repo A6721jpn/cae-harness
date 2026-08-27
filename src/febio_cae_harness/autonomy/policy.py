@@ -148,6 +148,19 @@ FailureKind = FailureClass
 FailureClassification = FailureClass
 
 
+_REQUIRED_INTENT_FACTS: tuple[str, ...] = (
+    "engineering_question",
+    "units",
+    "material",
+    "loads",
+    "constraints",
+    "contact",
+    "analysis_step",
+    "roi",
+    "evaluation_quantities",
+)
+
+
 class RetryDecision(StrEnum):
     """Result of applying failure routing and retry-budget policy."""
 
@@ -345,6 +358,8 @@ def _source_is_authoritative(value: object) -> bool:
             }:
                 return True
         return False
+    if isinstance(value, (list, tuple)):
+        return any(_source_is_authoritative(item) for item in value)
     return _normalise_token(value) in {
         "authoritative",
         "user",
@@ -354,6 +369,79 @@ def _source_is_authoritative(value: object) -> bool:
         "specification",
         "contract",
     }
+
+
+def _evidence_is_current(value: object) -> bool:
+    """Reject an evidence record explicitly marked stale or not current."""
+
+    if not isinstance(value, Mapping):
+        if isinstance(value, (list, tuple)):
+            return all(_evidence_is_current(item) for item in value)
+        return True
+    if value.get("stale") is True:
+        return False
+    if value.get("current") is False:
+        return False
+    if value.get("fresh") is False:
+        return False
+    if _normalise_token(value.get("status")) in {"stale", "expired", "superseded"}:
+        return False
+    return all(
+        _evidence_is_current(value.get(key))
+        for key in ("source", "provenance", "evidence")
+        if key in value
+    )
+
+
+def _value_is_present(value: object) -> bool:
+    """Return whether an intent fact has a non-empty explicit value."""
+
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, Mapping):
+        if not value:
+            return False
+        if "value" in value:
+            return _value_is_present(value["value"])
+        return True
+    if isinstance(value, (list, tuple)):
+        return bool(value) and any(_value_is_present(item) for item in value)
+    return True
+
+
+def _intent_has_current_authoritative_completeness(intent: IntentContract) -> bool:
+    """Check the current intent before accepting a completeness flag.
+
+    ``conditions_complete`` is a caller hint, not evidence.  Re-evaluate the
+    immutable intent projection so an empty, partially populated, or stale
+    ``BOUND`` contract cannot stay bound merely because an old boolean was
+    retained.  The required facts and their source records are evaluated at
+    the point of transition, keeping the evidence tied to this intent
+    instance.
+    """
+
+    source_records = _condition_records(intent.condition_sources)
+    sources: dict[str, object] = {}
+    for source_record in source_records:
+        name = _condition_name(source_record)
+        if name is not None:
+            sources[name.casefold()] = source_record
+        elif len(source_record) == 1:
+            key, value = next(iter(source_record.items()))
+            sources[str(key).casefold()] = value
+
+    for name in _REQUIRED_INTENT_FACTS:
+        value = getattr(intent, name)
+        if not _value_is_present(value) or not _evidence_is_current(value):
+            return False
+        source = sources.get(name.casefold())
+        if source is None:
+            return False
+        if not _evidence_is_current(source) or not _source_is_authoritative(source):
+            return False
+    return True
 
 
 def unresolved_authoritative_conditions(
@@ -459,21 +547,23 @@ def transition_intent(
 ) -> StateTransition:
     """Compute the next intent state without mutating the canonical contract.
 
-    Completeness is a caller-supplied, authoritative fact.  The policy does
-    not infer it from geometry, field names, or defaults.
+    ``conditions_complete`` is only a caller request to evaluate binding.  The
+    policy revalidates every required current fact and its authoritative source
+    record; it does not infer completeness from geometry, field names, or
+    defaults.
     """
 
     if not isinstance(intent, IntentContract):
         raise TypeError("intent must be an IntentContract")
     if not isinstance(conditions_complete, bool):
         raise TypeError("conditions_complete must be a bool")
-    complete = conditions_complete
+    complete = conditions_complete and _intent_has_current_authoritative_completeness(intent)
     blocking = unresolved_authoritative_conditions(intent, additional_conditions)
     previous = intent.state
     if blocking:
         current = IntentState.ASK_AND_BLOCK
         reason = "authoritative physical conditions remain unresolved"
-    elif previous is IntentState.BOUND:
+    elif previous is IntentState.BOUND and complete:
         # A bound intent remains bound until a new blocking condition appears.
         current = IntentState.BOUND
         reason = "intent remains bound"

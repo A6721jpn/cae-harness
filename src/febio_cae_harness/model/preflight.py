@@ -140,11 +140,11 @@ def run_preflight(
                     location=reference.path,
                 )
             )
-        for identifier in feb.duplicate_identifiers:
+        for kind, identifier in feb.duplicate_keys:
             diagnostics.append(
                 PreflightDiagnostic(
                     code="DUPLICATE_IDENTIFIER",
-                    message=f"XML identifier {identifier!r} is defined more than once",
+                    message=(f"XML {kind} identifier {identifier!r} is defined more than once"),
                     location=f"/{feb.root_tag}",
                 )
             )

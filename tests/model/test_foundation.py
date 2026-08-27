@@ -86,6 +86,33 @@ def test_feb_inventory_and_reference_closure_are_structural_and_read_only() -> N
         inspection.root_attributes["version"] = "tampered"  # type: ignore[index]
 
 
+def test_feb_duplicate_ids_are_scoped_to_definition_kind() -> None:
+    distinct_kinds = b"""
+    <febio_spec version='4.0'>
+      <Material><material id='1' name='synthetic-material'/></Material>
+      <Mesh>
+        <Nodes><node id='1'>0,0,0</node></Nodes>
+        <Elements><elem id='1'>1</elem></Elements>
+      </Mesh>
+    </febio_spec>
+    """
+    distinct_inspection = inspect_feb_xml(distinct_kinds)
+    assert distinct_inspection.duplicate_identifiers == ()
+    assert distinct_inspection.reference_closure.duplicate_keys == ()
+
+    duplicate_material = b"""
+    <febio_spec version='4.0'>
+      <Material>
+        <material id='1' name='first'/>
+        <material id='1' name='second'/>
+      </Material>
+    </febio_spec>
+    """
+    duplicate_inspection = inspect_feb_xml(duplicate_material)
+    assert duplicate_inspection.duplicate_identifiers == ("1",)
+    assert duplicate_inspection.reference_closure.duplicate_keys == (("material", "1"),)
+
+
 def test_completeness_reports_only_explicit_authoritative_conditions() -> None:
     authoritative = EvidenceProvenance(
         source="synthetic-intent",

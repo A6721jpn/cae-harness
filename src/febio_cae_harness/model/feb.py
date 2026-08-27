@@ -164,9 +164,24 @@ class ReferenceClosure:
         return self.unresolved
 
     @property
+    def duplicate_keys(self) -> tuple[tuple[str, str], ...]:
+        """Return duplicate ``(kind, identifier)`` definition keys.
+
+        FEBio uses separate identifier namespaces for materials, nodes,
+        elements, and other definition kinds.  A raw identifier therefore is
+        not a complete uniqueness key: material ``id=1`` and node ``id=1``
+        are valid together, while two material definitions with ``id=1`` are
+        not.
+        """
+
+        counts = Counter((item.kind, item.identifier) for item in self.definitions)
+        return tuple(key for key, count in counts.items() if count > 1)
+
+    @property
     def duplicate_identifiers(self) -> tuple[str, ...]:
-        counts = Counter(item.identifier for item in self.definitions)
-        return tuple(identifier for identifier, count in counts.items() if count > 1)
+        """Return identifiers whose kind-scoped definition key is repeated."""
+
+        return tuple(dict.fromkeys(identifier for _, identifier in self.duplicate_keys))
 
     @property
     def has_duplicate_identifiers(self) -> bool:
@@ -184,6 +199,7 @@ class ReferenceClosure:
             "references": [item.to_dict() for item in self.references],
             "unresolved": [item.to_dict() for item in self.unresolved],
             "is_closed": self.is_closed,
+            "duplicate_keys": [list(key) for key in self.duplicate_keys],
             "duplicate_identifiers": list(self.duplicate_identifiers),
         }
 
@@ -242,6 +258,10 @@ class FEBInspection:
     @property
     def has_unresolved_references(self) -> bool:
         return bool(self.unresolved_references)
+
+    @property
+    def duplicate_keys(self) -> tuple[tuple[str, str], ...]:
+        return self.reference_closure.duplicate_keys
 
     @property
     def duplicate_identifiers(self) -> tuple[str, ...]:

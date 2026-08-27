@@ -28,16 +28,28 @@ from febio_cae_harness.contracts import IntentContract
 
 def bound_intent(**overrides: object) -> IntentContract:
     values: dict[str, object] = {
-        "engineering_question": "What is the displacement?",
-        "units": "mm",
+        "engineering_question": {
+            "source": "user",
+            "value": "What is the displacement?",
+        },
+        "units": {"source": "user", "value": "mm"},
         "material": {"source": "user", "value": "steel"},
         "loads": ({"source": "user", "value": "100 N"},),
         "constraints": ({"source": "user", "value": "fixed"},),
+        "contact": {"source": "user", "value": "none"},
         "analysis_step": {"source": "user", "value": 1},
+        "roi": ({"source": "user", "value": "all"},),
+        "evaluation_quantities": ({"source": "user", "value": "displacement"},),
         "condition_sources": {
+            "engineering_question": {"authoritative": True, "source": "user"},
+            "units": {"authoritative": True, "source": "user"},
             "material": {"authoritative": True, "source": "user"},
             "loads": {"authoritative": True, "source": "user"},
             "constraints": {"authoritative": True, "source": "user"},
+            "contact": {"authoritative": True, "source": "user"},
+            "analysis_step": {"authoritative": True, "source": "user"},
+            "roi": {"authoritative": True, "source": "user"},
+            "evaluation_quantities": {"authoritative": True, "source": "user"},
         },
         "state": IntentState.GATHERING,
     }
@@ -77,6 +89,27 @@ def test_condition_source_mapping_can_authorize_a_named_unresolved_condition() -
     assert len(conditions) == 1
     assert conditions[0].condition == "contact"
     assert transition_intent(intent, conditions_complete=True).current is IntentState.ASK_AND_BLOCK
+
+
+def test_conditions_complete_flag_cannot_bind_empty_or_stale_intent() -> None:
+    empty = IntentContract()
+    assert transition_intent(empty, conditions_complete=True).current is IntentState.GATHERING
+
+    incomplete = bound_intent(contact=None)
+    assert transition_intent(incomplete, conditions_complete=True).current is IntentState.GATHERING
+
+    stale = IntentContract(state=IntentState.BOUND)
+    assert transition_intent(stale, conditions_complete=False).current is IntentState.GATHERING
+
+    sources = dict(bound_intent().condition_sources)  # type: ignore[arg-type]
+    sources["material"] = {"authoritative": True, "source": "user", "stale": True}
+    stale_evidence = bound_intent(
+        condition_sources=sources,
+        state=IntentState.BOUND,
+    )
+    assert (
+        transition_intent(stale_evidence, conditions_complete=True).current is IntentState.GATHERING
+    )
 
 
 def test_failure_classification_is_explicit_and_deterministic() -> None:
