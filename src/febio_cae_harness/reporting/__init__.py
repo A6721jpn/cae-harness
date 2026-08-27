@@ -10,6 +10,7 @@ from febio_cae_harness.solver import (  # noqa: E402
     SolverState,
 )
 
+from .authority import ReportAuthority, ReportAuthorityManager
 from .gates import (
     SuccessGate,
     evaluate_result_success,
@@ -72,6 +73,8 @@ __all__ = [
     "OutputFreshValidation",
     "OutputFreshness",
     "Report",
+    "ReportAuthority",
+    "ReportAuthorityManager",
     "ReportAssembler",
     "ReportAssembly",
     "ReportBuilder",
