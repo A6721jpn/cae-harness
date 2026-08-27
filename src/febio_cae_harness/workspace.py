@@ -176,6 +176,16 @@ def _open_directory(path: Path, label: str) -> int:
         except OSError as error:
             raise WorkspaceBoundaryError(f"cannot open {label}: {path}") from error
     return _windows_create(
+        path, 0x0001 | 0x0080, 0x0001 | 0x0002, 3, 0x02000000 | 0x00200000, label
+    )
+
+
+def _open_cleanup_directory(path: Path, label: str) -> int:
+    """Open a Windows directory handle that can delete its exact object."""
+
+    if os.name != "nt":
+        raise WorkspaceBoundaryError(f"handle-bound directory deletion is unavailable for {label}")
+    return _windows_create(
         path,
         0x0001 | 0x0080 | 0x00010000,
         0x0001 | 0x0002 | 0x0004,
@@ -276,12 +286,28 @@ def _remove_created_tree_contents(
 
             if stat.S_ISDIR(metadata.st_mode):
                 child_stamp = (int(metadata.st_dev), int(metadata.st_ino))
-                _remove_created_tree_contents(child, child_stamp, child_label)
-                _identity_stamp(child, child_label, child_stamp)
-                try:
-                    child.rmdir()
-                except OSError as error:
-                    raise WorkspaceBoundaryError(f"cannot remove {child_label}: {child}") from error
+                if os.name == "nt":
+                    child_handle = _open_cleanup_directory(child, child_label)
+                    try:
+                        _remove_created_tree_contents(
+                            child,
+                            child_stamp,
+                            child_label,
+                            already_guarded=True,
+                        )
+                        _identity_stamp(child, child_label, child_stamp)
+                        _delete_open_directory(child_handle, child_label)
+                    finally:
+                        _close_handle(child_handle)
+                else:
+                    _remove_created_tree_contents(child, child_stamp, child_label)
+                    _identity_stamp(child, child_label, child_stamp)
+                    try:
+                        child.rmdir()
+                    except OSError as error:
+                        raise WorkspaceBoundaryError(
+                            f"cannot remove {child_label}: {child}"
+                        ) from error
                 continue
 
             if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
@@ -327,9 +353,14 @@ def _case_creation_guard(
             )
             _identity_stamp(checked, "case root", case_stamp)
             if os.name == "nt":
-                _delete_open_directory(handle, "case root")
                 _close_handle(handle)
                 handle = -1
+                cleanup_handle = _open_cleanup_directory(checked, "case root")
+                try:
+                    _identity_stamp(checked, "case root", case_stamp)
+                    _delete_open_directory(cleanup_handle, "case root")
+                finally:
+                    _close_handle(cleanup_handle)
             else:
                 try:
                     checked.rmdir()

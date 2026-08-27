@@ -611,6 +611,68 @@ def test_write_rejects_case_substitution_at_atomic_replace(
     assert not (case_b.case_root / "90_Temporary" / "replace-race.txt").exists()
 
 
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows directory sharing semantics")
+def test_directory_guard_blocks_rename_while_held(tmp_path: Path) -> None:
+    guarded = tmp_path / "guarded"
+    renamed = tmp_path / "renamed"
+    guarded.mkdir()
+    stamp = workspace_module._identity_stamp(guarded, "guarded")
+
+    try:
+        with workspace_module._directory_guard(guarded, stamp, "guarded"), pytest.raises(OSError):
+            guarded.rename(renamed)
+    finally:
+        if renamed.exists():
+            renamed.rename(guarded)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows handle-bound deletion")
+def test_nested_cleanup_deletes_authoritative_child_not_foreign_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = tmp_path / "parent"
+    child = parent / "nested"
+    displaced = tmp_path / "displaced-nested"
+    child.mkdir(parents=True)
+    parent_stamp = workspace_module._identity_stamp(parent, "parent")
+    original_open_cleanup_directory = workspace_module._open_cleanup_directory
+    original_delete_open_directory = workspace_module._delete_open_directory
+    cleanup_handles: dict[int, Path] = {}
+    swapped = False
+
+    def track_open(path: Path, label: str) -> int:
+        handle = original_open_cleanup_directory(path, label)
+        cleanup_handles[handle] = path
+        return handle
+
+    def replace_before_delete(handle: int, label: str) -> None:
+        nonlocal swapped
+        if cleanup_handles.get(handle) == child:
+            child.rename(displaced)
+            child.mkdir()
+            swapped = True
+        original_delete_open_directory(handle, label)
+
+    monkeypatch.setattr(
+        workspace_module,
+        "_open_cleanup_directory",
+        track_open,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        workspace_module,
+        "_delete_open_directory",
+        replace_before_delete,
+    )
+
+    workspace_module._remove_created_tree_contents(parent, parent_stamp, "parent")
+
+    assert swapped
+    assert not displaced.exists(), "authoritative child directory must be deleted"
+    assert child.is_dir(), "foreign replacement must remain untouched"
+
+
 def test_failed_promotion_removes_destination_after_source_changes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -804,7 +866,8 @@ def test_failed_case_creation_deletes_authoritative_case_not_foreign_replacement
     )
 
     def replace_before_handle_delete(handle: int, label: str) -> None:
-        swap_case_path()
+        if label == "case root":
+            swap_case_path()
         assert original_handle_delete is not None
         original_handle_delete(handle, label)
 
