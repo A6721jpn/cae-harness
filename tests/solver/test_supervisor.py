@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import gc
 import hashlib
 import inspect
@@ -18,12 +19,17 @@ from unittest.mock import Mock
 
 import pytest
 
+import febio_cae_harness.solver.runtime as runtime_module
 import febio_cae_harness.solver.supervisor as supervisor_module
 from febio_cae_harness.contracts import IntentContract
 from febio_cae_harness.evidence import EvidenceStore
 from febio_cae_harness.solver import headless as headless_module
 from febio_cae_harness.solver.process_authority import ProcessAuthority, ProcessAuthorityError
-from febio_cae_harness.solver.runtime import FebioRuntimeDiagnostic, probe_febio
+from febio_cae_harness.solver.runtime import (
+    FebioRuntimeDiagnostic,
+    _acquire_runtime_launch_claim,
+    probe_febio,
+)
 from febio_cae_harness.solver.supervisor import SolverSupervisor
 from febio_cae_harness.solver.types import (
     SolverConfigurationError,
@@ -1247,6 +1253,328 @@ def test_windows_process_image_replacement_fails_before_resume(
     assert supervisor.state is SolverState.FAILED
     assert supervisor.process_id is None
     assert not supervisor.process_record_path.exists()
+
+
+def test_windows_runtime_claim_close_failure_after_resume_retains_exact_retry_ownership(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A post-resume runtime claim close failure keeps its exact handle reachable."""
+
+    if os.name != "nt":
+        pytest.fail("required Windows runtime claim test executed on a non-Windows host")
+
+    capability = _capability(tmp_path, monkeypatch, code="import time; time.sleep(30)")
+    captured_claims: list[runtime_module._RuntimeLaunchClaim] = []
+    original_acquire = _acquire_runtime_launch_claim
+
+    def capture_claim(value: object) -> runtime_module._RuntimeLaunchClaim:
+        claim = original_acquire(value)
+        captured_claims.append(claim)
+        return claim
+
+    monkeypatch.setattr(supervisor_module, "_acquire_runtime_launch_claim", capture_claim)
+    launched: list[subprocess.Popen[bytes]] = []
+    original_cleanup = SolverSupervisor._cleanup_failed_start
+
+    def capture_cleanup(
+        instance: SolverSupervisor,
+        process: subprocess.Popen[bytes] | None,
+        authority: ProcessAuthority | None,
+        bound: bool,
+    ) -> tuple[BaseException, ...]:
+        if process is not None:
+            launched.append(process)
+        return original_cleanup(instance, process, authority, bound)
+
+    monkeypatch.setattr(SolverSupervisor, "_cleanup_failed_start", capture_cleanup)
+    close_failures = True
+    close_attempts: list[int] = []
+    original_claim_close = runtime_module._RuntimeLaunchClaim.close
+
+    def flaky_close(claim: runtime_module._RuntimeLaunchClaim) -> None:
+        handle = claim.handle
+        assert handle is not None
+        close_attempts.append(handle)
+        if close_failures:
+            raise runtime_module.RuntimeProbeError("synthetic persistent runtime close failure")
+        original_claim_close(claim)
+
+    monkeypatch.setattr(runtime_module._RuntimeLaunchClaim, "close", flaky_close)
+    supervisor = SolverSupervisor(capability)
+    try:
+        with pytest.raises(SolverOwnershipError, match="cleanup|closed|authority"):
+            supervisor.start()
+
+        assert captured_claims
+        claim = captured_claims[0]
+        assert claim.handle is not None
+        runtime_fd = claim.handle
+        assert close_attempts
+        assert close_attempts == [runtime_fd] * len(close_attempts)
+        assert supervisor._runtime_launch_claim is claim
+        assert supervisor.state is SolverState.FAILED
+        assert supervisor._process is None
+        assert launched
+        child = launched[0]
+        assert child.poll() is not None
+        assert child.wait(timeout=0) == child.returncode
+
+        close_failures = False
+        supervisor._close_filesystem_authority()
+        assert supervisor._runtime_launch_claim is None
+        with pytest.raises(OSError):
+            os.fstat(runtime_fd)
+    finally:
+        close_failures = False
+        if captured_claims and captured_claims[0].handle is not None:
+            original_claim_close(captured_claims[0])
+        for child in launched:
+            if child.poll() is None:
+                child.kill()
+                child.wait(timeout=5.0)
+
+
+def test_windows_runtime_claim_close_failure_before_bind_retains_exact_retry_ownership(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed pre-bind start keeps a runtime claim for exact later cleanup."""
+
+    if os.name != "nt":
+        pytest.fail("required Windows runtime claim test executed on a non-Windows host")
+
+    capability = _capability(tmp_path, monkeypatch, code="import time; time.sleep(30)")
+    captured_claims: list[runtime_module._RuntimeLaunchClaim] = []
+    original_acquire = _acquire_runtime_launch_claim
+
+    def capture_claim(value: object) -> runtime_module._RuntimeLaunchClaim:
+        claim = original_acquire(value)
+        captured_claims.append(claim)
+        return claim
+
+    monkeypatch.setattr(supervisor_module, "_acquire_runtime_launch_claim", capture_claim)
+    launched: list[subprocess.Popen[bytes]] = []
+    original_cleanup = SolverSupervisor._cleanup_failed_start
+
+    def capture_cleanup(
+        instance: SolverSupervisor,
+        process: subprocess.Popen[bytes] | None,
+        authority: ProcessAuthority | None,
+        bound: bool,
+    ) -> tuple[BaseException, ...]:
+        if process is not None:
+            launched.append(process)
+        return original_cleanup(instance, process, authority, bound)
+
+    monkeypatch.setattr(SolverSupervisor, "_cleanup_failed_start", capture_cleanup)
+    metadata_calls = 0
+    original_metadata = supervisor_module._process_metadata
+
+    def fail_before_bind(pid: int) -> supervisor_module._ProcessMetadata:
+        nonlocal metadata_calls
+        metadata_calls += 1
+        if metadata_calls == 1:
+            raise OSError("synthetic pre-bind metadata failure")
+        return original_metadata(pid)
+
+    monkeypatch.setattr(supervisor_module, "_process_metadata", fail_before_bind)
+    close_failures = True
+    close_attempts: list[int] = []
+    original_claim_close = runtime_module._RuntimeLaunchClaim.close
+
+    def flaky_close(claim: runtime_module._RuntimeLaunchClaim) -> None:
+        handle = claim.handle
+        assert handle is not None
+        close_attempts.append(handle)
+        if close_failures:
+            raise runtime_module.RuntimeProbeError("synthetic persistent runtime close failure")
+        original_claim_close(claim)
+
+    monkeypatch.setattr(runtime_module._RuntimeLaunchClaim, "close", flaky_close)
+    supervisor = SolverSupervisor(capability)
+    try:
+        with pytest.raises(SolverOwnershipError, match="cleanup|closed|authority"):
+            supervisor.start()
+
+        assert captured_claims
+        claim = captured_claims[0]
+        assert claim.handle is not None
+        runtime_fd = claim.handle
+        assert close_attempts
+        assert close_attempts == [runtime_fd] * len(close_attempts)
+        assert supervisor._runtime_launch_claim is claim
+        assert supervisor.state is SolverState.FAILED
+        assert supervisor._process is None
+        assert launched
+        child = launched[0]
+        assert child.poll() is not None
+        assert child.wait(timeout=0) == child.returncode
+        assert supervisor._process_record is None
+
+        close_failures = False
+        supervisor._close_filesystem_authority()
+        assert supervisor._runtime_launch_claim is None
+        with pytest.raises(OSError):
+            os.fstat(runtime_fd)
+    finally:
+        close_failures = False
+        if captured_claims and captured_claims[0].handle is not None:
+            original_claim_close(captured_claims[0])
+        for child in launched:
+            if child.poll() is None:
+                child.kill()
+                child.wait(timeout=5.0)
+
+
+def test_windows_invalid_process_record_candidate_close_failure_retains_exact_retry_ownership(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Malformed record candidates remain owned when their close keeps failing."""
+
+    if os.name != "nt":
+        pytest.fail("required Windows process-record test executed on a non-Windows host")
+
+    capability = _capability(tmp_path, monkeypatch, code="pass")
+    supervisor = SolverSupervisor(capability)
+    record_path = Path(os.fspath(supervisor.process_record_path))
+    record_path.write_bytes(b"{")
+    candidate_fds: list[int] = []
+    original_open = supervisor_module._windows_open_process_record
+
+    def capture_open(path: Path, *, create: bool, delete_access: bool = True) -> int:
+        fd = original_open(path, create=create, delete_access=delete_access)
+        candidate_fds.append(fd)
+        return fd
+
+    monkeypatch.setattr(supervisor_module, "_windows_open_process_record", capture_open)
+    close_failures = True
+    close_attempts: list[int] = []
+    original_close = os.close
+
+    def fail_candidate_close(fd: int) -> None:
+        if fd in candidate_fds and close_failures:
+            close_attempts.append(fd)
+            raise OSError("synthetic persistent process-record close failure")
+        original_close(fd)
+
+    try:
+        with monkeypatch.context() as read_patch:
+            read_patch.setattr(os, "close", fail_candidate_close)
+            with pytest.raises(SolverOwnershipError, match="invalid|closed"):
+                supervisor._read_process_record()
+
+        assert candidate_fds
+        candidate_fd = candidate_fds[0]
+        assert close_attempts == [candidate_fd]
+        owned_candidates = getattr(supervisor, "_process_record_candidates", ())
+        assert any(candidate.handle == candidate_fd for candidate in owned_candidates)
+
+        close_failures = False
+        supervisor._close_filesystem_authority()
+        assert not getattr(supervisor, "_process_record_candidates", ())
+        with pytest.raises(OSError):
+            os.fstat(candidate_fd)
+    finally:
+        close_failures = False
+        for candidate_fd in candidate_fds:
+            try:
+                os.fstat(candidate_fd)
+            except OSError:
+                continue
+            else:
+                original_close(candidate_fd)
+        if record_path.exists():
+            record_path.unlink()
+
+
+def test_windows_process_record_candidate_validation_and_close_failure_preserves_prior_claim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A replacement candidate cannot displace a live prior claim before validation."""
+
+    if os.name != "nt":
+        pytest.fail("required Windows process-record test executed on a non-Windows host")
+
+    capability = _capability(tmp_path, monkeypatch, code="import time; time.sleep(30)")
+    supervisor = SolverSupervisor(capability)
+    supervisor.start()
+    prior_claim = supervisor._process_record_claim
+    assert prior_claim is not None and prior_claim.handle is not None
+    prior_fd = prior_claim.handle
+    record_path = Path(os.fspath(prior_claim.path))
+    record_key = supervisor_module._windows_record_claim_key(record_path)
+    prior_entry = (prior_fd, prior_claim.device, prior_claim.inode)
+    original_open = supervisor_module._windows_open_process_record
+    candidate_fds: list[int] = []
+
+    def capture_open(path: Path, *, create: bool, delete_access: bool = True) -> int:
+        fd = original_open(path, create=create, delete_access=delete_access)
+        candidate_fds.append(fd)
+        return fd
+
+    supervisor._process_record_claim = None
+    candidate_from_installed: supervisor_module._ProcessRecordClaim | None = None
+    try:
+        with monkeypatch.context() as read_patch:
+            read_patch.setattr(supervisor_module, "_windows_open_process_record", capture_open)
+            record = supervisor._read_process_record()
+        candidate_from_installed = supervisor._process_record_claim
+        supervisor._process_record_claim = prior_claim
+
+        assert candidate_fds
+        candidate_fd = candidate_fds[0]
+        owned_candidates = getattr(supervisor, "_process_record_candidates", ())
+        assert any(candidate.handle == candidate_fd for candidate in owned_candidates)
+        candidate = next(
+            candidate for candidate in owned_candidates if candidate.handle == candidate_fd
+        )
+        assert supervisor._process_record_claim is prior_claim
+        invalid_record = dict(record)
+        invalid_record["state"] = "NOT_RUNNING"
+        with pytest.raises(SolverOwnershipError, match="reconnectable|RUNNING"):
+            supervisor._validate_process_record(invalid_record)
+        assert supervisor._process_record_claim is prior_claim
+        assert os.fstat(prior_fd).st_size > 0
+        assert supervisor_module._WINDOWS_RECORD_CLAIMS.get(record_key) == [
+            prior_entry,
+            (candidate_fd, candidate.device, candidate.inode),
+        ]
+
+        close_failures = True
+        close_attempts: list[int] = []
+        original_close = os.close
+
+        def fail_candidate_close(fd: int) -> None:
+            if fd == candidate_fd:
+                close_attempts.append(fd)
+                if close_failures:
+                    raise OSError("synthetic persistent candidate close failure")
+            original_close(fd)
+
+        with monkeypatch.context() as close_patch:
+            close_patch.setattr(os, "close", fail_candidate_close)
+            failures = supervisor._release_process_record_claim(candidate)
+            assert failures
+            assert candidate.handle == candidate_fd
+            assert supervisor._process_record_claim is prior_claim
+            assert os.fstat(prior_fd).st_size > 0
+            assert supervisor_module._WINDOWS_RECORD_CLAIMS.get(record_key) == [
+                prior_entry,
+                (candidate_fd, candidate.device, candidate.inode),
+            ]
+            close_failures = False
+            assert supervisor._release_process_record_claim(candidate) == ()
+            assert supervisor._release_process_record_claim(candidate) == ()
+
+        assert close_attempts == [candidate_fd, candidate_fd]
+        assert supervisor._process_record_claim is prior_claim
+        assert supervisor_module._WINDOWS_RECORD_CLAIMS.get(record_key) == [prior_entry]
+    finally:
+        if candidate_from_installed is not None and candidate_from_installed.handle is not None:
+            with contextlib.suppress(OSError):
+                os.close(candidate_from_installed.handle)
+        supervisor._process_record_claim = prior_claim
+        if supervisor.process_id is not None:
+            supervisor.cancel()
 
 
 def test_windows_record_claim_close_failure_retains_exact_retry_ownership(
