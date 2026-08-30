@@ -260,7 +260,7 @@ def test_windows_native_failure_preserves_only_durable_authority_record(
     else:
         assert not supervisor.process_record_path.exists()
         assert events.count("terminate") == 1
-        with pytest.raises(SolverOwnershipError, match="missing|reconnectable|RUNNING"):
+        with pytest.raises(SolverOwnershipError, match="invalid|missing|reconnectable|RUNNING"):
             SolverSupervisor.reconnect(capability)
     assert supervisor.result is None
 

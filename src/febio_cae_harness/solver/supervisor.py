@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import ctypes
+import errno
 import json
 import math
 import os
@@ -23,6 +24,7 @@ from ..evidence import IntentSnapshotAuthority
 from .fbs import (
     FbsAdapterAuthority,
     FbsValidation,
+    _adopt_validation,
     _authority_record,
     _invalid_validation,
     _unregister_validation,
@@ -67,12 +69,231 @@ _WINDOWS_FILE_SHARE_READ = 0x00000001
 _WINDOWS_FILE_SHARE_WRITE = 0x00000002
 _WINDOWS_FILE_READ_ATTRIBUTES = 0x00000080
 _WINDOWS_FILE_LIST_DIRECTORY = 0x00000001
-_WINDOWS_OPEN_EXISTING = 3
 _WINDOWS_FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
 _WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
 _WINDOWS_FILE_ATTRIBUTE_DIRECTORY = 0x00000010
 _WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
 _WINDOWS_INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+_WINDOWS_GENERIC_READ = 0x80000000
+_WINDOWS_GENERIC_WRITE = 0x40000000
+_WINDOWS_DELETE = 0x00010000
+_WINDOWS_FILE_SHARE_DELETE = 0x00000004
+_WINDOWS_CREATE_NEW = 1
+_WINDOWS_OPEN_EXISTING = 3
+_WINDOWS_FILE_ATTRIBUTE_NORMAL = 0x00000080
+_WINDOWS_FILE_DISPOSITION_INFO = 4
+_POSIX_AT_EMPTY_PATH = 0x1000
+_POSIX_RENAME_EXCHANGE = 0x2
+
+
+def _same_file_identity(left: os.stat_result, right: os.stat_result) -> bool:
+    return int(left.st_dev) == int(right.st_dev) and int(left.st_ino) == int(right.st_ino)
+
+
+class _WindowsFileDispositionInfo(ctypes.Structure):
+    _fields_ = [("delete_file", ctypes.c_int)]
+
+
+def _windows_open_process_record(
+    path: Path,
+    *,
+    create: bool,
+    delete_access: bool = False,
+) -> int:
+    """Open a process record while retaining a handle to one exact object."""
+
+    import msvcrt
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+    ]
+    kernel32.CreateFileW.restype = ctypes.c_void_p
+    desired_access = _WINDOWS_GENERIC_READ | _WINDOWS_GENERIC_WRITE
+    if delete_access:
+        desired_access |= _WINDOWS_DELETE
+    share_mode = _WINDOWS_FILE_SHARE_READ | _WINDOWS_FILE_SHARE_WRITE | _WINDOWS_FILE_SHARE_DELETE
+    disposition = _WINDOWS_CREATE_NEW if create else _WINDOWS_OPEN_EXISTING
+    ctypes.set_last_error(0)
+    raw_handle = kernel32.CreateFileW(
+        os.fspath(path),
+        desired_access,
+        share_mode,
+        None,
+        disposition,
+        _WINDOWS_FILE_ATTRIBUTE_NORMAL,
+        None,
+    )
+    raw_value = raw_handle.value if isinstance(raw_handle, ctypes.c_void_p) else raw_handle
+    try:
+        value = 0 if raw_value is None else int(cast(int, raw_value))
+    except (TypeError, ValueError, OverflowError):
+        value = 0
+    if not value or value in {-1, _WINDOWS_INVALID_HANDLE_VALUE}:
+        error = ctypes.get_last_error()
+        if error in {80, 183}:  # ERROR_FILE_EXISTS / ERROR_ALREADY_EXISTS
+            raise FileExistsError(error, "process record already exists", os.fspath(path))
+        if error in {2, 3}:  # ERROR_FILE_NOT_FOUND / ERROR_PATH_NOT_FOUND
+            raise FileNotFoundError(error, "process record does not exist", os.fspath(path))
+        raise OSError(error, f"unable to open process record: {path}")
+    try:
+        return int(msvcrt.open_osfhandle(value, os.O_RDWR | getattr(os, "O_BINARY", 0)))
+    except BaseException:
+        with contextlib.suppress(BaseException):
+            kernel32.CloseHandle(value)
+        raise
+
+
+def _write_record_fd(fd: int, content: bytes) -> None:
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.ftruncate(fd, 0)
+        offset = 0
+        while offset < len(content):
+            written = os.write(fd, content[offset:])
+            if written <= 0:
+                raise OSError("unable to write process record")
+            offset += written
+        os.fsync(fd)
+    except OSError as error:
+        raise OSError("unable to publish process record") from error
+
+
+def _read_record_fd(fd: int) -> bytes:
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                return b"".join(chunks)
+            chunks.append(chunk)
+    except OSError as error:
+        raise SolverOwnershipError("unable to read the owned process record") from error
+
+
+def _windows_delete_process_record(fd: int, path: Path) -> None:
+    import msvcrt
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.SetFileInformationByHandle.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+    ]
+    kernel32.SetFileInformationByHandle.restype = ctypes.c_int
+    try:
+        delete_fd = _windows_open_process_record(path, create=False, delete_access=True)
+    except FileNotFoundError:
+        return
+    try:
+        if not _same_file_identity(os.fstat(fd), os.fstat(delete_fd)):
+            return
+        disposition = _WindowsFileDispositionInfo(1)
+        handle = msvcrt.get_osfhandle(delete_fd)
+        if not kernel32.SetFileInformationByHandle(
+            handle,
+            _WINDOWS_FILE_DISPOSITION_INFO,
+            ctypes.byref(disposition),
+            ctypes.sizeof(disposition),
+        ):
+            error = ctypes.get_last_error()
+            raise OSError(error, "unable to remove exact process record handle")
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(delete_fd)
+
+
+@contextlib.contextmanager
+def _posix_record_lock(parent_fd: int) -> Iterator[None]:
+    import fcntl
+
+    try:
+        fcntl.flock(parent_fd, fcntl.LOCK_EX)  # type: ignore[attr-defined]
+    except OSError as error:
+        raise SolverOwnershipError("unable to acquire process record transaction lock") from error
+    try:
+        yield
+    finally:
+        with contextlib.suppress(OSError):
+            fcntl.flock(parent_fd, fcntl.LOCK_UN)  # type: ignore[attr-defined]
+
+
+def _posix_libc_function(name: str) -> Any:
+    libc = ctypes.CDLL(None, use_errno=True)
+    function = getattr(libc, name, None)
+    if function is None:
+        raise OSError(f"POSIX {name} is unavailable")
+    return function
+
+
+def _posix_link_fd(source_fd: int, parent_fd: int, name: str) -> None:
+    function = _posix_libc_function("linkat")
+    function.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+    ]
+    function.restype = ctypes.c_int
+    result = function(source_fd, b"", parent_fd, os.fsencode(name), _POSIX_AT_EMPTY_PATH)
+    if result != 0:
+        error = ctypes.get_errno()
+        if error not in {errno.ENOSYS, errno.EPERM, errno.EINVAL}:
+            raise OSError(error, "unable to hold exact process record link")
+        alias = Path("/proc/self/fd") / str(source_fd)
+        try:
+            os.link(
+                os.fspath(alias),
+                name,
+                dst_dir_fd=parent_fd,
+                follow_symlinks=True,
+            )
+        except OSError as fallback_error:
+            raise OSError(
+                fallback_error.errno,
+                "unable to hold exact process record link",
+            ) from fallback_error
+
+
+def _posix_rename_exchange(parent_fd: int, left: str, right: str) -> None:
+    function = _posix_libc_function("renameat2")
+    function.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    function.restype = ctypes.c_int
+    result = function(
+        parent_fd,
+        os.fsencode(left),
+        parent_fd,
+        os.fsencode(right),
+        _POSIX_RENAME_EXCHANGE,
+    )
+    if result != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, "unable to atomically exchange process record entries")
+
+
+def _posix_unlink(parent_fd: int, name: str) -> None:
+    function = _posix_libc_function("unlinkat")
+    function.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+    function.restype = ctypes.c_int
+    result = function(parent_fd, os.fsencode(name), 0)
+    if result != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, "unable to unlink process record entry")
 
 
 @dataclass(frozen=True, slots=True)
@@ -426,6 +647,9 @@ class _ProcessRecordClaim:
     device: int
     inode: int
     state: str | None
+    handle: int | None = None
+    parent_fd: int | None = None
+    name: str = _PROCESS_RECORD_NAME
 
 
 @dataclass(frozen=True, slots=True)
@@ -446,10 +670,6 @@ class _ResultIssuance:
     finished_at: datetime | None
     filesystem_identities: tuple[_FilesystemIdentity, ...]
     snapshot: tuple[object, ...]
-
-
-_RESULT_REGISTRY: dict[int, _ResultIssuance] = {}
-_RESULT_REGISTRY_LOCK = threading.RLock()
 
 
 @dataclass(frozen=True, slots=True)
@@ -647,6 +867,8 @@ class SolverSupervisor:
         self._process: subprocess.Popen[bytes] | _ReconnectedProcess | None = None
         self._process_authority: ProcessAuthority | None = None
         self._started_at: datetime | None = None
+        self._result_latch: SolverRunResult | None = None
+        self._result_issuance: _ResultIssuance | None = None
         self._result: SolverRunResult | None = None
         self._process_record: dict[str, object] | None = None
         self._process_record_claim: _ProcessRecordClaim | None = None
@@ -654,6 +876,31 @@ class SolverSupervisor:
         filesystem_authority = _FilesystemAuthority(self.spec.attempt_root)
         try:
             self._filesystem_authority: _FilesystemAuthority | None = filesystem_authority
+            if fbs_adapter is not None:
+                fbs_record = _authority_record(fbs_adapter)
+                root_binding = fbs_record.root_binding
+                filesystem_root_identity = next(
+                    (
+                        identity
+                        for identity in self._filesystem_authority.identities
+                        if identity.path == self.spec.attempt_root
+                    ),
+                    None,
+                )
+                if (
+                    fbs_record.attempt_root != self.spec.attempt_root
+                    or root_binding is None
+                    or filesystem_root_identity is None
+                    or (
+                        root_binding.device,
+                        root_binding.inode,
+                    )
+                    != (
+                        filesystem_root_identity.device,
+                        filesystem_root_identity.inode,
+                    )
+                ):
+                    raise SolverConfigurationError("fbs adapter root authority does not match")
             self._revalidate_launch_binding()
         except BaseException:
             filesystem_authority.close()
@@ -694,7 +941,11 @@ class SolverSupervisor:
     @property
     def result(self) -> SolverRunResult | None:
         with self._lock:
-            return self._result
+            latch = self._result_latch
+            issuance = self._result_issuance
+            if latch is None or issuance is None or issuance.result is not latch:
+                return None
+            return latch
 
     def _acquire_filesystem_authority(self) -> None:
         if self._filesystem_authority is None:
@@ -773,8 +1024,23 @@ class SolverSupervisor:
     def _close_filesystem_authority(self) -> None:
         authority = self._filesystem_authority
         self._filesystem_authority = None
+        failures: list[BaseException] = []
         if authority is not None:
-            authority.close()
+            try:
+                authority.close()
+            except BaseException as error:
+                failures.append(error)
+        claim = self._process_record_claim
+        self._process_record_claim = None
+        if claim is not None:
+            for fd in (claim.handle, claim.parent_fd):
+                if fd is not None:
+                    try:
+                        os.close(fd)
+                    except BaseException as error:
+                        failures.append(error)
+        if failures:
+            raise SolverOwnershipError("authority handles could not be closed") from failures[0]
 
     def _path_for_io(self, path: Path) -> Path:
         authority = self._filesystem_authority
@@ -907,36 +1173,67 @@ class SolverSupervisor:
         return tuple(failures)
 
     def _record_claim_matches(self, claim: _ProcessRecordClaim) -> bool:
+        """Check the held record object and its directory entry, without reopening it."""
+
+        if claim.handle is None:
+            return False
         try:
-            metadata = os.lstat(os.fspath(claim.path))
+            if not self._record_claim_identity_matches(claim):
+                return False
+            return _read_record_fd(claim.handle) == claim.content
+        except FileNotFoundError:
+            return False
+        except OSError as error:
+            raise SolverOwnershipError("unable to verify the owned process record") from error
+
+    def _record_claim_identity_matches(self, claim: _ProcessRecordClaim) -> bool:
+        if claim.handle is None:
+            return False
+        try:
+            handle_metadata = os.fstat(claim.handle)
             if (
-                stat.S_ISLNK(metadata.st_mode)
-                or not stat.S_ISREG(metadata.st_mode)
-                or int(metadata.st_dev) != claim.device
-                or int(metadata.st_ino) != claim.inode
+                not stat.S_ISREG(handle_metadata.st_mode)
+                or int(handle_metadata.st_dev) != claim.device
+                or int(handle_metadata.st_ino) != claim.inode
             ):
                 return False
-            return self._read_path_bytes(claim.path) == claim.content
+            if claim.parent_fd is not None:
+                entry_metadata = os.stat(
+                    claim.name,
+                    dir_fd=claim.parent_fd,
+                    follow_symlinks=False,
+                )
+                return _same_file_identity(entry_metadata, handle_metadata)
+            if _NATIVE_WINDOWS:
+                try:
+                    path_fd = _windows_open_process_record(claim.path, create=False)
+                except FileNotFoundError:
+                    return False
+                try:
+                    return _same_file_identity(handle_metadata, os.fstat(path_fd))
+                finally:
+                    with contextlib.suppress(OSError):
+                        os.close(path_fd)
+            return True
         except FileNotFoundError:
             return False
         except OSError as error:
             raise SolverOwnershipError("unable to verify the owned process record") from error
 
     def _rollback_process_record(self) -> tuple[BaseException, ...]:
-        """Remove only the exact record inode and bytes this owner published."""
+        """Remove only the exact record object this owner published."""
 
         claim = self._process_record_claim
-        if claim is None:
+        if claim is None or claim.handle is None:
             return ()
         try:
-            if not self._record_claim_matches(claim):
-                return ()
-            if os.name == "posix":
-                # The claim path is an anchored /proc/self/fd path, so unlink
-                # cannot be redirected by a renamed lexical attempt root.
-                os.unlink(os.fspath(claim.path))
+            if _NATIVE_WINDOWS:
+                _windows_delete_process_record(claim.handle, claim.path)
             else:
-                claim.path.unlink()
+                parent_fd = claim.parent_fd
+                if parent_fd is None:
+                    raise SolverOwnershipError("process record transaction parent is unavailable")
+                self._rollback_posix_process_record(claim)
         except FileNotFoundError:
             return ()
         except BaseException as error:
@@ -944,6 +1241,76 @@ class SolverSupervisor:
             failure.__cause__ = error
             return (failure,)
         return ()
+
+    def _rollback_posix_process_record(self, claim: _ProcessRecordClaim) -> None:
+        """CAS-remove a held record, preserving any name replacement."""
+
+        parent_fd = claim.parent_fd
+        handle = claim.handle
+        if parent_fd is None or handle is None:
+            raise SolverOwnershipError("process record transaction handle is unavailable")
+        tombstone = f".{claim.name}.{self._owner_token}.rollback"
+        tombstone_is_owner = True
+        with _posix_record_lock(parent_fd):
+            try:
+                _posix_link_fd(handle, parent_fd, tombstone)
+            except OSError as error:
+                raise SolverOwnershipError(
+                    "process record cleanup cannot establish an exact transaction"
+                ) from error
+            try:
+                try:
+                    _posix_rename_exchange(parent_fd, claim.name, tombstone)
+                except FileNotFoundError:
+                    _posix_unlink(parent_fd, tombstone)
+                    return
+                except OSError as error:
+                    with contextlib.suppress(OSError):
+                        _posix_unlink(parent_fd, tombstone)
+                    raise SolverOwnershipError(
+                        "process record cleanup cannot exchange the owned entry"
+                    ) from error
+
+                entry_metadata = os.stat(
+                    tombstone,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+                owner_metadata = os.fstat(handle)
+                tombstone_is_owner = _same_file_identity(entry_metadata, owner_metadata)
+                if tombstone_is_owner:
+                    current_metadata = os.stat(
+                        claim.name,
+                        dir_fd=parent_fd,
+                        follow_symlinks=False,
+                    )
+                    if _same_file_identity(current_metadata, owner_metadata):
+                        _posix_unlink(parent_fd, claim.name)
+                    _posix_unlink(parent_fd, tombstone)
+                    return
+
+                # A foreign entry occupied the name at exchange time.  Put it
+                # back only when the owner entry is still the exchange result;
+                # otherwise leave every foreign entry untouched and fail closed.
+                current_metadata = os.stat(
+                    claim.name,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+                if not _same_file_identity(current_metadata, owner_metadata):
+                    raise SolverOwnershipError(
+                        "process record cleanup encountered an uncertain replacement"
+                    )
+                _posix_rename_exchange(parent_fd, claim.name, tombstone)
+                tombstone_is_owner = True
+                _posix_unlink(parent_fd, tombstone)
+            except BaseException:
+                # The tombstone is an exact held-object link.  Removing it
+                # cannot remove a foreign replacement at ``process.json``.
+                if tombstone_is_owner:
+                    with contextlib.suppress(OSError):
+                        _posix_unlink(parent_fd, tombstone)
+                raise
 
     def _revalidate_launch_binding(self) -> None:
         """Require the supervisor's capability and authority binding to remain exact."""
@@ -1074,11 +1441,6 @@ class SolverSupervisor:
                 self._prepare_outputs()
                 self._verify_filesystem_authority()
                 self._revalidate_launch_binding()
-                record_path = self._path_for_io(self.process_record_path)
-                if os.path.lexists(os.fspath(record_path)):
-                    raise SolverLaunchError(
-                        f"process record already exists: {self.process_record_path}"
-                    )
                 if not self._input_is_regular():
                     raise FileNotFoundError(f"solver input does not exist: {self.spec.input_path}")
                 authority = ProcessAuthority.create(
@@ -1187,7 +1549,6 @@ class SolverSupervisor:
                 self._started_at = None
                 self._process_authority = None
                 self._process_record = None
-                self._process_record_claim = None
                 try:
                     self._close_filesystem_authority()
                 except BaseException as close_error:
@@ -1279,8 +1640,11 @@ class SolverSupervisor:
         """Wait for completion, enforcing the configured timeout if present."""
 
         with self._lock:
-            if self._result is not None:
-                return self._result
+            if self._result_latch is not None:
+                issuance = self._result_issuance
+                if issuance is None or issuance.result is not self._result_latch:
+                    raise SolverOwnershipError("supervisor result latch is invalid")
+                return self._result_latch
             if self._state is SolverState.NOT_STARTED:
                 raise RuntimeError("solver has not been started")
             process = self._process
@@ -1329,8 +1693,11 @@ class SolverSupervisor:
         """Cancel the owned process tree and return a cancelled result."""
 
         with self._lock:
-            if self._result is not None:
-                return self._result
+            if self._result_latch is not None:
+                issuance = self._result_issuance
+                if issuance is None or issuance.result is not self._result_latch:
+                    raise SolverOwnershipError("supervisor result latch is invalid")
+                return self._result_latch
             if self._state is SolverState.NOT_STARTED:
                 return self._complete(SolverState.CANCELLED, None)
             process = self._process
@@ -1381,24 +1748,17 @@ class SolverSupervisor:
             "process_authority": claim,
         }
 
-    @staticmethod
-    def _read_path_bytes(path: Path) -> bytes:
-        if os.name != "posix":
-            return path.read_bytes()
-        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-        fd = os.open(os.fspath(path), flags)
-        try:
-            with os.fdopen(fd, "rb") as stream:
-                fd = -1
-                return stream.read()
-        finally:
-            if fd >= 0:
-                with contextlib.suppress(OSError):
-                    os.close(fd)
-
-    def _claim_process_record(self, path: Path, content: bytes, record: dict[str, object]) -> None:
-        metadata = os.stat(os.fspath(path), follow_symlinks=False)
-        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+    def _set_process_record_claim(
+        self,
+        path: Path,
+        content: bytes,
+        record: dict[str, object],
+        *,
+        handle: int,
+        parent_fd: int | None,
+    ) -> None:
+        metadata = os.fstat(handle)
+        if not stat.S_ISREG(metadata.st_mode):
             raise OSError("process record is not a regular file")
         record_state = record.get("state")
         self._process_record_claim = _ProcessRecordClaim(
@@ -1407,6 +1767,9 @@ class SolverSupervisor:
             device=int(metadata.st_dev),
             inode=int(metadata.st_ino),
             state=record_state if isinstance(record_state, str) else None,
+            handle=handle,
+            parent_fd=parent_fd,
+            name=self.process_record_path.name,
         )
 
     def _write_process_record(self, record: dict[str, object]) -> None:
@@ -1417,7 +1780,33 @@ class SolverSupervisor:
             content = json.dumps(record, indent=2, sort_keys=True).encode("utf-8")
         except (TypeError, ValueError) as error:
             raise OSError(f"unable to persist process record: {error}") from error
+        claim = self._process_record_claim
         try:
+            if claim is not None and claim.handle is not None:
+                if _NATIVE_WINDOWS:
+                    _write_record_fd(claim.handle, content)
+                else:
+                    parent_fd = claim.parent_fd
+                    if parent_fd is None:
+                        raise SolverOwnershipError(
+                            "process record transaction parent is unavailable"
+                        )
+                    with _posix_record_lock(parent_fd):
+                        if not self._record_claim_identity_matches(claim):
+                            raise SolverOwnershipError("owned process record was replaced")
+                        _write_record_fd(claim.handle, content)
+                record_state = record.get("state")
+                self._process_record_claim = _ProcessRecordClaim(
+                    path=claim.path,
+                    content=content,
+                    device=claim.device,
+                    inode=claim.inode,
+                    state=record_state if isinstance(record_state, str) else None,
+                    handle=claim.handle,
+                    parent_fd=claim.parent_fd,
+                    name=claim.name,
+                )
+                return
             if os.name == "posix":
                 authority = self._filesystem_authority
                 if authority is None:
@@ -1425,6 +1814,9 @@ class SolverSupervisor:
                 with authority.open_directory(
                     self.process_record_path.parent, create=True
                 ) as parent_fd:
+                    temp_fd: int | None = None
+                    claim_parent_fd: int | None = None
+                    claim_installed = False
                     flags = (
                         os.O_WRONLY
                         | os.O_CREAT
@@ -1432,43 +1824,65 @@ class SolverSupervisor:
                         | getattr(os, "O_CLOEXEC", 0)
                         | getattr(os, "O_NOFOLLOW", 0)
                     )
-                    temp_fd = os.open(temporary.name, flags, 0o600, dir_fd=parent_fd)
                     try:
-                        with os.fdopen(temp_fd, "wb") as stream:
-                            temp_fd = -1
-                            stream.write(content)
-                            stream.flush()
-                            os.fsync(stream.fileno())
+                        with _posix_record_lock(parent_fd):
+                            temp_fd = os.open(temporary.name, flags, 0o600, dir_fd=parent_fd)
+                            _write_record_fd(temp_fd, content)
+                            claim_parent_fd = os.dup(parent_fd)
+                            self._set_process_record_claim(
+                                path,
+                                content,
+                                record,
+                                handle=temp_fd,
+                                parent_fd=claim_parent_fd,
+                            )
+                            claim_installed = True
+                            # A create-new hard link publishes the record without
+                            # replacing a foreign file that won the name race.
+                            _posix_link_fd(temp_fd, parent_fd, path.name)
+                            _posix_unlink(parent_fd, temporary.name)
+                            os.fsync(parent_fd)
                     finally:
-                        if temp_fd >= 0:
-                            with contextlib.suppress(OSError):
-                                os.close(temp_fd)
-                    # A create-new hard link publishes the record without
-                    # replacing a foreign file that won the name race.
-                    os.link(
-                        temporary.name,
-                        path.name,
-                        src_dir_fd=parent_fd,
-                        dst_dir_fd=parent_fd,
-                        follow_symlinks=False,
-                    )
-                    os.unlink(temporary.name, dir_fd=parent_fd)
-                    self._claim_process_record(path, content, record)
-                    os.fsync(parent_fd)
+                        if not claim_installed:
+                            if temp_fd is not None:
+                                with contextlib.suppress(OSError):
+                                    os.close(temp_fd)
+                            if claim_parent_fd is not None:
+                                with contextlib.suppress(OSError):
+                                    os.close(claim_parent_fd)
+            elif _NATIVE_WINDOWS:
+                record_fd = _windows_open_process_record(path, create=True)
+                self._set_process_record_claim(
+                    path,
+                    content,
+                    record,
+                    handle=record_fd,
+                    parent_fd=None,
+                )
+                _write_record_fd(record_fd, content)
             else:
                 with temporary.open("x", encoding="utf-8", newline="") as stream:
                     stream.write(content.decode("utf-8"))
                     stream.flush()
                     os.fsync(stream.fileno())
                 os.replace(os.fspath(temporary), os.fspath(path))
-            if os.name != "posix":
-                self._claim_process_record(path, content, record)
-            if self._read_path_bytes(path) != content:
-                raise OSError("process record changed during publication")
+                record_fd = os.open(os.fspath(path), os.O_RDWR)
+                self._set_process_record_claim(
+                    path,
+                    content,
+                    record,
+                    handle=record_fd,
+                    parent_fd=None,
+                )
         except (OSError, SolverOwnershipError, TypeError, ValueError) as error:
             if os.name == "posix":
                 with contextlib.suppress(OSError):
-                    os.unlink(os.fspath(temporary))
+                    authority = self._filesystem_authority
+                    if authority is not None:
+                        with authority.open_directory(
+                            self.process_record_path.parent, create=False
+                        ) as parent_fd:
+                            _posix_unlink(parent_fd, temporary.name)
             else:
                 with contextlib.suppress(OSError):
                     temporary.unlink(missing_ok=True)
@@ -1479,33 +1893,65 @@ class SolverSupervisor:
     def _read_process_record(self) -> dict[str, object]:
         self._verify_filesystem_authority()
         path = self._path_for_io(self.process_record_path)
+        record_fd: int | None = None
+        parent_fd: int | None = None
         try:
-            metadata = os.stat(os.fspath(path), follow_symlinks=False)
-        except OSError as error:
-            raise SolverOwnershipError(f"missing process record: {path}") from error
-        if not stat.S_ISREG(metadata.st_mode):
-            raise SolverOwnershipError(f"missing process record: {path}")
-        try:
-            content = self._read_path_bytes(path)
+            if os.name == "posix":
+                authority = self._filesystem_authority
+                if authority is None:
+                    raise SolverOwnershipError("filesystem authority is unavailable")
+                with authority.open_directory(self.process_record_path.parent) as opened_parent:
+                    record_fd = os.open(
+                        path.name,
+                        os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+                        dir_fd=opened_parent,
+                    )
+                    parent_fd = os.dup(opened_parent)
+                    content = _read_record_fd(record_fd)
+            elif _NATIVE_WINDOWS:
+                record_fd = _windows_open_process_record(path, create=False)
+                content = _read_record_fd(record_fd)
+            else:
+                record_fd = os.open(os.fspath(path), os.O_RDWR)
+                content = _read_record_fd(record_fd)
             record = json.loads(content.decode("utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
+            if record_fd is not None:
+                with contextlib.suppress(OSError):
+                    os.close(record_fd)
+            if parent_fd is not None:
+                with contextlib.suppress(OSError):
+                    os.close(parent_fd)
             raise SolverOwnershipError(f"invalid process record: {path}") from error
         if not isinstance(record, dict):
+            if record_fd is not None:
+                with contextlib.suppress(OSError):
+                    os.close(record_fd)
+            if parent_fd is not None:
+                with contextlib.suppress(OSError):
+                    os.close(parent_fd)
             raise SolverOwnershipError("process record must be a JSON object")
         self._verify_filesystem_authority()
-        metadata = os.stat(os.fspath(path), follow_symlinks=False)
-        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
-            raise SolverOwnershipError("process record is not a regular file")
-        if self._read_path_bytes(path) != content:
-            raise SolverOwnershipError("process record changed during read")
-        record_state = record.get("state")
-        self._process_record_claim = _ProcessRecordClaim(
-            path=path,
-            content=content,
-            device=int(metadata.st_dev),
-            inode=int(metadata.st_ino),
-            state=record_state if isinstance(record_state, str) else None,
-        )
+        if record_fd is None:
+            raise SolverOwnershipError("process record handle is unavailable")
+        try:
+            self._set_process_record_claim(
+                path,
+                content,
+                record,
+                handle=record_fd,
+                parent_fd=parent_fd,
+            )
+            claim = self._process_record_claim
+            if claim is None or not self._record_claim_identity_matches(claim):
+                raise SolverOwnershipError("process record changed during read")
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.close(record_fd)
+            if parent_fd is not None:
+                with contextlib.suppress(OSError):
+                    os.close(parent_fd)
+            raise
         return record
 
     def _validate_record_path(self, value: object, expected: Path, label: str) -> None:
@@ -1718,7 +2164,8 @@ class SolverSupervisor:
         self._process = None
         self._started_at = None
         self._process_record = None
-        self._process_record_claim = None
+        self._result_latch = None
+        self._result_issuance = None
         self._result = None
         self._state = SolverState.FAILED
         try:
@@ -1732,6 +2179,8 @@ class SolverSupervisor:
     def _register_result(self, result: SolverRunResult) -> None:
         if type(result) is not SolverRunResult:
             raise SolverOwnershipError("solver result must be an exact SolverRunResult instance")
+        if self._result_latch is not None or self._result_issuance is not None:
+            raise SolverOwnershipError("supervisor already has an issued solver result")
         process_record = self._process_record
         identity = process_record.get("process_creation_identity") if process_record else None
         issuance = _ResultIssuance(
@@ -1754,21 +2203,20 @@ class SolverSupervisor:
             ),
             snapshot=tuple(getattr(result, field) for field in _RESULT_FIELDS),
         )
-        with _RESULT_REGISTRY_LOCK:
-            existing = _RESULT_REGISTRY.get(id(result))
-            if existing is not None and existing.result is not result:
-                raise SolverOwnershipError("solver result registry collision")
-            _RESULT_REGISTRY[id(result)] = issuance
+        self._result_issuance = issuance
 
     def _unregister_result(self, result: object) -> bool:
         if type(result) is not SolverRunResult:
             return False
-        with _RESULT_REGISTRY_LOCK:
-            issuance = _RESULT_REGISTRY.get(id(result))
-            if issuance is None or issuance.result is not result:
-                return False
-            del _RESULT_REGISTRY[id(result)]
-            return True
+        issuance = self._result_issuance
+        if issuance is None or issuance.result is not result:
+            return False
+        self._result_issuance = None
+        if self._result_latch is result:
+            self._result_latch = None
+        if self._result is result:
+            self._result = None
+        return True
 
     def _validate_result(self, candidate: object) -> SolverRunResult:
         if type(self) is not SolverSupervisor:
@@ -1776,14 +2224,15 @@ class SolverSupervisor:
         if type(candidate) is not SolverRunResult:
             raise SolverOwnershipError("solver result must be an exact SolverRunResult instance")
         with self._lock:
-            with _RESULT_REGISTRY_LOCK:
-                issuance = _RESULT_REGISTRY.get(id(candidate))
+            issuance = self._result_issuance
             if issuance is None or issuance.result is not candidate:
                 raise SolverOwnershipError("solver result was not issued by a supervisor")
             if issuance.supervisor is not self:
                 raise SolverOwnershipError("solver result belongs to another supervisor")
-            if self._result is not candidate:
+            if self._result_latch is not candidate:
                 raise SolverOwnershipError("supervisor result binding is invalid")
+            if self._result is not candidate:
+                raise SolverOwnershipError("supervisor result latch is invalid")
             if self.spec is not issuance.spec:
                 raise SolverOwnershipError("supervisor launch binding is invalid")
             for value, expected, label in (
@@ -1887,8 +2336,13 @@ class SolverSupervisor:
 
     def _complete(self, state: SolverState, return_code: int | None) -> SolverRunResult:
         with self._lock:
-            if self._result is not None:
-                return self._result
+            if self._result_latch is not None:
+                issuance = self._result_issuance
+                if issuance is None or issuance.result is not self._result_latch:
+                    raise SolverOwnershipError("supervisor result latch is invalid")
+                return self._result_latch
+            if self._result_issuance is not None:
+                raise SolverOwnershipError("supervisor has an unlatched solver result")
 
             # Cancellation before launch has no filesystem or process
             # publication to validate, but still receives an issued result.
@@ -1907,6 +2361,7 @@ class SolverSupervisor:
                 try:
                     self._register_result(cancelled_result)
                     self._state = state
+                    self._result_latch = cancelled_result
                     self._result = cancelled_result
                     self._close_filesystem_authority()
                     return cancelled_result
@@ -1953,9 +2408,6 @@ class SolverSupervisor:
                                 self._fbs_adapter,
                                 outputs.xplt_path,
                                 self._requested_fields,
-                                attempt_root=self.spec.attempt_root,
-                                physical_path=self._path_for_io(outputs.xplt_path),
-                                physical_root=self._path_for_io(self.spec.attempt_root),
                             )
                             self._verify_filesystem_authority()
                         except Exception as error:
@@ -1987,6 +2439,8 @@ class SolverSupervisor:
                     log_validation=log_validation,
                     fbs_validation=fbs_validation,
                 )
+                if fbs_validation is not None:
+                    _adopt_validation(fbs_validation, self, result)
                 self._register_result(result)
 
                 # Result/FBS issuance is provisional until the final live
@@ -2006,6 +2460,7 @@ class SolverSupervisor:
                 self._verify_filesystem_authority()
 
                 self._state = state
+                self._result_latch = result
                 self._result = result
                 self._close_filesystem_authority()
                 return result
@@ -2019,7 +2474,8 @@ class SolverSupervisor:
                 self._process = None
                 self._started_at = None
                 self._process_record = None
-                self._process_record_claim = None
+                self._result_latch = None
+                self._result_issuance = None
                 self._result = None
                 self._state = SolverState.FAILED
                 try:

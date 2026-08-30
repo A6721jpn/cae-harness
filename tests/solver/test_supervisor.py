@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import os
 import subprocess
 import sys
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
@@ -286,6 +289,90 @@ def test_posix_launch_anchors_preparation_and_child_paths_across_attempt_root_re
     assert (moved_root / "process.json").is_file()
 
 
+def test_rollback_process_record_has_no_check_then_path_unlink_window() -> None:
+    source = inspect.getsource(SolverSupervisor._rollback_process_record)
+    assert "_record_claim_matches" not in source
+    assert "claim.path.unlink" not in source
+
+
+def test_posix_rollback_preserves_replacement_at_former_unlink_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if os.name != "posix":
+        pytest.skip("POSIX atomic record transaction")
+
+    capability = _capability(tmp_path, monkeypatch, code="pass")
+    supervisor = SolverSupervisor(capability)
+    supervisor.start()
+    claim = supervisor._process_record_claim
+    assert claim is not None
+    replaced = False
+
+    original_exchange = supervisor_module._posix_rename_exchange
+
+    def racing_exchange(parent_fd: int, left: str, right: str) -> None:
+        nonlocal replaced
+        original_exchange(parent_fd, left, right)
+        if not replaced and left == claim.name:
+            replacement = supervisor.process_record_path.with_name("foreign.json")
+            replacement.write_text('{"foreign": true}', encoding="utf-8")
+            os.replace(os.fspath(replacement), os.fspath(supervisor.process_record_path))
+            replaced = True
+
+    monkeypatch.setattr(supervisor_module, "_posix_rename_exchange", racing_exchange)
+    try:
+        assert supervisor._rollback_process_record() == ()
+        assert replaced
+        assert supervisor.process_record_path.read_text(encoding="utf-8") == '{"foreign": true}'
+    finally:
+        supervisor.cancel()
+
+
+def test_posix_rollback_uncertainty_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if os.name != "posix":
+        pytest.skip("POSIX atomic record transaction")
+
+    capability = _capability(tmp_path, monkeypatch, code="pass")
+    supervisor = SolverSupervisor(capability)
+    supervisor.start()
+    try:
+        with monkeypatch.context() as transaction_patch:
+            transaction_patch.setattr(
+                supervisor_module,
+                "_posix_rename_exchange",
+                Mock(side_effect=OSError("synthetic exchange uncertainty")),
+            )
+            failures = supervisor._rollback_process_record()
+        assert failures
+        assert supervisor.process_record_path.is_file()
+    finally:
+        supervisor.cancel()
+    assert not supervisor.process_record_path.exists()
+
+
+def test_wait_replays_only_supervisor_latched_result_and_ignores_registry_injection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capability = _capability(tmp_path, monkeypatch, code="pass")
+    supervisor = SolverSupervisor(capability)
+    result = supervisor.run()
+    forged = replace(result)
+    object.__setattr__(supervisor, "_result", forged)
+    monkeypatch.setattr(
+        supervisor_module,
+        "_RESULT_REGISTRY",
+        {id(forged): forged},
+        raising=False,
+    )
+    assert supervisor.wait() is result
+    assert supervisor.result is result
+
+
 def test_windows_directory_authority_blocks_root_and_ancestor_rename(tmp_path: Path) -> None:
     if os.name != "nt":
         pytest.skip("Windows-only directory-handle authority")
@@ -514,16 +601,23 @@ def test_windows_late_failure_preserves_replaced_process_record(
     )
     monkeypatch.setattr(authority, "resume", fail_resume)
     original_write = SolverSupervisor._write_process_record
+    replacement_installed = False
 
     def record_write(supervisor: SolverSupervisor, record: dict[str, object]) -> None:
+        nonlocal replacement_installed
         original_write(supervisor, record)
         if record.get("state") == "BOUND_SUSPENDED":
             replacement = dict(record)
             replacement["replacement_marker"] = "foreign-regular-file"
             replacement_path = supervisor.process_record_path.with_name("foreign.json")
             replacement_path.write_text(json.dumps(replacement, sort_keys=True), encoding="utf-8")
-            os.replace(os.fspath(replacement_path), os.fspath(supervisor.process_record_path))
-            events.append("replaced-process-record")
+            try:
+                os.replace(os.fspath(replacement_path), os.fspath(supervisor.process_record_path))
+            except PermissionError:
+                events.append("foreign-replacement-blocked")
+            else:
+                replacement_installed = True
+                events.append("replaced-process-record")
 
     monkeypatch.setattr(SolverSupervisor, "_write_process_record", record_write)
     supervisor = SolverSupervisor(capability)
@@ -532,17 +626,23 @@ def test_windows_late_failure_preserves_replaced_process_record(
         supervisor.start()
 
     record_path = supervisor.process_record_path
-    replacement = json.loads(record_path.read_text(encoding="utf-8"))
-    assert record_path.is_file()
-    assert replacement["replacement_marker"] == "foreign-regular-file"
-    assert replacement["state"] == "BOUND_SUSPENDED"
+    if replacement_installed:
+        replacement = json.loads(record_path.read_text(encoding="utf-8"))
+        assert record_path.is_file()
+        assert replacement["replacement_marker"] == "foreign-regular-file"
+        assert replacement["state"] == "BOUND_SUSPENDED"
+    else:
+        assert not record_path.exists()
     assert supervisor.state is SolverState.FAILED
-    assert events.index("replaced-process-record") < events.index("resume-failure")
+    replacement_event = (
+        "replaced-process-record" if replacement_installed else "foreign-replacement-blocked"
+    )
+    assert events.index(replacement_event) < events.index("resume-failure")
     assert events.count("terminate") == 1
     assert events.count("close") == 1
     assert events.index("terminate") < events.index("close")
 
-    with pytest.raises(SolverOwnershipError, match="reconnectable|RUNNING"):
+    with pytest.raises(SolverOwnershipError, match="invalid|reconnectable|RUNNING"):
         SolverSupervisor.reconnect(capability)
 
 
@@ -599,15 +699,21 @@ def test_windows_final_guard_rolls_back_owned_record_without_foreign_delete(
         ),
     )
     original_write = SolverSupervisor._write_process_record
+    replacement_installed = False
 
     def record_write(supervisor: SolverSupervisor, record: dict[str, object]) -> None:
+        nonlocal replacement_installed
         original_write(supervisor, record)
         if replace_with_foreign and record.get("state") == "RUNNING":
             replacement = dict(record)
             replacement["replacement_marker"] = "foreign-final-guard"
             replacement_path = supervisor.process_record_path.with_name("foreign.json")
             replacement_path.write_text(json.dumps(replacement, sort_keys=True), encoding="utf-8")
-            os.replace(os.fspath(replacement_path), os.fspath(supervisor.process_record_path))
+            try:
+                os.replace(os.fspath(replacement_path), os.fspath(supervisor.process_record_path))
+            except PermissionError:
+                return
+            replacement_installed = True
 
     monkeypatch.setattr(SolverSupervisor, "_write_process_record", record_write)
     original_revalidate = SolverSupervisor._revalidate_launch_binding
@@ -635,7 +741,7 @@ def test_windows_final_guard_rolls_back_owned_record_without_foreign_delete(
     assert supervisor._process is None
     assert supervisor._process_authority is None
     record_path = supervisor.process_record_path
-    if replace_with_foreign:
+    if replacement_installed:
         replacement = json.loads(record_path.read_text(encoding="utf-8"))
         assert replacement["replacement_marker"] == "foreign-final-guard"
     else:
@@ -695,15 +801,21 @@ def test_windows_bound_suspended_rollback_removes_owned_record_without_foreign_d
         ),
     )
     original_write = SolverSupervisor._write_process_record
+    replacement_installed = False
 
     def record_write(supervisor: SolverSupervisor, record: dict[str, object]) -> None:
+        nonlocal replacement_installed
         original_write(supervisor, record)
         if replace_with_foreign and record.get("state") == "BOUND_SUSPENDED":
             replacement = dict(record)
             replacement["replacement_marker"] = "foreign-bound-record"
             replacement_path = supervisor.process_record_path.with_name("foreign.json")
             replacement_path.write_text(json.dumps(replacement, sort_keys=True), encoding="utf-8")
-            os.replace(os.fspath(replacement_path), os.fspath(supervisor.process_record_path))
+            try:
+                os.replace(os.fspath(replacement_path), os.fspath(supervisor.process_record_path))
+            except PermissionError:
+                return
+            replacement_installed = True
 
     def fail_resume(pid: int) -> None:
         assert pid == _OrderingProcess.pid
@@ -726,7 +838,7 @@ def test_windows_bound_suspended_rollback_removes_owned_record_without_foreign_d
     assert supervisor._process is None
     assert supervisor._process_authority is None
     record_path = supervisor.process_record_path
-    if replace_with_foreign:
+    if replacement_installed:
         replacement = json.loads(record_path.read_text(encoding="utf-8"))
         assert replacement["replacement_marker"] == "foreign-bound-record"
     else:

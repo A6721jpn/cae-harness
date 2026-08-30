@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import importlib
 import math
+import os
 import sys
 from collections.abc import Sequence
 from dataclasses import replace
@@ -147,6 +148,33 @@ def test_path_must_be_live_regular_xplt_inside_attempt_root(tmp_path: Path) -> N
             validate_requested_fields(authority, invalid, ("stress",))
 
 
+def test_caller_supplied_descriptor_alias_cannot_forge_physical_root_membership(
+    tmp_path: Path,
+) -> None:
+    if os.name != "posix":
+        pytest.skip("POSIX descriptor-relative XPLT authority")
+
+    authority, path = make_authority(tmp_path / "attempt")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_xplt = outside / path.name
+    outside_xplt.write_bytes(b"foreign-xplt")
+    outside_fd = os.open(os.fspath(outside), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        physical_root = Path(f"/proc/self/fd/{outside_fd}")
+        physical_path = physical_root / path.name
+        with pytest.raises(ValueError, match="physical|descriptor|authority"):
+            validate_requested_fields(
+                authority,
+                path,
+                ("stress",),
+                physical_path=physical_path,
+                physical_root=physical_root,
+            )
+    finally:
+        os.close(outside_fd)
+
+
 def test_adapter_mutation_invalidates_digest_bound_validation(tmp_path: Path) -> None:
     class MutatingAdapter:
         def read_fields(self, path: Path, fields: Sequence[str]) -> dict[str, object]:
@@ -192,11 +220,8 @@ def test_validation_binds_authority_runtime_path_digest_and_fields(tmp_path: Pat
 def test_only_validate_issued_validation_crosses_internal_boundary(
     tmp_path: Path,
 ) -> None:
-    module = importlib.import_module("febio_cae_harness.solver.fbs")
     authority, path = make_authority(tmp_path)
     issued = validate_requested_fields(authority, path, ("stress",))
-    registry = getattr(module, "_VALIDATION_REGISTRY", {})
-    assert id(issued) in registry
 
     caller_built = FbsValidation(
         xplt_path=path,
@@ -211,23 +236,44 @@ def test_only_validate_issued_validation_crosses_internal_boundary(
         digest_before=issued.digest_before,
         digest_after=issued.digest_after,
     )
-    assert id(caller_built) not in registry
-    check = module._require_issued_validation
-    assert (
+    check = fbs_module._require_issued_validation
+    with pytest.raises(TypeError, match="adopted|supervisor"):
         check(
             issued,
             authority=authority,
             xplt_path=path,
             requested_fields=("stress",),
         )
-        is issued
-    )
     with pytest.raises(TypeError):
         check(
             caller_built,
             authority=authority,
             xplt_path=path,
             requested_fields=("stress",),
+        )
+
+
+def test_former_fbs_registries_cannot_be_authority_sources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for name in ("_MANAGER_REGISTRY", "_AUTHORITY_REGISTRY", "_VALIDATION_REGISTRY"):
+        assert not hasattr(fbs_module, name)
+        monkeypatch.setattr(fbs_module, name, {}, raising=False)
+
+    authority, path = make_authority(tmp_path)
+    issued = validate_requested_fields(authority, path, ("stress",))
+    monkeypatch.setattr(
+        fbs_module,
+        "_VALIDATION_REGISTRY",
+        {id(issued): issued},
+        raising=False,
+    )
+    with pytest.raises(TypeError):
+        fbs_module._require_issued_validation(
+            issued,
+            authority,
+            path,
+            ("stress",),
         )
 
 
@@ -411,8 +457,16 @@ def test_late_completion_failure_rolls_back_exact_fbs_and_result_issuance(
     result = captured[0]
     validation = result.fbs_validation
     assert validation is not None
-    assert id(validation) not in fbs_module._VALIDATION_REGISTRY
-    assert id(result) not in supervisor_module._RESULT_REGISTRY
+    assert validation.authority is not None
+    with pytest.raises(TypeError):
+        fbs_module._require_issued_validation(
+            validation,
+            validation.authority,
+            result.xplt_path,
+            validation.requested_fields,
+        )
+    assert not hasattr(fbs_module, "_VALIDATION_REGISTRY")
+    assert not hasattr(supervisor_module, "_RESULT_REGISTRY")
     assert supervisor.result is None
     assert supervisor.state is SolverState.FAILED
 
@@ -423,4 +477,5 @@ def test_validation_rollback_does_not_unregister_foreign_entry(tmp_path: Path) -
     foreign = replace(issued)
 
     assert not fbs_module._unregister_validation(foreign)
-    assert fbs_module._VALIDATION_REGISTRY[id(issued)].validation is issued
+    assert fbs_module._unregister_validation(issued)
+    assert not fbs_module._unregister_validation(issued)
