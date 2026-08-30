@@ -392,6 +392,161 @@ def test_windows_directory_authority_blocks_root_and_ancestor_rename(tmp_path: P
     assert moved.is_dir()
 
 
+def test_windows_process_record_lease_blocks_replacement_through_running_transition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if os.name != "nt":
+        pytest.fail("required Windows transaction test executed on a non-Windows host")
+
+    capability = _capability(tmp_path, monkeypatch, code="import time; time.sleep(30)")
+    handle_number = 0
+
+    def permissive_directory_open(path: Path) -> supervisor_module._WindowsDirectoryHandle:
+        nonlocal handle_number
+        handle_number += 1
+        return supervisor_module._WindowsDirectoryHandle(0, 0, handle_number)
+
+    monkeypatch.setattr(supervisor_module, "_windows_open_directory", permissive_directory_open)
+    monkeypatch.setattr(supervisor_module, "_windows_verify_directory", lambda handle: None)
+    monkeypatch.setattr(supervisor_module, "_windows_close_directory", lambda handle: None)
+    supervisor = SolverSupervisor(capability)
+    original_write = SolverSupervisor._write_process_record
+    foreign_write_errors: list[OSError] = []
+    foreign_write_succeeded = False
+    replacement_errors: list[OSError] = []
+    replacement_succeeded = False
+    delete_errors: list[OSError] = []
+    delete_succeeded = False
+
+    def write_record(instance: SolverSupervisor, record: dict[str, object]) -> None:
+        nonlocal delete_succeeded, foreign_write_succeeded, replacement_succeeded
+        original_write(instance, record)
+        if record.get("state") != "BOUND_SUSPENDED":
+            return
+        try:
+            foreign_fd = os.open(os.fspath(instance.process_record_path), os.O_WRONLY)
+        except OSError as error:
+            foreign_write_errors.append(error)
+        else:
+            foreign_write_succeeded = True
+            os.close(foreign_fd)
+        foreign_path = instance.process_record_path.with_name("foreign.json")
+        foreign_path.write_text('{"foreign": true}', encoding="utf-8")
+        try:
+            os.replace(os.fspath(foreign_path), os.fspath(instance.process_record_path))
+        except OSError as error:
+            replacement_errors.append(error)
+        else:
+            replacement_succeeded = True
+        try:
+            os.unlink(os.fspath(instance.process_record_path))
+        except OSError as error:
+            delete_errors.append(error)
+        else:
+            delete_succeeded = True
+
+    monkeypatch.setattr(SolverSupervisor, "_write_process_record", write_record)
+    try:
+        supervisor.start()
+        assert foreign_write_errors
+        assert not foreign_write_succeeded
+        assert replacement_errors
+        assert not replacement_succeeded
+        assert delete_errors
+        assert not delete_succeeded
+        claim = supervisor._process_record_claim
+        assert claim is not None and claim.handle is not None
+        record = json.loads(supervisor_module._read_record_fd(claim.handle).decode("utf-8"))
+        assert record["state"] == SolverState.RUNNING.value
+        assert record.get("foreign") is None
+    finally:
+        if supervisor.process_id is not None:
+            supervisor.cancel()
+
+
+def test_windows_running_record_transition_rejects_lost_directory_entry_binding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if os.name != "nt":
+        pytest.fail("required Windows transaction test executed on a non-Windows host")
+
+    capability = _capability(tmp_path, monkeypatch, code="import time; time.sleep(30)")
+    supervisor = SolverSupervisor(capability)
+    original_identity_check = SolverSupervisor._record_claim_identity_matches
+    identity_checks = 0
+    persisted_states: list[object] = []
+
+    def lost_directory_entry(
+        instance: SolverSupervisor, claim: supervisor_module._ProcessRecordClaim
+    ) -> bool:
+        nonlocal identity_checks
+        if claim.state == "BOUND_SUSPENDED":
+            identity_checks += 1
+            return False
+        return original_identity_check(instance, claim)
+
+    original_write = SolverSupervisor._write_process_record
+
+    def track_write(instance: SolverSupervisor, record: dict[str, object]) -> None:
+        persisted_states.append(record.get("state"))
+        original_write(instance, record)
+
+    monkeypatch.setattr(SolverSupervisor, "_record_claim_identity_matches", lost_directory_entry)
+    monkeypatch.setattr(SolverSupervisor, "_write_process_record", track_write)
+    try:
+        with pytest.raises(SolverOwnershipError, match="record|directory|replaced"):
+            supervisor.start()
+        assert identity_checks >= 1
+        assert SolverState.RUNNING.value not in persisted_states
+        assert supervisor.state is SolverState.FAILED
+        assert supervisor.process_id is None
+        assert not supervisor.process_record_path.exists()
+    finally:
+        if supervisor.process_id is not None:
+            supervisor.cancel()
+
+
+def test_windows_owned_record_rollback_uses_held_handle_without_path_reopen(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if os.name != "nt":
+        pytest.fail("required Windows transaction test executed on a non-Windows host")
+
+    capability = _capability(tmp_path, monkeypatch, code="import time; time.sleep(30)")
+    supervisor = SolverSupervisor(capability)
+    supervisor.start()
+    claim = supervisor._process_record_claim
+    assert claim is not None
+    original_open = supervisor_module._windows_open_process_record
+    reopen_attempts: list[Path] = []
+
+    def reject_path_reopen(path: Path, *, create: bool, delete_access: bool = False) -> int:
+        if not create:
+            reopen_attempts.append(path)
+            raise AssertionError("rollback reopened process record by path")
+        return original_open(path, create=create, delete_access=delete_access)
+
+    try:
+        with monkeypatch.context() as rollback_patch:
+            rollback_patch.setattr(
+                supervisor_module,
+                "_windows_open_process_record",
+                reject_path_reopen,
+            )
+            failures = supervisor._rollback_process_record()
+        assert failures == ()
+        assert not reopen_attempts
+    finally:
+        process = supervisor._process
+        if process is not None:
+            supervisor._terminate_owned_process(process)
+        supervisor._release_process_authority()
+        supervisor._process = None
+        supervisor._process_record = None
+        supervisor._close_filesystem_authority()
+    assert not supervisor.process_record_path.exists()
+
+
 class _OrderingProcess:
     pid = 4242
 

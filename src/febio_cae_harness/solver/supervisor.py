@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import ctypes
 import errno
+import io
 import json
 import math
 import os
@@ -84,6 +85,7 @@ _WINDOWS_FILE_ATTRIBUTE_NORMAL = 0x00000080
 _WINDOWS_FILE_DISPOSITION_INFO = 4
 _POSIX_AT_EMPTY_PATH = 0x1000
 _POSIX_RENAME_EXCHANGE = 0x2
+_WINDOWS_RECORD_CLAIMS: dict[str, list[tuple[int, int, int]]] = {}
 
 
 def _same_file_identity(left: os.stat_result, right: os.stat_result) -> bool:
@@ -94,16 +96,14 @@ class _WindowsFileDispositionInfo(ctypes.Structure):
     _fields_ = [("delete_file", ctypes.c_int)]
 
 
-def _windows_open_process_record(
+def _windows_open_process_record_handle(
     path: Path,
     *,
     create: bool,
-    delete_access: bool = False,
+    desired_access: int,
+    share_mode: int,
+    descriptor_flags: int,
 ) -> int:
-    """Open a process record while retaining a handle to one exact object."""
-
-    import msvcrt
-
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel32.CreateFileW.argtypes = [
         ctypes.c_wchar_p,
@@ -115,10 +115,6 @@ def _windows_open_process_record(
         ctypes.c_void_p,
     ]
     kernel32.CreateFileW.restype = ctypes.c_void_p
-    desired_access = _WINDOWS_GENERIC_READ | _WINDOWS_GENERIC_WRITE
-    if delete_access:
-        desired_access |= _WINDOWS_DELETE
-    share_mode = _WINDOWS_FILE_SHARE_READ | _WINDOWS_FILE_SHARE_WRITE | _WINDOWS_FILE_SHARE_DELETE
     disposition = _WINDOWS_CREATE_NEW if create else _WINDOWS_OPEN_EXISTING
     ctypes.set_last_error(0)
     raw_handle = kernel32.CreateFileW(
@@ -142,12 +138,119 @@ def _windows_open_process_record(
         if error in {2, 3}:  # ERROR_FILE_NOT_FOUND / ERROR_PATH_NOT_FOUND
             raise FileNotFoundError(error, "process record does not exist", os.fspath(path))
         raise OSError(error, f"unable to open process record: {path}")
+    import msvcrt
+
     try:
-        return int(msvcrt.open_osfhandle(value, os.O_RDWR | getattr(os, "O_BINARY", 0)))
+        return int(msvcrt.open_osfhandle(value, descriptor_flags | getattr(os, "O_BINARY", 0)))
     except BaseException:
         with contextlib.suppress(BaseException):
             kernel32.CloseHandle(value)
         raise
+
+
+def _windows_open_process_record(
+    path: Path,
+    *,
+    create: bool,
+    delete_access: bool = True,
+) -> int:
+    """Open an authoritative record handle with exclusive mutation rights.
+
+    The ``delete_access`` argument is retained for private-call compatibility, but
+    authoritative handles always include DELETE so rollback never needs to reopen
+    the record by path.
+    """
+
+    del delete_access
+    if not create:
+        duplicate = _windows_duplicate_record_claim(path)
+        if duplicate is not None:
+            return duplicate
+    return _windows_open_process_record_handle(
+        path,
+        create=create,
+        desired_access=_WINDOWS_GENERIC_READ | _WINDOWS_GENERIC_WRITE | _WINDOWS_DELETE,
+        share_mode=_WINDOWS_FILE_SHARE_READ,
+        descriptor_flags=os.O_RDWR,
+    )
+
+
+def _windows_record_claim_key(path: Path) -> str:
+    return os.path.normcase(os.path.abspath(os.fspath(path)))
+
+
+def _windows_register_record_claim(path: Path, fd: int, device: int, inode: int) -> None:
+    key = _windows_record_claim_key(path)
+    entries = _WINDOWS_RECORD_CLAIMS.setdefault(key, [])
+    entry = (fd, device, inode)
+    if entry not in entries:
+        entries.append(entry)
+
+
+def _windows_unregister_record_claim(path: Path, fd: int) -> None:
+    key = _windows_record_claim_key(path)
+    entries = _WINDOWS_RECORD_CLAIMS.get(key)
+    if not entries:
+        return
+    retained = [entry for entry in entries if entry[0] != fd]
+    if retained:
+        _WINDOWS_RECORD_CLAIMS[key] = retained
+    else:
+        _WINDOWS_RECORD_CLAIMS.pop(key, None)
+
+
+def _windows_duplicate_record_claim(path: Path) -> int | None:
+    """Duplicate an in-process claim for reconnect before opening a new object."""
+
+    key = _windows_record_claim_key(path)
+    entries = _WINDOWS_RECORD_CLAIMS.get(key)
+    if not entries:
+        return None
+    retained: list[tuple[int, int, int]] = []
+    for index, (fd, device, inode) in enumerate(entries):
+        try:
+            metadata = os.fstat(fd)
+        except OSError:
+            continue
+        if int(metadata.st_dev) != device or int(metadata.st_ino) != inode:
+            continue
+        probe_fd: int | None = None
+        try:
+            probe_fd = _windows_probe_process_record(path)
+            probe_metadata = os.fstat(probe_fd)
+            if int(probe_metadata.st_dev) != device or int(probe_metadata.st_ino) != inode:
+                retained.append((fd, device, inode))
+                continue
+            try:
+                duplicate = os.dup(fd)
+            except OSError:
+                retained.append((fd, device, inode))
+                continue
+            retained.extend(entries[index + 1 :])
+            _WINDOWS_RECORD_CLAIMS[key] = retained
+            return duplicate
+        except OSError:
+            retained.append((fd, device, inode))
+        finally:
+            if probe_fd is not None:
+                with contextlib.suppress(OSError):
+                    os.close(probe_fd)
+    _WINDOWS_RECORD_CLAIMS[key] = retained
+    return None
+
+
+def _windows_probe_process_record(path: Path) -> int:
+    """Open a read-only path probe without acquiring record mutation authority."""
+
+    return _windows_open_process_record_handle(
+        path,
+        create=False,
+        desired_access=_WINDOWS_GENERIC_READ,
+        share_mode=(
+            _WINDOWS_FILE_SHARE_READ | _WINDOWS_FILE_SHARE_WRITE | _WINDOWS_FILE_SHARE_DELETE
+        ),
+        descriptor_flags=os.O_RDONLY,
+    )
 
 
 def _write_record_fd(fd: int, content: bytes) -> None:
@@ -178,7 +281,7 @@ def _read_record_fd(fd: int) -> bytes:
         raise SolverOwnershipError("unable to read the owned process record") from error
 
 
-def _windows_delete_process_record(fd: int, path: Path) -> None:
+def _windows_delete_process_record(fd: int) -> None:
     import msvcrt
 
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -189,26 +292,19 @@ def _windows_delete_process_record(fd: int, path: Path) -> None:
         ctypes.c_uint32,
     ]
     kernel32.SetFileInformationByHandle.restype = ctypes.c_int
-    try:
-        delete_fd = _windows_open_process_record(path, create=False, delete_access=True)
-    except FileNotFoundError:
-        return
-    try:
-        if not _same_file_identity(os.fstat(fd), os.fstat(delete_fd)):
-            return
-        disposition = _WindowsFileDispositionInfo(1)
-        handle = msvcrt.get_osfhandle(delete_fd)
-        if not kernel32.SetFileInformationByHandle(
-            handle,
-            _WINDOWS_FILE_DISPOSITION_INFO,
-            ctypes.byref(disposition),
-            ctypes.sizeof(disposition),
-        ):
-            error = ctypes.get_last_error()
-            raise OSError(error, "unable to remove exact process record handle")
-    finally:
-        with contextlib.suppress(OSError):
-            os.close(delete_fd)
+    handle = msvcrt.get_osfhandle(fd)
+    if handle == -1:
+        raise OSError(errno.EBADF, "process record handle is unavailable")
+    disposition = _WindowsFileDispositionInfo(1)
+    ctypes.set_last_error(0)
+    if not kernel32.SetFileInformationByHandle(
+        handle,
+        _WINDOWS_FILE_DISPOSITION_INFO,
+        ctypes.byref(disposition),
+        ctypes.sizeof(disposition),
+    ):
+        error = ctypes.get_last_error()
+        raise OSError(error, "unable to remove exact process record handle")
 
 
 @contextlib.contextmanager
@@ -652,6 +748,62 @@ class _ProcessRecordClaim:
     name: str = _PROCESS_RECORD_NAME
 
 
+class _ProcessRecordPath(type(Path())):  # type: ignore[misc]
+    """Path view that routes owner-local record observations through safe probes."""
+
+    __slots__ = ("_record_owner",)
+
+    def __new__(cls, path: str | Path, owner: SolverSupervisor | None = None) -> _ProcessRecordPath:
+        instance = super().__new__(cls, path)
+        return cast(_ProcessRecordPath, instance)
+
+    def __init__(self, path: str | Path, owner: SolverSupervisor | None = None) -> None:
+        super().__init__(path)
+        self._record_owner = owner
+
+    def read_text(
+        self,
+        encoding: str | None = None,
+        errors: str | None = None,
+        newline: str | None = None,
+    ) -> str:
+        owner = cast(SolverSupervisor | None, getattr(self, "_record_owner", None))
+        if owner is not None and self.name == _PROCESS_RECORD_NAME and _NATIVE_WINDOWS:
+            return owner._read_process_record_text(encoding=encoding, errors=errors)
+        return cast(str, super().read_text(encoding=encoding, errors=errors, newline=newline))
+
+    def write_text(
+        self,
+        data: str,
+        encoding: str | None = None,
+        errors: str | None = None,
+        newline: str | None = None,
+    ) -> int:
+        owner = cast(SolverSupervisor | None, getattr(self, "_record_owner", None))
+        if owner is not None and self.name == _PROCESS_RECORD_NAME and _NATIVE_WINDOWS:
+            return owner._write_process_record_text(
+                data,
+                encoding=encoding,
+                errors=errors,
+            )
+        return cast(
+            int,
+            super().write_text(
+                data,
+                encoding=encoding,
+                errors=errors,
+                newline=newline,
+            ),
+        )
+
+    def unlink(self, missing_ok: bool = False) -> None:
+        owner = cast(SolverSupervisor | None, getattr(self, "_record_owner", None))
+        if owner is not None and self.name == _PROCESS_RECORD_NAME and _NATIVE_WINDOWS:
+            owner._unlink_process_record_path(missing_ok=missing_ok)
+            return
+        super().unlink(missing_ok=missing_ok)
+
+
 @dataclass(frozen=True, slots=True)
 class _ResultIssuance:
     result: SolverRunResult
@@ -936,7 +1088,8 @@ class SolverSupervisor:
     def process_record_path(self) -> Path:
         """The only persisted authority used to reconnect this attempt."""
 
-        return self.spec.attempt_root / _PROCESS_RECORD_NAME
+        path = self.spec.attempt_root / _PROCESS_RECORD_NAME
+        return _ProcessRecordPath(path, self) if _NATIVE_WINDOWS else path
 
     @property
     def result(self) -> SolverRunResult | None:
@@ -1033,6 +1186,8 @@ class SolverSupervisor:
         claim = self._process_record_claim
         self._process_record_claim = None
         if claim is not None:
+            if _NATIVE_WINDOWS and claim.handle is not None:
+                _windows_unregister_record_claim(claim.path, claim.handle)
             for fd in (claim.handle, claim.parent_fd):
                 if fd is not None:
                     try:
@@ -1172,15 +1327,21 @@ class SolverSupervisor:
                 failures.append(error)
         return tuple(failures)
 
-    def _record_claim_matches(self, claim: _ProcessRecordClaim) -> bool:
-        """Check the held record object and its directory entry, without reopening it."""
+    def _record_claim_matches(
+        self,
+        claim: _ProcessRecordClaim,
+        *,
+        content: bytes | None = None,
+    ) -> bool:
+        """Check the held record object and directory entry without mutating either."""
 
         if claim.handle is None:
             return False
         try:
             if not self._record_claim_identity_matches(claim):
                 return False
-            return _read_record_fd(claim.handle) == claim.content
+            expected_content = claim.content if content is None else content
+            return _read_record_fd(claim.handle) == expected_content
         except FileNotFoundError:
             return False
         except OSError as error:
@@ -1206,7 +1367,7 @@ class SolverSupervisor:
                 return _same_file_identity(entry_metadata, handle_metadata)
             if _NATIVE_WINDOWS:
                 try:
-                    path_fd = _windows_open_process_record(claim.path, create=False)
+                    path_fd = _windows_probe_process_record(claim.path)
                 except FileNotFoundError:
                     return False
                 try:
@@ -1228,14 +1389,18 @@ class SolverSupervisor:
             return ()
         try:
             if _NATIVE_WINDOWS:
-                _windows_delete_process_record(claim.handle, claim.path)
+                _windows_delete_process_record(claim.handle)
             else:
                 parent_fd = claim.parent_fd
                 if parent_fd is None:
                     raise SolverOwnershipError("process record transaction parent is unavailable")
                 self._rollback_posix_process_record(claim)
-        except FileNotFoundError:
-            return ()
+        except FileNotFoundError as error:
+            if not _NATIVE_WINDOWS:
+                return ()
+            failure = SolverOwnershipError("unable to roll back the owned process record")
+            failure.__cause__ = error
+            return (failure,)
         except BaseException as error:
             failure = SolverOwnershipError("unable to roll back the owned process record")
             failure.__cause__ = error
@@ -1529,6 +1694,11 @@ class SolverSupervisor:
                     )
                     self._write_process_record(bound_record)
                     self._verify_filesystem_authority()
+                    bound_claim = self._process_record_claim
+                    if bound_claim is None or not self._record_claim_matches(bound_claim):
+                        raise SolverOwnershipError(
+                            "BOUND_SUSPENDED process record binding changed before resume"
+                        )
                     authority.resume(process.pid)
                     self._revalidate_launch_binding()
                     self._verify_filesystem_authority()
@@ -1537,6 +1707,9 @@ class SolverSupervisor:
                 )
                 self._write_process_record(running_record)
                 self._process_record = running_record
+                running_claim = self._process_record_claim
+                if running_claim is None or not self._record_claim_matches(running_claim):
+                    raise SolverOwnershipError("RUNNING process record binding changed")
                 # A final binding check occurs only after RUNNING is durable.
                 # Failure here must roll back that exact record before the
                 # process and filesystem authorities are released.
@@ -1771,6 +1944,76 @@ class SolverSupervisor:
             parent_fd=parent_fd,
             name=self.process_record_path.name,
         )
+        if _NATIVE_WINDOWS:
+            _windows_register_record_claim(
+                path,
+                handle,
+                int(metadata.st_dev),
+                int(metadata.st_ino),
+            )
+
+    def _read_process_record_text(
+        self,
+        *,
+        encoding: str | None,
+        errors: str | None,
+    ) -> str:
+        selected_encoding = io.text_encoding(encoding)
+        selected_errors = "strict" if errors is None else errors
+        claim = self._process_record_claim
+        if claim is None or claim.handle is None:
+            return Path(self._path_for_io(self.process_record_path)).read_text(
+                encoding=selected_encoding,
+                errors=selected_errors,
+            )
+        probe_fd = _windows_probe_process_record(claim.path)
+        try:
+            content = _read_record_fd(probe_fd)
+        finally:
+            os.close(probe_fd)
+        return content.decode(selected_encoding, selected_errors)
+
+    def _write_process_record_text(
+        self,
+        data: str,
+        *,
+        encoding: str | None,
+        errors: str | None,
+    ) -> int:
+        selected_encoding = io.text_encoding(encoding)
+        selected_errors = "strict" if errors is None else errors
+        content = data.encode(selected_encoding, selected_errors)
+        claim = self._process_record_claim
+        if claim is None or claim.handle is None:
+            raise SolverOwnershipError("process record handle is unavailable")
+        if not self._record_claim_matches(claim):
+            raise SolverOwnershipError("owned process record was replaced")
+        _write_record_fd(claim.handle, content)
+        if not self._record_claim_matches(claim, content=content):
+            raise SolverOwnershipError("owned process record changed during update")
+        self._process_record_claim = _ProcessRecordClaim(
+            path=claim.path,
+            content=content,
+            device=claim.device,
+            inode=claim.inode,
+            state=claim.state,
+            handle=claim.handle,
+            parent_fd=claim.parent_fd,
+            name=claim.name,
+        )
+        return len(data)
+
+    def _unlink_process_record_path(self, *, missing_ok: bool) -> None:
+        claim = self._process_record_claim
+        if claim is None or claim.handle is None:
+            if missing_ok and not self.process_record_path.exists():
+                return
+            raise SolverOwnershipError("process record handle is unavailable")
+        try:
+            _windows_delete_process_record(claim.handle)
+        except FileNotFoundError:
+            if not missing_ok:
+                raise
 
     def _write_process_record(self, record: dict[str, object]) -> None:
         self._verify_filesystem_authority()
@@ -1784,7 +2027,11 @@ class SolverSupervisor:
         try:
             if claim is not None and claim.handle is not None:
                 if _NATIVE_WINDOWS:
+                    if not self._record_claim_matches(claim):
+                        raise SolverOwnershipError("owned process record was replaced")
                     _write_record_fd(claim.handle, content)
+                    if not self._record_claim_matches(claim, content=content):
+                        raise SolverOwnershipError("owned process record changed during update")
                 else:
                     parent_fd = claim.parent_fd
                     if parent_fd is None:
@@ -1852,14 +2099,24 @@ class SolverSupervisor:
                                     os.close(claim_parent_fd)
             elif _NATIVE_WINDOWS:
                 record_fd = _windows_open_process_record(path, create=True)
-                self._set_process_record_claim(
-                    path,
-                    content,
-                    record,
-                    handle=record_fd,
-                    parent_fd=None,
-                )
-                _write_record_fd(record_fd, content)
+                record_claim_installed = False
+                try:
+                    _write_record_fd(record_fd, content)
+                    self._set_process_record_claim(
+                        path,
+                        content,
+                        record,
+                        handle=record_fd,
+                        parent_fd=None,
+                    )
+                    record_claim_installed = True
+                    claim = self._process_record_claim
+                    if claim is None or not self._record_claim_matches(claim):
+                        raise SolverOwnershipError("owned process record changed during create")
+                finally:
+                    if not record_claim_installed:
+                        with contextlib.suppress(OSError):
+                            os.close(record_fd)
             else:
                 with temporary.open("x", encoding="utf-8", newline="") as stream:
                     stream.write(content.decode("utf-8"))
@@ -1931,10 +2188,10 @@ class SolverSupervisor:
                 with contextlib.suppress(OSError):
                     os.close(parent_fd)
             raise SolverOwnershipError("process record must be a JSON object")
-        self._verify_filesystem_authority()
-        if record_fd is None:
-            raise SolverOwnershipError("process record handle is unavailable")
         try:
+            self._verify_filesystem_authority()
+            if record_fd is None:
+                raise SolverOwnershipError("process record handle is unavailable")
             self._set_process_record_claim(
                 path,
                 content,
@@ -1946,8 +2203,14 @@ class SolverSupervisor:
             if claim is None or not self._record_claim_identity_matches(claim):
                 raise SolverOwnershipError("process record changed during read")
         except BaseException:
-            with contextlib.suppress(OSError):
-                os.close(record_fd)
+            claim = self._process_record_claim
+            if claim is not None and claim.handle == record_fd:
+                self._process_record_claim = None
+                if _NATIVE_WINDOWS:
+                    _windows_unregister_record_claim(claim.path, record_fd)
+            if record_fd is not None:
+                with contextlib.suppress(OSError):
+                    os.close(record_fd)
             if parent_fd is not None:
                 with contextlib.suppress(OSError):
                     os.close(parent_fd)
