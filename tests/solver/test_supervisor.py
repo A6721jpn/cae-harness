@@ -93,6 +93,47 @@ def _capability(
     )
 
 
+def _windows_process_handle_count() -> int:
+    import ctypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetProcessHandleCount.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_uint32),
+    ]
+    kernel32.GetProcessHandleCount.restype = ctypes.c_int
+    count = ctypes.c_uint32()
+    if not kernel32.GetProcessHandleCount(kernel32.GetCurrentProcess(), ctypes.byref(count)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return int(count.value)
+
+
+def _assert_windows_record_mutation_blocked(record_path: Path) -> Path:
+    try:
+        foreign_fd = os.open(os.fspath(record_path), os.O_WRONLY)
+    except OSError:
+        pass
+    else:
+        os.close(foreign_fd)
+        pytest.fail("foreign write opened the owned process record")
+
+    foreign_path = record_path.with_name(f"{record_path.name}.foreign")
+    foreign_path.write_bytes(b'{"foreign": true}')
+    try:
+        os.replace(os.fspath(foreign_path), os.fspath(record_path))
+    except OSError:
+        pass
+    else:
+        pytest.fail("foreign replacement changed the owned process record")
+    try:
+        os.unlink(os.fspath(record_path))
+    except OSError:
+        pass
+    else:
+        pytest.fail("foreign deletion removed the owned process record")
+    return foreign_path
+
+
 def test_start_persists_attempt_owned_process_record(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -529,6 +570,296 @@ def test_windows_active_supervisor_finalizer_releases_process_record_lease(
                 os.close(cleanup_fd)
         if filesystem_authority is not None:
             filesystem_authority.close()
+
+
+def test_windows_active_record_read_validation_failure_retains_exact_claim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if os.name != "nt":
+        pytest.fail("required Windows active-record validation test executed on a non-Windows host")
+
+    capability = _capability(tmp_path, monkeypatch, code="import time; time.sleep(30)")
+    supervisor = SolverSupervisor(capability)
+    supervisor.start()
+    process = cast(subprocess.Popen[bytes], supervisor._process)
+    claim = supervisor._process_record_claim
+    assert claim is not None and claim.handle is not None
+    original_claim = claim
+    original_fd = claim.handle
+    original_content = supervisor_module._read_record_fd(original_fd)
+    record_path = Path(os.fspath(claim.path))
+    record_key = supervisor_module._windows_record_claim_key(record_path)
+    record_claim_entry = (original_fd, claim.device, claim.inode)
+    assert supervisor_module._WINDOWS_RECORD_CLAIMS.get(record_key) == [record_claim_entry]
+
+    probe_paths: list[Path] = []
+    path_reopens: list[Path] = []
+    lifecycle_actions: list[str] = []
+    original_probe = supervisor_module._windows_probe_process_record
+    original_open = supervisor_module._windows_open_process_record
+
+    def fail_second_probe(path: Path) -> int:
+        probe_paths.append(Path(os.fspath(path)))
+        if len(probe_paths) == 2:
+            raise OSError("synthetic second process-record read probe failure")
+        return original_probe(path)
+
+    def track_path_open(path: Path, *, create: bool, delete_access: bool = True) -> int:
+        path_reopens.append(Path(os.fspath(path)))
+        return original_open(path, create=create, delete_access=delete_access)
+
+    def forbidden_complete(
+        instance: SolverSupervisor, state: SolverState, return_code: int | None
+    ) -> object:
+        del instance, state, return_code
+        lifecycle_actions.append("complete")
+        raise AssertionError("active record read completed the supervisor")
+
+    def forbidden_rollback(instance: SolverSupervisor) -> tuple[BaseException, ...]:
+        del instance
+        lifecycle_actions.append("rollback")
+        raise AssertionError("active record read rolled back the supervisor")
+
+    def forbidden_delete(fd: int) -> None:
+        del fd
+        lifecycle_actions.append("delete")
+        raise AssertionError("active record read deleted the process record")
+
+    def forbidden_terminate(
+        instance: SolverSupervisor,
+        owned_process: subprocess.Popen[bytes] | supervisor_module._ReconnectedProcess,
+    ) -> None:
+        del instance, owned_process
+        lifecycle_actions.append("terminate")
+        raise AssertionError("active record read terminated the solver")
+
+    foreign_path: Path | None = None
+    try:
+        with monkeypatch.context() as read_patch:
+            read_patch.setattr(
+                supervisor_module,
+                "_windows_probe_process_record",
+                fail_second_probe,
+            )
+            read_patch.setattr(
+                supervisor_module,
+                "_windows_open_process_record",
+                track_path_open,
+            )
+            read_patch.setattr(SolverSupervisor, "_complete", forbidden_complete)
+            read_patch.setattr(
+                SolverSupervisor,
+                "_rollback_process_record",
+                forbidden_rollback,
+            )
+            read_patch.setattr(
+                supervisor_module,
+                "_windows_delete_process_record",
+                forbidden_delete,
+            )
+            read_patch.setattr(
+                SolverSupervisor,
+                "_terminate_owned_process",
+                forbidden_terminate,
+            )
+            with pytest.raises(SolverOwnershipError):
+                supervisor._read_process_record()
+
+        assert probe_paths == [record_path, record_path]
+        assert path_reopens == []
+        assert lifecycle_actions == []
+        assert supervisor.state is SolverState.RUNNING
+        assert process.poll() is None
+        assert process.returncode is None
+        assert supervisor.result is None
+        retained_claim = supervisor._process_record_claim
+        assert retained_claim is original_claim or (
+            retained_claim is not None
+            and retained_claim.handle == original_fd
+            and retained_claim.path == original_claim.path
+            and retained_claim.device == original_claim.device
+            and retained_claim.inode == original_claim.inode
+        )
+        assert os.fstat(original_fd).st_size == len(original_content)
+        assert supervisor_module._read_record_fd(original_fd) == original_content
+        assert supervisor_module._WINDOWS_RECORD_CLAIMS.get(record_key) == [record_claim_entry]
+        foreign_path = _assert_windows_record_mutation_blocked(record_path)
+    finally:
+        try:
+            if supervisor.process_id is not None:
+                supervisor.cancel()
+        finally:
+            for path in (foreign_path, record_path):
+                if path is not None and path.exists():
+                    path.unlink()
+
+
+def test_windows_active_record_read_reuses_exact_claim_without_rotation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if os.name != "nt":
+        pytest.fail("required Windows active-record reuse test executed on a non-Windows host")
+
+    capability = _capability(tmp_path, monkeypatch, code="import time; time.sleep(30)")
+    supervisor = SolverSupervisor(capability)
+    supervisor.start()
+    process = cast(subprocess.Popen[bytes], supervisor._process)
+    claim = supervisor._process_record_claim
+    assert claim is not None and claim.handle is not None
+    original_claim = claim
+    original_fd = claim.handle
+    original_content = supervisor_module._read_record_fd(original_fd)
+    original_record = json.loads(original_content.decode("utf-8"))
+    record_path = Path(os.fspath(claim.path))
+    record_key = supervisor_module._windows_record_claim_key(record_path)
+    record_claim_entry = (original_fd, claim.device, claim.inode)
+    assert supervisor_module._WINDOWS_RECORD_CLAIMS.get(record_key) == [record_claim_entry]
+    handle_count_before = _windows_process_handle_count()
+
+    release_fds: list[int] = []
+    closed_fds: list[int] = []
+    path_reopens: list[Path] = []
+    probe_paths: list[Path] = []
+    original_release = SolverSupervisor._release_process_record_claim
+    original_open = supervisor_module._windows_open_process_record
+    original_probe = supervisor_module._windows_probe_process_record
+    original_close = os.close
+
+    def track_release(
+        instance: SolverSupervisor,
+        candidate: supervisor_module._ProcessRecordClaim | None,
+    ) -> tuple[BaseException, ...]:
+        if candidate is not None and candidate.handle == original_fd:
+            release_fds.append(original_fd)
+        return original_release(instance, candidate)
+
+    def track_close(fd: int) -> None:
+        if fd == original_fd:
+            closed_fds.append(fd)
+        original_close(fd)
+
+    def track_path_open(path: Path, *, create: bool, delete_access: bool = True) -> int:
+        path_reopens.append(Path(os.fspath(path)))
+        return original_open(path, create=create, delete_access=delete_access)
+
+    def track_probe(path: Path) -> int:
+        probe_paths.append(Path(os.fspath(path)))
+        return original_probe(path)
+
+    try:
+        with monkeypatch.context() as read_patch:
+            read_patch.setattr(SolverSupervisor, "_release_process_record_claim", track_release)
+            read_patch.setattr(os, "close", track_close)
+            read_patch.setattr(
+                supervisor_module,
+                "_windows_open_process_record",
+                track_path_open,
+            )
+            read_patch.setattr(supervisor_module, "_windows_probe_process_record", track_probe)
+            records = [supervisor._read_process_record() for _ in range(5)]
+
+        assert records == [original_record] * 5
+        assert len(probe_paths) == 10
+        assert path_reopens == []
+        assert release_fds == []
+        assert closed_fds == []
+        assert _windows_process_handle_count() == handle_count_before
+        assert supervisor.state is SolverState.RUNNING
+        assert process.poll() is None
+        assert process.returncode is None
+        assert supervisor.result is None
+        retained_claim = supervisor._process_record_claim
+        assert retained_claim is original_claim or (
+            retained_claim is not None
+            and retained_claim.handle == original_fd
+            and retained_claim.path == original_claim.path
+            and retained_claim.device == original_claim.device
+            and retained_claim.inode == original_claim.inode
+        )
+        assert os.fstat(original_fd).st_size == len(original_content)
+        assert supervisor_module._read_record_fd(original_fd) == original_content
+        assert supervisor_module._WINDOWS_RECORD_CLAIMS.get(record_key) == [record_claim_entry]
+    finally:
+        if supervisor.process_id is not None:
+            supervisor.cancel()
+
+
+def test_windows_reconnect_validation_failure_preserves_existing_record_claim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if os.name != "nt":
+        pytest.fail("required Windows reconnect validation test executed on a non-Windows host")
+
+    capability = _capability(tmp_path, monkeypatch, code="import time; time.sleep(30)")
+    original_supervisor = SolverSupervisor(capability)
+    original_supervisor.start()
+    original_process = cast(subprocess.Popen[bytes], original_supervisor._process)
+    original_claim = original_supervisor._process_record_claim
+    assert original_claim is not None and original_claim.handle is not None
+    original_fd = original_claim.handle
+    original_content = supervisor_module._read_record_fd(original_fd)
+    record_path = Path(os.fspath(original_claim.path))
+    record_key = supervisor_module._windows_record_claim_key(record_path)
+    record_claim_entry = (original_fd, original_claim.device, original_claim.inode)
+    assert supervisor_module._WINDOWS_RECORD_CLAIMS.get(record_key) == [record_claim_entry]
+
+    candidate_fds: list[int] = []
+    original_duplicate = supervisor_module._windows_duplicate_record_claim
+    original_identity = SolverSupervisor._record_claim_identity_matches
+
+    def track_duplicate(path: Path) -> int | None:
+        duplicate = original_duplicate(path)
+        if duplicate is not None:
+            candidate_fds.append(duplicate)
+        return duplicate
+
+    def fail_candidate_identity(
+        instance: SolverSupervisor,
+        candidate: supervisor_module._ProcessRecordClaim,
+    ) -> bool:
+        if instance is not original_supervisor:
+            assert candidate.handle in candidate_fds
+            return False
+        return original_identity(instance, candidate)
+
+    foreign_path: Path | None = None
+    try:
+        with monkeypatch.context() as reconnect_patch:
+            reconnect_patch.setattr(
+                supervisor_module,
+                "_windows_duplicate_record_claim",
+                track_duplicate,
+            )
+            reconnect_patch.setattr(
+                SolverSupervisor,
+                "_record_claim_identity_matches",
+                fail_candidate_identity,
+            )
+            with pytest.raises(SolverOwnershipError):
+                SolverSupervisor.reconnect(capability)
+
+        assert candidate_fds
+        assert len(candidate_fds) == len(set(candidate_fds))
+        for candidate_fd in candidate_fds:
+            with pytest.raises(OSError):
+                os.fstat(candidate_fd)
+        assert original_supervisor.state is SolverState.RUNNING
+        assert original_process.poll() is None
+        assert original_process.returncode is None
+        assert original_supervisor.result is None
+        assert original_supervisor._process_record_claim is original_claim
+        assert os.fstat(original_fd).st_size == len(original_content)
+        assert supervisor_module._read_record_fd(original_fd) == original_content
+        assert supervisor_module._WINDOWS_RECORD_CLAIMS.get(record_key) == [record_claim_entry]
+        foreign_path = _assert_windows_record_mutation_blocked(record_path)
+    finally:
+        try:
+            if original_supervisor.process_id is not None:
+                original_supervisor.cancel()
+        finally:
+            for path in (foreign_path, record_path):
+                if path is not None and path.exists():
+                    path.unlink()
 
 
 def test_windows_process_record_lease_blocks_replacement_through_running_transition(

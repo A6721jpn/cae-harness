@@ -226,6 +226,7 @@ def _windows_duplicate_record_claim(path: Path) -> int | None:
             except OSError:
                 retained.append((fd, device, inode))
                 continue
+            retained.append((fd, device, inode))
             retained.extend(entries[index + 1 :])
             _WINDOWS_RECORD_CLAIMS[key] = retained
             return duplicate
@@ -2165,6 +2166,22 @@ class SolverSupervisor:
     def _read_process_record(self) -> dict[str, object]:
         self._verify_filesystem_authority()
         path = self._path_for_io(self.process_record_path)
+        active_claim = self._process_record_claim
+        if _NATIVE_WINDOWS and active_claim is not None and active_claim.handle is not None:
+            if not self._record_claim_matches(active_claim):
+                raise SolverOwnershipError("owned process record changed before read")
+            content = _read_record_fd(active_claim.handle)
+            try:
+                record = json.loads(content.decode("utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
+                raise SolverOwnershipError(f"invalid process record: {path}") from error
+            if not isinstance(record, dict):
+                raise SolverOwnershipError("process record must be a JSON object")
+            if not self._record_claim_matches(active_claim, content=content):
+                raise SolverOwnershipError("process record changed during read")
+            self._verify_filesystem_authority()
+            return record
+
         record_fd: int | None = None
         parent_fd: int | None = None
         try:
