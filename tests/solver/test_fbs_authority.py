@@ -8,18 +8,30 @@ from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
 from typing import cast
+from unittest.mock import Mock
 
 import pytest
 
+import febio_cae_harness.solver.fbs as fbs_module
+import febio_cae_harness.solver.supervisor as supervisor_module
+from febio_cae_harness.contracts import IntentContract
+from febio_cae_harness.evidence import EvidenceStore
 from febio_cae_harness.solver import (
     FbsAdapterAuthority,
     FbsAdapterManager,
     FbsValidation,
     SolverConfigurationError,
     SolverLaunchSpec,
+    SolverOwnershipError,
+    SolverRunResult,
+    SolverState,
     SolverSupervisor,
     validate_requested_fields,
 )
+from febio_cae_harness.solver import headless as headless_module
+from febio_cae_harness.solver.process_authority import ProcessAuthorityError
+from febio_cae_harness.solver.runtime import FebioRuntimeDiagnostic, probe_febio
+from febio_cae_harness.workspace import AttemptWorkspace, ValidatedCaseWorkspace
 
 
 class MappingAdapter:
@@ -289,3 +301,126 @@ def test_supervisor_rejects_arbitrary_adapter_and_caller_validation(tmp_path: Pa
     forged = cast(FbsAdapterAuthority, object.__new__(FbsValidation))
     with pytest.raises(TypeError):
         validate_requested_fields(forged, tmp_path / "attempt.xplt", ("stress",))
+
+
+_NORMAL_LOG = """
+FEBio run
+===== time step 1 =====
+time = 0.5
+===== time step 2 =====
+time = 1.0
+N O R M A L   T E R M I N A T I O N
+"""
+
+
+def _issued_runtime(monkeypatch: pytest.MonkeyPatch) -> FebioRuntimeDiagnostic:
+    class ProbeProcess:
+        returncode = 0
+
+        def communicate(self, input: bytes, timeout: float) -> tuple[bytes, bytes]:
+            del timeout
+            assert input == b"quit\n"
+            return b"version 4.12.0\n", b""
+
+    with monkeypatch.context() as probe_patch:
+        probe_patch.setattr(
+            "febio_cae_harness.solver.runtime.subprocess.Popen",
+            lambda command, **kwargs: ProbeProcess(),
+        )
+        return probe_febio(Path(sys.executable))
+
+
+def _supervisor_with_fbs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[SolverSupervisor, FbsAdapterAuthority]:
+    manager = ValidatedCaseWorkspace(tmp_path / "tool", tmp_path / "cae")
+    case = manager.create_case("case-a")
+    store = EvidenceStore(case, IntentContract())
+    store.record_attempt("attempt-a")
+    attempt = AttemptWorkspace._from_manager(
+        case,
+        "attempt-a",
+        case.temporary_root / "attempts" / "attempt-a",
+    )
+    intent = store.issue_intent_snapshot()
+    code = (
+        "from pathlib import Path; import os; "
+        f"Path(os.environ['FEBIO_CAE_HARNESS_LOG']).write_text({_NORMAL_LOG!r}, encoding='utf-8'); "
+        "Path(os.environ['FEBIO_CAE_HARNESS_XPLT']).write_bytes(b'synthetic-xplt')"
+    )
+    input_path = attempt.write_text("input.feb", code)
+    runtime = _issued_runtime(monkeypatch)
+    capability = headless_module._issue_launch_capability(
+        attempt,
+        intent,
+        runtime,
+        input_path,
+        expected_steps=2,
+        expected_final_time=1.0,
+        timeout_seconds=None,
+    )
+    fbs_manager = FbsAdapterManager(MappingAdapter(), "synthetic-runtime", attempt.root)
+    authority = fbs_manager.issue_authority()
+    return (
+        SolverSupervisor(capability, fbs_adapter=authority, requested_fields=("stress",)),
+        authority,
+    )
+
+
+@pytest.mark.parametrize("failure", ["result", "guard", "release"])
+def test_late_completion_failure_rolls_back_exact_fbs_and_result_issuance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    supervisor, authority = _supervisor_with_fbs(tmp_path, monkeypatch)
+    supervisor.start()
+    captured: list[SolverRunResult] = []
+    original_register = supervisor._register_result
+
+    def capture_register(result: SolverRunResult) -> None:
+        captured.append(result)
+        if failure == "result":
+            raise RuntimeError("synthetic late result registration failure")
+        original_register(result)
+
+    monkeypatch.setattr(supervisor, "_register_result", capture_register)
+
+    if failure == "guard":
+        original_guard = supervisor._revalidate_launch_binding
+
+        def final_guard() -> None:
+            original_guard()
+            if captured:
+                raise RuntimeError("synthetic final guard failure")
+
+        monkeypatch.setattr(supervisor, "_revalidate_launch_binding", final_guard)
+    elif failure == "release":
+        process_authority = supervisor._process_authority
+        assert process_authority is not None
+        monkeypatch.setattr(
+            process_authority,
+            "drain",
+            Mock(side_effect=ProcessAuthorityError("synthetic release failure")),
+        )
+
+    with pytest.raises((RuntimeError, SolverOwnershipError)):
+        supervisor.wait()
+
+    assert captured
+    result = captured[0]
+    validation = result.fbs_validation
+    assert validation is not None
+    assert id(validation) not in fbs_module._VALIDATION_REGISTRY
+    assert id(result) not in supervisor_module._RESULT_REGISTRY
+    assert supervisor.result is None
+    assert supervisor.state is SolverState.FAILED
+
+
+def test_validation_rollback_does_not_unregister_foreign_entry(tmp_path: Path) -> None:
+    authority, path = make_authority(tmp_path)
+    issued = validate_requested_fields(authority, path, ("stress",))
+    foreign = replace(issued)
+
+    assert not fbs_module._unregister_validation(foreign)
+    assert fbs_module._VALIDATION_REGISTRY[id(issued)].validation is issued

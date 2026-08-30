@@ -6,6 +6,7 @@ import contextlib
 import json
 import math
 import os
+import stat
 import subprocess
 import threading
 import time
@@ -22,12 +23,12 @@ from .fbs import (
     FbsValidation,
     _authority_record,
     _invalid_validation,
+    _unregister_validation,
     validate_requested_fields,
 )
 from .log import LogValidation, LogValidator, validate_log
 from .process_authority import ProcessAuthority, ProcessAuthorityError
 from .types import (
-    OutputFreshnessError,
     SolverClassification,
     SolverConfigurationError,
     SolverLaunchCapability,
@@ -61,6 +62,131 @@ _RESULT_FIELDS = (
 
 
 @dataclass(frozen=True, slots=True)
+class _FilesystemIdentity:
+    path: Path
+    device: int
+    inode: int
+
+
+class _FilesystemAuthority:
+    """Keep the attempt path and every ancestor bound to stable identities."""
+
+    def __init__(self, root: Path) -> None:
+        self.root = Path(os.path.abspath(os.fspath(root)))
+        self._entries: tuple[tuple[_FilesystemIdentity, int | None], ...] = ()
+        self._root_fd: int | None = None
+        self._closed = False
+        fds: list[int] = []
+        entries: list[tuple[_FilesystemIdentity, int | None]] = []
+        try:
+            paths: list[Path] = []
+            current = self.root
+            while True:
+                paths.append(current)
+                if current == current.parent:
+                    break
+                current = current.parent
+
+            for path in paths:
+                metadata = os.lstat(os.fspath(path))
+                if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+                    raise SolverOwnershipError(f"attempt path is not a stable directory: {path}")
+                identity = _FilesystemIdentity(
+                    path,
+                    int(metadata.st_dev),
+                    int(metadata.st_ino),
+                )
+                fd: int | None = None
+                if os.name == "posix":
+                    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+                    flags |= getattr(os, "O_CLOEXEC", 0)
+                    fd = os.open(os.fspath(path), flags)
+                    fds.append(fd)
+                    held = os.fstat(fd)
+                    if int(held.st_dev) != identity.device or int(held.st_ino) != identity.inode:
+                        raise SolverOwnershipError(
+                            f"attempt path changed while acquiring authority: {path}"
+                        )
+                    if path == self.root:
+                        self._root_fd = fd
+                entries.append((identity, fd))
+            self._entries = tuple(entries)
+            self.verify()
+        except BaseException:
+            for fd in fds:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+            raise
+
+    @property
+    def child_pass_fds(self) -> tuple[int, ...]:
+        return () if self._root_fd is None else (self._root_fd,)
+
+    @property
+    def identities(self) -> tuple[_FilesystemIdentity, ...]:
+        return tuple(identity for identity, _fd in self._entries)
+
+    def verify(self) -> None:
+        if self._closed:
+            raise SolverOwnershipError("filesystem authority is closed")
+        for identity, fd in self._entries:
+            try:
+                metadata = os.lstat(os.fspath(identity.path))
+            except OSError as error:
+                raise SolverOwnershipError(
+                    f"attempt path authority is unavailable: {identity.path}"
+                ) from error
+            if (
+                stat.S_ISLNK(metadata.st_mode)
+                or not stat.S_ISDIR(metadata.st_mode)
+                or int(metadata.st_dev) != identity.device
+                or int(metadata.st_ino) != identity.inode
+            ):
+                raise SolverOwnershipError(f"attempt path authority changed: {identity.path}")
+            if fd is not None:
+                try:
+                    held = os.fstat(fd)
+                except OSError as error:
+                    raise SolverOwnershipError(
+                        f"attempt directory handle is unavailable: {identity.path}"
+                    ) from error
+                if int(held.st_dev) != identity.device or int(held.st_ino) != identity.inode:
+                    raise SolverOwnershipError(f"attempt directory handle changed: {identity.path}")
+
+    def anchor(self, path: Path) -> Path:
+        """Return a child path rooted at the held attempt directory on POSIX."""
+
+        path = Path(os.path.abspath(os.fspath(path)))
+        try:
+            relative = path.relative_to(self.root)
+        except ValueError as error:
+            raise SolverOwnershipError(f"path escapes the attempt root: {path}") from error
+        if os.name != "posix":
+            return path
+        if self._root_fd is None:
+            raise SolverOwnershipError("POSIX attempt directory handle is unavailable")
+        return Path("/proc/self/fd") / str(self._root_fd) / relative
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for _identity, fd in self._entries:
+            if fd is not None:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+
+
+@dataclass(frozen=True, slots=True)
+class _ProcessRecordClaim:
+    path: Path
+    content: bytes
+    device: int
+    inode: int
+    state: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class _ResultIssuance:
     result: SolverRunResult
     supervisor: SolverSupervisor
@@ -76,6 +202,7 @@ class _ResultIssuance:
     log_path: Path
     xplt_path: Path
     finished_at: datetime | None
+    filesystem_identities: tuple[_FilesystemIdentity, ...]
     snapshot: tuple[object, ...]
 
 
@@ -280,6 +407,21 @@ class SolverSupervisor:
         self._started_at: datetime | None = None
         self._result: SolverRunResult | None = None
         self._process_record: dict[str, object] | None = None
+        self._process_record_claim: _ProcessRecordClaim | None = None
+        self._record_owner_token = self._owner_token
+        filesystem_authority = _FilesystemAuthority(self.spec.attempt_root)
+        try:
+            self._filesystem_authority: _FilesystemAuthority | None = filesystem_authority
+            self._revalidate_launch_binding()
+        except BaseException:
+            filesystem_authority.close()
+            raise
+
+    def __del__(self) -> None:
+        authority = getattr(self, "_filesystem_authority", None)
+        if authority is not None:
+            with contextlib.suppress(BaseException):
+                authority.close()
 
     @property
     def state(self) -> SolverState:
@@ -311,6 +453,190 @@ class SolverSupervisor:
     def result(self) -> SolverRunResult | None:
         with self._lock:
             return self._result
+
+    def _acquire_filesystem_authority(self) -> None:
+        if self._filesystem_authority is None:
+            self._filesystem_authority = _FilesystemAuthority(self.spec.attempt_root)
+        self._filesystem_authority.verify()
+
+    def _verify_filesystem_authority(self) -> None:
+        authority = self._filesystem_authority
+        if authority is None:
+            raise SolverOwnershipError("filesystem authority is unavailable")
+        authority.verify()
+
+    def _filesystem_identities(self) -> tuple[_FilesystemIdentity, ...]:
+        authority = self._filesystem_authority
+        if authority is None:
+            raise SolverOwnershipError("filesystem authority is unavailable")
+        return authority.identities
+
+    @staticmethod
+    def _validate_filesystem_identities(
+        identities: tuple[_FilesystemIdentity, ...],
+    ) -> None:
+        for identity in identities:
+            try:
+                metadata = os.lstat(os.fspath(identity.path))
+            except OSError as error:
+                raise SolverOwnershipError(
+                    f"filesystem authority is unavailable: {identity.path}"
+                ) from error
+            if (
+                stat.S_ISLNK(metadata.st_mode)
+                or not stat.S_ISDIR(metadata.st_mode)
+                or int(metadata.st_dev) != identity.device
+                or int(metadata.st_ino) != identity.inode
+            ):
+                raise SolverOwnershipError(f"filesystem authority changed: {identity.path}")
+
+    def _record_filesystem_identities(self) -> list[dict[str, object]]:
+        return [
+            {
+                "path": os.fspath(identity.path),
+                "device": identity.device,
+                "inode": identity.inode,
+            }
+            for identity in self._filesystem_identities()
+        ]
+
+    def _parse_record_filesystem_identities(self, value: object) -> tuple[_FilesystemIdentity, ...]:
+        if not isinstance(value, list):
+            raise SolverOwnershipError("process record filesystem authority is invalid")
+        identities: list[_FilesystemIdentity] = []
+        for item in value:
+            if not isinstance(item, dict):
+                raise SolverOwnershipError("process record filesystem authority is invalid")
+            path_value = item.get("path")
+            device = item.get("device")
+            inode = item.get("inode")
+            if (
+                not isinstance(path_value, str)
+                or not Path(path_value).is_absolute()
+                or isinstance(device, bool)
+                or not isinstance(device, int)
+                or isinstance(inode, bool)
+                or not isinstance(inode, int)
+            ):
+                raise SolverOwnershipError("process record filesystem authority is invalid")
+            identities.append(
+                _FilesystemIdentity(
+                    Path(os.path.abspath(path_value)),
+                    device,
+                    inode,
+                )
+            )
+        return tuple(identities)
+
+    def _close_filesystem_authority(self) -> None:
+        authority = self._filesystem_authority
+        self._filesystem_authority = None
+        if authority is not None:
+            authority.close()
+
+    def _path_for_io(self, path: Path) -> Path:
+        authority = self._filesystem_authority
+        return path if authority is None else authority.anchor(path)
+
+    def _child_command(self) -> tuple[str, ...]:
+        root = self.spec.attempt_root
+        command: list[str] = []
+        for value in self.spec.command:
+            try:
+                candidate = Path(value)
+            except (TypeError, ValueError):
+                command.append(value)
+                continue
+            if candidate.is_absolute() and candidate.is_relative_to(root):
+                command.append(os.fspath(self._path_for_io(candidate)))
+            else:
+                command.append(value)
+        return tuple(command)
+
+    def _child_environment(self) -> dict[str, str]:
+        environment = os.environ.copy()
+        environment.update(self.spec.environment)
+        root = self.spec.attempt_root
+        for key, value in tuple(environment.items()):
+            try:
+                candidate = Path(value)
+            except (TypeError, ValueError):
+                continue
+            if candidate.is_absolute() and candidate.is_relative_to(root):
+                environment[key] = os.fspath(self._path_for_io(candidate))
+
+        outputs = self.spec.expected_outputs
+        environment["FEBIO_CAE_HARNESS_OWNER"] = self._owner_token
+        environment["FEBIO_CAE_HARNESS_ATTEMPT_ROOT"] = os.fspath(self._path_for_io(root))
+        environment["FEBIO_CAE_HARNESS_LOG"] = os.fspath(self._path_for_io(outputs.log_path))
+        environment["FEBIO_CAE_HARNESS_XPLT"] = os.fspath(self._path_for_io(outputs.xplt_path))
+        return environment
+
+    def _cleanup_failed_start(
+        self,
+        process: subprocess.Popen[bytes] | None,
+        authority: ProcessAuthority | None,
+        bound: bool,
+    ) -> None:
+        if process is None:
+            if authority is not None:
+                with contextlib.suppress(BaseException):
+                    authority.close()
+            return
+
+        if authority is not None and bound:
+            try:
+                if self._process_authority is authority:
+                    self._terminate_owned_process(process)
+                else:
+                    authority.terminate(process.pid)
+            except BaseException:
+                with contextlib.suppress(BaseException):
+                    authority.terminate(process.pid, force=True)
+                with contextlib.suppress(BaseException):
+                    authority.drain()
+            else:
+                with contextlib.suppress(BaseException):
+                    authority.drain()
+        elif not bound:
+            with contextlib.suppress(BaseException):
+                process.kill()
+
+        with contextlib.suppress(BaseException):
+            process.wait(timeout=2.0)
+        if authority is not None:
+            with contextlib.suppress(BaseException):
+                authority.close()
+
+    def _record_claim_matches(self, claim: _ProcessRecordClaim) -> bool:
+        try:
+            metadata = os.lstat(os.fspath(claim.path))
+            if (
+                stat.S_ISLNK(metadata.st_mode)
+                or not stat.S_ISREG(metadata.st_mode)
+                or int(metadata.st_dev) != claim.device
+                or int(metadata.st_ino) != claim.inode
+            ):
+                return False
+            return Path(claim.path).read_bytes() == claim.content
+        except OSError:
+            return False
+
+    def _rollback_process_record(self) -> None:
+        """Remove only the exact record inode and bytes this owner published."""
+
+        claim = self._process_record_claim
+        if claim is None:
+            return
+        # A BOUND_SUSPENDED record is a durable failed-launch marker.  Keep it
+        # as the restoration of the supervisor-owned publication; a RUNNING
+        # record must not survive a late launch/completion failure.
+        if claim.state == "BOUND_SUSPENDED":
+            return
+        if not self._record_claim_matches(claim):
+            return
+        with contextlib.suppress(OSError):
+            claim.path.unlink()
 
     def _revalidate_launch_binding(self) -> None:
         """Require the supervisor's capability and authority binding to remain exact."""
@@ -428,35 +754,35 @@ class SolverSupervisor:
             if self._state is not SolverState.NOT_STARTED:
                 raise RuntimeError(f"solver cannot start from state {self._state}")
 
-            # Revalidate every authority immediately before the first mutation
-            # of the attempt directory or process creation.
+            # Revalidate every authority immediately before acquiring the
+            # filesystem handles used to anchor all later launch paths.
             self._revalidate_launch_binding()
 
             authority: ProcessAuthority | None = None
             process: subprocess.Popen[bytes] | None = None
             bound = False
             try:
+                self._acquire_filesystem_authority()
+                self._verify_filesystem_authority()
                 self.spec.prepare_outputs()
+                self._verify_filesystem_authority()
                 self._revalidate_launch_binding()
-                if os.path.lexists(os.fspath(self.process_record_path)):
+                record_path = self._path_for_io(self.process_record_path)
+                if os.path.lexists(os.fspath(record_path)):
                     raise SolverLaunchError(
                         f"process record already exists: {self.process_record_path}"
                     )
-                if not self.spec.input_path.is_file():
+                input_path = self._path_for_io(self.spec.input_path)
+                if not input_path.is_file():
                     raise FileNotFoundError(f"solver input does not exist: {self.spec.input_path}")
                 authority = ProcessAuthority.create(
                     self.spec.attempt_root, self._launch_context_digest
                 )
-                environment = os.environ.copy()
-                environment.update(self.spec.environment)
-                # These markers let a child process discover its owned attempt
-                # without granting it any additional filesystem authority.
-                environment["FEBIO_CAE_HARNESS_OWNER"] = self._owner_token
-                environment["FEBIO_CAE_HARNESS_ATTEMPT_ROOT"] = os.fspath(self.spec.attempt_root)
-                outputs = self.spec.expected_outputs
-                environment["FEBIO_CAE_HARNESS_LOG"] = os.fspath(outputs.log_path)
-                environment["FEBIO_CAE_HARNESS_XPLT"] = os.fspath(outputs.xplt_path)
+                self._verify_filesystem_authority()
+                environment = self._child_environment()
                 environment.update(authority.child_environment())
+                command = self._child_command()
+                cwd = os.fspath(self._path_for_io(self.spec.cwd))
 
                 if os.name == "nt":
                     creation_flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | (
@@ -467,9 +793,8 @@ class SolverSupervisor:
                         raise ProcessAuthorityError("process attestation handle is unavailable")
                     startup_info = subprocess.STARTUPINFO()
                     startup_info.lpAttributeList = {"handle_list": [child_handle]}
-                    command = self.spec.command
-                    cwd = os.fspath(self.spec.cwd)
                     self._revalidate_launch_binding()
+                    self._verify_filesystem_authority()
                     process = subprocess.Popen(
                         command,
                         cwd=cwd,
@@ -483,10 +808,16 @@ class SolverSupervisor:
                         startupinfo=startup_info,
                     )
                 else:
-                    command = self.spec.command
-                    cwd = os.fspath(self.spec.cwd)
-                    pass_fds = authority.child_pass_fds()
+                    filesystem_authority = self._filesystem_authority
+                    if filesystem_authority is None:  # pragma: no cover - state guard
+                        raise SolverOwnershipError("filesystem authority is unavailable")
+                    pass_fds = tuple(
+                        dict.fromkeys(
+                            authority.child_pass_fds() + filesystem_authority.child_pass_fds
+                        )
+                    )
                     self._revalidate_launch_binding()
+                    self._verify_filesystem_authority()
                     process = subprocess.Popen(
                         command,
                         cwd=cwd,
@@ -498,9 +829,11 @@ class SolverSupervisor:
                         start_new_session=True,
                         pass_fds=pass_fds,
                     )
+                self._verify_filesystem_authority()
                 metadata = _process_metadata(process.pid)
                 authority.bind(process.pid, metadata.creation_identity)
                 bound = True
+                self._verify_filesystem_authority()
                 bound_metadata = _process_metadata(process.pid)
                 if (
                     not bound_metadata.alive
@@ -514,6 +847,10 @@ class SolverSupervisor:
                     raise ProcessAuthorityError("process start identity is unavailable")
                 started_at = metadata.started_at
                 self._revalidate_launch_binding()
+                self._verify_filesystem_authority()
+                self._process = process
+                self._started_at = started_at
+                self._process_authority = authority
                 if os.name == "nt":
                     bound_record = self._make_process_record(
                         process.pid,
@@ -523,42 +860,34 @@ class SolverSupervisor:
                         state="BOUND_SUSPENDED",
                     )
                     self._write_process_record(bound_record)
+                    self._verify_filesystem_authority()
                     authority.resume(process.pid)
                     self._revalidate_launch_binding()
+                    self._verify_filesystem_authority()
                 running_record = self._make_process_record(
                     process.pid, metadata, started_at, authority, state=SolverState.RUNNING.value
                 )
                 self._write_process_record(running_record)
-                self._process = process
-                self._started_at = started_at
-                self._process_authority = authority
                 self._process_record = running_record
-            except (OSError, OutputFreshnessError, ValueError) as error:
-                process = locals().get("process")
-                if process is not None:
-                    try:
-                        if authority is not None and self._process_authority is authority:
-                            self._terminate_owned_process(process)
-                        elif authority is not None and bound and os.name == "nt":
-                            authority.terminate(process.pid, force=True)
-                        else:
-                            process.kill()
-                        process.wait(timeout=2.0)
-                    except (
-                        OSError,
-                        ProcessLookupError,
-                        SolverOwnershipError,
-                        subprocess.TimeoutExpired,
-                    ):
-                        with contextlib.suppress(OSError):
-                            process.kill()
-                if authority is not None:
-                    if bound and os.name != "nt":
-                        with contextlib.suppress(ProcessAuthorityError):
-                            authority.drain()
-                    authority.close()
+                # A final binding check occurs only after RUNNING is durable.
+                # Failure here must roll back that exact record before the
+                # process and filesystem authorities are released.
+                self._revalidate_launch_binding()
+                self._verify_filesystem_authority()
+            except BaseException as error:
+                self._cleanup_failed_start(process, authority, bound)
+                self._rollback_process_record()
+                self._process = None
+                self._started_at = None
+                self._process_authority = None
+                self._process_record = None
+                self._process_record_claim = None
+                self._close_filesystem_authority()
                 self._state = SolverState.FAILED
-                if isinstance(error, SolverConfigurationError):
+                if isinstance(
+                    error,
+                    (SolverConfigurationError, SolverLaunchError, SolverOwnershipError),
+                ):
                     raise
                 raise SolverLaunchError(f"unable to launch solver: {error}") from error
 
@@ -574,7 +903,10 @@ class SolverSupervisor:
             process = self._process
         if process is None:
             return None
-        return process.poll()
+        self._verify_filesystem_authority()
+        return_code = process.poll()
+        self._verify_filesystem_authority()
+        return return_code
 
     @classmethod
     def reconnect(
@@ -593,11 +925,17 @@ class SolverSupervisor:
             requested_fields=requested_fields,
             log_validator=log_validator,
         )
-        record = supervisor._read_process_record()
-        supervisor._revalidate_launch_binding()
-        metadata, started_at, authority = supervisor._validate_process_record(record)
+        authority: ProcessAuthority | None = None
         try:
+            supervisor._acquire_filesystem_authority()
+            record = supervisor._read_process_record()
             supervisor._revalidate_launch_binding()
+            metadata, started_at, authority = supervisor._validate_process_record(record)
+            supervisor._revalidate_launch_binding()
+            supervisor._verify_filesystem_authority()
+            owner_token = record.get("owner_token")
+            if isinstance(owner_token, str) and owner_token:
+                supervisor._record_owner_token = owner_token
             supervisor._process_record = record
             pid = cast(int, record["pid"])
             supervisor._process = _ReconnectedProcess(
@@ -608,7 +946,11 @@ class SolverSupervisor:
             supervisor._state = SolverState.RUNNING
             return supervisor
         except BaseException:
-            authority.close()
+            if authority is not None:
+                with contextlib.suppress(BaseException):
+                    authority.close()
+            supervisor._process_authority = None
+            supervisor._close_filesystem_authority()
             raise
 
     def wait(self, timeout_seconds: float | None = None) -> SolverRunResult:
@@ -696,6 +1038,7 @@ class SolverSupervisor:
             "intent_id": self._intent_id,
             "attempt_id": self._attempt_id,
             "state": state,
+            "owner_token": self._record_owner_token,
             "executable_path": str(self.spec.executable),
             "pid": pid,
             "process_creation_identity": metadata.creation_identity,
@@ -704,35 +1047,71 @@ class SolverSupervisor:
                 "log": str(outputs.log_path),
                 "xplt": str(outputs.xplt_path),
             },
+            "filesystem_authority": self._record_filesystem_identities(),
             "launch_context": self._launch_context,
             "launch_context_digest": self._launch_context_digest,
             "process_authority": claim,
         }
 
     def _write_process_record(self, record: dict[str, object]) -> None:
-        path = self.process_record_path
+        self._verify_filesystem_authority()
+        path = self._path_for_io(self.process_record_path)
         temporary = path.with_name(f".{path.name}.{self._owner_token}.tmp")
         try:
-            with temporary.open("x", encoding="utf-8") as stream:
-                json.dump(record, stream, indent=2, sort_keys=True)
+            content = json.dumps(record, indent=2, sort_keys=True).encode("utf-8")
+        except (TypeError, ValueError) as error:
+            raise OSError(f"unable to persist process record: {error}") from error
+        try:
+            with temporary.open("x", encoding="utf-8", newline="") as stream:
+                stream.write(content.decode("utf-8"))
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(os.fspath(temporary), os.fspath(path))
+            metadata = os.lstat(os.fspath(path))
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+                raise OSError("process record is not a regular file")
+            record_state = record.get("state")
+            claim = _ProcessRecordClaim(
+                path=path,
+                content=content,
+                device=int(metadata.st_dev),
+                inode=int(metadata.st_ino),
+                state=record_state if isinstance(record_state, str) else None,
+            )
+            self._process_record_claim = claim
+            if Path(path).read_bytes() != content:
+                raise OSError("process record changed during publication")
         except (OSError, TypeError, ValueError) as error:
             with contextlib.suppress(OSError):
                 temporary.unlink(missing_ok=True)
             raise OSError(f"unable to persist process record: {error}") from error
 
     def _read_process_record(self) -> dict[str, object]:
-        path = self.process_record_path
+        self._verify_filesystem_authority()
+        path = self._path_for_io(self.process_record_path)
         if not path.is_file() or path.is_symlink():
             raise SolverOwnershipError(f"missing process record: {path}")
         try:
-            record = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as error:
+            content = path.read_bytes()
+            record = json.loads(content.decode("utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
             raise SolverOwnershipError(f"invalid process record: {path}") from error
         if not isinstance(record, dict):
             raise SolverOwnershipError("process record must be a JSON object")
+        self._verify_filesystem_authority()
+        metadata = os.lstat(os.fspath(path))
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+            raise SolverOwnershipError("process record is not a regular file")
+        if path.read_bytes() != content:
+            raise SolverOwnershipError("process record changed during read")
+        record_state = record.get("state")
+        self._process_record_claim = _ProcessRecordClaim(
+            path=path,
+            content=content,
+            device=int(metadata.st_dev),
+            inode=int(metadata.st_ino),
+            state=record_state if isinstance(record_state, str) else None,
+        )
         return record
 
     def _validate_record_path(self, value: object, expected: Path, label: str) -> None:
@@ -750,6 +1129,7 @@ class SolverSupervisor:
     def _validate_process_record(
         self, record: dict[str, object]
     ) -> tuple[_ProcessMetadata, datetime, ProcessAuthority]:
+        self._verify_filesystem_authority()
         expected_ids = {
             "case_id": self._case_id,
             "intent_id": self._intent_id,
@@ -760,6 +1140,12 @@ class SolverSupervisor:
 
         if record.get("state") != SolverState.RUNNING.value:
             raise SolverOwnershipError("process record is not a reconnectable RUNNING state")
+        filesystem_identities = self._parse_record_filesystem_identities(
+            record.get("filesystem_authority")
+        )
+        if filesystem_identities != self._filesystem_identities():
+            raise SolverOwnershipError("process record filesystem authority does not match")
+        self._validate_filesystem_identities(filesystem_identities)
         context = record.get("launch_context")
         if not isinstance(context, dict):
             raise SolverOwnershipError("process record launch context is invalid")
@@ -849,6 +1235,7 @@ class SolverSupervisor:
             raise SolverOwnershipError("current process start time does not match")
         if authority is None:  # pragma: no cover - defensive type/state guard
             raise SolverOwnershipError("recorded process authority is unavailable")
+        self._verify_filesystem_authority()
         return metadata, metadata.started_at, authority
 
     def _terminate_owned_process(
@@ -879,12 +1266,19 @@ class SolverSupervisor:
         authority = self._process_authority
         if authority is None:
             return
+        self._process_authority = None
+        failure: BaseException | None = None
         try:
             authority.drain()
+        except BaseException as error:
+            failure = error
+        try:
             authority.close()
-        except ProcessAuthorityError as error:
-            raise SolverOwnershipError("owned process descendants could not be drained") from error
-        self._process_authority = None
+        except BaseException as error:
+            if failure is None:
+                failure = error
+        if failure is not None:
+            raise SolverOwnershipError("owned process authority could not be released") from failure
 
     def _register_result(self, result: SolverRunResult) -> None:
         if type(result) is not SolverRunResult:
@@ -906,6 +1300,9 @@ class SolverSupervisor:
             log_path=self.spec.expected_outputs.log_path,
             xplt_path=self.spec.expected_outputs.xplt_path,
             finished_at=result.finished_at,
+            filesystem_identities=(
+                self._filesystem_identities() if self._filesystem_authority is not None else ()
+            ),
             snapshot=tuple(getattr(result, field) for field in _RESULT_FIELDS),
         )
         with _RESULT_REGISTRY_LOCK:
@@ -913,6 +1310,16 @@ class SolverSupervisor:
             if existing is not None and existing.result is not result:
                 raise SolverOwnershipError("solver result registry collision")
             _RESULT_REGISTRY[id(result)] = issuance
+
+    def _unregister_result(self, result: object) -> bool:
+        if type(result) is not SolverRunResult:
+            return False
+        with _RESULT_REGISTRY_LOCK:
+            issuance = _RESULT_REGISTRY.get(id(result))
+            if issuance is None or issuance.result is not result:
+                return False
+            del _RESULT_REGISTRY[id(result)]
+            return True
 
     def _validate_result(self, candidate: object) -> SolverRunResult:
         if type(self) is not SolverSupervisor:
@@ -945,6 +1352,7 @@ class SolverSupervisor:
                     raise SolverOwnershipError(f"solver result {label} binding is invalid")
             if self._process is not issuance.process or self._process is None:
                 raise SolverOwnershipError("solver result process binding is invalid")
+            self._validate_filesystem_identities(issuance.filesystem_identities)
             pid = getattr(self._process, "pid", None)
             if (
                 isinstance(pid, bool)
@@ -1029,69 +1437,139 @@ class SolverSupervisor:
             return candidate
 
     def _complete(self, state: SolverState, return_code: int | None) -> SolverRunResult:
-        with self._lock, contextlib.ExitStack() as cleanup:
+        with self._lock:
             if self._result is not None:
                 return self._result
-            cleanup.callback(self._release_process_authority)
-            started_at = self._started_at
-            pid = self._process.pid if self._process is not None else None
 
-            log_validation = (
-                self._log_validator.validate(self.spec.expected_outputs.log_path)
-                if self._log_validator is not None
-                else validate_log(
-                    self.spec.expected_outputs.log_path,
-                    expected_steps=self.spec.expected_steps,
-                    expected_final_time=self.spec.expected_final_time,
+            # Cancellation before launch has no filesystem or process
+            # publication to validate, but still receives an issued result.
+            if self._process is None and state is SolverState.CANCELLED:
+                cancelled_result = SolverRunResult(
+                    state=state,
+                    classification=SolverClassification.CANCELLED,
+                    return_code=return_code,
+                    pid=None,
+                    command=self.spec.command,
+                    log_path=self.spec.expected_outputs.log_path,
+                    xplt_path=self.spec.expected_outputs.xplt_path,
+                    started_at=None,
+                    finished_at=datetime.now(UTC),
                 )
-            )
-            fbs_validation: FbsValidation | None = None
-            classification = self._classify_process_and_outputs(
-                state,
-                return_code,
-                log_validation,
-            )
-            if classification is None:
-                if self._fbs_adapter is None:
-                    classification = SolverClassification.FBS_UNVERIFIED
-                else:
-                    try:
-                        fbs_validation = validate_requested_fields(
-                            self._fbs_adapter,
-                            self.spec.expected_outputs.xplt_path,
-                            self._requested_fields,
-                            attempt_root=self.spec.attempt_root,
-                        )
-                    except Exception as error:
-                        fbs_validation = _invalid_validation(
-                            self._fbs_adapter,
-                            self.spec.expected_outputs.xplt_path,
-                            self._requested_fields,
-                            str(error),
-                        )
-                    if not fbs_validation.valid:
-                        classification = SolverClassification.FBS_INVALID
-                    else:
-                        classification = SolverClassification.FBS_UNVERIFIED
+                try:
+                    self._register_result(cancelled_result)
+                    self._state = state
+                    self._result = cancelled_result
+                    self._close_filesystem_authority()
+                    return cancelled_result
+                except BaseException:
+                    self._unregister_result(cancelled_result)
+                    self._state = SolverState.FAILED
+                    self._close_filesystem_authority()
+                    raise
 
-            finished_at = datetime.now(UTC)
-            result = SolverRunResult(
-                state=state,
-                classification=classification,
-                return_code=return_code,
-                pid=pid,
-                command=self.spec.command,
-                log_path=self.spec.expected_outputs.log_path,
-                xplt_path=self.spec.expected_outputs.xplt_path,
-                started_at=started_at,
-                finished_at=finished_at,
-                log_validation=log_validation,
-                fbs_validation=fbs_validation,
-            )
-            self._register_result(result)
-            self._state = state
-            self._result = result
-            return result
+            fbs_validation: FbsValidation | None = None
+            result: SolverRunResult | None = None
+            try:
+                if state is not SolverState.CANCELLED:
+                    self._revalidate_launch_binding()
+                self._verify_filesystem_authority()
+                started_at = self._started_at
+                pid = self._process.pid if self._process is not None else None
+                outputs = self.spec.expected_outputs
+                log_path = self._path_for_io(outputs.log_path)
+
+                log_validation = (
+                    self._log_validator.validate(log_path)
+                    if self._log_validator is not None
+                    else validate_log(
+                        log_path,
+                        expected_steps=self.spec.expected_steps,
+                        expected_final_time=self.spec.expected_final_time,
+                    )
+                )
+                self._verify_filesystem_authority()
+                classification = self._classify_process_and_outputs(
+                    state,
+                    return_code,
+                    log_validation,
+                )
+                self._verify_filesystem_authority()
+                if classification is None:
+                    if self._fbs_adapter is None:
+                        classification = SolverClassification.FBS_UNVERIFIED
+                    else:
+                        try:
+                            self._verify_filesystem_authority()
+                            fbs_validation = validate_requested_fields(
+                                self._fbs_adapter,
+                                outputs.xplt_path,
+                                self._requested_fields,
+                                attempt_root=self.spec.attempt_root,
+                                physical_path=self._path_for_io(outputs.xplt_path),
+                            )
+                            self._verify_filesystem_authority()
+                        except Exception as error:
+                            if fbs_validation is not None:
+                                _unregister_validation(fbs_validation)
+                                fbs_validation = None
+                            fbs_validation = _invalid_validation(
+                                self._fbs_adapter,
+                                outputs.xplt_path,
+                                self._requested_fields,
+                                str(error),
+                            )
+                        if not fbs_validation.valid:
+                            classification = SolverClassification.FBS_INVALID
+                        else:
+                            classification = SolverClassification.FBS_UNVERIFIED
+
+                finished_at = datetime.now(UTC)
+                result = SolverRunResult(
+                    state=state,
+                    classification=classification,
+                    return_code=return_code,
+                    pid=pid,
+                    command=self.spec.command,
+                    log_path=outputs.log_path,
+                    xplt_path=outputs.xplt_path,
+                    started_at=started_at,
+                    finished_at=finished_at,
+                    log_validation=log_validation,
+                    fbs_validation=fbs_validation,
+                )
+                self._register_result(result)
+
+                # Result/FBS issuance is provisional until the final live
+                # binding and root checks pass and process authority release
+                # completes successfully.
+                if state is not SolverState.CANCELLED:
+                    self._revalidate_launch_binding()
+                self._verify_filesystem_authority()
+                self._release_process_authority()
+                if state is not SolverState.CANCELLED:
+                    self._revalidate_launch_binding()
+                self._verify_filesystem_authority()
+
+                self._state = state
+                self._result = result
+                self._close_filesystem_authority()
+                return result
+            except BaseException:
+                if result is not None:
+                    self._unregister_result(result)
+                if fbs_validation is not None:
+                    _unregister_validation(fbs_validation)
+                self._rollback_process_record()
+                with contextlib.suppress(BaseException):
+                    self._release_process_authority()
+                self._process = None
+                self._started_at = None
+                self._process_record = None
+                self._process_record_claim = None
+                self._result = None
+                self._state = SolverState.FAILED
+                self._close_filesystem_authority()
+                raise
 
     def _classify_process_and_outputs(
         self,
@@ -1109,7 +1587,11 @@ class SolverSupervisor:
             SolverClassification.INIT_ONLY,
         }:
             return log_validation.classification
-        if not self.spec.expected_outputs.present():
+        outputs = self.spec.expected_outputs
+        if not (
+            self._path_for_io(outputs.log_path).is_file()
+            and self._path_for_io(outputs.xplt_path).is_file()
+        ):
             return SolverClassification.MISSING_OUTPUT
         if return_code != 0:
             return SolverClassification.NONZERO_EXIT

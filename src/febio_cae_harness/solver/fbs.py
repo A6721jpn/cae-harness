@@ -233,19 +233,23 @@ def _path(path: str | Path) -> Path:
         raise ValueError("XPLT path must be a filesystem path") from error
 
 
-def _inside(path: Path, root: Path) -> bool:
+def _inside(path: Path, root: Path, *, allow_fd_alias: bool = False) -> bool:
     try:
         path.relative_to(root)
+    except ValueError:
+        if not allow_fd_alias or path.parts[:4] != (os.sep, "proc", "self", "fd"):
+            return False
+    try:
         Path(os.path.realpath(path)).relative_to(Path(os.path.realpath(root)))
     except ValueError:
         return False
     return True
 
 
-def _require_xplt(path: Path, root: Path | None) -> None:
+def _require_xplt(path: Path, root: Path | None, *, allow_fd_alias: bool = False) -> None:
     if path.suffix.lower() != ".xplt":
         raise ValueError("validation requires an XPLT path")
-    if root is not None and not _inside(path, root):
+    if root is not None and not _inside(path, root, allow_fd_alias=allow_fd_alias):
         raise ValueError("XPLT path is outside the solver attempt outputs")
     if path.is_symlink():
         raise ValueError("XPLT path must not be a symlink")
@@ -373,6 +377,24 @@ def _register_validation(
     return validation
 
 
+def _unregister_validation(value: object) -> bool:
+    """Revoke exactly one validation issued by this module.
+
+    Rollback is deliberately identity based.  A caller-provided object or a
+    replacement occupying the same integer key must never remove an issued
+    validation belonging to another operation.
+    """
+
+    if type(value) is not FbsValidation:
+        return False
+    key = id(value)
+    record = _VALIDATION_REGISTRY.get(key)
+    if record is None or record.validation is not value:
+        return False
+    del _VALIDATION_REGISTRY[key]
+    return True
+
+
 def _issued_validation_record(value: object) -> _ValidationRecord:
     if type(value) is not FbsValidation:
         raise TypeError("value is not an exact FbsValidation instance")
@@ -461,7 +483,7 @@ def _invalid_validation(
 def _build_validation(
     authority: FbsAdapterAuthority,
     record: _AuthorityRecord,
-    path: Path,
+    reported_path: Path,
     fields: tuple[str, ...],
     values: Mapping[str, object],
     digest_before: str,
@@ -480,7 +502,7 @@ def _build_validation(
     validation = FbsValidation(
         authority=authority,
         runtime_identity=record.runtime_identity,
-        xplt_path=path,
+        xplt_path=reported_path,
         requested_fields=fields,
         available_fields=available,
         values=values,
@@ -501,16 +523,26 @@ def validate_requested_fields(
     requested_fields: Iterable[str],
     *,
     attempt_root: str | Path | None = None,
+    physical_path: str | Path | None = None,
 ) -> FbsValidation:
     """Read and validate requested fields through an issued authority."""
 
     record = _authority_record(authority)
     fields = _normalise_fields(requested_fields)
-    path = _path(xplt_path)
+    reported_path = _path(xplt_path)
+    path = reported_path if physical_path is None else _path(physical_path)
+    allow_fd_alias = physical_path is not None
     if record.attempt_root is not None:
-        _require_xplt(path, record.attempt_root)
+        _require_xplt(reported_path, record.attempt_root)
+        _require_xplt(path, record.attempt_root, allow_fd_alias=allow_fd_alias)
     if attempt_root is not None:
-        _require_xplt(path, _normalise_root(attempt_root))
+        normalised_attempt_root = _normalise_root(attempt_root)
+        _require_xplt(reported_path, normalised_attempt_root)
+        _require_xplt(
+            path,
+            normalised_attempt_root,
+            allow_fd_alias=allow_fd_alias,
+        )
     if record.attempt_root is None and attempt_root is None:
         _require_xplt(path, None)
 
@@ -519,13 +551,17 @@ def validate_requested_fields(
         raw_result = record.reader(path, fields)
     except Exception as error:
         try:
-            _require_xplt(path, record.attempt_root)
+            _require_xplt(
+                path,
+                record.attempt_root,
+                allow_fd_alias=allow_fd_alias,
+            )
             digest_after = _digest(path)
         except Exception:
             digest_after = ""
         return _invalid_validation(
             authority,
-            path,
+            reported_path,
             fields,
             f"adapter execution failed: {error}",
             digest_before=digest_before,
@@ -533,14 +569,22 @@ def validate_requested_fields(
         )
 
     try:
-        _require_xplt(path, record.attempt_root)
+        _require_xplt(
+            path,
+            record.attempt_root,
+            allow_fd_alias=allow_fd_alias,
+        )
         if attempt_root is not None:
-            _require_xplt(path, _normalise_root(attempt_root))
+            _require_xplt(
+                path,
+                _normalise_root(attempt_root),
+                allow_fd_alias=allow_fd_alias,
+            )
         digest_after = _digest(path)
     except Exception as error:
         return _invalid_validation(
             authority,
-            path,
+            reported_path,
             fields,
             f"XPLT changed or became unavailable during adapter execution: {error}",
             digest_before=digest_before,
@@ -548,7 +592,7 @@ def validate_requested_fields(
     if digest_before != digest_after:
         return _invalid_validation(
             authority,
-            path,
+            reported_path,
             fields,
             "adapter mutated the XPLT artifact",
             digest_before=digest_before,
@@ -557,7 +601,7 @@ def validate_requested_fields(
     if not isinstance(raw_result, Mapping):
         return _invalid_validation(
             authority,
-            path,
+            reported_path,
             fields,
             "adapter must return a field mapping",
             digest_before=digest_before,
@@ -568,7 +612,7 @@ def validate_requested_fields(
     except Exception as error:
         return _invalid_validation(
             authority,
-            path,
+            reported_path,
             fields,
             f"adapter returned an unreadable field mapping: {error}",
             digest_before=digest_before,
@@ -577,7 +621,7 @@ def validate_requested_fields(
     if any(not isinstance(field, str) for field in values):
         return _invalid_validation(
             authority,
-            path,
+            reported_path,
             fields,
             "adapter field mapping keys must be strings",
             digest_before=digest_before,
@@ -586,7 +630,7 @@ def validate_requested_fields(
     return _build_validation(
         authority,
         record,
-        path,
+        reported_path,
         fields,
         values,
         digest_before,

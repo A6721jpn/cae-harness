@@ -239,6 +239,53 @@ def test_start_revalidates_after_prepare_outputs_before_popen(
     assert not popen_reached
 
 
+def test_posix_launch_anchors_child_paths_across_attempt_root_rename(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if os.name != "posix":
+        pytest.skip("POSIX-only launch path anchoring")
+
+    manager = ValidatedCaseWorkspace(tmp_path / "tool", tmp_path / "cae")
+    case = manager.create_case("case-a")
+    store = EvidenceStore(case, IntentContract())
+    store.record_attempt("attempt-a")
+    attempt = AttemptWorkspace._from_manager(
+        case,
+        "attempt-a",
+        case.temporary_root / "attempts" / "attempt-a",
+    )
+    intent = store.issue_intent_snapshot()
+    attempt_root = Path(os.fspath(attempt))
+    code = (
+        "from pathlib import Path; import os; "
+        f"root = Path({str(attempt_root)!r}); "
+        "moved = root.with_name(root.name + '-moved'); "
+        "root.rename(moved); root.mkdir(); "
+        "Path(os.environ['FEBIO_CAE_HARNESS_LOG']).write_text('replacement', encoding='utf-8'); "
+        "Path(os.environ['FEBIO_CAE_HARNESS_XPLT']).write_bytes(b'replacement')"
+    )
+    input_path = attempt.write_text("input.feb", code)
+    runtime = _issued_runtime(monkeypatch)
+    capability = headless_module._issue_launch_capability(
+        attempt,
+        intent,
+        runtime,
+        input_path,
+        expected_steps=None,
+        expected_final_time=None,
+        timeout_seconds=None,
+    )
+    supervisor = SolverSupervisor(capability)
+
+    with pytest.raises((SolverLaunchError, SolverOwnershipError)):
+        supervisor.run()
+
+    replacement_root = attempt_root
+    moved_root = attempt_root.with_name(attempt_root.name + "-moved")
+    assert not (replacement_root / "input.log").exists()
+    assert (moved_root / "input.log").read_text(encoding="utf-8") == "replacement"
+
+
 class _OrderingProcess:
     pid = 4242
 
@@ -463,3 +510,99 @@ def test_windows_late_failure_preserves_replaced_process_record(
 
     with pytest.raises(SolverOwnershipError, match="reconnectable|RUNNING"):
         SolverSupervisor.reconnect(capability)
+
+
+@pytest.mark.parametrize("replace_with_foreign", [False, True])
+def test_windows_final_guard_rolls_back_owned_record_without_foreign_delete(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    replace_with_foreign: bool,
+) -> None:
+    capability = _capability(tmp_path, monkeypatch, code="pass")
+    events: list[str] = []
+    authority = _OrderingAuthority(events)
+
+    class StartupInfo:
+        lpAttributeList: object | None = None
+
+    def fake_popen(*args: object, **kwargs: object) -> _OrderingProcess:
+        del args
+        creation_flags = kwargs["creationflags"]
+        assert isinstance(creation_flags, int)
+        assert creation_flags & 0x00000004
+        events.append("created-suspended")
+        process = _OrderingProcess(events)
+        authority._process = process
+        return process
+
+    monkeypatch.setattr(os, "name", "nt")
+    monkeypatch.setattr(subprocess, "STARTUPINFO", StartupInfo, raising=False)
+
+    def fake_create(
+        attempt_root: Path,
+        context_digest: str | None = None,
+        *,
+        root_pid: int | None = None,
+        root_creation_identity: str | None = None,
+    ) -> _OrderingAuthority:
+        del attempt_root
+        del root_pid, root_creation_identity
+        if context_digest is not None:
+            authority._context_digest = context_digest
+        return authority
+
+    monkeypatch.setattr(ProcessAuthority, "create", fake_create)
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(
+        supervisor_module,
+        "_process_metadata",
+        lambda pid: supervisor_module._ProcessMetadata(
+            str(Path(sys.executable)),
+            "windows:test",
+            True,
+            None,
+            datetime(2026, 1, 1, tzinfo=UTC),
+        ),
+    )
+    original_write = SolverSupervisor._write_process_record
+
+    def record_write(supervisor: SolverSupervisor, record: dict[str, object]) -> None:
+        original_write(supervisor, record)
+        if replace_with_foreign and record.get("state") == "RUNNING":
+            replacement = dict(record)
+            replacement["replacement_marker"] = "foreign-final-guard"
+            replacement_path = supervisor.process_record_path.with_name("foreign.json")
+            replacement_path.write_text(json.dumps(replacement, sort_keys=True), encoding="utf-8")
+            os.replace(os.fspath(replacement_path), os.fspath(supervisor.process_record_path))
+
+    monkeypatch.setattr(SolverSupervisor, "_write_process_record", record_write)
+    original_revalidate = SolverSupervisor._revalidate_launch_binding
+    guard_failed = False
+
+    def final_guard(supervisor: SolverSupervisor) -> None:
+        nonlocal guard_failed
+        original_revalidate(supervisor)
+        if any(event == "persist:RUNNING" for event in events) and not guard_failed:
+            guard_failed = True
+            raise SolverConfigurationError("synthetic final guard failure")
+
+    def record_events(supervisor: SolverSupervisor, record: dict[str, object]) -> None:
+        events.append(f"persist:{record.get('state')}")
+        record_write(supervisor, record)
+
+    monkeypatch.setattr(SolverSupervisor, "_revalidate_launch_binding", final_guard)
+    monkeypatch.setattr(SolverSupervisor, "_write_process_record", record_events)
+    supervisor = SolverSupervisor(capability)
+
+    with pytest.raises(SolverConfigurationError, match="final guard"):
+        supervisor.start()
+
+    assert supervisor.state is SolverState.FAILED
+    assert supervisor._process is None
+    assert supervisor._process_authority is None
+    record_path = supervisor.process_record_path
+    if replace_with_foreign:
+        replacement = json.loads(record_path.read_text(encoding="utf-8"))
+        assert replacement["replacement_marker"] == "foreign-final-guard"
+    else:
+        assert not record_path.exists()
