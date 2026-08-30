@@ -1062,7 +1062,7 @@ class SolverSupervisor:
         authority = getattr(self, "_filesystem_authority", None)
         if authority is not None:
             with contextlib.suppress(BaseException):
-                authority.close()
+                self._close_filesystem_authority()
 
     @property
     def state(self) -> SolverState:
@@ -1174,6 +1174,21 @@ class SolverSupervisor:
             )
         return tuple(identities)
 
+    def _release_process_record_claim(
+        self, claim: _ProcessRecordClaim | None
+    ) -> tuple[BaseException, ...]:
+        failures: list[BaseException] = []
+        if claim is not None:
+            if _NATIVE_WINDOWS and claim.handle is not None:
+                _windows_unregister_record_claim(claim.path, claim.handle)
+            for fd in (claim.handle, claim.parent_fd):
+                if fd is not None:
+                    try:
+                        os.close(fd)
+                    except BaseException as error:
+                        failures.append(error)
+        return tuple(failures)
+
     def _close_filesystem_authority(self) -> None:
         authority = self._filesystem_authority
         self._filesystem_authority = None
@@ -1185,15 +1200,7 @@ class SolverSupervisor:
                 failures.append(error)
         claim = self._process_record_claim
         self._process_record_claim = None
-        if claim is not None:
-            if _NATIVE_WINDOWS and claim.handle is not None:
-                _windows_unregister_record_claim(claim.path, claim.handle)
-            for fd in (claim.handle, claim.parent_fd):
-                if fd is not None:
-                    try:
-                        os.close(fd)
-                    except BaseException as error:
-                        failures.append(error)
+        failures.extend(self._release_process_record_claim(claim))
         if failures:
             raise SolverOwnershipError("authority handles could not be closed") from failures[0]
 
@@ -1934,6 +1941,14 @@ class SolverSupervisor:
         if not stat.S_ISREG(metadata.st_mode):
             raise OSError("process record is not a regular file")
         record_state = record.get("state")
+        previous_claim = self._process_record_claim
+        if previous_claim is not None and previous_claim.handle != handle:
+            self._process_record_claim = None
+            release_failures = self._release_process_record_claim(previous_claim)
+            if release_failures:
+                raise SolverOwnershipError(
+                    "previous process record handle could not be closed"
+                ) from release_failures[0]
         self._process_record_claim = _ProcessRecordClaim(
             path=path,
             content=content,

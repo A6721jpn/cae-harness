@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import gc
 import hashlib
 import inspect
 import json
 import os
 import subprocess
 import sys
+import weakref
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 from unittest.mock import Mock
 
 import pytest
@@ -390,6 +393,142 @@ def test_windows_directory_authority_blocks_root_and_ancestor_rename(tmp_path: P
     moved = root.with_name(root.name + "-moved")
     root.rename(moved)
     assert moved.is_dir()
+
+
+def test_windows_active_supervisor_finalizer_releases_process_record_lease(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if os.name != "nt":
+        pytest.fail("required Windows finalizer transaction test executed on a non-Windows host")
+
+    capability = _capability(tmp_path, monkeypatch, code="import time; time.sleep(30)")
+    supervisor = SolverSupervisor(capability)
+    process: subprocess.Popen[bytes] | None = None
+    process_authority: ProcessAuthority | None = None
+    filesystem_authority: supervisor_module._FilesystemAuthority | None = None
+    record_fd: int | None = None
+    record_path = capability.spec.attempt_root / "process.json"
+    record_key = supervisor_module._windows_record_claim_key(record_path)
+    record_claim_entry: tuple[int, int, int] | None = None
+    record_content = b""
+    supervisor_ref: weakref.ReferenceType[SolverSupervisor] | None = None
+    original_open = supervisor_module._windows_open_process_record
+    original_delete = supervisor_module._windows_delete_process_record
+    original_complete = SolverSupervisor._complete
+    original_rollback = SolverSupervisor._rollback_process_record
+    reopen_calls: list[Path] = []
+    terminal_actions: list[str] = []
+    delete_calls: list[int] = []
+
+    def track_open(path: Path, *, create: bool, delete_access: bool = True) -> int:
+        reopen_calls.append(Path(os.fspath(path)))
+        return original_open(path, create=create, delete_access=delete_access)
+
+    def track_delete(fd: int) -> None:
+        delete_calls.append(fd)
+        original_delete(fd)
+
+    def unexpected_complete(
+        instance: SolverSupervisor, state: SolverState, return_code: int | None
+    ) -> object:
+        terminal_actions.append("complete")
+        return original_complete(instance, state, return_code)
+
+    def unexpected_rollback(instance: SolverSupervisor) -> tuple[BaseException, ...]:
+        terminal_actions.append("rollback")
+        return original_rollback(instance)
+
+    try:
+        supervisor.start()
+        assert supervisor._process is not None
+        process = cast(subprocess.Popen[bytes], supervisor._process)
+        process_authority = supervisor._process_authority
+        filesystem_authority = supervisor._filesystem_authority
+        claim = supervisor._process_record_claim
+        assert process_authority is not None
+        assert filesystem_authority is not None
+        assert claim is not None and claim.handle is not None
+        record_fd = claim.handle
+        record_claim_entry = (record_fd, claim.device, claim.inode)
+        record_path = Path(os.fspath(claim.path))
+        record_key = supervisor_module._windows_record_claim_key(record_path)
+        record_content = supervisor_module._read_record_fd(record_fd)
+        record = json.loads(record_content.decode("utf-8"))
+        assert record["state"] == SolverState.RUNNING.value
+        assert process.poll() is None
+        assert process.returncode is None
+        assert supervisor_module._WINDOWS_RECORD_CLAIMS.get(record_key) == [record_claim_entry]
+        del claim
+
+        supervisor_ref = weakref.ref(supervisor)
+        monkeypatch.setattr(supervisor_module, "_windows_open_process_record", track_open)
+        monkeypatch.setattr(supervisor_module, "_windows_delete_process_record", track_delete)
+        monkeypatch.setattr(SolverSupervisor, "_complete", unexpected_complete)
+        monkeypatch.setattr(SolverSupervisor, "_rollback_process_record", unexpected_rollback)
+        del supervisor
+        for _ in range(3):
+            gc.collect()
+            if supervisor_ref() is None:
+                break
+
+        assert supervisor_ref() is None
+        assert process.poll() is None
+        assert process.returncode is None
+        process_authority.verify(process.pid)
+        with pytest.raises(SolverOwnershipError, match="closed"):
+            filesystem_authority.verify()
+        with pytest.raises(OSError):
+            os.fstat(record_fd)
+        assert record_key not in supervisor_module._WINDOWS_RECORD_CLAIMS
+        assert record_path.is_file()
+        assert record_path.read_bytes() == record_content
+        assert json.loads(record_content.decode("utf-8"))["state"] == SolverState.RUNNING.value
+        assert delete_calls == []
+        assert terminal_actions == []
+        assert reopen_calls == []
+
+        reconnect_fd = supervisor_module._windows_open_process_record(record_path, create=False)
+        try:
+            assert reopen_calls == [record_path]
+            assert supervisor_module._read_record_fd(reconnect_fd) == record_content
+            supervisor_module._windows_delete_process_record(reconnect_fd)
+        finally:
+            os.close(reconnect_fd)
+        assert not record_path.exists()
+    finally:
+        if process is not None:
+            try:
+                if process.poll() is None:
+                    try:
+                        if process_authority is not None:
+                            process_authority.terminate(process.pid)
+                        else:
+                            process.kill()
+                    except BaseException:
+                        process.kill()
+                process.wait(timeout=5.0)
+            finally:
+                if process_authority is not None:
+                    process_authority.close()
+
+        if record_fd is not None:
+            try:
+                os.fstat(record_fd)
+            except OSError:
+                pass
+            else:
+                if record_path.exists():
+                    original_delete(record_fd)
+                supervisor_module._windows_unregister_record_claim(record_path, record_fd)
+                os.close(record_fd)
+        if record_path.exists():
+            cleanup_fd = original_open(record_path, create=False)
+            try:
+                original_delete(cleanup_fd)
+            finally:
+                os.close(cleanup_fd)
+        if filesystem_authority is not None:
+            filesystem_authority.close()
 
 
 def test_windows_process_record_lease_blocks_replacement_through_running_transition(
