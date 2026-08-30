@@ -95,3 +95,21 @@ integration branchへ取り込む。
 
 最小仕様の必須E2Eがすべてfresh evidence付きで合格し、BottomFrame最終E2E、固定shortcut、
 GitHub boundary、clean source commitを確認できた時点で完成とする。
+
+## 6. Trust-boundary review and implementation rule
+
+Review and implementation use Trust Model A: the shipped `febio_cae_harness` code
+plus its Python runtime is the product TCB, and the headless CLI does not load or
+execute untrusted or user-supplied Python or plugins in-process. CAE inputs,
+filesystem names and artifacts and concurrent replacement, child processes, FEBio/FBS
+outputs, crash/reconnect state, and external runtime identity remain untrusted
+boundaries.
+
+Arbitrary mutation or introspection by code already executing in the trusted Python
+process (including monkeypatching, `object.__getattribute__`, ctypes/native-memory
+access, debugger or process injection, or package-internal replacement) is process
+compromise and is outside the product contract. Python-private issuance, latch, and
+registry state remains fail-closed correctness and tamper-detection state rather than
+an unforgeable native authority. This narrows only same-process hostile-code claims;
+it does not weaken OS, file, process, or FBS evidence requirements. Synthetic FBS
+remains synthetic-unverified with `official=false`.

@@ -186,3 +186,23 @@ BottomFrame E2Eは`02_CAE`の権威ある入力を使い、既存成果物を変
 実行identityがbuild commitと一致し、実CAEデータがGitHubに0件の場合だけ完成とする。
 
 未実施、合成試験だけ、途中中断、環境エラー、未回収結果を完成に含めない。
+
+## 14. Product trust boundary (Trust Model A)
+
+The shipped `febio_cae_harness` code and its Python runtime are the product trusted
+computing base (TCB). The headless CLI does not load or execute untrusted or
+user-supplied Python or plugins in-process.
+
+The untrusted boundaries remain CAE input files, filesystem names and artifacts and
+their concurrent replacement, child processes, FEBio/FBS outputs, crash or reconnect
+state, and external runtime identity. Python code already executing inside the trusted
+process with arbitrary object mutation, monkeypatching, `object.__getattribute__`,
+ctypes/native-memory access, debugger or process injection, or replacement of package
+internals is process compromise and is outside this product security contract.
+
+Python-private issuance, latch, and registry state is a correctness and tamper-
+detection mechanism, not an unforgeable native authority boundary. Existing fail-closed
+consistency checks must remain in force. This trust-boundary decision narrows only
+same-process hostile-code claims; it does not weaken OS, file, process, or FBS evidence
+requirements. Synthetic FBS evidence remains synthetic-unverified with `official=false`
+and must not be presented as official FBS or real integration success.
