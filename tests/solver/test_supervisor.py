@@ -16,7 +16,7 @@ import febio_cae_harness.solver.supervisor as supervisor_module
 from febio_cae_harness.contracts import IntentContract
 from febio_cae_harness.evidence import EvidenceStore
 from febio_cae_harness.solver import headless as headless_module
-from febio_cae_harness.solver.process_authority import ProcessAuthority
+from febio_cae_harness.solver.process_authority import ProcessAuthority, ProcessAuthorityError
 from febio_cae_harness.solver.runtime import FebioRuntimeDiagnostic, probe_febio
 from febio_cae_harness.solver.supervisor import SolverSupervisor
 from febio_cae_harness.solver.types import (
@@ -215,14 +215,13 @@ def test_start_revalidates_after_prepare_outputs_before_popen(
     capability = _capability(tmp_path, monkeypatch, code="pass")
     attempt = object.__getattribute__(capability, "_attempt_workspace")
     assert type(attempt) is AttemptWorkspace
-    original_prepare_outputs = SolverLaunchSpec.prepare_outputs
+    original_prepare_outputs = SolverSupervisor._prepare_outputs
 
-    def racing_prepare_outputs(spec: SolverLaunchSpec) -> object:
-        outputs = original_prepare_outputs(spec)
+    def racing_prepare_outputs(supervisor: SolverSupervisor) -> None:
+        original_prepare_outputs(supervisor)
         object.__setattr__(attempt, "attempt_id", "attempt-b")
-        return outputs
 
-    monkeypatch.setattr(SolverLaunchSpec, "prepare_outputs", racing_prepare_outputs)
+    monkeypatch.setattr(SolverSupervisor, "_prepare_outputs", racing_prepare_outputs)
     popen_reached = False
 
     def unexpected_popen(*args: object, **kwargs: object) -> None:
@@ -239,7 +238,7 @@ def test_start_revalidates_after_prepare_outputs_before_popen(
     assert not popen_reached
 
 
-def test_posix_launch_anchors_child_paths_across_attempt_root_rename(
+def test_posix_launch_anchors_preparation_and_child_paths_across_attempt_root_rename(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     if os.name != "posix":
@@ -258,9 +257,6 @@ def test_posix_launch_anchors_child_paths_across_attempt_root_rename(
     attempt_root = Path(os.fspath(attempt))
     code = (
         "from pathlib import Path; import os; "
-        f"root = Path({str(attempt_root)!r}); "
-        "moved = root.with_name(root.name + '-moved'); "
-        "root.rename(moved); root.mkdir(); "
         "Path(os.environ['FEBIO_CAE_HARNESS_LOG']).write_text('replacement', encoding='utf-8'); "
         "Path(os.environ['FEBIO_CAE_HARNESS_XPLT']).write_bytes(b'replacement')"
     )
@@ -276,14 +272,37 @@ def test_posix_launch_anchors_child_paths_across_attempt_root_rename(
         timeout_seconds=None,
     )
     supervisor = SolverSupervisor(capability)
-
-    with pytest.raises((SolverLaunchError, SolverOwnershipError)):
-        supervisor.run()
-
-    replacement_root = attempt_root
     moved_root = attempt_root.with_name(attempt_root.name + "-moved")
+    attempt_root.rename(moved_root)
+    replacement_root = attempt_root
+    replacement_root.mkdir()
+
+    result = supervisor.run()
+    assert result.state is SolverState.NORMAL_EXIT
+
     assert not (replacement_root / "input.log").exists()
     assert (moved_root / "input.log").read_text(encoding="utf-8") == "replacement"
+    assert not (replacement_root / "process.json").exists()
+    assert (moved_root / "process.json").is_file()
+
+
+def test_windows_directory_authority_blocks_root_and_ancestor_rename(tmp_path: Path) -> None:
+    if os.name != "nt":
+        pytest.skip("Windows-only directory-handle authority")
+
+    root = tmp_path / "attempt"
+    root.mkdir()
+    authority = supervisor_module._FilesystemAuthority(root)
+    try:
+        for target in (root, root.parent):
+            with pytest.raises(OSError):
+                target.rename(target.with_name(target.name + "-renamed"))
+    finally:
+        authority.close()
+
+    moved = root.with_name(root.name + "-moved")
+    root.rename(moved)
+    assert moved.is_dir()
 
 
 class _OrderingProcess:
@@ -350,6 +369,21 @@ class _OrderingAuthority:
 
     def drain(self) -> None:
         self._events.append("drain")
+
+
+class _CleanupFailureAuthority(_OrderingAuthority):
+    def terminate(self, pid: int, *, force: bool = False) -> None:
+        assert pid == _OrderingProcess.pid
+        self._events.append("terminate-force" if force else "terminate")
+        raise ProcessAuthorityError("synthetic termination failure")
+
+    def drain(self) -> None:
+        self._events.append("drain")
+        raise ProcessAuthorityError("synthetic drain failure")
+
+    def close(self) -> None:
+        self._events.append("close")
+        raise ProcessAuthorityError("synthetic close failure")
 
 
 def test_windows_persists_bound_record_before_resume(
@@ -606,3 +640,162 @@ def test_windows_final_guard_rolls_back_owned_record_without_foreign_delete(
         assert replacement["replacement_marker"] == "foreign-final-guard"
     else:
         assert not record_path.exists()
+
+
+@pytest.mark.parametrize("replace_with_foreign", [False, True])
+def test_windows_bound_suspended_rollback_removes_owned_record_without_foreign_delete(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    replace_with_foreign: bool,
+) -> None:
+    capability = _capability(tmp_path, monkeypatch, code="pass")
+    events: list[str] = []
+    authority = _OrderingAuthority(events)
+
+    class StartupInfo:
+        lpAttributeList: object | None = None
+
+    def fake_popen(*args: object, **kwargs: object) -> _OrderingProcess:
+        del args
+        creation_flags = kwargs["creationflags"]
+        assert isinstance(creation_flags, int)
+        assert creation_flags & 0x00000004
+        events.append("created-suspended")
+        process = _OrderingProcess(events)
+        authority._process = process
+        return process
+
+    monkeypatch.setattr(os, "name", "nt")
+    monkeypatch.setattr(subprocess, "STARTUPINFO", StartupInfo, raising=False)
+
+    def fake_create(
+        attempt_root: Path,
+        context_digest: str | None = None,
+        *,
+        root_pid: int | None = None,
+        root_creation_identity: str | None = None,
+    ) -> _OrderingAuthority:
+        del attempt_root
+        del root_pid, root_creation_identity
+        if context_digest is not None:
+            authority._context_digest = context_digest
+        return authority
+
+    monkeypatch.setattr(ProcessAuthority, "create", fake_create)
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(
+        supervisor_module,
+        "_process_metadata",
+        lambda pid: supervisor_module._ProcessMetadata(
+            str(Path(sys.executable)),
+            "windows:test",
+            True,
+            None,
+            datetime(2026, 1, 1, tzinfo=UTC),
+        ),
+    )
+    original_write = SolverSupervisor._write_process_record
+
+    def record_write(supervisor: SolverSupervisor, record: dict[str, object]) -> None:
+        original_write(supervisor, record)
+        if replace_with_foreign and record.get("state") == "BOUND_SUSPENDED":
+            replacement = dict(record)
+            replacement["replacement_marker"] = "foreign-bound-record"
+            replacement_path = supervisor.process_record_path.with_name("foreign.json")
+            replacement_path.write_text(json.dumps(replacement, sort_keys=True), encoding="utf-8")
+            os.replace(os.fspath(replacement_path), os.fspath(supervisor.process_record_path))
+
+    def fail_resume(pid: int) -> None:
+        assert pid == _OrderingProcess.pid
+        events.append("resume-failure")
+        raise OSError("synthetic late resume failure")
+
+    monkeypatch.setattr(authority, "resume", fail_resume)
+
+    def record_events(supervisor: SolverSupervisor, record: dict[str, object]) -> None:
+        events.append(f"persist:{record.get('state')}")
+        record_write(supervisor, record)
+
+    monkeypatch.setattr(SolverSupervisor, "_write_process_record", record_events)
+    supervisor = SolverSupervisor(capability)
+
+    with pytest.raises(SolverLaunchError, match="late resume failure"):
+        supervisor.start()
+
+    assert supervisor.state is SolverState.FAILED
+    assert supervisor._process is None
+    assert supervisor._process_authority is None
+    record_path = supervisor.process_record_path
+    if replace_with_foreign:
+        replacement = json.loads(record_path.read_text(encoding="utf-8"))
+        assert replacement["replacement_marker"] == "foreign-bound-record"
+    else:
+        assert not record_path.exists()
+
+
+def test_failed_start_cleanup_errors_propagate_and_roll_back_owned_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    capability = _capability(tmp_path, monkeypatch, code="pass")
+    events: list[str] = []
+    authority = _CleanupFailureAuthority(events)
+
+    class StartupInfo:
+        lpAttributeList: object | None = None
+
+    def fake_popen(*args: object, **kwargs: object) -> _OrderingProcess:
+        del args
+        creation_flags = kwargs["creationflags"]
+        assert isinstance(creation_flags, int)
+        assert creation_flags & supervisor_module._CREATE_SUSPENDED
+        events.append("created-suspended")
+        process = _OrderingProcess(events)
+        authority._process = process
+        return process
+
+    monkeypatch.setattr(os, "name", "nt")
+    monkeypatch.setattr(subprocess, "STARTUPINFO", StartupInfo, raising=False)
+
+    def fake_create(
+        attempt_root: Path,
+        context_digest: str | None = None,
+        *,
+        root_pid: int | None = None,
+        root_creation_identity: str | None = None,
+    ) -> _CleanupFailureAuthority:
+        del attempt_root, root_pid, root_creation_identity
+        if context_digest is not None:
+            authority._context_digest = context_digest
+        return authority
+
+    def fail_resume(pid: int) -> None:
+        assert pid == _OrderingProcess.pid
+        events.append("resume-failure")
+        raise OSError("synthetic late resume failure")
+
+    monkeypatch.setattr(ProcessAuthority, "create", fake_create)
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(
+        supervisor_module,
+        "_process_metadata",
+        lambda pid: supervisor_module._ProcessMetadata(
+            str(Path(sys.executable)),
+            "windows:test",
+            True,
+            None,
+            datetime(2026, 1, 1, tzinfo=UTC),
+        ),
+    )
+    monkeypatch.setattr(authority, "resume", fail_resume)
+
+    supervisor = SolverSupervisor(capability)
+    with pytest.raises(SolverOwnershipError, match="cleanup|termination|drain|close"):
+        supervisor.start()
+
+    assert supervisor.state is SolverState.FAILED
+    assert supervisor._process is None
+    assert supervisor._process_authority is None
+    assert not supervisor.process_record_path.exists()
+    assert events.index("terminate") < events.index("terminate-force")
+    assert events.index("terminate-force") < events.index("drain")
+    assert events.index("drain") < events.index("close")

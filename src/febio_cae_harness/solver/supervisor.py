@@ -3,19 +3,21 @@
 from __future__ import annotations
 
 import contextlib
+import ctypes
 import json
 import math
 import os
 import stat
 import subprocess
+import sys
 import threading
 import time
 import uuid
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 from ..evidence import IntentSnapshotAuthority
 from .fbs import (
@@ -29,6 +31,7 @@ from .fbs import (
 from .log import LogValidation, LogValidator, validate_log
 from .process_authority import ProcessAuthority, ProcessAuthorityError
 from .types import (
+    OutputFreshnessError,
     SolverClassification,
     SolverConfigurationError,
     SolverLaunchCapability,
@@ -59,6 +62,17 @@ _RESULT_FIELDS = (
     "fbs_validation",
     "error",
 )
+_NATIVE_WINDOWS = sys.platform == "win32"
+_WINDOWS_FILE_SHARE_READ = 0x00000001
+_WINDOWS_FILE_SHARE_WRITE = 0x00000002
+_WINDOWS_FILE_READ_ATTRIBUTES = 0x00000080
+_WINDOWS_FILE_LIST_DIRECTORY = 0x00000001
+_WINDOWS_OPEN_EXISTING = 3
+_WINDOWS_FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+_WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+_WINDOWS_FILE_ATTRIBUTE_DIRECTORY = 0x00000010
+_WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
+_WINDOWS_INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,16 +82,137 @@ class _FilesystemIdentity:
     inode: int
 
 
+@dataclass(slots=True)
+class _WindowsDirectoryHandle:
+    value: int
+    volume_serial: int
+    file_index: int
+
+
+class _WindowsFileInformation(ctypes.Structure):
+    _fields_ = [
+        ("dwFileAttributes", ctypes.c_uint32),
+        ("ftCreationTime", ctypes.c_uint32 * 2),
+        ("ftLastAccessTime", ctypes.c_uint32 * 2),
+        ("ftLastWriteTime", ctypes.c_uint32 * 2),
+        ("dwVolumeSerialNumber", ctypes.c_uint32),
+        ("nFileSizeHigh", ctypes.c_uint32),
+        ("nFileSizeLow", ctypes.c_uint32),
+        ("nNumberOfLinks", ctypes.c_uint32),
+        ("nFileIndexHigh", ctypes.c_uint32),
+        ("nFileIndexLow", ctypes.c_uint32),
+    ]
+
+
+def _windows_kernel32() -> Any:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+    ]
+    kernel32.CreateFileW.restype = ctypes.c_void_p
+    kernel32.GetFileInformationByHandle.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(_WindowsFileInformation),
+    ]
+    kernel32.GetFileInformationByHandle.restype = ctypes.c_int
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_int
+    return kernel32
+
+
+def _windows_directory_information(handle: int) -> _WindowsFileInformation:
+    kernel32 = _windows_kernel32()
+    information = _WindowsFileInformation()
+    if not kernel32.GetFileInformationByHandle(handle, ctypes.byref(information)):
+        error = ctypes.get_last_error()
+        raise OSError(error, "unable to query directory handle identity")
+    if not information.dwFileAttributes & _WINDOWS_FILE_ATTRIBUTE_DIRECTORY:
+        raise SolverOwnershipError("filesystem authority handle is not a directory")
+    if information.dwFileAttributes & _WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT:
+        raise SolverOwnershipError("filesystem authority directory is a reparse point")
+    return information
+
+
+def _windows_open_directory(path: Path) -> _WindowsDirectoryHandle:
+    kernel32 = _windows_kernel32()
+    desired_access = _WINDOWS_FILE_READ_ATTRIBUTES | _WINDOWS_FILE_LIST_DIRECTORY
+    share_mode = _WINDOWS_FILE_SHARE_READ | _WINDOWS_FILE_SHARE_WRITE
+    flags = _WINDOWS_FILE_FLAG_BACKUP_SEMANTICS | _WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT
+    ctypes.set_last_error(0)
+    raw_handle = kernel32.CreateFileW(
+        os.fspath(path),
+        desired_access,
+        share_mode,
+        None,
+        _WINDOWS_OPEN_EXISTING,
+        flags,
+        None,
+    )
+    raw_value = raw_handle.value if isinstance(raw_handle, ctypes.c_void_p) else raw_handle
+    if raw_value is None:
+        raw_value_int = 0
+    else:
+        try:
+            raw_value_int = int(raw_value)
+        except (TypeError, ValueError, OverflowError):
+            raw_value_int = 0
+    if not raw_value_int or raw_value_int in {-1, _WINDOWS_INVALID_HANDLE_VALUE}:
+        error = ctypes.get_last_error()
+        raise OSError(error, f"unable to hold directory authority: {path}")
+    value = raw_value_int
+    try:
+        information = _windows_directory_information(value)
+    except BaseException:
+        with contextlib.suppress(BaseException):
+            kernel32.CloseHandle(value)
+        raise
+    file_index = (int(information.nFileIndexHigh) << 32) | int(information.nFileIndexLow)
+    return _WindowsDirectoryHandle(
+        value=value,
+        volume_serial=int(information.dwVolumeSerialNumber),
+        file_index=file_index,
+    )
+
+
+def _windows_close_directory(handle: _WindowsDirectoryHandle) -> None:
+    kernel32 = _windows_kernel32()
+    if not kernel32.CloseHandle(handle.value):
+        error = ctypes.get_last_error()
+        raise OSError(error, "unable to close filesystem authority handle")
+
+
+def _windows_verify_directory(handle: _WindowsDirectoryHandle) -> None:
+    try:
+        information = _windows_directory_information(handle.value)
+    except SolverOwnershipError:
+        raise
+    except OSError as error:
+        raise SolverOwnershipError("filesystem authority handle is unavailable") from error
+    file_index = (int(information.nFileIndexHigh) << 32) | int(information.nFileIndexLow)
+    if (
+        int(information.dwVolumeSerialNumber) != handle.volume_serial
+        or file_index != handle.file_index
+    ):
+        raise SolverOwnershipError("filesystem authority handle identity changed")
+
+
 class _FilesystemAuthority:
     """Keep the attempt path and every ancestor bound to stable identities."""
 
     def __init__(self, root: Path) -> None:
         self.root = Path(os.path.abspath(os.fspath(root)))
-        self._entries: tuple[tuple[_FilesystemIdentity, int | None], ...] = ()
+        self._entries: tuple[
+            tuple[_FilesystemIdentity, int | _WindowsDirectoryHandle | None], ...
+        ] = ()
         self._root_fd: int | None = None
         self._closed = False
-        fds: list[int] = []
-        entries: list[tuple[_FilesystemIdentity, int | None]] = []
+        entries: list[tuple[_FilesystemIdentity, int | _WindowsDirectoryHandle | None]] = []
         try:
             paths: list[Path] = []
             current = self.root
@@ -87,40 +222,84 @@ class _FilesystemAuthority:
                     break
                 current = current.parent
 
-            for path in paths:
-                metadata = os.lstat(os.fspath(path))
-                if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
-                    raise SolverOwnershipError(f"attempt path is not a stable directory: {path}")
-                identity = _FilesystemIdentity(
-                    path,
-                    int(metadata.st_dev),
-                    int(metadata.st_ino),
-                )
-                fd: int | None = None
+            parent_fd: int | None = None
+            for path in reversed(paths):
+                held: int | _WindowsDirectoryHandle | None = None
                 if os.name == "posix":
                     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-                    flags |= getattr(os, "O_CLOEXEC", 0)
-                    fd = os.open(os.fspath(path), flags)
-                    fds.append(fd)
-                    held = os.fstat(fd)
-                    if int(held.st_dev) != identity.device or int(held.st_ino) != identity.inode:
+                    flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+                    try:
+                        if parent_fd is None:
+                            held = os.open(os.fspath(path), flags)
+                        else:
+                            held = os.open(path.name, flags, dir_fd=parent_fd)
+                    except OSError as error:
                         raise SolverOwnershipError(
-                            f"attempt path changed while acquiring authority: {path}"
+                            f"unable to hold directory authority: {path}"
+                        ) from error
+                    metadata = os.fstat(held)
+                    if not stat.S_ISDIR(metadata.st_mode):
+                        with contextlib.suppress(OSError):
+                            os.close(held)
+                        raise SolverOwnershipError(
+                            f"attempt path is not a stable directory: {path}"
                         )
+                    identity = _FilesystemIdentity(
+                        path,
+                        int(metadata.st_dev),
+                        int(metadata.st_ino),
+                    )
                     if path == self.root:
-                        self._root_fd = fd
-                entries.append((identity, fd))
+                        self._root_fd = held
+                    parent_fd = held
+                elif os.name == "nt" and _NATIVE_WINDOWS:
+                    try:
+                        held = _windows_open_directory(path)
+                        metadata = os.lstat(os.fspath(path))
+                        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+                            raise SolverOwnershipError(
+                                f"attempt path is not a stable directory: {path}"
+                            )
+                        identity = _FilesystemIdentity(
+                            path,
+                            int(metadata.st_dev),
+                            int(metadata.st_ino),
+                        )
+                    except BaseException:
+                        if isinstance(held, _WindowsDirectoryHandle):
+                            with contextlib.suppress(BaseException):
+                                _windows_close_directory(held)
+                        raise
+                else:
+                    metadata = os.lstat(os.fspath(path))
+                    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+                        raise SolverOwnershipError(
+                            f"attempt path is not a stable directory: {path}"
+                        )
+                    identity = _FilesystemIdentity(
+                        path,
+                        int(metadata.st_dev),
+                        int(metadata.st_ino),
+                    )
+                entries.append((identity, held))
+            if parent_fd is not None and os.name == "posix":
+                # ``parent_fd`` is the root descriptor and is retained in entries.
+                parent_fd = None
             self._entries = tuple(entries)
             self.verify()
         except BaseException:
-            for fd in fds:
-                with contextlib.suppress(OSError):
-                    os.close(fd)
+            self._entries = tuple(entries)
+            with contextlib.suppress(BaseException):
+                self.close()
             raise
 
     @property
     def child_pass_fds(self) -> tuple[int, ...]:
         return () if self._root_fd is None else (self._root_fd,)
+
+    @property
+    def root_fd(self) -> int | None:
+        return self._root_fd
 
     @property
     def identities(self) -> tuple[_FilesystemIdentity, ...]:
@@ -129,29 +308,36 @@ class _FilesystemAuthority:
     def verify(self) -> None:
         if self._closed:
             raise SolverOwnershipError("filesystem authority is closed")
-        for identity, fd in self._entries:
-            try:
-                metadata = os.lstat(os.fspath(identity.path))
-            except OSError as error:
-                raise SolverOwnershipError(
-                    f"attempt path authority is unavailable: {identity.path}"
-                ) from error
-            if (
-                stat.S_ISLNK(metadata.st_mode)
-                or not stat.S_ISDIR(metadata.st_mode)
-                or int(metadata.st_dev) != identity.device
-                or int(metadata.st_ino) != identity.inode
-            ):
-                raise SolverOwnershipError(f"attempt path authority changed: {identity.path}")
-            if fd is not None:
+        for identity, held in self._entries:
+            if os.name == "posix" and isinstance(held, int):
                 try:
-                    held = os.fstat(fd)
+                    metadata = os.fstat(held)
                 except OSError as error:
                     raise SolverOwnershipError(
                         f"attempt directory handle is unavailable: {identity.path}"
                     ) from error
-                if int(held.st_dev) != identity.device or int(held.st_ino) != identity.inode:
+                if (
+                    not stat.S_ISDIR(metadata.st_mode)
+                    or int(metadata.st_dev) != identity.device
+                    or int(metadata.st_ino) != identity.inode
+                ):
                     raise SolverOwnershipError(f"attempt directory handle changed: {identity.path}")
+            elif os.name == "nt" and isinstance(held, _WindowsDirectoryHandle):
+                _windows_verify_directory(held)
+            else:
+                try:
+                    metadata = os.lstat(os.fspath(identity.path))
+                except OSError as error:
+                    raise SolverOwnershipError(
+                        f"attempt path authority is unavailable: {identity.path}"
+                    ) from error
+                if (
+                    stat.S_ISLNK(metadata.st_mode)
+                    or not stat.S_ISDIR(metadata.st_mode)
+                    or int(metadata.st_dev) != identity.device
+                    or int(metadata.st_ino) != identity.inode
+                ):
+                    raise SolverOwnershipError(f"attempt path authority changed: {identity.path}")
 
     def anchor(self, path: Path) -> Path:
         """Return a child path rooted at the held attempt directory on POSIX."""
@@ -167,14 +353,70 @@ class _FilesystemAuthority:
             raise SolverOwnershipError("POSIX attempt directory handle is unavailable")
         return Path("/proc/self/fd") / str(self._root_fd) / relative
 
+    @contextlib.contextmanager
+    def open_directory(self, path: Path, *, create: bool = False) -> Iterator[int]:
+        """Open a directory relative to the held POSIX root descriptor."""
+
+        if os.name != "posix":
+            raise SolverOwnershipError("descriptor-relative directories require POSIX")
+        self.verify()
+        root_fd = self._root_fd
+        if root_fd is None:
+            raise SolverOwnershipError("POSIX attempt directory handle is unavailable")
+        path = Path(os.path.abspath(os.fspath(path)))
+        try:
+            relative = path.relative_to(self.root)
+        except ValueError as error:
+            raise SolverOwnershipError(f"path escapes the attempt root: {path}") from error
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        current_fd = os.dup(root_fd)
+        try:
+            for component in relative.parts:
+                try:
+                    next_fd = os.open(component, flags, dir_fd=current_fd)
+                except FileNotFoundError:
+                    if not create:
+                        raise
+                    with contextlib.suppress(FileExistsError):
+                        os.mkdir(component, dir_fd=current_fd)
+                    next_fd = os.open(component, flags, dir_fd=current_fd)
+                previous_fd = current_fd
+                current_fd = next_fd
+                try:
+                    os.close(previous_fd)
+                except OSError:
+                    with contextlib.suppress(OSError):
+                        os.close(current_fd)
+                    current_fd = -1
+                    raise
+            yield current_fd
+        except OSError as error:
+            raise SolverOwnershipError(f"unable to open directory authority: {path}") from error
+        finally:
+            if current_fd >= 0:
+                with contextlib.suppress(OSError):
+                    os.close(current_fd)
+
     def close(self) -> None:
         if self._closed:
             return
         self._closed = True
-        for _identity, fd in self._entries:
-            if fd is not None:
-                with contextlib.suppress(OSError):
-                    os.close(fd)
+        failures: list[BaseException] = []
+        for _identity, held in self._entries:
+            if os.name == "posix" and isinstance(held, int):
+                try:
+                    os.close(held)
+                except BaseException as error:
+                    failures.append(error)
+            elif os.name == "nt" and isinstance(held, _WindowsDirectoryHandle):
+                try:
+                    _windows_close_directory(held)
+                except BaseException as error:
+                    failures.append(error)
+        self._root_fd = None
+        if failures:
+            raise SolverOwnershipError("filesystem authority could not be closed") from failures[0]
 
 
 @dataclass(frozen=True, slots=True)
@@ -538,6 +780,53 @@ class SolverSupervisor:
         authority = self._filesystem_authority
         return path if authority is None else authority.anchor(path)
 
+    def _prepare_outputs(self) -> None:
+        """Prepare outputs without leaving the held attempt authority."""
+
+        authority = self._filesystem_authority
+        if authority is None:
+            raise SolverOwnershipError("filesystem authority is unavailable")
+        if os.name != "posix":
+            self.spec.prepare_outputs()
+            return
+
+        outputs = self.spec.expected_outputs
+        for path, label in ((outputs.log_path, "LOG"), (outputs.xplt_path, "XPLT")):
+            try:
+                with authority.open_directory(path.parent, create=True) as parent_fd:
+                    try:
+                        os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+                    except FileNotFoundError:
+                        continue
+                    raise OutputFreshnessError(f"{label} path already exists: {path}")
+            except SolverOwnershipError:
+                raise
+            except OSError as error:
+                raise SolverOwnershipError(f"unable to prepare {label} output: {path}") from error
+
+    def _input_is_regular(self) -> bool:
+        input_path = self.spec.input_path
+        authority = self._filesystem_authority
+        if authority is None:
+            raise SolverOwnershipError("filesystem authority is unavailable")
+        if os.name == "posix":
+            try:
+                with authority.open_directory(input_path.parent) as parent_fd:
+                    metadata = os.stat(input_path.name, dir_fd=parent_fd, follow_symlinks=False)
+            except SolverOwnershipError as error:
+                if isinstance(error.__cause__, FileNotFoundError):
+                    return False
+                raise
+            except OSError:
+                return False
+            return stat.S_ISREG(metadata.st_mode)
+        path = self._path_for_io(input_path)
+        try:
+            metadata = os.stat(os.fspath(path), follow_symlinks=False)
+        except OSError:
+            return False
+        return stat.S_ISREG(metadata.st_mode)
+
     def _child_command(self) -> tuple[str, ...]:
         root = self.spec.attempt_root
         command: list[str] = []
@@ -577,36 +866,45 @@ class SolverSupervisor:
         process: subprocess.Popen[bytes] | None,
         authority: ProcessAuthority | None,
         bound: bool,
-    ) -> None:
-        if process is None:
-            if authority is not None:
-                with contextlib.suppress(BaseException):
-                    authority.close()
-            return
+    ) -> tuple[BaseException, ...]:
+        """Attempt every failed-start cleanup action and retain all failures."""
 
-        if authority is not None and bound:
+        failures: list[BaseException] = []
+        if process is not None:
+            if authority is not None and bound:
+                termination_failed = False
+                try:
+                    if self._process_authority is authority:
+                        self._terminate_owned_process(process)
+                    else:
+                        authority.terminate(process.pid)
+                except BaseException as error:
+                    failures.append(error)
+                    termination_failed = True
+                if termination_failed:
+                    try:
+                        authority.terminate(process.pid, force=True)
+                    except BaseException as error:
+                        failures.append(error)
+            elif not bound:
+                try:
+                    process.kill()
+                except BaseException as error:
+                    failures.append(error)
             try:
-                if self._process_authority is authority:
-                    self._terminate_owned_process(process)
-                else:
-                    authority.terminate(process.pid)
-            except BaseException:
-                with contextlib.suppress(BaseException):
-                    authority.terminate(process.pid, force=True)
-                with contextlib.suppress(BaseException):
-                    authority.drain()
-            else:
-                with contextlib.suppress(BaseException):
-                    authority.drain()
-        elif not bound:
-            with contextlib.suppress(BaseException):
-                process.kill()
-
-        with contextlib.suppress(BaseException):
-            process.wait(timeout=2.0)
+                process.wait(timeout=2.0)
+            except BaseException as error:
+                failures.append(error)
         if authority is not None:
-            with contextlib.suppress(BaseException):
+            try:
+                authority.drain()
+            except BaseException as error:
+                failures.append(error)
+            try:
                 authority.close()
+            except BaseException as error:
+                failures.append(error)
+        return tuple(failures)
 
     def _record_claim_matches(self, claim: _ProcessRecordClaim) -> bool:
         try:
@@ -618,25 +916,34 @@ class SolverSupervisor:
                 or int(metadata.st_ino) != claim.inode
             ):
                 return False
-            return Path(claim.path).read_bytes() == claim.content
-        except OSError:
+            return self._read_path_bytes(claim.path) == claim.content
+        except FileNotFoundError:
             return False
+        except OSError as error:
+            raise SolverOwnershipError("unable to verify the owned process record") from error
 
-    def _rollback_process_record(self) -> None:
+    def _rollback_process_record(self) -> tuple[BaseException, ...]:
         """Remove only the exact record inode and bytes this owner published."""
 
         claim = self._process_record_claim
         if claim is None:
-            return
-        # A BOUND_SUSPENDED record is a durable failed-launch marker.  Keep it
-        # as the restoration of the supervisor-owned publication; a RUNNING
-        # record must not survive a late launch/completion failure.
-        if claim.state == "BOUND_SUSPENDED":
-            return
-        if not self._record_claim_matches(claim):
-            return
-        with contextlib.suppress(OSError):
-            claim.path.unlink()
+            return ()
+        try:
+            if not self._record_claim_matches(claim):
+                return ()
+            if os.name == "posix":
+                # The claim path is an anchored /proc/self/fd path, so unlink
+                # cannot be redirected by a renamed lexical attempt root.
+                os.unlink(os.fspath(claim.path))
+            else:
+                claim.path.unlink()
+        except FileNotFoundError:
+            return ()
+        except BaseException as error:
+            failure = SolverOwnershipError("unable to roll back the owned process record")
+            failure.__cause__ = error
+            return (failure,)
+        return ()
 
     def _revalidate_launch_binding(self) -> None:
         """Require the supervisor's capability and authority binding to remain exact."""
@@ -764,7 +1071,7 @@ class SolverSupervisor:
             try:
                 self._acquire_filesystem_authority()
                 self._verify_filesystem_authority()
-                self.spec.prepare_outputs()
+                self._prepare_outputs()
                 self._verify_filesystem_authority()
                 self._revalidate_launch_binding()
                 record_path = self._path_for_io(self.process_record_path)
@@ -772,8 +1079,7 @@ class SolverSupervisor:
                     raise SolverLaunchError(
                         f"process record already exists: {self.process_record_path}"
                     )
-                input_path = self._path_for_io(self.spec.input_path)
-                if not input_path.is_file():
+                if not self._input_is_regular():
                     raise FileNotFoundError(f"solver input does not exist: {self.spec.input_path}")
                 authority = ProcessAuthority.create(
                     self.spec.attempt_root, self._launch_context_digest
@@ -875,15 +1181,22 @@ class SolverSupervisor:
                 self._revalidate_launch_binding()
                 self._verify_filesystem_authority()
             except BaseException as error:
-                self._cleanup_failed_start(process, authority, bound)
-                self._rollback_process_record()
+                cleanup_failures = list(self._cleanup_failed_start(process, authority, bound))
+                cleanup_failures.extend(self._rollback_process_record())
                 self._process = None
                 self._started_at = None
                 self._process_authority = None
                 self._process_record = None
                 self._process_record_claim = None
-                self._close_filesystem_authority()
+                try:
+                    self._close_filesystem_authority()
+                except BaseException as close_error:
+                    cleanup_failures.append(close_error)
                 self._state = SolverState.FAILED
+                if cleanup_failures:
+                    details = "; ".join(str(failure) for failure in cleanup_failures)
+                    cleanup_error = SolverOwnershipError(f"solver launch cleanup failed: {details}")
+                    raise cleanup_error from error
                 if isinstance(
                     error,
                     (SolverConfigurationError, SolverLaunchError, SolverOwnershipError),
@@ -945,12 +1258,21 @@ class SolverSupervisor:
             supervisor._started_at = started_at
             supervisor._state = SolverState.RUNNING
             return supervisor
-        except BaseException:
+        except BaseException as error:
+            cleanup_failures: list[BaseException] = []
             if authority is not None:
-                with contextlib.suppress(BaseException):
+                try:
                     authority.close()
+                except BaseException as close_error:
+                    cleanup_failures.append(close_error)
             supervisor._process_authority = None
-            supervisor._close_filesystem_authority()
+            try:
+                supervisor._close_filesystem_authority()
+            except BaseException as close_error:
+                cleanup_failures.append(close_error)
+            if cleanup_failures:
+                details = "; ".join(str(failure) for failure in cleanup_failures)
+                raise SolverOwnershipError(f"reconnect cleanup failed: {details}") from error
             raise
 
     def wait(self, timeout_seconds: float | None = None) -> SolverRunResult:
@@ -982,7 +1304,10 @@ class SolverSupervisor:
         try:
             return_code = process.wait(timeout=effective_timeout)
         except subprocess.TimeoutExpired:
-            self._terminate_owned_process(process)
+            try:
+                self._terminate_owned_process(process)
+            except BaseException as error:
+                self._fail_terminal_operation(error)
             return self._complete(SolverState.TIMED_OUT, process.poll())
         return self._complete(
             SolverState.NORMAL_EXIT if return_code == 0 else SolverState.FAILED,
@@ -1011,7 +1336,10 @@ class SolverSupervisor:
             process = self._process
         if process is None:  # pragma: no cover - defensive state guard
             raise SolverLaunchError("solver process ownership was lost")
-        self._terminate_owned_process(process)
+        try:
+            self._terminate_owned_process(process)
+        except BaseException as error:
+            self._fail_terminal_operation(error)
         return self._complete(SolverState.CANCELLED, process.poll())
 
     def _make_process_record(
@@ -1053,6 +1381,34 @@ class SolverSupervisor:
             "process_authority": claim,
         }
 
+    @staticmethod
+    def _read_path_bytes(path: Path) -> bytes:
+        if os.name != "posix":
+            return path.read_bytes()
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(os.fspath(path), flags)
+        try:
+            with os.fdopen(fd, "rb") as stream:
+                fd = -1
+                return stream.read()
+        finally:
+            if fd >= 0:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+
+    def _claim_process_record(self, path: Path, content: bytes, record: dict[str, object]) -> None:
+        metadata = os.stat(os.fspath(path), follow_symlinks=False)
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+            raise OSError("process record is not a regular file")
+        record_state = record.get("state")
+        self._process_record_claim = _ProcessRecordClaim(
+            path=path,
+            content=content,
+            device=int(metadata.st_dev),
+            inode=int(metadata.st_ino),
+            state=record_state if isinstance(record_state, str) else None,
+        )
+
     def _write_process_record(self, record: dict[str, object]) -> None:
         self._verify_filesystem_authority()
         path = self._path_for_io(self.process_record_path)
@@ -1062,47 +1418,85 @@ class SolverSupervisor:
         except (TypeError, ValueError) as error:
             raise OSError(f"unable to persist process record: {error}") from error
         try:
-            with temporary.open("x", encoding="utf-8", newline="") as stream:
-                stream.write(content.decode("utf-8"))
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(os.fspath(temporary), os.fspath(path))
-            metadata = os.lstat(os.fspath(path))
-            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
-                raise OSError("process record is not a regular file")
-            record_state = record.get("state")
-            claim = _ProcessRecordClaim(
-                path=path,
-                content=content,
-                device=int(metadata.st_dev),
-                inode=int(metadata.st_ino),
-                state=record_state if isinstance(record_state, str) else None,
-            )
-            self._process_record_claim = claim
-            if Path(path).read_bytes() != content:
+            if os.name == "posix":
+                authority = self._filesystem_authority
+                if authority is None:
+                    raise SolverOwnershipError("filesystem authority is unavailable")
+                with authority.open_directory(
+                    self.process_record_path.parent, create=True
+                ) as parent_fd:
+                    flags = (
+                        os.O_WRONLY
+                        | os.O_CREAT
+                        | os.O_EXCL
+                        | getattr(os, "O_CLOEXEC", 0)
+                        | getattr(os, "O_NOFOLLOW", 0)
+                    )
+                    temp_fd = os.open(temporary.name, flags, 0o600, dir_fd=parent_fd)
+                    try:
+                        with os.fdopen(temp_fd, "wb") as stream:
+                            temp_fd = -1
+                            stream.write(content)
+                            stream.flush()
+                            os.fsync(stream.fileno())
+                    finally:
+                        if temp_fd >= 0:
+                            with contextlib.suppress(OSError):
+                                os.close(temp_fd)
+                    # A create-new hard link publishes the record without
+                    # replacing a foreign file that won the name race.
+                    os.link(
+                        temporary.name,
+                        path.name,
+                        src_dir_fd=parent_fd,
+                        dst_dir_fd=parent_fd,
+                        follow_symlinks=False,
+                    )
+                    os.unlink(temporary.name, dir_fd=parent_fd)
+                    self._claim_process_record(path, content, record)
+                    os.fsync(parent_fd)
+            else:
+                with temporary.open("x", encoding="utf-8", newline="") as stream:
+                    stream.write(content.decode("utf-8"))
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(os.fspath(temporary), os.fspath(path))
+            if os.name != "posix":
+                self._claim_process_record(path, content, record)
+            if self._read_path_bytes(path) != content:
                 raise OSError("process record changed during publication")
-        except (OSError, TypeError, ValueError) as error:
-            with contextlib.suppress(OSError):
-                temporary.unlink(missing_ok=True)
+        except (OSError, SolverOwnershipError, TypeError, ValueError) as error:
+            if os.name == "posix":
+                with contextlib.suppress(OSError):
+                    os.unlink(os.fspath(temporary))
+            else:
+                with contextlib.suppress(OSError):
+                    temporary.unlink(missing_ok=True)
+            if isinstance(error, SolverOwnershipError):
+                raise
             raise OSError(f"unable to persist process record: {error}") from error
 
     def _read_process_record(self) -> dict[str, object]:
         self._verify_filesystem_authority()
         path = self._path_for_io(self.process_record_path)
-        if not path.is_file() or path.is_symlink():
+        try:
+            metadata = os.stat(os.fspath(path), follow_symlinks=False)
+        except OSError as error:
+            raise SolverOwnershipError(f"missing process record: {path}") from error
+        if not stat.S_ISREG(metadata.st_mode):
             raise SolverOwnershipError(f"missing process record: {path}")
         try:
-            content = path.read_bytes()
+            content = self._read_path_bytes(path)
             record = json.loads(content.decode("utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError) as error:
             raise SolverOwnershipError(f"invalid process record: {path}") from error
         if not isinstance(record, dict):
             raise SolverOwnershipError("process record must be a JSON object")
         self._verify_filesystem_authority()
-        metadata = os.lstat(os.fspath(path))
+        metadata = os.stat(os.fspath(path), follow_symlinks=False)
         if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
             raise SolverOwnershipError("process record is not a regular file")
-        if path.read_bytes() != content:
+        if self._read_path_bytes(path) != content:
             raise SolverOwnershipError("process record changed during read")
         record_state = record.get("state")
         self._process_record_claim = _ProcessRecordClaim(
@@ -1262,23 +1656,78 @@ class SolverSupervisor:
                 raise SolverOwnershipError("process authority could not be verified") from error
             process.wait(timeout=2.0)
 
-    def _release_process_authority(self) -> None:
+    def _release_process_authority(self) -> tuple[BaseException, ...]:
         authority = self._process_authority
         if authority is None:
-            return
+            return ()
         self._process_authority = None
-        failure: BaseException | None = None
+        failures: list[BaseException] = []
         try:
             authority.drain()
         except BaseException as error:
-            failure = error
+            failures.append(error)
         try:
             authority.close()
         except BaseException as error:
-            if failure is None:
-                failure = error
-        if failure is not None:
-            raise SolverOwnershipError("owned process authority could not be released") from failure
+            failures.append(error)
+        return tuple(failures)
+
+    def _cleanup_terminal_failure(
+        self,
+        process: subprocess.Popen[bytes] | _ReconnectedProcess | None,
+    ) -> tuple[BaseException, ...]:
+        """Terminate, drain, and close an owned process after a late failure."""
+
+        authority = self._process_authority
+        if authority is None:
+            return ()
+        failures: list[BaseException] = []
+        if process is not None:
+            termination_failed = False
+            try:
+                self._terminate_owned_process(process)
+            except BaseException as error:
+                failures.append(error)
+                termination_failed = True
+            if termination_failed:
+                try:
+                    authority.terminate(process.pid, force=True)
+                except BaseException as error:
+                    failures.append(error)
+            try:
+                process.wait(timeout=2.0)
+            except BaseException as error:
+                failures.append(error)
+        try:
+            authority.drain()
+        except BaseException as error:
+            failures.append(error)
+        try:
+            authority.close()
+        except BaseException as error:
+            failures.append(error)
+        self._process_authority = None
+        return tuple(failures)
+
+    def _fail_terminal_operation(self, error: BaseException) -> None:
+        """Roll back a cancel/timeout failure without hiding cleanup errors."""
+
+        cleanup_failures = [error]
+        cleanup_failures.extend(self._cleanup_terminal_failure(self._process))
+        cleanup_failures.extend(self._rollback_process_record())
+        self._process = None
+        self._started_at = None
+        self._process_record = None
+        self._process_record_claim = None
+        self._result = None
+        self._state = SolverState.FAILED
+        try:
+            self._close_filesystem_authority()
+        except BaseException as close_error:
+            cleanup_failures.append(close_error)
+        details = "; ".join(str(failure) for failure in cleanup_failures)
+        cleanup_error = SolverOwnershipError(f"terminal cleanup failed: {details}")
+        raise cleanup_error from error
 
     def _register_result(self, result: SolverRunResult) -> None:
         if type(result) is not SolverRunResult:
@@ -1506,6 +1955,7 @@ class SolverSupervisor:
                                 self._requested_fields,
                                 attempt_root=self.spec.attempt_root,
                                 physical_path=self._path_for_io(outputs.xplt_path),
+                                physical_root=self._path_for_io(self.spec.attempt_root),
                             )
                             self._verify_filesystem_authority()
                         except Exception as error:
@@ -1545,7 +1995,12 @@ class SolverSupervisor:
                 if state is not SolverState.CANCELLED:
                     self._revalidate_launch_binding()
                 self._verify_filesystem_authority()
-                self._release_process_authority()
+                release_failures = self._release_process_authority()
+                if release_failures:
+                    details = "; ".join(str(failure) for failure in release_failures)
+                    raise SolverOwnershipError(
+                        f"owned process authority could not be released: {details}"
+                    ) from release_failures[0]
                 if state is not SolverState.CANCELLED:
                     self._revalidate_launch_binding()
                 self._verify_filesystem_authority()
@@ -1554,21 +2009,27 @@ class SolverSupervisor:
                 self._result = result
                 self._close_filesystem_authority()
                 return result
-            except BaseException:
+            except BaseException as error:
                 if result is not None:
                     self._unregister_result(result)
                 if fbs_validation is not None:
                     _unregister_validation(fbs_validation)
-                self._rollback_process_record()
-                with contextlib.suppress(BaseException):
-                    self._release_process_authority()
+                cleanup_failures = list(self._cleanup_terminal_failure(self._process))
+                cleanup_failures.extend(self._rollback_process_record())
                 self._process = None
                 self._started_at = None
                 self._process_record = None
                 self._process_record_claim = None
                 self._result = None
                 self._state = SolverState.FAILED
-                self._close_filesystem_authority()
+                try:
+                    self._close_filesystem_authority()
+                except BaseException as close_error:
+                    cleanup_failures.append(close_error)
+                if cleanup_failures:
+                    details = "; ".join(str(failure) for failure in cleanup_failures)
+                    cleanup_error = SolverOwnershipError(f"terminal cleanup failed: {details}")
+                    raise cleanup_error from error
                 raise
 
     def _classify_process_and_outputs(

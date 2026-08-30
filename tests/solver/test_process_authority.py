@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 import subprocess
 import sys
@@ -259,10 +258,9 @@ def test_windows_native_failure_preserves_only_durable_authority_record(
     if failure == "bind":
         assert not supervisor.process_record_path.exists()
     else:
-        record = json.loads(supervisor.process_record_path.read_text(encoding="utf-8"))
-        assert record["state"] == "BOUND_SUSPENDED"
+        assert not supervisor.process_record_path.exists()
         assert events.count("terminate") == 1
-        with pytest.raises(SolverOwnershipError, match="reconnectable|RUNNING"):
+        with pytest.raises(SolverOwnershipError, match="missing|reconnectable|RUNNING"):
             SolverSupervisor.reconnect(capability)
     assert supervisor.result is None
 

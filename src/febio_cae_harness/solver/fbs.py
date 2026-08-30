@@ -233,12 +233,37 @@ def _path(path: str | Path) -> Path:
         raise ValueError("XPLT path must be a filesystem path") from error
 
 
-def _inside(path: Path, root: Path, *, allow_fd_alias: bool = False) -> bool:
+def _fd_alias_parts(path: Path) -> tuple[int, tuple[str, ...]] | None:
+    parts = path.parts
+    if len(parts) < 5 or parts[:4] != (os.sep, "proc", "self", "fd"):
+        return None
+    fd_text = parts[4]
+    if not fd_text.isdigit():
+        return None
+    return int(fd_text), tuple(parts[5:])
+
+
+def _inside(
+    path: Path,
+    root: Path,
+    *,
+    allow_fd_alias: bool = False,
+    physical_root: Path | None = None,
+) -> bool:
     try:
         path.relative_to(root)
     except ValueError:
-        if not allow_fd_alias or path.parts[:4] != (os.sep, "proc", "self", "fd"):
+        alias = _fd_alias_parts(path)
+        physical_alias = None if physical_root is None else _fd_alias_parts(physical_root)
+        if not allow_fd_alias or alias is None or physical_alias is None:
             return False
+        if alias[0] != physical_alias[0]:
+            return False
+        try:
+            Path(*alias[1]).relative_to(Path(*physical_alias[1]))
+        except ValueError:
+            return False
+        return True
     try:
         Path(os.path.realpath(path)).relative_to(Path(os.path.realpath(root)))
     except ValueError:
@@ -246,15 +271,40 @@ def _inside(path: Path, root: Path, *, allow_fd_alias: bool = False) -> bool:
     return True
 
 
-def _require_xplt(path: Path, root: Path | None, *, allow_fd_alias: bool = False) -> None:
+def _require_xplt(
+    path: Path,
+    root: Path | None,
+    *,
+    allow_fd_alias: bool = False,
+    physical_root: Path | None = None,
+    require_exists: bool = True,
+) -> None:
     if path.suffix.lower() != ".xplt":
         raise ValueError("validation requires an XPLT path")
-    if root is not None and not _inside(path, root, allow_fd_alias=allow_fd_alias):
+    if _fd_alias_parts(path) is not None and (
+        not allow_fd_alias
+        or physical_root is None
+        or not _inside(
+            path,
+            physical_root,
+            allow_fd_alias=True,
+            physical_root=physical_root,
+        )
+    ):
+        raise ValueError("descriptor XPLT paths require a bound physical root")
+    if root is not None and not _inside(
+        path,
+        root,
+        allow_fd_alias=allow_fd_alias,
+        physical_root=physical_root,
+    ):
         raise ValueError("XPLT path is outside the solver attempt outputs")
     if path.is_symlink():
         raise ValueError("XPLT path must not be a symlink")
+    if not require_exists:
+        return
     try:
-        if not stat.S_ISREG(path.stat().st_mode):
+        if not stat.S_ISREG(path.stat(follow_symlinks=False).st_mode):
             raise ValueError("XPLT path must be a regular file")
     except FileNotFoundError as error:
         raise FileNotFoundError(f"XPLT file does not exist: {path}") from error
@@ -524,6 +574,7 @@ def validate_requested_fields(
     *,
     attempt_root: str | Path | None = None,
     physical_path: str | Path | None = None,
+    physical_root: str | Path | None = None,
 ) -> FbsValidation:
     """Read and validate requested fields through an issued authority."""
 
@@ -531,20 +582,40 @@ def validate_requested_fields(
     fields = _normalise_fields(requested_fields)
     reported_path = _path(xplt_path)
     path = reported_path if physical_path is None else _path(physical_path)
+    normalised_physical_root = None if physical_root is None else _path(physical_root)
     allow_fd_alias = physical_path is not None
     if record.attempt_root is not None:
-        _require_xplt(reported_path, record.attempt_root)
-        _require_xplt(path, record.attempt_root, allow_fd_alias=allow_fd_alias)
+        _require_xplt(
+            reported_path,
+            record.attempt_root,
+            require_exists=physical_path is None,
+        )
+        _require_xplt(
+            path,
+            record.attempt_root,
+            allow_fd_alias=allow_fd_alias,
+            physical_root=normalised_physical_root,
+        )
     if attempt_root is not None:
         normalised_attempt_root = _normalise_root(attempt_root)
-        _require_xplt(reported_path, normalised_attempt_root)
+        _require_xplt(
+            reported_path,
+            normalised_attempt_root,
+            require_exists=physical_path is None,
+        )
         _require_xplt(
             path,
             normalised_attempt_root,
             allow_fd_alias=allow_fd_alias,
+            physical_root=normalised_physical_root,
         )
     if record.attempt_root is None and attempt_root is None:
-        _require_xplt(path, None)
+        _require_xplt(
+            path,
+            None,
+            allow_fd_alias=allow_fd_alias,
+            physical_root=normalised_physical_root,
+        )
 
     digest_before = _digest(path)
     try:
@@ -555,6 +626,7 @@ def validate_requested_fields(
                 path,
                 record.attempt_root,
                 allow_fd_alias=allow_fd_alias,
+                physical_root=normalised_physical_root,
             )
             digest_after = _digest(path)
         except Exception:
@@ -573,12 +645,14 @@ def validate_requested_fields(
             path,
             record.attempt_root,
             allow_fd_alias=allow_fd_alias,
+            physical_root=normalised_physical_root,
         )
         if attempt_root is not None:
             _require_xplt(
                 path,
                 _normalise_root(attempt_root),
                 allow_fd_alias=allow_fd_alias,
+                physical_root=normalised_physical_root,
             )
         digest_after = _digest(path)
     except Exception as error:
