@@ -1170,6 +1170,147 @@ def test_windows_persists_bound_record_before_resume(
         supervisor.cancel()
 
 
+def test_windows_process_image_replacement_fails_before_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A suspended child with a replaced image must never become RUNNING."""
+
+    capability = _capability(tmp_path, monkeypatch, code="pass")
+    events: list[str] = []
+    authority = _OrderingAuthority(events)
+
+    class StartupInfo:
+        lpAttributeList: object | None = None
+
+    def fake_popen(*args: object, **kwargs: object) -> _OrderingProcess:
+        del args
+        creation_flags = kwargs["creationflags"]
+        assert isinstance(creation_flags, int)
+        assert creation_flags & 0x00000004
+        events.append("created-suspended")
+        process = _OrderingProcess(events)
+        authority._process = process
+        return process
+
+    monkeypatch.setattr(os, "name", "nt")
+    monkeypatch.setattr(subprocess, "STARTUPINFO", StartupInfo, raising=False)
+
+    def fake_create(
+        attempt_root: Path,
+        context_digest: str | None = None,
+        *,
+        root_pid: int | None = None,
+        root_creation_identity: str | None = None,
+    ) -> _OrderingAuthority:
+        del attempt_root
+        del root_pid, root_creation_identity
+        if context_digest is not None:
+            authority._context_digest = context_digest
+        return authority
+
+    replacement = tmp_path / "replacement-febio.exe"
+    replacement.write_bytes(b"replacement image")
+    metadata_calls = 0
+
+    def process_metadata(pid: int) -> supervisor_module._ProcessMetadata:
+        nonlocal metadata_calls
+        assert pid == _OrderingProcess.pid
+        metadata_calls += 1
+        executable = Path(sys.executable) if metadata_calls == 1 else replacement
+        return supervisor_module._ProcessMetadata(
+            str(executable),
+            "windows:test",
+            True,
+            None,
+            datetime(2026, 1, 1, tzinfo=UTC),
+        )
+
+    monkeypatch.setattr(ProcessAuthority, "create", fake_create)
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(supervisor_module, "_process_metadata", process_metadata)
+    original_write = SolverSupervisor._write_process_record
+
+    def record_write(supervisor: SolverSupervisor, record: dict[str, object]) -> None:
+        events.append(f"persist:{record.get('state')}")
+        original_write(supervisor, record)
+
+    monkeypatch.setattr(SolverSupervisor, "_write_process_record", record_write)
+    supervisor = SolverSupervisor(capability)
+
+    with pytest.raises(SolverLaunchError, match="executable|image|runtime"):
+        supervisor.start()
+
+    assert "resume" not in events
+    assert "persist:RUNNING" not in events
+    assert events.count("terminate") == 1
+    assert events.count("close") == 1
+    assert supervisor.state is SolverState.FAILED
+    assert supervisor.process_id is None
+    assert not supervisor.process_record_path.exists()
+
+
+def test_windows_record_claim_close_failure_retains_exact_retry_ownership(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed record close keeps the exact claim for a later close retry."""
+
+    if os.name != "nt":
+        pytest.fail("required Windows record claim test executed on a non-Windows host")
+
+    capability = _capability(tmp_path, monkeypatch, code="import time; time.sleep(30)")
+    supervisor = SolverSupervisor(capability)
+    supervisor.start()
+    process = supervisor._process
+    claim = supervisor._process_record_claim
+    assert process is not None
+    assert claim is not None and claim.handle is not None
+    record_fd = claim.handle
+    record_path = Path(os.fspath(claim.path))
+    record_key = supervisor_module._windows_record_claim_key(record_path)
+    record_entry = (record_fd, claim.device, claim.inode)
+    process_record = supervisor_module._read_record_fd(record_fd)
+    close_attempts = 0
+    original_close = os.close
+
+    def fail_once(fd: int) -> None:
+        nonlocal close_attempts
+        if fd == record_fd and close_attempts == 0:
+            close_attempts += 1
+            raise OSError("synthetic process record close failure")
+        original_close(fd)
+
+    try:
+        with monkeypatch.context() as close_patch:
+            close_patch.setattr(os, "close", fail_once)
+            with pytest.raises(SolverOwnershipError, match="handles|closed"):
+                supervisor._close_filesystem_authority()
+
+        assert supervisor.state is SolverState.RUNNING
+        assert supervisor._process is process
+        assert supervisor._process_record_claim is claim
+        assert claim.handle == record_fd
+        assert supervisor_module._WINDOWS_RECORD_CLAIMS.get(record_key) == [record_entry]
+        assert supervisor_module._read_record_fd(record_fd) == process_record
+        assert process.poll() is None
+
+        supervisor._close_filesystem_authority()
+        assert supervisor._process_record_claim is None
+        assert record_key not in supervisor_module._WINDOWS_RECORD_CLAIMS
+        with pytest.raises(OSError):
+            os.fstat(record_fd)
+        assert process.poll() is None
+        assert json.loads(record_path.read_text(encoding="utf-8"))["state"] == "RUNNING"
+    finally:
+        active_process = supervisor._process
+        if active_process is not None and active_process.poll() is None:
+            supervisor._terminate_owned_process(active_process)
+        supervisor._release_process_authority()
+        supervisor._process = None
+        supervisor._process_record = None
+        if record_path.exists():
+            record_path.unlink()
+
+
 def test_windows_late_failure_preserves_replaced_process_record(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

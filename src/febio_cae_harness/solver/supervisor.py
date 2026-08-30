@@ -33,6 +33,7 @@ from .fbs import (
 )
 from .log import LogValidation, LogValidator, validate_log
 from .process_authority import ProcessAuthority, ProcessAuthorityError
+from .runtime import RuntimeProbeError, _acquire_runtime_launch_claim, _RuntimeLaunchClaim
 from .types import (
     OutputFreshnessError,
     SolverClassification,
@@ -737,7 +738,7 @@ class _FilesystemAuthority:
             raise SolverOwnershipError("filesystem authority could not be closed") from failures[0]
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class _ProcessRecordClaim:
     path: Path
     content: bytes
@@ -996,6 +997,7 @@ class SolverSupervisor:
             launch_context_digest,
         ) = _validate_launch_capability(launch_capability)
         self._launch_capability = launch_capability
+        self._runtime_diagnostic = _capability_record.runtime_diagnostic
         self.spec = _capability_record.spec
         self._case_id = case_id
         self._intent_id = intent_id
@@ -1180,14 +1182,17 @@ class SolverSupervisor:
     ) -> tuple[BaseException, ...]:
         failures: list[BaseException] = []
         if claim is not None:
-            if _NATIVE_WINDOWS and claim.handle is not None:
-                _windows_unregister_record_claim(claim.path, claim.handle)
-            for fd in (claim.handle, claim.parent_fd):
+            for attribute in ("handle", "parent_fd"):
+                fd = getattr(claim, attribute)
                 if fd is not None:
                     try:
                         os.close(fd)
                     except BaseException as error:
                         failures.append(error)
+                    else:
+                        setattr(claim, attribute, None)
+                        if attribute == "handle" and _NATIVE_WINDOWS:
+                            _windows_unregister_record_claim(claim.path, fd)
         return tuple(failures)
 
     def _close_filesystem_authority(self) -> None:
@@ -1200,8 +1205,9 @@ class SolverSupervisor:
             except BaseException as error:
                 failures.append(error)
         claim = self._process_record_claim
-        self._process_record_claim = None
         failures.extend(self._release_process_record_claim(claim))
+        if claim is None or (claim.handle is None and claim.parent_fd is None):
+            self._process_record_claim = None
         if failures:
             raise SolverOwnershipError("authority handles could not be closed") from failures[0]
 
@@ -1607,6 +1613,7 @@ class SolverSupervisor:
 
             authority: ProcessAuthority | None = None
             process: subprocess.Popen[bytes] | None = None
+            runtime_claim: _RuntimeLaunchClaim | None = None
             bound = False
             try:
                 self._acquire_filesystem_authority()
@@ -1620,6 +1627,13 @@ class SolverSupervisor:
                     self.spec.attempt_root, self._launch_context_digest
                 )
                 self._verify_filesystem_authority()
+                if os.name == "nt":
+                    try:
+                        runtime_claim = _acquire_runtime_launch_claim(self._runtime_diagnostic)
+                    except RuntimeProbeError as error:
+                        raise SolverLaunchError(
+                            "unable to hold the probed runtime executable identity"
+                        ) from error
                 environment = self._child_environment()
                 environment.update(authority.child_environment())
                 command = self._child_command()
@@ -1672,6 +1686,8 @@ class SolverSupervisor:
                     )
                 self._verify_filesystem_authority()
                 metadata = _process_metadata(process.pid)
+                if runtime_claim is not None:
+                    runtime_claim.authenticate(metadata.executable_path)
                 authority.bind(process.pid, metadata.creation_identity)
                 bound = True
                 self._verify_filesystem_authority()
@@ -1683,6 +1699,8 @@ class SolverSupervisor:
                     raise ProcessAuthorityError(
                         "process creation identity changed during assignment"
                     )
+                if runtime_claim is not None:
+                    runtime_claim.authenticate(bound_metadata.executable_path)
                 metadata = bound_metadata
                 if metadata.started_at is None:
                     raise ProcessAuthorityError("process start identity is unavailable")
@@ -1707,9 +1725,22 @@ class SolverSupervisor:
                         raise SolverOwnershipError(
                             "BOUND_SUSPENDED process record binding changed before resume"
                         )
+                    resume_metadata = _process_metadata(process.pid)
+                    if (
+                        not resume_metadata.alive
+                        or resume_metadata.creation_identity != metadata.creation_identity
+                    ):
+                        raise ProcessAuthorityError(
+                            "process creation identity changed before resume"
+                        )
+                    if runtime_claim is not None:
+                        runtime_claim.authenticate(resume_metadata.executable_path)
                     authority.resume(process.pid)
                     self._revalidate_launch_binding()
                     self._verify_filesystem_authority()
+                    if runtime_claim is not None:
+                        runtime_claim.close()
+                        runtime_claim = None
                 running_record = self._make_process_record(
                     process.pid, metadata, started_at, authority, state=SolverState.RUNNING.value
                 )
@@ -1724,7 +1755,13 @@ class SolverSupervisor:
                 self._revalidate_launch_binding()
                 self._verify_filesystem_authority()
             except BaseException as error:
-                cleanup_failures = list(self._cleanup_failed_start(process, authority, bound))
+                cleanup_failures: list[BaseException] = []
+                if runtime_claim is not None:
+                    try:
+                        runtime_claim.close()
+                    except BaseException as close_error:
+                        cleanup_failures.append(close_error)
+                cleanup_failures.extend(self._cleanup_failed_start(process, authority, bound))
                 cleanup_failures.extend(self._rollback_process_record())
                 self._process = None
                 self._started_at = None
@@ -1944,12 +1981,16 @@ class SolverSupervisor:
         record_state = record.get("state")
         previous_claim = self._process_record_claim
         if previous_claim is not None and previous_claim.handle != handle:
-            self._process_record_claim = None
             release_failures = self._release_process_record_claim(previous_claim)
-            if release_failures:
+            if (
+                release_failures
+                or previous_claim.handle is not None
+                or previous_claim.parent_fd is not None
+            ):
                 raise SolverOwnershipError(
                     "previous process record handle could not be closed"
-                ) from release_failures[0]
+                ) from (release_failures[0] if release_failures else None)
+            self._process_record_claim = None
         self._process_record_claim = _ProcessRecordClaim(
             path=path,
             content=content,
@@ -2237,15 +2278,20 @@ class SolverSupervisor:
         except BaseException:
             claim = self._process_record_claim
             if claim is not None and claim.handle == record_fd:
-                self._process_record_claim = None
-                if _NATIVE_WINDOWS:
-                    _windows_unregister_record_claim(claim.path, record_fd)
-            if record_fd is not None:
-                with contextlib.suppress(OSError):
-                    os.close(record_fd)
-            if parent_fd is not None:
-                with contextlib.suppress(OSError):
-                    os.close(parent_fd)
+                release_failures = self._release_process_record_claim(claim)
+                if claim.handle is None and claim.parent_fd is None:
+                    self._process_record_claim = None
+                if release_failures:
+                    raise SolverOwnershipError(
+                        "process record handle could not be closed"
+                    ) from release_failures[0]
+            else:
+                if record_fd is not None:
+                    with contextlib.suppress(OSError):
+                        os.close(record_fd)
+                if parent_fd is not None:
+                    with contextlib.suppress(OSError):
+                        os.close(parent_fd)
             raise
         return record
 

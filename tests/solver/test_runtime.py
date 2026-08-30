@@ -4,11 +4,13 @@ import hashlib
 import os
 import stat
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+import febio_cae_harness.solver.runtime as runtime_module
 from febio_cae_harness.solver.runtime import (
     FebioRuntimeDiagnostic,
     RuntimeProbeError,
@@ -282,6 +284,43 @@ def test_probe_requires_exact_executable_arguments(
 
     assert diagnostic.version == "4.2.0"
     assert observed["command"] == [str(executable.absolute())]
+
+
+def test_windows_launch_claim_rejects_digest_mismatch_before_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if os.name != "nt":
+        pytest.fail("required Windows runtime image test executed on a non-Windows host")
+
+    executable = _fake_file(tmp_path)
+
+    class CompletedProcess:
+        returncode = 0
+
+        def communicate(self, input: bytes, timeout: float) -> tuple[bytes, bytes]:
+            del input, timeout
+            return b"version 4.2.0\n", b""
+
+    monkeypatch.setattr(
+        subprocess,
+        "Popen",
+        lambda command, **kwargs: CompletedProcess(),
+    )
+    diagnostic = probe_febio(executable)
+    claim = runtime_module._acquire_runtime_launch_claim(diagnostic)
+    assert claim.handle is not None
+    original_snapshot = runtime_module._snapshot_from_handle
+
+    def changed_snapshot(path: Path, handle: int) -> object:
+        snapshot = original_snapshot(path, handle)
+        return replace(snapshot, sha256="0" * 64)
+
+    monkeypatch.setattr(runtime_module, "_snapshot_from_handle", changed_snapshot)
+    try:
+        with pytest.raises(RuntimeProbeError, match="digest|identity"):
+            claim.authenticate(diagnostic.path)
+    finally:
+        claim.close()
 
 
 def test_probe_rejects_arbitrary_runner_arguments(tmp_path: Path) -> None:

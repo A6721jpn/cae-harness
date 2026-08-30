@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import math
 import os
@@ -27,6 +28,11 @@ __all__ = [
 _DEFAULT_TIMEOUT_SECONDS: Final[float] = 5.0
 _REPARSE_POINT: Final[int] = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
 _VERSION_BANNER: Final[re.Pattern[str]] = re.compile(r"version (?P<version>[0-9]+\.[0-9]+\.[0-9]+)")
+_WINDOWS_GENERIC_READ: Final[int] = 0x80000000
+_WINDOWS_FILE_SHARE_READ: Final[int] = 0x00000001
+_WINDOWS_OPEN_EXISTING: Final[int] = 3
+_WINDOWS_FILE_ATTRIBUTE_NORMAL: Final[int] = 0x00000080
+_WINDOWS_INVALID_HANDLE_VALUE: Final[int | None] = ctypes.c_void_p(-1).value
 
 
 class RuntimeProbeError(RuntimeError):
@@ -88,11 +94,43 @@ class _RuntimeIssuance:
     after: _FileSnapshot
 
 
+@dataclass(slots=True)
+class _RuntimeLaunchClaim:
+    """A short-lived Windows claim held across suspended process creation."""
+
+    path: Path
+    snapshot: _FileSnapshot
+    handle: int | None
+
+    def authenticate(self, executable_path: str | Path) -> None:
+        if _normalise_path(executable_path) != _normalise_path(self.path):
+            raise RuntimeProbeError("launched process executable image does not match runtime")
+        if self.handle is None:
+            return
+        current = _snapshot_from_handle(self.path, self.handle)
+        if current != self.snapshot:
+            raise RuntimeProbeError("runtime executable digest or identity changed before resume")
+
+    def close(self) -> None:
+        handle = self.handle
+        if handle is None:
+            return
+        try:
+            os.close(handle)
+        except OSError as error:
+            raise RuntimeProbeError("runtime executable claim could not be closed") from error
+        self.handle = None
+
+
 _RUNTIME_REGISTRY: dict[int, _RuntimeIssuance] = {}
 
 
 def _absolute_path(value: str | Path) -> Path:
     return Path(os.path.abspath(os.fspath(Path(value).expanduser())))
+
+
+def _normalise_path(value: str | Path) -> str:
+    return os.path.normcase(os.path.realpath(os.path.abspath(os.fspath(value))))
 
 
 def _reject_alias(path: Path) -> None:
@@ -151,6 +189,74 @@ def _snapshot(path: Path) -> _FileSnapshot:
     return _FileSnapshot(
         metadata.st_dev, metadata.st_ino, metadata.st_nlink, metadata.st_size, hasher.hexdigest()
     )
+
+
+def _snapshot_from_handle(path: Path, handle: int) -> _FileSnapshot:
+    metadata = _validate_target(path)
+    try:
+        opened = os.fstat(handle)
+        if not _same_file(metadata, opened):
+            raise RuntimeProbeError(
+                f"FEBio executable changed while acquiring launch claim: {path}"
+            )
+        os.lseek(handle, 0, os.SEEK_SET)
+        hasher = hashlib.sha256()
+        while chunk := os.read(handle, 1024 * 1024):
+            hasher.update(chunk)
+        finished = os.fstat(handle)
+    except RuntimeProbeError:
+        raise
+    except OSError as error:
+        raise RuntimeProbeError(f"unable to read FEBio executable launch claim: {path}") from error
+    if not _same_file(metadata, finished):
+        raise RuntimeProbeError(f"FEBio executable changed while acquiring launch claim: {path}")
+    return _FileSnapshot(
+        metadata.st_dev, metadata.st_ino, metadata.st_nlink, metadata.st_size, hasher.hexdigest()
+    )
+
+
+def _windows_open_runtime_claim(path: Path) -> int:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+    ]
+    kernel32.CreateFileW.restype = ctypes.c_void_p
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_int
+    ctypes.set_last_error(0)
+    raw_handle = kernel32.CreateFileW(
+        os.fspath(path),
+        _WINDOWS_GENERIC_READ,
+        _WINDOWS_FILE_SHARE_READ,
+        None,
+        _WINDOWS_OPEN_EXISTING,
+        _WINDOWS_FILE_ATTRIBUTE_NORMAL,
+        None,
+    )
+    raw_value = raw_handle.value if isinstance(raw_handle, ctypes.c_void_p) else raw_handle
+    try:
+        value = 0 if raw_value is None else int(raw_value)
+    except (TypeError, ValueError, OverflowError):
+        value = 0
+    if not value or value in {-1, _WINDOWS_INVALID_HANDLE_VALUE}:
+        error = ctypes.get_last_error()
+        raise RuntimeProbeError(f"unable to hold FEBio executable identity: {path} ({error})")
+    import msvcrt
+
+    try:
+        descriptor_flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+        descriptor_flags |= getattr(os, "O_NOINHERIT", 0)
+        return int(msvcrt.open_osfhandle(value, descriptor_flags))
+    except BaseException:
+        with suppress(BaseException):
+            kernel32.CloseHandle(value)
+        raise
 
 
 def _validate_timeout(timeout_seconds: float) -> float:
@@ -273,6 +379,28 @@ def validate_runtime_diagnostic(value: object) -> FebioRuntimeDiagnostic:
     if current != issuance.after:
         raise RuntimeProbeError("runtime executable changed after probe")
     return diagnostic
+
+
+def _acquire_runtime_launch_claim(value: object) -> _RuntimeLaunchClaim:
+    """Hold the probed Windows image identity through suspended process setup."""
+
+    diagnostic = validate_runtime_diagnostic(value)
+    issuance = _RUNTIME_REGISTRY.get(id(diagnostic))
+    if issuance is None or issuance.diagnostic is not diagnostic:  # pragma: no cover
+        raise RuntimeProbeError("runtime diagnostic issuance is unavailable")
+    if os.name != "nt" or not hasattr(ctypes, "WinDLL"):
+        return _RuntimeLaunchClaim(issuance.path, issuance.after, None)
+
+    handle = _windows_open_runtime_claim(issuance.path)
+    try:
+        current = _snapshot_from_handle(issuance.path, handle)
+        if current != issuance.after:
+            raise RuntimeProbeError("runtime executable changed before process creation")
+    except BaseException:
+        with suppress(OSError):
+            os.close(handle)
+        raise
+    return _RuntimeLaunchClaim(issuance.path, issuance.after, handle)
 
 
 probe_runtime = probe_febio
