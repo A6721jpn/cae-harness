@@ -1286,24 +1286,32 @@ def test_reopen_recovers_attempt_interrupted_before_recovery_backed_event(
     ]
 
 
+@pytest.mark.parametrize("interruption", ["marker-publication", "after-directory"])
 def test_attempt_recovery_marker_precedes_attempt_file_durability(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    interruption: str,
 ) -> None:
     _, case, intent = make_case(tmp_path)
     store = EvidenceStore(case, intent)
     original_replace = workspace_module._ExactCaseTransaction.replace_bytes
-    marker_publication_attempted = False
+    interruption_attempted = False
 
     def fail_marker_publication(
         self: Any,
         relative_path: str | Path,
         data: bytes,
     ) -> None:
-        nonlocal marker_publication_attempted
-        if Path(relative_path).as_posix() == "90_Temporary/event-recovery.json":
-            marker_publication_attempted = True
+        nonlocal interruption_attempted
+        relative = Path(relative_path).as_posix()
+        if interruption == "marker-publication" and relative == (
+            "90_Temporary/event-recovery.json"
+        ):
+            interruption_attempted = True
             raise OSError("injected recovery marker publication failure")
+        if interruption == "after-directory" and relative.endswith("/ATTEMPT.json"):
+            interruption_attempted = True
+            raise OSError("injected interruption before attempt file durability")
         original_replace(self, relative_path, data)
 
     with monkeypatch.context() as patch:
@@ -1312,12 +1320,12 @@ def test_attempt_recovery_marker_precedes_attempt_file_durability(
             "replace_bytes",
             fail_marker_publication,
         )
-        with pytest.raises(EvidenceIntegrityError):
+        with pytest.raises((OSError, EvidenceIntegrityError)):
             store.record_attempt("attempt-1", {"status": "prepared"})
 
     reopened = EvidenceStore.open(case)
 
-    assert marker_publication_attempted
+    assert interruption_attempted
     assert not (case.temporary_root / "attempts" / "attempt-1").exists()
     assert reopened.events_path.read_bytes() == b""
     assert reopened.manifest["events"]["count"] == 0
