@@ -458,6 +458,77 @@ def test_attempt_factory_reuses_only_recorded_exact_creation_identity(tmp_path: 
     assert attempt_root.joinpath("foreign.txt").read_text(encoding="utf-8") == "foreign"
 
 
+def test_attempt_write_creates_nested_parents_under_exact_authority(tmp_path: Path) -> None:
+    workspace = make_workspace(tmp_path)
+    case = workspace.create_case("case-a")
+    attempt = case.allocate_attempt("attempt-1")
+
+    written = attempt.write_text("nested/child/model.feb", "owned")
+
+    assert written == attempt.root / "nested" / "child" / "model.feb"
+    assert written.read_text(encoding="utf-8") == "owned"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows rename substitution")
+def test_attempt_nested_write_rejects_substituted_created_parent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = make_workspace(tmp_path)
+    case_a = workspace.create_case("case-a")
+    case_b = workspace.create_case("case-b")
+    attempt_a = case_a.allocate_attempt("attempt-1")
+    attempt_b = case_b.allocate_attempt("attempt-1")
+    foreign = attempt_b.root / "nested"
+    foreign.mkdir()
+    foreign.joinpath("foreign.txt").write_text("foreign", encoding="utf-8")
+    displaced = attempt_a.root / "nested-owned"
+    original_make_directory = workspace_module._ExactCaseTransaction.make_directory
+    substituted = False
+    blocked = False
+
+    def substitute_created_parent(
+        self: Any,
+        relative_path: str | Path,
+    ) -> tuple[int, int]:
+        nonlocal blocked, substituted
+        stamp = original_make_directory(self, relative_path)
+        target = self.root / Path(relative_path)
+        if not substituted and target == attempt_a.root / "nested":
+            try:
+                target.rename(displaced)
+            except OSError:
+                blocked = True
+            else:
+                foreign.rename(target)
+                substituted = True
+        return stamp
+
+    monkeypatch.setattr(
+        workspace_module._ExactCaseTransaction,
+        "make_directory",
+        substitute_created_parent,
+    )
+
+    try:
+        written = attempt_a.write_text("nested/model.feb", "owned")
+    except WorkspaceBoundaryError:
+        written = None
+
+    assert blocked or (substituted and written is None)
+    if blocked:
+        assert written is not None
+        assert written.read_text(encoding="utf-8") == "owned"
+        assert foreign.joinpath("foreign.txt").read_text(encoding="utf-8") == "foreign"
+        assert not displaced.exists()
+    else:
+        assert (attempt_a.root / "nested" / "foreign.txt").read_text(encoding="utf-8") == (
+            "foreign"
+        )
+        assert not (attempt_a.root / "nested" / "model.feb").exists()
+        assert tuple(displaced.iterdir()) == ()
+
+
 def test_case_handle_rejects_reparse_write_alias_inside_owned_tree(tmp_path: Path) -> None:
     workspace = make_workspace(tmp_path)
     case = workspace.create_case("case-a")
@@ -1407,17 +1478,22 @@ def test_make_directory_rejects_substituted_created_entry(
     displaced = case_a.temporary_root / "attempts" / "attempt-1-owned"
     original_directory = workspace_module._ExactCaseTransaction._directory
     substituted = False
+    blocked = False
 
     def substitute_before_open(
         self: Any,
         parts: tuple[str, ...],
     ) -> Any:
-        nonlocal substituted
+        nonlocal blocked, substituted
         target = self.root.joinpath(*parts)
         if not substituted and target == case_a.case_root / relative and target.exists():
-            substituted = True
-            target.rename(displaced)
-            foreign.rename(target)
+            try:
+                target.rename(displaced)
+            except OSError:
+                blocked = True
+            else:
+                substituted = True
+                foreign.rename(target)
         return original_directory(self, parts)
 
     monkeypatch.setattr(
@@ -1426,12 +1502,24 @@ def test_make_directory_rejects_substituted_created_entry(
         substitute_before_open,
     )
 
-    with case_a._exact_transaction() as exact, pytest.raises(WorkspaceBoundaryError):
-        exact.make_directory(relative)
+    try:
+        with case_a._exact_transaction() as exact:
+            exact.make_directory(relative)
+    except WorkspaceBoundaryError:
+        failed = True
+    else:
+        failed = False
 
-    assert substituted
-    assert (case_a.case_root / relative / "foreign.txt").read_text(encoding="utf-8") == "foreign"
-    assert tuple(displaced.iterdir()) == ()
+    assert blocked or (substituted and failed)
+    if blocked:
+        assert tuple((case_a.case_root / relative).iterdir()) == ()
+        assert foreign.joinpath("foreign.txt").read_text(encoding="utf-8") == "foreign"
+        assert not displaced.exists()
+    else:
+        assert (case_a.case_root / relative / "foreign.txt").read_text(encoding="utf-8") == (
+            "foreign"
+        )
+        assert tuple(displaced.iterdir()) == ()
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires Windows rename substitution")

@@ -580,6 +580,99 @@ def _open_exact_file_descriptor(
         raise
 
 
+def _create_exact_directory(
+    parent_handle: int,
+    parent_path: Path,
+    name: str,
+    label: str,
+) -> int:
+    """Create and return a child directory relative to one held exact parent."""
+
+    if os.name != "nt":
+        try:
+            os.mkdir(name, dir_fd=parent_handle)
+            flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+            return os.open(name, flags, dir_fd=parent_handle)
+        except OSError:
+            raise
+
+    import ctypes
+
+    class UnicodeString(ctypes.Structure):
+        _fields_ = [
+            ("Length", ctypes.c_ushort),
+            ("MaximumLength", ctypes.c_ushort),
+            ("Buffer", ctypes.c_wchar_p),
+        ]
+
+    class ObjectAttributes(ctypes.Structure):
+        _fields_ = [
+            ("Length", ctypes.c_ulong),
+            ("RootDirectory", ctypes.c_void_p),
+            ("ObjectName", ctypes.POINTER(UnicodeString)),
+            ("Attributes", ctypes.c_ulong),
+            ("SecurityDescriptor", ctypes.c_void_p),
+            ("SecurityQualityOfService", ctypes.c_void_p),
+        ]
+
+    class IoStatusBlock(ctypes.Structure):
+        _fields_ = [("Status", ctypes.c_void_p), ("Information", ctypes.c_size_t)]
+
+    name_buffer = ctypes.create_unicode_buffer(name)
+    encoded_length = len(name.encode("utf-16-le"))
+    unicode_name = UnicodeString(
+        encoded_length,
+        encoded_length + ctypes.sizeof(ctypes.c_wchar),
+        ctypes.cast(name_buffer, ctypes.c_wchar_p),
+    )
+    attributes = ObjectAttributes(
+        ctypes.sizeof(ObjectAttributes),
+        ctypes.c_void_p(parent_handle),
+        ctypes.pointer(unicode_name),
+        0x00000040,
+        None,
+        None,
+    )
+    result = ctypes.c_void_p()
+    status_block = IoStatusBlock()
+    ntdll = ctypes.WinDLL("ntdll")
+    create_file = ntdll.NtCreateFile
+    create_file.argtypes = [
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_ulong,
+        ctypes.POINTER(ObjectAttributes),
+        ctypes.POINTER(IoStatusBlock),
+        ctypes.c_void_p,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+        ctypes.c_void_p,
+        ctypes.c_ulong,
+    ]
+    create_file.restype = ctypes.c_long
+    status = create_file(
+        ctypes.byref(result),
+        0x0001 | 0x0080 | 0x00100000,
+        ctypes.byref(attributes),
+        ctypes.byref(status_block),
+        None,
+        0x00000010,
+        0x0001 | 0x0002,
+        2,
+        0x00000001 | 0x00000020 | 0x00200000,
+        None,
+        0,
+    )
+    if status < 0 or result.value is None:
+        rtl_error = ntdll.RtlNtStatusToDosError
+        rtl_error.argtypes = [ctypes.c_long]
+        rtl_error.restype = ctypes.c_ulong
+        error = int(rtl_error(status))
+        raise ctypes.WinError(error, f"cannot create {label}: {parent_path / name}")
+    return int(result.value)
+
+
 @dataclass(slots=True)
 class _ExactOwner:
     """One close-once owner that cannot later close a reused foreign value."""
@@ -983,15 +1076,39 @@ class _ExactCaseTransaction:
         parts = self._parts(relative_path, "exact directory creation")
         parent = self._directory(parts[:-1])
         parent_path = self.root.joinpath(*parts[:-1])
+        handle: int | None = None
         try:
-            if os.name == "nt":
-                (parent_path / parts[-1]).mkdir()
-            else:
-                os.mkdir(parts[-1], dir_fd=parent.handle)
+            parent.validate()
+            handle = _create_exact_directory(
+                parent.handle,
+                parent_path,
+                parts[-1],
+                "exact directory",
+            )
         except FileExistsError:
             raise
         except OSError as error:
             raise WorkspaceBoundaryError("cannot create exact directory") from error
+        try:
+            owner = _ExactOwner(
+                handle,
+                _native_directory_identity(handle),
+                _native_directory_identity,
+                lambda value: _close_handle(value),
+                "exact directory",
+            )
+            self._owners.append(owner)
+            handle = None
+            owner.validate()
+            parent.validate()
+            self._directories[parts] = owner
+        except BaseException as primary:
+            if handle is not None:
+                try:
+                    _close_handle(handle)
+                except BaseException as cleanup:
+                    primary.add_note(f"exact directory cleanup failed: {cleanup}")
+            raise
         metadata = self._entry_state(parts[:-1], parts[-1], "created exact directory")
         created_stamp = (int(metadata.st_dev), int(metadata.st_ino))
         owner = self._directory(parts)
@@ -1005,6 +1122,17 @@ class _ExactCaseTransaction:
                 created_stamp,
             )
         return created_stamp
+
+    def ensure_directories(self, relative_path: str | Path) -> None:
+        parts = self._parts(relative_path, "exact directory parents")
+        for index in range(1, len(parts) + 1):
+            current = parts[:index]
+            try:
+                self._directory(current)
+            except WorkspaceBoundaryError as error:
+                if not isinstance(error.__cause__, FileNotFoundError):
+                    raise
+                self.make_directory(Path(*current))
 
     def exists(self, relative_path: str | Path) -> bool:
         parts = self._parts(relative_path, "exact existence check")
@@ -1568,6 +1696,7 @@ class AttemptWorkspace:
             attempt_owner = exact._directory(tuple(attempt_relative.parts))
             if attempt_owner.expected != _expected_native_directory_identity(attempt_stamp):
                 raise WorkspaceBoundaryError("attempt root changed before exact write")
+            exact.ensure_directories(target_relative.parent)
             exact.replace_bytes(target_relative, data)
         return target
 
