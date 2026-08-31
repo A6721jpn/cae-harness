@@ -37,6 +37,12 @@ def _validate_pid(value: object) -> int:
     return value
 
 
+def _validate_thread_id(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ProcessAuthorityError("process authority thread ID is invalid")
+    return value
+
+
 def _validate_creation_identity(value: object) -> str:
     identity = value.split(":", 1)[1] if isinstance(value, str) else ""
     if (
@@ -388,6 +394,7 @@ class _WindowsProcessAuthority(ProcessAuthority):
     _TH32CS_SNAPPROCESS = 0x00000002
     _TH32CS_SNAPTHREAD = 0x00000004
     _STILL_SUSPENDED = 0xFFFFFFFF
+    _STILL_ACTIVE = 259
 
     class _SecurityAttributes(ctypes.Structure):
         _fields_ = [
@@ -430,12 +437,16 @@ class _WindowsProcessAuthority(ProcessAuthority):
         context_digest: str,
         bound_pid: int | None = None,
         bound_creation_identity: str | None = None,
+        bound_thread_id: int | None = None,
+        bound_thread_creation_identity: str | None = None,
     ) -> None:
         self._binding = _attempt_binding(attempt_root)
         self._context_digest = _validate_context_digest(context_digest)
         self._handle = handle
         self._bound_pid = bound_pid
         self._bound_creation_identity = bound_creation_identity
+        self._bound_thread_id = bound_thread_id
+        self._bound_thread_creation_identity = bound_thread_creation_identity
         self._claim_verified = False
         self._root_checked = False
         self._claim = {
@@ -486,8 +497,20 @@ class _WindowsProcessAuthority(ProcessAuthority):
         k.OpenThread.restype = ctypes.c_void_p
         k.GetProcessIdOfThread.argtypes = [ctypes.c_void_p]
         k.GetProcessIdOfThread.restype = ctypes.c_uint32
+        k.GetThreadTimes.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        ]
+        k.GetThreadTimes.restype = ctypes.c_int
+        k.GetExitCodeThread.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        k.GetExitCodeThread.restype = ctypes.c_int
         k.ResumeThread.argtypes = [ctypes.c_void_p]
         k.ResumeThread.restype = ctypes.c_uint32
+        k.SuspendThread.argtypes = [ctypes.c_void_p]
+        k.SuspendThread.restype = ctypes.c_uint32
         k.CloseHandle.argtypes = [ctypes.c_void_p]
         return k
 
@@ -529,6 +552,12 @@ class _WindowsProcessAuthority(ProcessAuthority):
             raise ProcessAuthorityError("process authority context binding does not match")
         bound_pid = _validate_pid(claim.get("root_pid"))
         bound_creation_identity = _validate_creation_identity(claim.get("root_creation_identity"))
+        bound_thread_id = _validate_thread_id(claim.get("root_thread_id"))
+        bound_thread_creation_identity = _validate_creation_identity(
+            claim.get("root_thread_creation_identity")
+        )
+        if not bound_thread_creation_identity.startswith("windows:"):
+            raise ProcessAuthorityError("process authority thread creation identity is invalid")
         expected_name = _windows_job_name(binding, context_digest)
         if not isinstance(name, str) or name != expected_name:
             raise ProcessAuthorityError("process authority job name is invalid")
@@ -542,16 +571,25 @@ class _WindowsProcessAuthority(ProcessAuthority):
             context_digest=context_digest,
             bound_pid=bound_pid,
             bound_creation_identity=bound_creation_identity,
+            bound_thread_id=bound_thread_id,
+            bound_thread_creation_identity=bound_thread_creation_identity,
         )
 
     @property
     def claim(self) -> dict[str, object]:
-        if self._bound_pid is None or self._bound_creation_identity is None:
+        if (
+            self._bound_pid is None
+            or self._bound_creation_identity is None
+            or self._bound_thread_id is None
+            or self._bound_thread_creation_identity is None
+        ):
             raise ProcessAuthorityError("process authority root process is not bound")
         return {
             **self._claim,
             "root_pid": self._bound_pid,
             "root_creation_identity": self._bound_creation_identity,
+            "root_thread_id": self._bound_thread_id,
+            "root_thread_creation_identity": self._bound_thread_creation_identity,
         }
 
     def child_environment(self) -> dict[str, str]:
@@ -626,6 +664,112 @@ class _WindowsProcessAuthority(ProcessAuthority):
             k.CloseHandle(snapshot)
         return tuple(members)
 
+    def _process_thread_ids(self, pid: int) -> tuple[int, ...]:
+        """Return the unique live thread IDs currently owned by ``pid``."""
+
+        pid = _validate_pid(pid)
+        k = self._kernel32()
+        snapshot = k.CreateToolhelp32Snapshot(self._TH32CS_SNAPTHREAD, 0)
+        invalid_handle = ctypes.c_void_p(-1).value
+        if not snapshot or snapshot == invalid_handle:
+            raise ProcessAuthorityError("unable to enumerate attested process threads")
+        thread_ids: list[int] = []
+        try:
+            entry = self._ThreadEntry32()
+            entry.dwSize = ctypes.sizeof(entry)
+            if k.Thread32First(snapshot, ctypes.byref(entry)):
+                while True:
+                    if entry.th32OwnerProcessID == pid:
+                        thread_id = int(entry.th32ThreadID)
+                        if thread_id <= 0 or thread_id in thread_ids:
+                            raise ProcessAuthorityError(
+                                "attested process primary thread identity is ambiguous"
+                            )
+                        thread_ids.append(thread_id)
+                    entry.dwSize = ctypes.sizeof(entry)
+                    if not k.Thread32Next(snapshot, ctypes.byref(entry)):
+                        break
+        finally:
+            k.CloseHandle(snapshot)
+        return tuple(thread_ids)
+
+    def _thread_creation_identity_from_handle(self, handle: Any) -> str:
+        from ctypes import wintypes
+
+        k = self._kernel32()
+        times = [wintypes.FILETIME() for _ in range(4)]
+        if not k.GetThreadTimes(handle, *(ctypes.byref(value) for value in times)):
+            raise ProcessAuthorityError("unable to query process primary thread identity")
+        creation_value = (times[0].dwHighDateTime << 32) | times[0].dwLowDateTime
+        if creation_value <= 0:
+            raise ProcessAuthorityError("process primary thread identity is invalid")
+        return f"windows:{creation_value}"
+
+    def _capture_primary_thread(self, pid: int) -> tuple[int, str]:
+        """Capture the sole suspended primary thread before it can run code."""
+
+        thread_ids = self._process_thread_ids(pid)
+        if len(thread_ids) != 1:
+            raise ProcessAuthorityError(
+                "attested process does not have one unambiguous primary thread"
+            )
+        thread_id = thread_ids[0]
+        k = self._kernel32()
+        thread = k.OpenThread(
+            self._THREAD_SUSPEND_RESUME | self._THREAD_QUERY_LIMITED_INFORMATION,
+            False,
+            thread_id,
+        )
+        if not thread:
+            raise ProcessAuthorityError("unable to open attested process primary thread")
+        try:
+            if k.GetProcessIdOfThread(thread) != pid:
+                raise ProcessAuthorityError("attested process primary thread owner changed")
+            from ctypes import wintypes
+
+            exit_code = wintypes.DWORD()
+            if not k.GetExitCodeThread(thread, ctypes.byref(exit_code)):
+                raise ProcessAuthorityError("unable to query attested process primary thread")
+            if exit_code.value != self._STILL_ACTIVE:
+                raise ProcessAuthorityError("attested process primary thread is not live")
+            return thread_id, self._thread_creation_identity_from_handle(thread)
+        finally:
+            k.CloseHandle(thread)
+
+    def _verify_primary_thread(self, pid: int) -> None:
+        """Re-attest the persisted TID and creation identity without resuming it."""
+
+        pid = _validate_pid(pid)
+        thread_id = self._bound_thread_id
+        expected_identity = self._bound_thread_creation_identity
+        if thread_id is None or expected_identity is None:
+            raise ProcessAuthorityError("process primary thread authority is unavailable")
+        thread_ids = self._process_thread_ids(pid)
+        if thread_ids.count(thread_id) != 1:
+            raise ProcessAuthorityError("attested process primary thread is missing or ambiguous")
+        k = self._kernel32()
+        thread = k.OpenThread(
+            self._THREAD_SUSPEND_RESUME | self._THREAD_QUERY_LIMITED_INFORMATION,
+            False,
+            thread_id,
+        )
+        if not thread:
+            raise ProcessAuthorityError("attested process primary thread is unavailable")
+        try:
+            if k.GetProcessIdOfThread(thread) != pid:
+                raise ProcessAuthorityError("attested process primary thread owner changed")
+            if self._thread_creation_identity_from_handle(thread) != expected_identity:
+                raise ProcessAuthorityError("attested process primary thread identity changed")
+            from ctypes import wintypes
+
+            exit_code = wintypes.DWORD()
+            if not k.GetExitCodeThread(thread, ctypes.byref(exit_code)):
+                raise ProcessAuthorityError("unable to query attested process primary thread")
+            if exit_code.value != self._STILL_ACTIVE:
+                raise ProcessAuthorityError("attested process primary thread is not live")
+        finally:
+            k.CloseHandle(thread)
+
     def _verify_root_process(self, pid: int, identity: str) -> None:
         if self._root_checked:
             return
@@ -670,73 +814,64 @@ class _WindowsProcessAuthority(ProcessAuthority):
             self._bound_pid = pid
             self._bound_creation_identity = live_identity
             assigned = True
+            self._bound_thread_id, self._bound_thread_creation_identity = (
+                self._capture_primary_thread(pid)
+            )
             self.verify(pid)
         except ProcessAuthorityError:
             if assigned:
                 with contextlib.suppress(ProcessAuthorityError):
                     self._terminate_job()
+            self._bound_pid = None
+            self._bound_creation_identity = None
+            self._bound_thread_id = None
+            self._bound_thread_creation_identity = None
             raise
         finally:
             k.CloseHandle(process)
 
     def resume(self, pid: int) -> None:
-        """Resume only threads belonging to the already-attested process."""
+        """Resume the persisted primary thread, safely accepting an earlier resume."""
 
-        try:
-            self.verify(pid)
-        except ProcessAuthorityError:
-            self._fail_closed(pid, "unable to verify attested process before resume")
+        self.verify(pid)
+        self._verify_primary_thread(pid)
+        thread_id = self._bound_thread_id
+        if thread_id is None:  # pragma: no cover - state guard
+            raise ProcessAuthorityError("process primary thread authority is unavailable")
         k = self._kernel32()
-        snapshot = k.CreateToolhelp32Snapshot(self._TH32CS_SNAPTHREAD, 0)
-        invalid_handle = ctypes.c_void_p(-1).value
-        if not snapshot or snapshot == invalid_handle:
-            self._fail_closed(pid, "unable to enumerate attested process threads")
-        thread_ids: list[int] = []
+        thread = k.OpenThread(
+            self._THREAD_SUSPEND_RESUME | self._THREAD_QUERY_LIMITED_INFORMATION,
+            False,
+            thread_id,
+        )
+        if not thread:
+            raise ProcessAuthorityError("unable to open attested process primary thread")
         try:
-            entry = self._ThreadEntry32()
-            entry.dwSize = ctypes.sizeof(entry)
-            if k.Thread32First(snapshot, ctypes.byref(entry)):
-                while True:
-                    if entry.th32OwnerProcessID == pid:
-                        thread_ids.append(entry.th32ThreadID)
-                    entry.dwSize = ctypes.sizeof(entry)
-                    if not k.Thread32Next(snapshot, ctypes.byref(entry)):
-                        break
-        finally:
-            k.CloseHandle(snapshot)
-        if not thread_ids:
-            self._fail_closed(pid, "attested process has no resumable primary thread")
-
-        try:
-            for thread_id in thread_ids:
-                thread = k.OpenThread(
-                    self._THREAD_SUSPEND_RESUME | self._THREAD_QUERY_LIMITED_INFORMATION,
-                    False,
-                    thread_id,
+            if k.GetProcessIdOfThread(thread) != pid:
+                raise ProcessAuthorityError("attested process primary thread owner changed")
+            if (
+                self._thread_creation_identity_from_handle(thread)
+                != self._bound_thread_creation_identity
+            ):
+                raise ProcessAuthorityError("attested process primary thread identity changed")
+            previous_count = k.ResumeThread(thread)
+            if previous_count == self._STILL_SUSPENDED:
+                raise ProcessAuthorityError("unable to resume attested process primary thread")
+            if previous_count > 1:
+                # Restore an unexpected nested suspension before rejecting it.
+                restored_count = k.SuspendThread(thread)
+                if restored_count == self._STILL_SUSPENDED:
+                    raise ProcessAuthorityError(
+                        "attested process primary thread suspension is ambiguous"
+                    )
+                raise ProcessAuthorityError(
+                    "attested process primary thread was not suspended exactly once"
                 )
-                if not thread:
-                    raise ProcessAuthorityError("unable to open attested process primary thread")
-                try:
-                    if k.GetProcessIdOfThread(thread) != pid:
-                        raise ProcessAuthorityError(
-                            "attested process primary thread identity changed"
-                        )
-                    previous_count = k.ResumeThread(thread)
-                    if previous_count == self._STILL_SUSPENDED or previous_count != 1:
-                        raise ProcessAuthorityError(
-                            "attested process primary thread was not suspended exactly once"
-                        )
-                finally:
-                    k.CloseHandle(thread)
-        except ProcessAuthorityError:
-            self._fail_closed(pid, "unable to resume attested process primary thread")
-
-    def _fail_closed(self, pid: int, message: str) -> None:
-        try:
-            self._terminate_job()
-        except ProcessAuthorityError as error:
-            raise ProcessAuthorityError(f"{message}; unable to terminate attested job") from error
-        raise ProcessAuthorityError(message)
+            # A previous count of one is the first resume.  Zero means another
+            # supervisor already completed this transaction; ResumeThread is
+            # a no-op at count zero, so recovery is idempotent.
+        finally:
+            k.CloseHandle(thread)
 
     def _terminate_job(self) -> None:
         if not self._handle or not self._kernel32().TerminateJobObject(self._handle, 1):
@@ -761,6 +896,7 @@ class _WindowsProcessAuthority(ProcessAuthority):
             if not in_job.value:
                 raise ProcessAuthorityError("process is not in the attested job")
             self._verify_root_process(pid, self._bound_creation_identity)
+            self._verify_primary_thread(pid)
             self._claim_verified = True
         except ProcessAuthorityError:
             raise

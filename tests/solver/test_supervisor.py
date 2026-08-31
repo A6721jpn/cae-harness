@@ -26,7 +26,11 @@ import febio_cae_harness.solver.supervisor as supervisor_module
 from febio_cae_harness.contracts import IntentContract
 from febio_cae_harness.evidence import EvidenceStore
 from febio_cae_harness.solver import headless as headless_module
-from febio_cae_harness.solver.process_authority import ProcessAuthority, ProcessAuthorityError
+from febio_cae_harness.solver.process_authority import (
+    ProcessAuthority,
+    ProcessAuthorityError,
+    _WindowsProcessAuthority,
+)
 from febio_cae_harness.solver.runtime import (
     FebioRuntimeDiagnostic,
     _acquire_runtime_launch_claim,
@@ -152,6 +156,109 @@ def _assert_windows_record_mutation_blocked(record_path: Path) -> Path:
     else:
         pytest.fail("foreign deletion removed the owned process record")
     return foreign_path
+
+
+def _suspend_windows_primary_thread(authority: ProcessAuthority, pid: int) -> None:
+    thread_id = authority.claim.get("root_thread_id")
+    assert isinstance(thread_id, int) and thread_id > 0
+    kernel32 = _WindowsProcessAuthority._kernel32()
+    thread = kernel32.OpenThread(
+        _WindowsProcessAuthority._THREAD_SUSPEND_RESUME
+        | _WindowsProcessAuthority._THREAD_QUERY_LIMITED_INFORMATION,
+        False,
+        thread_id,
+    )
+    assert thread
+    try:
+        previous_count = kernel32.SuspendThread(thread)
+        assert previous_count != _WindowsProcessAuthority._STILL_SUSPENDED
+    finally:
+        kernel32.CloseHandle(thread)
+
+
+def _prepare_windows_resume_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    resume_before_crash: bool,
+) -> tuple[
+    SolverLaunchCapability,
+    SolverSupervisor,
+    subprocess.Popen[bytes],
+    ProcessAuthority,
+    dict[str, object],
+    dict[str, object],
+    Path,
+]:
+    if os.name != "nt":
+        pytest.fail("required Windows resume recovery test executed on a non-Windows host")
+    capability = _capability(tmp_path, monkeypatch, code="import time; time.sleep(30)")
+    supervisor = SolverSupervisor(capability)
+    supervisor.start()
+    process = cast(subprocess.Popen[bytes], supervisor._process)
+    authority = supervisor._process_authority
+    assert authority is not None
+    process_id = process.pid
+    record_path = Path(os.fspath(supervisor.process_record_path))
+    record_claim = supervisor._process_record_claim
+    assert record_claim is not None and record_claim.handle is not None
+    running_record = json.loads(
+        supervisor_module._read_record_fd(record_claim.handle).decode("utf-8")
+    )
+    assert isinstance(running_record, dict)
+    assert running_record["state"] == SolverState.RUNNING.value
+    bound_record = dict(running_record)
+    bound_record["state"] = "BOUND_SUSPENDED"
+    supervisor._write_process_record(bound_record)
+    supervisor._prepare_windows_resume_transaction(bound_record, running_record)
+    _suspend_windows_primary_thread(authority, process_id)
+    if resume_before_crash:
+        authority.resume(process_id)
+
+    # Detach every coordinator-owned filesystem and process-authority handle;
+    # the Popen object is retained only so the test can prove the child survives.
+    supervisor._process = None
+    supervisor._process_authority = None
+    supervisor._close_filesystem_authority()
+    authority.close()
+    return (
+        capability,
+        supervisor,
+        process,
+        authority,
+        bound_record,
+        running_record,
+        record_path,
+    )
+
+
+def _cleanup_windows_resume_recovery(
+    capability: SolverLaunchCapability,
+    supervisor: SolverSupervisor,
+    process: subprocess.Popen[bytes],
+    bound_record: dict[str, object],
+    record_path: Path,
+) -> None:
+    if process.poll() is None:
+        cleanup_authority: ProcessAuthority | None = None
+        try:
+            cleanup_authority = ProcessAuthority.from_claim(
+                capability.spec.attempt_root,
+                bound_record["process_authority"],
+                supervisor._launch_context_digest,
+            )
+            cleanup_authority.terminate(process.pid)
+        except BaseException:
+            with contextlib.suppress(BaseException):
+                process.kill()
+        with contextlib.suppress(BaseException):
+            process.wait(timeout=5.0)
+        if cleanup_authority is not None:
+            with contextlib.suppress(BaseException):
+                cleanup_authority.close()
+    for path in (record_path, record_path.with_name(".process.json.resume")):
+        with contextlib.suppress(OSError):
+            path.unlink()
 
 
 def test_start_persists_attempt_owned_process_record(
@@ -1625,6 +1732,203 @@ def test_windows_running_record_transition_rejects_lost_directory_entry_binding(
             supervisor.cancel()
 
 
+def test_windows_reconnect_recovers_crash_before_native_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (
+        capability,
+        supervisor,
+        process,
+        _authority,
+        bound_record,
+        _running_record,
+        record_path,
+    ) = _prepare_windows_resume_recovery(
+        tmp_path,
+        monkeypatch,
+        resume_before_crash=False,
+    )
+    reconnected: SolverSupervisor | None = None
+    transaction_path = record_path.with_name(".process.json.resume")
+    try:
+        assert transaction_path.is_file()
+        reconnected = SolverSupervisor.reconnect(capability)
+        assert reconnected.state is SolverState.RUNNING
+        assert reconnected.pid == process.pid
+        assert reconnected.poll() is None
+        reconnected_claim = reconnected._process_record_claim
+        assert reconnected_claim is not None and reconnected_claim.handle is not None
+        assert (
+            json.loads(supervisor_module._read_record_fd(reconnected_claim.handle).decode("utf-8"))[
+                "state"
+            ]
+            == SolverState.RUNNING.value
+        )
+        assert not transaction_path.exists()
+    finally:
+        if reconnected is not None:
+            with contextlib.suppress(BaseException):
+                reconnected.cancel()
+        _cleanup_windows_resume_recovery(
+            capability,
+            supervisor,
+            process,
+            bound_record,
+            record_path,
+        )
+
+
+def test_windows_reconnect_recovers_crash_after_native_resume_before_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (
+        capability,
+        supervisor,
+        process,
+        _authority,
+        bound_record,
+        _running_record,
+        record_path,
+    ) = _prepare_windows_resume_recovery(
+        tmp_path,
+        monkeypatch,
+        resume_before_crash=True,
+    )
+    reconnected: SolverSupervisor | None = None
+    transaction_path = record_path.with_name(".process.json.resume")
+    try:
+        assert transaction_path.is_file()
+        reconnected = SolverSupervisor.reconnect(capability)
+        assert reconnected.state is SolverState.RUNNING
+        assert reconnected.pid == process.pid
+        assert reconnected.poll() is None
+        reconnected_claim = reconnected._process_record_claim
+        assert reconnected_claim is not None and reconnected_claim.handle is not None
+        assert (
+            json.loads(supervisor_module._read_record_fd(reconnected_claim.handle).decode("utf-8"))[
+                "state"
+            ]
+            == SolverState.RUNNING.value
+        )
+        assert not transaction_path.exists()
+    finally:
+        if reconnected is not None:
+            with contextlib.suppress(BaseException):
+                reconnected.cancel()
+        _cleanup_windows_resume_recovery(
+            capability,
+            supervisor,
+            process,
+            bound_record,
+            record_path,
+        )
+
+
+def test_windows_reconnect_rejects_torn_resume_transaction_without_touching_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (
+        capability,
+        supervisor,
+        process,
+        _authority,
+        bound_record,
+        _running_record,
+        record_path,
+    ) = _prepare_windows_resume_recovery(
+        tmp_path,
+        monkeypatch,
+        resume_before_crash=False,
+    )
+    transaction_path = record_path.with_name(".process.json.resume")
+    try:
+        transaction_path.write_bytes(b'{"version": 1, "kind":')
+        with pytest.raises(SolverOwnershipError, match="transaction|invalid|torn"):
+            SolverSupervisor.reconnect(capability)
+        assert process.poll() is None
+        assert transaction_path.read_bytes() == b'{"version": 1, "kind":'
+    finally:
+        _cleanup_windows_resume_recovery(
+            capability,
+            supervisor,
+            process,
+            bound_record,
+            record_path,
+        )
+
+
+def test_windows_reconnect_rejects_parseable_intermediate_resume_transaction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (
+        capability,
+        supervisor,
+        process,
+        _authority,
+        bound_record,
+        _running_record,
+        record_path,
+    ) = _prepare_windows_resume_recovery(
+        tmp_path,
+        monkeypatch,
+        resume_before_crash=False,
+    )
+    transaction_path = record_path.with_name(".process.json.resume")
+    try:
+        transaction = json.loads(transaction_path.read_text(encoding="utf-8"))
+        assert isinstance(transaction, dict)
+        transaction["running_record"] = dict(bound_record)
+        transaction_path.write_bytes(
+            json.dumps(transaction, indent=2, sort_keys=True).encode("utf-8")
+        )
+        with pytest.raises(SolverOwnershipError, match="transaction|state|digest"):
+            SolverSupervisor.reconnect(capability)
+        assert process.poll() is None
+    finally:
+        _cleanup_windows_resume_recovery(
+            capability,
+            supervisor,
+            process,
+            bound_record,
+            record_path,
+        )
+
+
+def test_windows_reconnect_rejects_resume_transaction_after_record_binding_loss(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (
+        capability,
+        supervisor,
+        process,
+        _authority,
+        bound_record,
+        _running_record,
+        record_path,
+    ) = _prepare_windows_resume_recovery(
+        tmp_path,
+        monkeypatch,
+        resume_before_crash=False,
+    )
+    transaction_path = record_path.with_name(".process.json.resume")
+    try:
+        foreign_path = record_path.with_name("process.foreign.json")
+        foreign_path.write_bytes(json.dumps(bound_record, indent=2, sort_keys=True).encode("utf-8"))
+        os.replace(os.fspath(foreign_path), os.fspath(record_path))
+        with pytest.raises(SolverOwnershipError, match="record|binding|identity"):
+            SolverSupervisor.reconnect(capability)
+        assert process.poll() is None
+        assert transaction_path.is_file()
+    finally:
+        _cleanup_windows_resume_recovery(
+            capability,
+            supervisor,
+            process,
+            bound_record,
+            record_path,
+        )
+
+
 def test_windows_owned_record_rollback_uses_held_handle_without_path_reopen(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1701,6 +2005,8 @@ class _OrderingAuthority:
             "context_digest": self._context_digest,
             "root_pid": None if self._process is None else self._process.pid,
             "root_creation_identity": "windows:test",
+            "root_thread_id": 4243,
+            "root_thread_creation_identity": "windows:4243",
         }
 
     def child_environment(self) -> dict[str, str]:

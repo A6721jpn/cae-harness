@@ -65,6 +65,8 @@ class _FakeWindowsAuthority:
             "context_digest": self._context_digest,
             "root_pid": None if self._process is None else self._process.pid,
             "root_creation_identity": "windows:test",
+            "root_thread_id": 4243,
+            "root_thread_creation_identity": "windows:4243",
         }
 
     def child_environment(self) -> dict[str, str]:
@@ -303,6 +305,8 @@ def _windows_claim(root: Path, digest: str, name: str) -> dict[str, object]:
         "context_digest": digest,
         "root_pid": 101,
         "root_creation_identity": "windows:1001",
+        "root_thread_id": 202,
+        "root_thread_creation_identity": "windows:2002",
     }
 
 
@@ -380,6 +384,75 @@ def test_windows_binding_rejects_creation_identity_changed_before_assignment(
 
     assert kernel.opened_pids == [101]
     assert kernel.terminated == []
+
+
+def test_windows_claim_persists_exact_primary_thread_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    capability = _capability(tmp_path, monkeypatch, code="import time; time.sleep(30)")
+    supervisor = SolverSupervisor(capability)
+    try:
+        supervisor.start()
+        authority = supervisor._process_authority
+        assert authority is not None
+        claim = authority.claim
+        thread_id = claim.get("root_thread_id")
+        thread_identity = claim.get("root_thread_creation_identity")
+        assert isinstance(thread_id, int) and thread_id > 0
+        assert isinstance(thread_identity, str)
+        assert thread_identity.startswith("windows:")
+    finally:
+        if supervisor.process_id is not None:
+            supervisor.cancel()
+
+
+def test_windows_resume_recovery_accepts_already_resumed_primary_thread(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    capability = _capability(tmp_path, monkeypatch, code="import time; time.sleep(30)")
+    supervisor = SolverSupervisor(capability)
+    try:
+        supervisor.start()
+        process_id = supervisor.process_id
+        authority = supervisor._process_authority
+        assert process_id is not None
+        assert authority is not None
+        authority.resume(process_id)
+        assert supervisor.poll() is None
+    finally:
+        if supervisor.process_id is not None:
+            supervisor.cancel()
+
+
+def test_windows_reconnect_rejects_foreign_primary_thread_identity_without_termination(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    capability = _capability(tmp_path, monkeypatch, code="import time; time.sleep(30)")
+    supervisor = SolverSupervisor(capability)
+    supervisor.start()
+    process_id = supervisor.process_id
+    authority = supervisor._process_authority
+    assert process_id is not None
+    assert authority is not None
+    claim = dict(authority.claim)
+    thread_id = claim.get("root_thread_id")
+    assert isinstance(thread_id, int)
+    claim["root_thread_id"] = thread_id + 1
+    foreign_authority: ProcessAuthority | None = None
+    try:
+        foreign_authority = ProcessAuthority.from_claim(
+            capability.spec.attempt_root,
+            claim,
+            supervisor._launch_context_digest,
+        )
+        with pytest.raises(ProcessAuthorityError, match="thread|identity|missing"):
+            foreign_authority.verify(process_id)
+        assert supervisor.poll() is None
+    finally:
+        if foreign_authority is not None:
+            foreign_authority.close()
+        if supervisor.process_id is not None:
+            supervisor.cancel()
 
 
 class _FakeProcFile:

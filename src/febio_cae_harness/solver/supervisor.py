@@ -100,6 +100,8 @@ _WINDOWS_CREATE_NEW = 1
 _WINDOWS_OPEN_EXISTING = 3
 _WINDOWS_FILE_ATTRIBUTE_NORMAL = 0x00000080
 _WINDOWS_FILE_DISPOSITION_INFO = 4
+_WINDOWS_RESUME_TRANSACTION_NAME = ".process.json.resume"
+_WINDOWS_RESUME_TRANSACTION_VERSION = 1
 _POSIX_AT_EMPTY_PATH = 0x1000
 _POSIX_RENAME_EXCHANGE = 0x2
 
@@ -1331,6 +1333,18 @@ class _ProcessRecordClaim:
     parent_native_handle: int | None = None
 
 
+@dataclass(slots=True)
+class _WindowsResumeTransactionClaim:
+    """Held authority for the crash-recovery transition journal."""
+
+    path: Path
+    content: bytes
+    device: int
+    inode: int
+    handle: int | None
+    native_handle: int | None
+
+
 class _DurableClaimCleanup:
     """Retain only exact claim objects whose descriptors could not be closed."""
 
@@ -1341,6 +1355,7 @@ class _DurableClaimCleanup:
         "_input_leases",
         "_runtime_claims",
         "_process_record_claims",
+        "_resume_transaction_claims",
     )
 
     def __init__(self) -> None:
@@ -1350,6 +1365,7 @@ class _DurableClaimCleanup:
         self._input_leases: list[_InputLease] = []
         self._runtime_claims: list[_RuntimeLaunchClaim] = []
         self._process_record_claims: list[_ProcessRecordClaim] = []
+        self._resume_transaction_claims: list[_WindowsResumeTransactionClaim] = []
 
     @staticmethod
     def _discard_identity(entries: list[Any], target: Any) -> None:
@@ -1376,6 +1392,7 @@ class _DurableClaimCleanup:
         *,
         filesystem_authority: _FilesystemAuthority | None = None,
         input_lease: _InputLease | None = None,
+        resume_transaction: _WindowsResumeTransactionClaim | None = None,
     ) -> None:
         """Adopt still-live claims without retaining their supervisor owner."""
 
@@ -1421,6 +1438,15 @@ class _DurableClaimCleanup:
                     continue
                 if not any(held is candidate for held in self._process_record_claims):
                     self._process_record_claims.append(candidate)
+            if (
+                resume_transaction is not None
+                and (
+                    resume_transaction.handle is not None
+                    or resume_transaction.native_handle is not None
+                )
+                and not any(held is resume_transaction for held in self._resume_transaction_claims)
+            ):
+                self._resume_transaction_claims.append(resume_transaction)
 
     def _drain_runtime_claims(self) -> None:
         for claim in tuple(self._runtime_claims):
@@ -1489,6 +1515,18 @@ class _DurableClaimCleanup:
             ):
                 self._discard_identity(self._process_record_claims, claim)
 
+    def _drain_resume_transaction_claims(self) -> None:
+        for claim in tuple(self._resume_transaction_claims):
+            if claim.handle is None and claim.native_handle is None:
+                self._discard_identity(self._resume_transaction_claims, claim)
+                continue
+            try:
+                _windows_close_owned_fd(claim, "handle", "native_handle")
+            except BaseException:
+                continue
+            if claim.handle is None and claim.native_handle is None:
+                self._discard_identity(self._resume_transaction_claims, claim)
+
     def _drain_filesystem_authorities(self) -> None:
         for authority in tuple(self._filesystem_authorities):
             try:
@@ -1525,6 +1563,7 @@ class _DurableClaimCleanup:
             _drain_runtime_claims()
             self._drain_runtime_claims()
             self._drain_process_record_claims()
+            self._drain_resume_transaction_claims()
             _drain_windows_probe_claims()
 
 
@@ -1872,6 +1911,10 @@ class SolverSupervisor:
         self._process_record_claim: _ProcessRecordClaim | None = None
         self._process_record_candidates: list[_ProcessRecordClaim] = []
         self._pending_process_record_claim: _ProcessRecordClaim | None = None
+        self._resume_transaction_claim: _WindowsResumeTransactionClaim | None = None
+        self._pending_windows_resume_recovery: (
+            tuple[dict[str, object], dict[str, object]] | None
+        ) = None
         self._runtime_launch_claim: _RuntimeLaunchClaim | None = None
         self._runtime_image_snapshot: _FileSnapshot | None = None
         self._input_lease: _InputLease | None = None
@@ -1945,6 +1988,7 @@ class SolverSupervisor:
                 candidate_values,
                 filesystem_authority=getattr(self, "_filesystem_authority", None),
                 input_lease=getattr(self, "_input_lease", None),
+                resume_transaction=getattr(self, "_resume_transaction_claim", None),
             )
         except BaseException:
             # Finalization must not surface an unraisable exception. Claims
@@ -2255,6 +2299,34 @@ class SolverSupervisor:
         self._runtime_launch_claim = None
         return ()
 
+    def _release_resume_transaction_claim(self) -> tuple[BaseException, ...]:
+        claim = self._resume_transaction_claim
+        if claim is None:
+            return ()
+        try:
+            _windows_close_owned_fd(claim, "handle", "native_handle")
+        except BaseException as error:
+            return (error,)
+        self._resume_transaction_claim = None
+        return ()
+
+    def _delete_resume_transaction(self) -> tuple[BaseException, ...]:
+        """Delete only the exact held transition journal, then release it."""
+
+        claim = self._resume_transaction_claim
+        if claim is None:
+            return ()
+        failures: list[BaseException] = []
+        if claim.handle is None:
+            failures.append(SolverOwnershipError("resume transaction handle is unavailable"))
+        else:
+            try:
+                _windows_delete_process_record(claim.handle)
+            except BaseException as error:
+                failures.append(error)
+        failures.extend(self._release_resume_transaction_claim())
+        return tuple(failures)
+
     def _close_filesystem_authority(self) -> None:
         authority = self._filesystem_authority
         failures: list[BaseException] = []
@@ -2276,6 +2348,7 @@ class SolverSupervisor:
             self._process_record_claim = None
         for candidate in tuple(self._process_record_candidates):
             failures.extend(self._release_process_record_claim(candidate))
+        failures.extend(self._release_resume_transaction_claim())
         failures.extend(self._release_input_lease())
         failures.extend(self._release_runtime_launch_claim())
         _drain_runtime_claims()
@@ -2489,6 +2562,9 @@ class SolverSupervisor:
     def _rollback_process_record(self) -> tuple[BaseException, ...]:
         """Remove only the exact record object this owner published."""
 
+        failures: list[BaseException] = []
+        if self._resume_transaction_claim is not None:
+            failures.extend(self._delete_resume_transaction())
         claim = self._process_record_claim
         if claim is None or claim.handle is None:
             claim = next(
@@ -2501,7 +2577,7 @@ class SolverSupervisor:
                 None,
             )
         if claim is None or claim.handle is None:
-            return ()
+            return tuple(failures)
         try:
             if _NATIVE_WINDOWS:
                 _windows_delete_process_record(claim.handle)
@@ -2512,15 +2588,17 @@ class SolverSupervisor:
                 self._rollback_posix_process_record(claim)
         except FileNotFoundError as error:
             if not _NATIVE_WINDOWS:
-                return ()
+                return tuple(failures)
             failure = SolverOwnershipError("unable to roll back the owned process record")
             failure.__cause__ = error
-            return (failure,)
+            failures.append(failure)
+            return tuple(failures)
         except BaseException as error:
             failure = SolverOwnershipError("unable to roll back the owned process record")
             failure.__cause__ = error
-            return (failure,)
-        return ()
+            failures.append(failure)
+            return tuple(failures)
+        return tuple(failures)
 
     def _rollback_posix_process_record(self, claim: _ProcessRecordClaim) -> None:
         """CAS-remove a held record, preserving any name replacement."""
@@ -2864,6 +2942,14 @@ class SolverSupervisor:
                         raise SolverOwnershipError(
                             "BOUND_SUSPENDED process record binding changed before resume"
                         )
+                    running_record = self._make_process_record(
+                        process.pid,
+                        metadata,
+                        started_at,
+                        authority,
+                        state=SolverState.RUNNING.value,
+                    )
+                    self._prepare_windows_resume_transaction(bound_record, running_record)
                     resume_metadata = _process_metadata(process.pid)
                     if (
                         not resume_metadata.alive
@@ -2904,6 +2990,12 @@ class SolverSupervisor:
                 # process and filesystem authorities are released.
                 self._revalidate_launch_binding()
                 self._verify_filesystem_authority()
+                if os.name == "nt":
+                    transaction_failures = self._delete_resume_transaction()
+                    if transaction_failures:
+                        raise SolverOwnershipError(
+                            "resume transaction could not be finalized"
+                        ) from transaction_failures[0]
             except BaseException as error:
                 cleanup_failures: list[BaseException] = []
                 cleanup_failures.extend(self._release_runtime_launch_claim())
@@ -2970,12 +3062,58 @@ class SolverSupervisor:
                 supervisor._acquire_input_lease()
             record = supervisor._read_process_record()
             supervisor._revalidate_launch_binding()
+            transition: tuple[dict[str, object], dict[str, object]] | None = None
+            recovering_transition = False
+            if _NATIVE_WINDOWS:
+                pending_claim = supervisor._pending_process_record_claim
+                if pending_claim is None:
+                    raise SolverOwnershipError("process record candidate is unavailable")
+                pending_recovery = supervisor._pending_windows_resume_recovery
+                if pending_recovery is not None:
+                    transition = pending_recovery
+                    recovering_transition = True
+                elif record.get("state") == "BOUND_SUSPENDED":
+                    try:
+                        transition = supervisor._read_windows_resume_transaction(pending_claim)
+                    except FileNotFoundError as error:
+                        raise SolverOwnershipError(
+                            "BOUND_SUSPENDED process record is not a reconnectable RUNNING state "
+                            "and has no recoverable transaction"
+                        ) from error
+                    supervisor._validate_windows_resume_transaction(
+                        transition[0], transition[1], record
+                    )
+                    recovering_transition = True
+                    record = transition[1]
+                elif record.get("state") == SolverState.RUNNING.value:
+                    try:
+                        transition = supervisor._read_windows_resume_transaction(pending_claim)
+                    except FileNotFoundError:
+                        transition = None
+                    else:
+                        supervisor._validate_windows_resume_transaction(
+                            transition[0], transition[1], record
+                        )
+                        recovering_transition = True
             metadata, started_at, authority = supervisor._validate_process_record(record)
             if os.name == "posix":
                 supervisor._acquire_reconnected_posix_input_lease(record, metadata, authority)
             supervisor._revalidate_launch_binding()
             supervisor._verify_filesystem_authority()
+            if recovering_transition:
+                authority.resume(cast(int, record["pid"]))
+                candidate = supervisor._pending_process_record_claim
+                if candidate is None:
+                    raise SolverOwnershipError("process record candidate is unavailable")
+                supervisor._repair_process_record_from_resume_transaction(record, candidate)
             supervisor._install_pending_process_record_claim()
+            supervisor._pending_windows_resume_recovery = None
+            if transition is not None:
+                transaction_failures = supervisor._delete_resume_transaction()
+                if transaction_failures:
+                    raise SolverOwnershipError(
+                        "resume transaction could not be finalized"
+                    ) from transaction_failures[0]
             owner_token = record.get("owner_token")
             if isinstance(owner_token, str) and owner_token:
                 supervisor._record_owner_token = owner_token
@@ -3132,6 +3270,229 @@ class SolverSupervisor:
             raise SolverOwnershipError("process record sealed input identity is invalid")
         return fd, sha256, cast(tuple[int, int, int, int, int], tuple(identity))
 
+    def _resume_transaction_path(self) -> Path:
+        return self._path_for_io(self.spec.attempt_root / _WINDOWS_RESUME_TRANSACTION_NAME)
+
+    @staticmethod
+    def _record_content(record: dict[str, object]) -> bytes:
+        try:
+            return json.dumps(record, indent=2, sort_keys=True).encode("utf-8")
+        except (TypeError, ValueError) as error:
+            raise SolverOwnershipError("process record content is not serializable") from error
+
+    def _own_resume_transaction_claim(
+        self, handle: int, path: Path, content: bytes
+    ) -> _WindowsResumeTransactionClaim:
+        native_handle = getattr(handle, "native_handle", None)
+        if _NATIVE_WINDOWS and native_handle is None:
+            raise SolverOwnershipError("resume transaction has no exact native guard")
+        metadata = os.fstat(handle)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise SolverOwnershipError("resume transaction is not a regular file")
+        return _WindowsResumeTransactionClaim(
+            path=path,
+            content=content,
+            device=int(metadata.st_dev),
+            inode=int(metadata.st_ino),
+            handle=int(handle),
+            native_handle=native_handle,
+        )
+
+    def _prepare_windows_resume_transaction(
+        self,
+        bound_record: dict[str, object],
+        running_record: dict[str, object],
+    ) -> None:
+        """Durably journal the exact record to publish after a native resume."""
+
+        if not _NATIVE_WINDOWS:
+            return
+        if self._resume_transaction_claim is not None:
+            raise SolverOwnershipError("resume transaction is already owned")
+        process_claim = self._process_record_claim
+        if process_claim is None or process_claim.handle is None:
+            raise SolverOwnershipError("process record handle is unavailable")
+        if not self._record_claim_matches(process_claim):
+            raise SolverOwnershipError("owned process record was replaced")
+        path = self._resume_transaction_path()
+        transaction: dict[str, object] = {
+            "version": _WINDOWS_RESUME_TRANSACTION_VERSION,
+            "kind": "windows-resume-transaction",
+            "record_path": os.fspath(self.process_record_path),
+            "record_identity": {
+                "device": process_claim.device,
+                "inode": process_claim.inode,
+            },
+            "bound_digest": _json_digest(bound_record),
+            "bound_record": bound_record,
+            "running_digest": _json_digest(running_record),
+            "running_record": running_record,
+        }
+        content = self._record_content(transaction)
+        handle: int | None = None
+        try:
+            handle = _windows_open_process_record_handle(
+                path,
+                create=True,
+                desired_access=_WINDOWS_GENERIC_READ | _WINDOWS_GENERIC_WRITE | _WINDOWS_DELETE,
+                share_mode=_WINDOWS_FILE_SHARE_READ,
+                descriptor_flags=os.O_RDWR,
+            )
+            claim = self._own_resume_transaction_claim(handle, path, content)
+            self._resume_transaction_claim = claim
+            transaction_handle = claim.handle
+            if transaction_handle is None:  # pragma: no cover - state guard
+                raise SolverOwnershipError("resume transaction handle is unavailable")
+            _write_record_fd(transaction_handle, content)
+            if _read_record_fd(transaction_handle) != content:
+                raise SolverOwnershipError("resume transaction changed during publication")
+            self._verify_filesystem_authority()
+        except BaseException:
+            if handle is not None and self._resume_transaction_claim is None:
+                temporary_claim = _WindowsResumeTransactionClaim(
+                    path=path,
+                    content=b"",
+                    device=0,
+                    inode=0,
+                    handle=int(handle),
+                    native_handle=getattr(handle, "native_handle", None),
+                )
+                with contextlib.suppress(BaseException):
+                    _windows_close_owned_fd(temporary_claim, "handle", "native_handle")
+            raise
+
+    def _parse_windows_resume_transaction(
+        self,
+        content: bytes,
+        process_claim: _ProcessRecordClaim,
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        try:
+            value = json.loads(content.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError, ValueError) as error:
+            raise SolverOwnershipError("resume transaction is torn or invalid") from error
+        if not isinstance(value, dict):
+            raise SolverOwnershipError("resume transaction is invalid")
+        version = value.get("version")
+        if (
+            isinstance(version, bool)
+            or not isinstance(version, int)
+            or version != _WINDOWS_RESUME_TRANSACTION_VERSION
+            or value.get("kind") != "windows-resume-transaction"
+        ):
+            raise SolverOwnershipError("resume transaction version is invalid")
+        record_path = value.get("record_path")
+        if (
+            not isinstance(record_path, str)
+            or not Path(record_path).is_absolute()
+            or os.path.normcase(os.path.abspath(record_path))
+            != os.path.normcase(os.path.abspath(os.fspath(self.process_record_path)))
+        ):
+            raise SolverOwnershipError("resume transaction record binding is invalid")
+        record_identity = value.get("record_identity")
+        if not isinstance(record_identity, dict):
+            raise SolverOwnershipError("resume transaction record identity is invalid")
+        device = record_identity.get("device")
+        inode = record_identity.get("inode")
+        if (
+            isinstance(device, bool)
+            or not isinstance(device, int)
+            or device < 0
+            or isinstance(inode, bool)
+            or not isinstance(inode, int)
+            or inode < 0
+        ):
+            raise SolverOwnershipError("resume transaction record identity is invalid")
+        if device != process_claim.device or inode != process_claim.inode:
+            raise SolverOwnershipError("resume transaction process record identity changed")
+        bound_record = value.get("bound_record")
+        running_record = value.get("running_record")
+        if not isinstance(bound_record, dict) or not isinstance(running_record, dict):
+            raise SolverOwnershipError("resume transaction records are invalid")
+        if bound_record.get("state") != "BOUND_SUSPENDED":
+            raise SolverOwnershipError("resume transaction bound state is invalid")
+        if running_record.get("state") != SolverState.RUNNING.value:
+            raise SolverOwnershipError("resume transaction running state is invalid")
+        try:
+            bound_digest = _json_digest(bound_record)
+            running_digest = _json_digest(running_record)
+        except SolverConfigurationError as error:
+            raise SolverOwnershipError("resume transaction records are invalid") from error
+        if (
+            value.get("bound_digest") != bound_digest
+            or value.get("running_digest") != running_digest
+        ):
+            raise SolverOwnershipError("resume transaction digest is invalid")
+        equivalent_bound = dict(running_record)
+        equivalent_bound["state"] = "BOUND_SUSPENDED"
+        if equivalent_bound != bound_record:
+            raise SolverOwnershipError("resume transaction record transition is invalid")
+        return bound_record, running_record
+
+    def _read_windows_resume_transaction(
+        self, process_claim: _ProcessRecordClaim
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        if not _NATIVE_WINDOWS:
+            raise SolverOwnershipError("Windows resume transaction is unsupported")
+        if self._resume_transaction_claim is not None:
+            raise SolverOwnershipError("resume transaction is already owned")
+        path = self._resume_transaction_path()
+        handle: int | None = None
+        try:
+            handle = _windows_open_process_record_handle(
+                path,
+                create=False,
+                desired_access=_WINDOWS_GENERIC_READ | _WINDOWS_GENERIC_WRITE | _WINDOWS_DELETE,
+                share_mode=_WINDOWS_FILE_SHARE_READ,
+                descriptor_flags=os.O_RDWR,
+            )
+            claim = self._own_resume_transaction_claim(handle, path, b"")
+            self._resume_transaction_claim = claim
+            transaction_handle = claim.handle
+            if transaction_handle is None:  # pragma: no cover - state guard
+                raise SolverOwnershipError("resume transaction handle is unavailable")
+            content = _read_record_fd(transaction_handle)
+            claim.content = content
+            return self._parse_windows_resume_transaction(content, process_claim)
+        except BaseException:
+            failures = self._release_resume_transaction_claim()
+            if failures:
+                raise SolverOwnershipError(
+                    "resume transaction handle could not be closed"
+                ) from failures[0]
+            raise
+
+    def _validate_windows_resume_transaction(
+        self,
+        bound_record: dict[str, object],
+        running_record: dict[str, object],
+        current_record: dict[str, object] | None,
+    ) -> None:
+        if current_record is None:
+            return
+        if current_record.get("state") == "BOUND_SUSPENDED":
+            expected = bound_record
+        elif current_record.get("state") == SolverState.RUNNING.value:
+            expected = running_record
+        else:
+            raise SolverOwnershipError("process record transition state is invalid")
+        if current_record != expected:
+            raise SolverOwnershipError("process record transition does not match its journal")
+
+    def _repair_process_record_from_resume_transaction(
+        self,
+        running_record: dict[str, object],
+        candidate: _ProcessRecordClaim,
+    ) -> None:
+        if candidate.handle is None or not self._record_claim_identity_matches(candidate):
+            raise SolverOwnershipError("owned process record binding changed during recovery")
+        record_handle = candidate.handle
+        content = self._record_content(running_record)
+        _write_record_fd(record_handle, content)
+        if _read_record_fd(record_handle) != content:
+            raise SolverOwnershipError("process record changed during recovery")
+        candidate.content = content
+        candidate.state = SolverState.RUNNING.value
+
     def _make_process_record(
         self,
         pid: int,
@@ -3151,6 +3512,17 @@ class SolverSupervisor:
             raise ProcessAuthorityError(
                 "process authority root creation identity binding is invalid"
             )
+        if os.name == "nt":
+            thread_id = claim.get("root_thread_id")
+            thread_identity = claim.get("root_thread_creation_identity")
+            if (
+                isinstance(thread_id, bool)
+                or not isinstance(thread_id, int)
+                or thread_id <= 0
+                or not isinstance(thread_identity, str)
+                or not thread_identity.startswith("windows:")
+            ):
+                raise ProcessAuthorityError("process authority primary thread binding is invalid")
         executable_snapshot = self._runtime_image_snapshot
         if executable_snapshot is None:
             raise ProcessAuthorityError("runtime executable image binding is unavailable")
@@ -3538,6 +3910,27 @@ class SolverSupervisor:
             candidate.content = content
             record = json.loads(content.decode("utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
+            if _NATIVE_WINDOWS and candidate is not None:
+                try:
+                    if not self._record_claim_identity_matches(candidate):
+                        raise SolverOwnershipError("owned process record was replaced")
+                    transaction = self._read_windows_resume_transaction(candidate)
+                except FileNotFoundError:
+                    transaction = None
+                except BaseException as recovery_error:
+                    release_failures = self._release_process_record_claim(candidate)
+                    if release_failures:
+                        raise SolverOwnershipError(
+                            "process record candidate handles could not be closed"
+                        ) from release_failures[0]
+                    raise SolverOwnershipError(
+                        f"invalid process record: {path}"
+                    ) from recovery_error
+                if transaction is not None:
+                    _bound_record, running_record = transaction
+                    self._pending_windows_resume_recovery = transaction
+                    self._pending_process_record_claim = candidate
+                    return running_record
             release_failures = self._release_process_record_claim(candidate)
             if release_failures:
                 raise SolverOwnershipError(
