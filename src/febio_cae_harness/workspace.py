@@ -15,7 +15,7 @@ from collections.abc import Callable, Iterable, Iterator
 from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import FrozenInstanceError, dataclass
 from pathlib import Path
-from typing import Any, SupportsIndex, cast
+from typing import Any, BinaryIO, SupportsIndex, cast
 
 __all__ = [
     "AttemptWorkspace",
@@ -34,6 +34,13 @@ _REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
 
 
 type _IdentityStamp = tuple[int, int]
+type _FileState = tuple[int, int, int, int, int, int, int]
+
+
+@dataclass(frozen=True, slots=True)
+class _OriginalInputSource:
+    path: Path
+    state: _FileState
 
 
 _MANAGER_REGISTRY: dict[int, tuple[Any, ...]] = {}
@@ -110,6 +117,50 @@ def _identity_stamp(
     if expected is not None and stamp != expected:
         raise WorkspaceBoundaryError(f"{label} was replaced or renamed")
     return stamp
+
+
+def _file_state(metadata: os.stat_result) -> _FileState:
+    return (
+        int(metadata.st_dev),
+        int(metadata.st_ino),
+        int(metadata.st_mode),
+        int(metadata.st_nlink),
+        int(metadata.st_size),
+        int(metadata.st_mtime_ns),
+        int(metadata.st_ctime_ns),
+    )
+
+
+def _file_state_identity(state: _FileState) -> _IdentityStamp:
+    return (state[0], state[1])
+
+
+def _source_path_state(path: Path) -> _FileState:
+    try:
+        checked = _reject_reparse_alias(path, "original input")
+        metadata = os.lstat(os.fspath(checked))
+    except (OSError, WorkspaceBoundaryError) as error:
+        raise WorkspaceBoundaryError("original input changed during case creation") from error
+    if not stat.S_ISREG(metadata.st_mode):
+        raise WorkspaceBoundaryError("original input changed during case creation")
+    return _file_state(metadata)
+
+
+def _source_stream_state(stream: BinaryIO) -> _FileState:
+    try:
+        metadata = os.fstat(stream.fileno())
+    except OSError as error:
+        raise WorkspaceBoundaryError("original input changed during case creation") from error
+    if not stat.S_ISREG(metadata.st_mode):
+        raise WorkspaceBoundaryError("original input changed during case creation")
+    return _file_state(metadata)
+
+
+def _stream_sha256(stream: BinaryIO) -> str:
+    digest = hashlib.sha256()
+    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+        digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _windows_create(
@@ -1221,24 +1272,28 @@ class ValidatedCaseWorkspace:
     @staticmethod
     def _normalise_inputs(
         original_inputs: Iterable[str | Path] | str | Path,
-    ) -> tuple[Path, ...]:
+    ) -> tuple[_OriginalInputSource, ...]:
         candidates: tuple[str | Path, ...]
         if isinstance(original_inputs, (str, Path)):
             candidates = (original_inputs,)
         else:
             candidates = tuple(original_inputs)
 
-        sources: list[Path] = []
+        sources: list[_OriginalInputSource] = []
         names: set[str] = set()
         for candidate in candidates:
             source = _reject_reparse_alias(candidate, "original input")
-            if not source.is_file():
+            try:
+                metadata = os.lstat(os.fspath(source))
+            except OSError as error:
+                raise ValueError(f"original input is not a file: {source}") from error
+            if not stat.S_ISREG(metadata.st_mode):
                 raise ValueError(f"original input is not a file: {source}")
             name_key = source.name.casefold()
             if name_key in names:
                 raise ValueError(f"duplicate original input name: {source.name}")
             names.add(name_key)
-            sources.append(source)
+            sources.append(_OriginalInputSource(source, _file_state(metadata)))
         return tuple(sources)
 
     def create_case(
@@ -1269,23 +1324,83 @@ class ValidatedCaseWorkspace:
                     with _parent_guard(case_path, case_stamp, directory.parent, "dir"):
                         directory.mkdir(parents=False, exist_ok=False)
 
-                copied_inputs: list[Path] = []
-                for source in sources:
-                    _reject_reparse_alias(source, "original input")
-                    destination = case_path / "01_Input" / source.name
-                    with _parent_guard(
+                with ExitStack() as source_stack:
+                    opened_sources: list[
+                        tuple[_OriginalInputSource, BinaryIO, _FileState, str]
+                    ] = []
+                    for source in sources:
+                        try:
+                            source_stream = cast(
+                                BinaryIO,
+                                source_stack.enter_context(source.path.open("rb")),
+                            )
+                        except OSError as error:
+                            raise WorkspaceBoundaryError(
+                                "original input changed during case creation"
+                            ) from error
+                        stream_state = _source_stream_state(source_stream)
+                        if (
+                            _file_state_identity(stream_state) != _file_state_identity(source.state)
+                            or _source_path_state(source.path) != source.state
+                        ):
+                            raise WorkspaceBoundaryError(
+                                "original input changed during case creation"
+                            )
+                        initial_digest = _stream_sha256(source_stream)
+                        if (
+                            _source_stream_state(source_stream) != stream_state
+                            or _source_path_state(source.path) != source.state
+                        ):
+                            raise WorkspaceBoundaryError(
+                                "original input changed during case creation"
+                            )
+                        source_stream.seek(0)
+                        opened_sources.append((source, source_stream, stream_state, initial_digest))
+
+                    copied_inputs: list[Path] = []
+                    for source, source_stream, stream_state, initial_digest in opened_sources:
+                        destination = case_path / "01_Input" / source.path.name
+                        with _parent_guard(
+                            case_path,
+                            case_stamp,
+                            destination.parent,
+                            "original input",
+                        ):
+                            _identity_stamp(case_path, "case root", case_stamp)
+                            with destination.open("x+b") as target:
+                                shutil.copyfileobj(source_stream, target)
+                                target.flush()
+                                os.fsync(target.fileno())
+                                target.seek(0)
+                                copied_digest = _stream_sha256(target)
+
+                        if (
+                            _source_stream_state(source_stream) != stream_state
+                            or _source_path_state(source.path) != source.state
+                        ):
+                            raise WorkspaceBoundaryError(
+                                "original input changed during case creation"
+                            )
+                        source_stream.seek(0)
+                        final_digest = _stream_sha256(source_stream)
+                        if (
+                            final_digest != initial_digest
+                            or copied_digest != initial_digest
+                            or _source_stream_state(source_stream) != stream_state
+                            or _source_path_state(source.path) != source.state
+                        ):
+                            raise WorkspaceBoundaryError(
+                                "original input changed during case creation"
+                            )
+                        copied_inputs.append(_lexical_path(destination))
+
+                    return CaseWorkspace._from_manager(
+                        manager,
+                        case_id,
                         case_path,
-                        case_stamp,
-                        destination.parent,
-                        "original input",
-                    ):
-                        _identity_stamp(case_path, "case root", case_stamp)
-                        with source.open("rb") as source_stream, destination.open("xb") as target:
-                            shutil.copyfileobj(source_stream, target)
-                    copied_inputs.append(_lexical_path(destination))
-                return CaseWorkspace._from_manager(
-                    manager, case_id, case_path, copied_inputs, sources
-                )
+                        copied_inputs,
+                        (source.path for source in sources),
+                    )
 
     def open_case(self, case_id: str) -> CaseWorkspace:
         """Open an existing case without granting access outside its root."""

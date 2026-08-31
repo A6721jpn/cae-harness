@@ -9,6 +9,7 @@ import shutil
 import subprocess
 from collections.abc import Callable
 from pathlib import Path
+from typing import IO, Any
 
 import pytest
 
@@ -89,6 +90,75 @@ def test_create_case_copies_inputs_and_creates_canonical_layout(tmp_path: Path) 
         "90_Temporary/attempts",
     ):
         assert (case.case_root / directory_name).is_dir()
+
+
+def test_create_case_rejects_concurrent_source_replacement_and_removes_partial_case(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "input.feb"
+    displaced = tmp_path / "displaced-input.feb"
+    source.write_bytes(b"authoritative input")
+    workspace = make_workspace(tmp_path)
+    original_open = Path.open
+    replaced = False
+
+    def replace_before_open(
+        path: Path,
+        mode: str = "r",
+        buffering: int = -1,
+        encoding: str | None = None,
+        errors: str | None = None,
+        newline: str | None = None,
+    ) -> IO[Any]:
+        nonlocal replaced
+        if path == source and mode == "rb" and not replaced:
+            source.replace(displaced)
+            replaced = True
+            source.write_bytes(b"replacement input")
+        return original_open(path, mode, buffering, encoding, errors, newline)
+
+    monkeypatch.setattr(Path, "open", replace_before_open)
+
+    with pytest.raises(WorkspaceBoundaryError, match="changed during case creation"):
+        workspace.create_case("case-a", [source])
+
+    assert replaced
+    assert not (workspace.cae_root / "case-a").exists()
+    assert displaced.read_bytes() == b"authoritative input"
+    assert source.read_bytes() == b"replacement input"
+
+
+def test_create_case_copies_one_stable_source_object(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "input.feb"
+    source.write_bytes(b"authoritative input")
+    workspace = make_workspace(tmp_path)
+    original_open = Path.open
+    source_opens = 0
+
+    def track_open(
+        path: Path,
+        mode: str = "r",
+        buffering: int = -1,
+        encoding: str | None = None,
+        errors: str | None = None,
+        newline: str | None = None,
+    ) -> IO[Any]:
+        nonlocal source_opens
+        if path == source and mode == "rb":
+            source_opens += 1
+        return original_open(path, mode, buffering, encoding, errors, newline)
+
+    monkeypatch.setattr(Path, "open", track_open)
+
+    case = workspace.create_case("case-a", [source])
+
+    assert source_opens == 1
+    assert case.original_inputs[0].read_bytes() == b"authoritative input"
+    assert source.read_bytes() == b"authoritative input"
 
 
 def test_original_input_is_immutable_through_case_handle(tmp_path: Path) -> None:
