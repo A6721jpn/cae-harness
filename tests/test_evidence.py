@@ -6,14 +6,15 @@ import json
 import multiprocessing
 import os
 import pickle
+import stat
 import sys
 import threading
 import time
-from types import SimpleNamespace
 from collections.abc import Callable
 from copy import copy, deepcopy
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -723,7 +724,7 @@ def test_concurrent_store_event_writers_do_not_race_sequence_or_predecessor(
 
     assert not first.is_alive()
     assert not second.is_alive()
-    assert not errors
+    assert not errors, [(error, error.__cause__) for error in errors]
     assert not overlapped_event_appends
     assert sorted(cast(int, event["sequence"]) for event in events) == [1, 2]
     assert store_a.reopen() is store_a
@@ -1095,13 +1096,15 @@ def test_posix_lock_acquire_never_double_closes_a_reused_descriptor(
     monkeypatch.setitem(sys.modules, "fcntl", fake_fcntl)
     monkeypatch.setattr(evidence_module, "_open_posix_lock_descriptor", lambda _root: 103)
     monkeypatch.setattr(
-        evidence_module.os,
+        os,
         "fstat",
-        lambda _descriptor: SimpleNamespace(st_mode=evidence_module.stat.S_IFDIR),
+        lambda _descriptor: SimpleNamespace(
+            st_dev=1,
+            st_ino=2,
+            st_mode=stat.S_IFDIR,
+        ),
     )
-    monkeypatch.setattr(
-        evidence_module.os, "close", lambda descriptor: close_calls.append(descriptor)
-    )
+    monkeypatch.setattr(os, "close", lambda descriptor: close_calls.append(descriptor))
 
     with pytest.raises(EvidenceIntegrityError, match="cannot acquire"):
         evidence_module._acquire_posix_event_lock(71)

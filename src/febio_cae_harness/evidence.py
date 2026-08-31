@@ -12,7 +12,7 @@ import os
 import stat
 import threading
 from collections.abc import Callable, Iterator, Mapping
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,6 +23,7 @@ from .workspace import (
     CaseWorkspace,
     WorkspaceBoundaryError,
     _ExactCaseTransaction,
+    _ExactOwner,
     _lexical_path,
     _reject_reparse_alias,
 )
@@ -43,6 +44,7 @@ INTENT_FILE = "intent.json"
 EVENTS_FILE = "90_Temporary/events.jsonl"
 ATTEMPT_FILE = "ATTEMPT.json"
 EVENT_LOCK_FILE = "90_Temporary/events.lock"
+_EVENT_RECOVERY_FILE = "90_Temporary/event-recovery.json"
 SCHEMA_VERSION = 1
 _VERIFICATION_FIELDS = frozenset(
     {
@@ -592,44 +594,77 @@ def _open_posix_lock_descriptor(
     return opener(".", flags, dir_fd=root_descriptor)
 
 
-def _acquire_posix_event_lock(root_descriptor: int) -> int:
+def _posix_lock_identity(descriptor: int) -> tuple[int, int, int]:
+    metadata = os.fstat(descriptor)
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise EvidenceIntegrityError("evidence case lock target is not a directory")
+    return (int(metadata.st_dev), int(metadata.st_ino), int(metadata.st_mode))
+
+
+def _acquire_posix_event_lock(root_descriptor: int) -> _ExactOwner:
     """Lock the validated case directory, whose inode is not events.lock."""
 
-    descriptor = -1
+    descriptor: int | None = None
+    owner: _ExactOwner | None = None
     try:
         import fcntl
 
         descriptor = _open_posix_lock_descriptor(root_descriptor)
-        metadata = os.fstat(descriptor)
-        if not stat.S_ISDIR(metadata.st_mode):
-            raise EvidenceIntegrityError("evidence case lock target is not a directory")
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX)  # type: ignore[attr-defined]
-        except OSError:
-            os.close(descriptor)
-            raise
-        return descriptor
-    except EvidenceIntegrityError:
-        if descriptor >= 0:
-            with suppress(OSError):
+        owner = _ExactOwner(
+            descriptor,
+            _posix_lock_identity(descriptor),
+            _posix_lock_identity,
+            lambda value: os.close(value),
+            "POSIX event lock",
+        )
+        owner.validate()
+        fcntl.flock(owner.handle, fcntl.LOCK_EX)  # type: ignore[attr-defined]
+        return owner
+    except EvidenceIntegrityError as primary:
+        if owner is not None:
+            try:
+                owner.close()
+            except BaseException as cleanup:
+                primary.add_note(f"POSIX event lock cleanup failed: {cleanup}")
+        elif descriptor is not None:
+            try:
                 os.close(descriptor)
+            except OSError as cleanup:
+                primary.add_note(f"POSIX event lock cleanup failed: {cleanup}")
         raise
     except OSError as error:
-        if descriptor >= 0:
-            with suppress(OSError):
+        acquire_error = EvidenceIntegrityError("cannot acquire case event lock")
+        if owner is not None:
+            try:
+                owner.close()
+            except BaseException as cleanup:
+                acquire_error.add_note(f"POSIX event lock cleanup failed: {cleanup}")
+        elif descriptor is not None:
+            try:
                 os.close(descriptor)
-        raise EvidenceIntegrityError("cannot acquire case event lock") from error
+            except OSError as cleanup:
+                acquire_error.add_note(f"POSIX event lock cleanup failed: {cleanup}")
+        raise acquire_error from error
 
 
-def _release_posix_event_lock(descriptor: int) -> None:
+def _release_posix_event_lock(owner: _ExactOwner) -> None:
+    unlock_error: EvidenceIntegrityError | None = None
     try:
         import fcntl
 
-        fcntl.flock(descriptor, fcntl.LOCK_UN)  # type: ignore[attr-defined]
-    except OSError:
-        pass
-    with suppress(OSError):
-        os.close(descriptor)
+        fcntl.flock(owner.handle, fcntl.LOCK_UN)  # type: ignore[attr-defined]
+    except OSError as error:
+        unlock_error = EvidenceIntegrityError("cannot release case event lock")
+        unlock_error.__cause__ = error
+    try:
+        owner.close()
+    except BaseException as cleanup:
+        if unlock_error is not None:
+            unlock_error.add_note(f"POSIX event lock cleanup failed: {cleanup}")
+            raise unlock_error from cleanup
+        raise EvidenceIntegrityError("cannot close case event lock") from cleanup
+    if unlock_error is not None:
+        raise unlock_error
 
 
 def _acquire_windows_event_lock(identity: str) -> tuple[Any, Any]:
@@ -664,10 +699,28 @@ def _acquire_windows_event_lock(identity: str) -> tuple[Any, Any]:
 
 def _release_windows_event_lock(lock: tuple[Any, Any]) -> None:
     kernel32, handle = lock
-    with suppress(AttributeError, OSError):
-        kernel32.ReleaseMutex(handle)
-    with suppress(OSError):
-        kernel32.CloseHandle(handle)
+    primary: EvidenceIntegrityError | None = None
+    try:
+        if not kernel32.ReleaseMutex(handle):
+            primary = EvidenceIntegrityError("cannot release case event lock")
+    except (AttributeError, OSError) as error:
+        primary = EvidenceIntegrityError("cannot release case event lock")
+        primary.__cause__ = error
+    try:
+        close_error: EvidenceIntegrityError | None
+        closed = kernel32.CloseHandle(handle)
+    except OSError as error:
+        close_error = EvidenceIntegrityError("cannot close case event lock")
+        close_error.__cause__ = error
+    else:
+        close_error = None if closed else EvidenceIntegrityError("cannot close case event lock")
+    if close_error is not None:
+        if primary is not None:
+            primary.add_note(str(close_error))
+            raise primary
+        raise close_error
+    if primary is not None:
+        raise primary
 
 
 @contextmanager
@@ -917,7 +970,12 @@ class EvidenceStore:
             raise EvidenceIntegrityError(
                 "intent revision events must be recorded through their dedicated API"
             )
-        if event_type in {"artifact_verified", _DIAGNOSTIC_EVENT, _PROMOTION_CONSUMED_EVENT}:
+        if event_type in {
+            "attempt_recorded",
+            "artifact_verified",
+            _DIAGNOSTIC_EVENT,
+            _PROMOTION_CONSUMED_EVENT,
+        }:
             raise EvidenceIntegrityError(
                 "verification events must be recorded through their dedicated API"
             )
@@ -951,6 +1009,7 @@ class EvidenceStore:
                 )
                 self._intent = new_intent
                 self._refresh_manifest()
+                self._clear_event_recovery()
             except (OSError, WorkspaceBoundaryError, EvidenceIntegrityError) as error:
                 raise EvidenceIntegrityError(
                     "intent revision projection was interrupted"
@@ -1466,6 +1525,7 @@ class EvidenceStore:
         manifest = self._read_json(self.manifest_path)
         persisted_intent, persisted_payload, _ = self._read_intent()
         events, last_event_sha256 = self._read_events()
+        recovery = self._read_event_recovery()
         revision = self._latest_intent_revision(events)
         if revision is None:
             intent = persisted_intent
@@ -1491,29 +1551,43 @@ class EvidenceStore:
             attempts,
         )
         if persisted_payload == intent_payload and manifest == expected:
+            if recovery is not None:
+                if not self._recovery_is_current_or_pending(
+                    recovery,
+                    events,
+                    last_event_sha256,
+                ):
+                    raise EvidenceIntegrityError("event recovery record does not match evidence")
+                self._clear_event_recovery()
             self._case_sha256 = str(expected["case_sha256"])
             return
 
-        if revision is None or not events or events[-1]["event_type"] != _INTENT_REVISED_EVENT:
+        if recovery is None or not events or not self._recovery_matches_event(recovery, events[-1]):
             raise EvidenceIntegrityError("intent or manifest projection does not match evidence")
 
-        previous_payload = cast(dict[str, Any], revision["previous_intent"])
+        terminal = events[-1]
+        if terminal["event_type"] == _INTENT_REVISED_EVENT:
+            terminal_revision = self._validate_intent_revision_payload(terminal["payload"])
+            previous_payload = cast(dict[str, Any], terminal_revision["previous_intent"])
+        else:
+            previous_payload = intent_payload
         previous_events = events[:-1]
         previous_event_sha256 = (
             cast(str, previous_events[-1]["sha256"]) if previous_events else None
         )
+        previous_attempts = self._attempts_before_terminal(attempts, terminal)
         previous_manifest = self._project_manifest(
             previous_payload,
             _digest(previous_payload),
             previous_events,
             previous_event_sha256,
-            attempts,
+            previous_attempts,
         )
         if (
             persisted_payload not in (previous_payload, intent_payload)
             or manifest != previous_manifest
         ):
-            raise EvidenceIntegrityError("intent revision projections are split-brain")
+            raise EvidenceIntegrityError("event projections are split-brain")
 
         try:
             if persisted_payload != intent_payload:
@@ -1525,11 +1599,98 @@ class EvidenceStore:
                 MANIFEST_FILE,
                 _json_text(expected).encode("utf-8"),
             )
+            self._clear_event_recovery()
         except (OSError, WorkspaceBoundaryError) as error:
-            raise EvidenceIntegrityError(
-                "intent revision projections could not be recovered"
-            ) from error
+            raise EvidenceIntegrityError("event projections could not be recovered") from error
         self._case_sha256 = str(expected["case_sha256"])
+
+    def _read_event_recovery(self) -> dict[str, Any] | None:
+        exact = self._exact()
+        if not exact.exists(_EVENT_RECOVERY_FILE):
+            return None
+        if not exact.read_bytes(_EVENT_RECOVERY_FILE):
+            return None
+        marker = self._read_json(self._safe_case_path(_EVENT_RECOVERY_FILE))
+        expected_keys = {
+            "schema_version",
+            "case_id",
+            "sequence",
+            "previous_sha256",
+            "event_sha256",
+        }
+        if set(marker) != expected_keys:
+            raise EvidenceIntegrityError("event recovery record has unexpected fields")
+        previous_sha256 = marker["previous_sha256"]
+        if previous_sha256 is not None:
+            previous_sha256 = _validate_digest(previous_sha256, "event recovery predecessor")
+        event_sha256 = _validate_digest(marker["event_sha256"], "event recovery event")
+        if (
+            marker["schema_version"] != SCHEMA_VERSION
+            or marker["case_id"] != self.case_workspace.case_id
+            or type(marker["sequence"]) is not int
+            or marker["sequence"] < 1
+        ):
+            raise EvidenceIntegrityError("event recovery record identity is invalid")
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "case_id": self.case_workspace.case_id,
+            "sequence": marker["sequence"],
+            "previous_sha256": previous_sha256,
+            "event_sha256": event_sha256,
+        }
+
+    @staticmethod
+    def _recovery_matches_event(
+        recovery: Mapping[str, Any],
+        event: Mapping[str, Any],
+    ) -> bool:
+        return bool(
+            recovery["sequence"] == event["sequence"]
+            and recovery["previous_sha256"] == event["previous_sha256"]
+            and recovery["event_sha256"] == event["sha256"]
+        )
+
+    def _recovery_is_current_or_pending(
+        self,
+        recovery: Mapping[str, Any],
+        events: list[dict[str, Any]],
+        last_event_sha256: str | None,
+    ) -> bool:
+        if events and self._recovery_matches_event(recovery, events[-1]):
+            return True
+        return (
+            recovery["sequence"] == len(events) + 1
+            and recovery["previous_sha256"] == last_event_sha256
+            and all(event["sha256"] != recovery["event_sha256"] for event in events)
+        )
+
+    def _attempts_before_terminal(
+        self,
+        attempts: list[dict[str, object]],
+        terminal: Mapping[str, Any],
+    ) -> list[dict[str, object]]:
+        if terminal["event_type"] != "attempt_recorded":
+            return attempts
+        payload = _as_mapping(terminal["payload"], "attempt recovery event")
+        if set(payload) != {"attempt_id", "sha256"}:
+            raise EvidenceIntegrityError("attempt recovery event is invalid")
+        previous: list[dict[str, object]] = []
+        matched = False
+        for attempt in attempts:
+            if attempt["attempt_id"] == payload["attempt_id"]:
+                if matched or attempt["sha256"] != payload["sha256"]:
+                    raise EvidenceIntegrityError("attempt recovery binding is invalid")
+                matched = True
+                continue
+            previous.append(attempt)
+        if not matched:
+            raise EvidenceIntegrityError("attempt recovery record is missing")
+        return previous
+
+    def _clear_event_recovery(self) -> None:
+        exact = self._exact()
+        if exact.exists(_EVENT_RECOVERY_FILE):
+            exact.replace_bytes(_EVENT_RECOVERY_FILE, b"")
 
     def _read_intent(self) -> tuple[IntentContract, dict[str, Any], str]:
         payload = self._read_json(self.intent_path)
@@ -1911,12 +2072,24 @@ class EvidenceStore:
         }
         event = dict(body)
         event["sha256"] = _digest(body)
+        recovery = {
+            "schema_version": SCHEMA_VERSION,
+            "case_id": self.case_workspace.case_id,
+            "sequence": event["sequence"],
+            "previous_sha256": previous_sha256,
+            "event_sha256": event["sha256"],
+        }
         try:
+            self._exact().replace_bytes(
+                _EVENT_RECOVERY_FILE,
+                _json_text(recovery).encode("utf-8"),
+            )
             self._exact().append_bytes(EVENTS_FILE, _json_text(event).encode("utf-8"))
         except (OSError, WorkspaceBoundaryError) as error:
             raise EvidenceIntegrityError("event log is missing or unreadable") from error
         if refresh_manifest:
             self._refresh_manifest()
+            self._clear_event_recovery()
         return event
 
     def _refresh_manifest(self) -> None:
