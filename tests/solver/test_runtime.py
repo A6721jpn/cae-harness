@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import ctypes
 import hashlib
 import os
 import stat
@@ -47,6 +49,52 @@ def _patch_lstat_metadata(
         )
 
     monkeypatch.setattr(Path, "lstat", fake_lstat)
+
+
+@pytest.mark.parametrize(
+    ("last_error", "expected"),
+    [(1656, False), (6, False), (5, None)],
+)
+def test_windows_compare_object_handles_classifies_false_last_error(
+    monkeypatch: pytest.MonkeyPatch, last_error: int, expected: bool | None
+) -> None:
+    """FALSE is definitive only for the two documented object-identity errors."""
+
+    events: list[tuple[str, int | str]] = []
+
+    def compare(first: object, second: object) -> int:
+        first_value = getattr(first, "value", first)
+        second_value = getattr(second, "value", second)
+        assert isinstance(first_value, int)
+        assert isinstance(second_value, int)
+        events.append(("invoke", first_value))
+        events.append(("second", second_value))
+        return 0
+
+    fake_library = SimpleNamespace(CompareObjectHandles=compare)
+
+    def fake_windll(name: str, *, use_last_error: bool) -> object:
+        events.append(("windll", name))
+        assert use_last_error
+        return fake_library
+
+    def fake_set_last_error(value: int) -> None:
+        events.append(("set", value))
+
+    reads: list[int] = []
+
+    def fake_get_last_error() -> int:
+        events.append(("get", last_error))
+        reads.append(last_error)
+        return last_error
+
+    monkeypatch.setattr(ctypes, "WinDLL", fake_windll, raising=False)
+    monkeypatch.setattr(ctypes, "set_last_error", fake_set_last_error, raising=False)
+    monkeypatch.setattr(ctypes, "get_last_error", fake_get_last_error, raising=False)
+
+    assert runtime_module._windows_compare_object_handles(101, 202) is expected
+    assert reads == [last_error]
+    assert [event[0] for event in events[-4:]] == ["set", "invoke", "second", "get"]
 
 
 def test_probe_fake_executable_returns_immutable_identity(
@@ -321,6 +369,354 @@ def test_windows_launch_claim_rejects_digest_mismatch_before_resume(
             claim.authenticate(diagnostic.path)
     finally:
         claim.close()
+
+
+def test_windows_runtime_claim_partial_close_retires_reused_descriptor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A partial CRT close must not retry after the descriptor number is reused."""
+
+    if os.name != "nt":
+        pytest.fail("required Windows runtime claim test executed on a non-Windows host")
+
+    executable = _fake_file(tmp_path)
+
+    class CompletedProcess:
+        returncode = 0
+
+        def communicate(self, input: bytes, timeout: float) -> tuple[bytes, bytes]:
+            del input, timeout
+            return b"version 4.2.0\n", b""
+
+    monkeypatch.setattr(
+        subprocess,
+        "Popen",
+        lambda command, **kwargs: CompletedProcess(),
+    )
+    claim = runtime_module._acquire_runtime_launch_claim(probe_febio(executable))
+    assert claim.handle is not None
+    original_close = os.close
+    original_open = os.open
+    target_fd = claim.handle
+    unrelated_path = tmp_path / "unrelated.bin"
+    unrelated_fd: int | None = None
+
+    def partial_close(fd: int) -> None:
+        nonlocal unrelated_fd
+        if fd == target_fd and unrelated_fd is None:
+            original_close(fd)
+            unrelated_fd = original_open(os.fspath(unrelated_path), os.O_RDWR | os.O_CREAT, 0o600)
+            assert unrelated_fd == target_fd
+            raise OSError("synthetic close reported failure after retiring the CRT descriptor")
+        original_close(fd)
+
+    try:
+        with monkeypatch.context() as close_patch:
+            close_patch.setattr(os, "close", partial_close)
+            with contextlib.suppress(RuntimeProbeError):
+                claim.close()
+
+        assert claim.handle is None
+        assert unrelated_fd is not None
+        os.write(unrelated_fd, b"still-owned-by-test")
+    finally:
+        if unrelated_fd is not None:
+            with contextlib.suppress(OSError):
+                original_close(unrelated_fd)
+        claim.handle = None
+
+
+def test_windows_fd_identity_rejects_same_file_descriptor_number_reuse(
+    tmp_path: Path,
+) -> None:
+    """A reused CRT slot for the same path is not the old kernel object."""
+
+    if os.name != "nt":
+        pytest.fail("required Windows descriptor identity test executed on a non-Windows host")
+
+    path = tmp_path / "same-file.bin"
+    path.write_bytes(b"same-file descriptor reuse")
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+    original_fd = os.open(os.fspath(path), flags)
+    guard = runtime_module._windows_duplicate_fd_handle(original_fd)
+    reused_fd: int | None = None
+    owner = SimpleNamespace(handle=None, native_handle=guard)
+    try:
+        os.close(original_fd)
+        reused_fd = os.open(os.fspath(path), flags)
+        assert reused_fd == original_fd
+        owner.handle = reused_fd
+
+        assert runtime_module._windows_fd_identity_matches(reused_fd, guard) is False
+        runtime_module._windows_close_owned_fd(owner, "handle", "native_handle")
+        assert owner.handle is None
+        assert owner.native_handle is None
+        os.fstat(reused_fd)
+    finally:
+        if reused_fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(reused_fd)
+        if owner.native_handle is not None:
+            with contextlib.suppress(OSError):
+                runtime_module._windows_close_native_handle(owner.native_handle)
+
+
+def test_windows_runtime_open_duplicates_raw_handle_before_crt_transfer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CreateFileW H1 must be guarded by DuplicateHandle H2 before open_osfhandle."""
+
+    if os.name != "nt":
+        pytest.fail("required Windows runtime acquisition test executed on a non-Windows host")
+
+    import msvcrt
+
+    executable = _fake_file(tmp_path)
+    events: list[tuple[str, int]] = []
+    original_duplicate = runtime_module._windows_duplicate_native_handle
+    original_open_osfhandle = msvcrt.open_osfhandle
+    claim_fd: int | None = None
+
+    def duplicate(raw_handle: int) -> int:
+        events.append(("duplicate", raw_handle))
+        return original_duplicate(raw_handle)
+
+    def open_osfhandle(raw_handle: int, descriptor_flags: int) -> int:
+        events.append(("open_osfhandle", int(raw_handle)))
+        return original_open_osfhandle(raw_handle, descriptor_flags)
+
+    monkeypatch.setattr(
+        runtime_module,
+        "_windows_duplicate_native_handle",
+        duplicate,
+        raising=False,
+    )
+    monkeypatch.setattr(msvcrt, "open_osfhandle", open_osfhandle)
+    try:
+        claim_fd = runtime_module._windows_open_runtime_claim(executable)
+        assert events[:2] == [
+            ("duplicate", events[0][1]),
+            ("open_osfhandle", events[0][1]),
+        ]
+        assert getattr(claim_fd, "native_handle", None) is not None
+    finally:
+        if claim_fd is not None:
+            native_handle = getattr(claim_fd, "native_handle", None)
+            with contextlib.suppress(OSError):
+                os.close(int(claim_fd))
+            if native_handle is not None:
+                with contextlib.suppress(OSError):
+                    runtime_module._windows_close_native_handle(native_handle)
+
+
+def test_windows_runtime_validation_failure_before_close_retains_exact_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pre-close failure keeps the exact runtime claim for a later retry."""
+
+    if os.name != "nt":
+        pytest.fail("required Windows runtime acquisition test executed on a non-Windows host")
+
+    executable = _fake_file(tmp_path)
+
+    class CompletedProcess:
+        returncode = 0
+
+        def communicate(self, input: bytes, timeout: float) -> tuple[bytes, bytes]:
+            del input, timeout
+            return b"version 4.2.0\n", b""
+
+    monkeypatch.setattr(
+        subprocess,
+        "Popen",
+        lambda command, **kwargs: CompletedProcess(),
+    )
+    diagnostic = probe_febio(executable)
+    opened: list[int] = []
+    original_open = runtime_module._windows_open_runtime_claim
+
+    def capture_open(path: Path) -> int:
+        claim_fd = original_open(path)
+        opened.append(claim_fd)
+        return claim_fd
+
+    monkeypatch.setattr(runtime_module, "_windows_open_runtime_claim", capture_open)
+    monkeypatch.setattr(
+        runtime_module,
+        "_snapshot_from_handle",
+        lambda path, handle: (_ for _ in ()).throw(
+            RuntimeProbeError("synthetic launch validation failure")
+        ),
+    )
+    close_attempts: list[int] = []
+    original_close = os.close
+    fail_close = True
+
+    def fail_before_close(fd: int) -> None:
+        if opened and fd == int(opened[0]) and fail_close:
+            close_attempts.append(fd)
+            raise OSError("synthetic CRT close failed before closing")
+        original_close(fd)
+
+    try:
+        with monkeypatch.context() as close_patch:
+            close_patch.setattr(os, "close", fail_before_close)
+            with pytest.raises(RuntimeProbeError, match="validation"):
+                runtime_module._acquire_runtime_launch_claim(diagnostic)
+
+        assert opened
+        target_fd = int(opened[0])
+        assert close_attempts == [target_fd]
+        durable = getattr(runtime_module, "_RUNTIME_DURABLE_CLAIMS", ())
+        assert any(getattr(claim, "handle", None) == target_fd for claim in durable)
+
+        fail_close = False
+        runtime_module._drain_runtime_claims()
+        with pytest.raises(OSError):
+            os.fstat(target_fd)
+        assert not any(getattr(claim, "handle", None) == target_fd for claim in durable)
+    finally:
+        fail_close = False
+        with contextlib.suppress(BaseException):
+            runtime_module._drain_runtime_claims()
+
+
+def test_windows_runtime_validation_failure_partial_close_retires_reused_slot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A partial CRT close retires a same-file reused slot before guard cleanup."""
+
+    if os.name != "nt":
+        pytest.fail("required Windows runtime acquisition test executed on a non-Windows host")
+
+    executable = _fake_file(tmp_path)
+
+    class CompletedProcess:
+        returncode = 0
+
+        def communicate(self, input: bytes, timeout: float) -> tuple[bytes, bytes]:
+            del input, timeout
+            return b"version 4.2.0\n", b""
+
+    monkeypatch.setattr(
+        subprocess,
+        "Popen",
+        lambda command, **kwargs: CompletedProcess(),
+    )
+    diagnostic = probe_febio(executable)
+    opened: list[int] = []
+    original_open = runtime_module._windows_open_runtime_claim
+
+    def capture_open(path: Path) -> int:
+        claim_fd = original_open(path)
+        opened.append(claim_fd)
+        return claim_fd
+
+    monkeypatch.setattr(runtime_module, "_windows_open_runtime_claim", capture_open)
+    monkeypatch.setattr(
+        runtime_module,
+        "_snapshot_from_handle",
+        lambda path, handle: (_ for _ in ()).throw(
+            RuntimeProbeError("synthetic launch validation failure")
+        ),
+    )
+    events: list[str] = []
+    original_close = os.close
+    original_open_fd = os.open
+    original_close_native = runtime_module._windows_close_native_handle
+    reused_fd: int | None = None
+
+    def partial_close(fd: int) -> None:
+        nonlocal reused_fd
+        if opened and fd == int(opened[0]) and reused_fd is None:
+            events.append("crt")
+            original_close(fd)
+            reused_fd = original_open_fd(
+                os.fspath(executable), os.O_RDONLY | getattr(os, "O_BINARY", 0)
+            )
+            assert reused_fd == fd
+            raise OSError("synthetic CRT close reported failure after retiring the slot")
+        original_close(fd)
+
+    def close_native(native_handle: int) -> None:
+        events.append("native")
+        original_close_native(native_handle)
+
+    monkeypatch.setattr(runtime_module, "_windows_close_native_handle", close_native)
+    try:
+        with monkeypatch.context() as close_patch:
+            close_patch.setattr(os, "close", partial_close)
+            with pytest.raises(RuntimeProbeError, match="validation"):
+                runtime_module._acquire_runtime_launch_claim(diagnostic)
+
+        assert events[:2] == ["crt", "native"]
+        assert reused_fd is not None
+        os.fstat(reused_fd)
+    finally:
+        if reused_fd is not None:
+            with contextlib.suppress(OSError):
+                original_close(reused_fd)
+        with contextlib.suppress(BaseException):
+            runtime_module._drain_runtime_claims()
+
+
+@pytest.mark.parametrize("failure", ["duplicate", "open_osfhandle"])
+def test_windows_runtime_conversion_failure_retains_exact_raw_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    """DuplicateHandle/open_osfhandle failures cannot strand or lose H1/H2 ownership."""
+
+    if os.name != "nt":
+        pytest.fail("required Windows runtime conversion test executed on a non-Windows host")
+
+    import msvcrt
+
+    executable = _fake_file(tmp_path)
+    captured: list[int] = []
+    result: int | None = None
+    original_duplicate = runtime_module._windows_duplicate_native_handle
+
+    def fail_duplicate(raw_handle: int) -> int:
+        captured.append(int(raw_handle))
+        raise OSError("synthetic DuplicateHandle failure")
+
+    def fail_open(raw_handle: int, descriptor_flags: int) -> int:
+        captured.append(int(raw_handle))
+        raise OSError("synthetic open_osfhandle failure")
+
+    def fail_close(native_handle: int) -> None:
+        del native_handle
+        raise OSError("synthetic CloseHandle failure")
+
+    if failure == "duplicate":
+        monkeypatch.setattr(
+            runtime_module,
+            "_windows_duplicate_native_handle",
+            fail_duplicate,
+            raising=False,
+        )
+    else:
+        monkeypatch.setattr(
+            runtime_module,
+            "_windows_duplicate_native_handle",
+            lambda raw_handle: original_duplicate(raw_handle),
+            raising=False,
+        )
+        monkeypatch.setattr(msvcrt, "open_osfhandle", fail_open)
+    monkeypatch.setattr(runtime_module, "_windows_close_native_handle", fail_close)
+
+    try:
+        with pytest.raises(OSError, match="failure"):
+            result = runtime_module._windows_open_runtime_claim(executable)
+        assert captured
+        durable = getattr(runtime_module, "_RUNTIME_DURABLE_CLAIMS", ())
+        assert any(getattr(claim, "raw_handle", None) in captured for claim in durable)
+    finally:
+        if result is not None:
+            with contextlib.suppress(OSError):
+                os.close(result)
+        with contextlib.suppress(BaseException):
+            runtime_module._drain_runtime_claims()
 
 
 def test_probe_rejects_arbitrary_runner_arguments(tmp_path: Path) -> None:

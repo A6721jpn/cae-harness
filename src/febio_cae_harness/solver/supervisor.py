@@ -34,7 +34,18 @@ from .fbs import (
 )
 from .log import LogValidation, LogValidator, validate_log
 from .process_authority import ProcessAuthority, ProcessAuthorityError
-from .runtime import RuntimeProbeError, _acquire_runtime_launch_claim, _RuntimeLaunchClaim
+from .runtime import (
+    RuntimeProbeError,
+    _acquire_runtime_launch_claim,
+    _drain_runtime_claims,
+    _RuntimeLaunchClaim,
+    _windows_close_native_handle,
+    _windows_close_owned_fd,
+    _windows_convert_raw_handle,
+    _windows_duplicate_fd_handle,  # noqa: F401
+    _windows_duplicate_native_handle,
+    _windows_fd_identity_matches,
+)
 from .types import (
     OutputFreshnessError,
     SolverClassification,
@@ -87,8 +98,49 @@ _WINDOWS_FILE_ATTRIBUTE_NORMAL = 0x00000080
 _WINDOWS_FILE_DISPOSITION_INFO = 4
 _POSIX_AT_EMPTY_PATH = 0x1000
 _POSIX_RENAME_EXCHANGE = 0x2
-_WINDOWS_RECORD_CLAIMS: dict[str, list[tuple[int, int, int]]] = {}
+
+
+class _WindowsRecordClaimEntry(tuple[int, int, int]):
+    """Tuple-compatible registry entry carrying a stable native identity."""
+
+    native_handle: int | None
+
+    def __new__(
+        cls,
+        fd: int,
+        device: int,
+        inode: int,
+        native_handle: int | None = None,
+    ) -> _WindowsRecordClaimEntry:
+        entry = tuple.__new__(cls, (fd, device, inode))
+        entry.native_handle = native_handle
+        return entry
+
+
+class _WindowsProbeFd(int):
+    """Int-compatible read-only probe retaining an independent native handle."""
+
+    handle: int | None
+    native_handle: int | None
+    path: Path
+
+    def __new__(
+        cls,
+        fd: int,
+        path: Path,
+        native_handle: int | None,
+    ) -> _WindowsProbeFd:
+        probe = int.__new__(cls, fd)
+        probe.handle = fd
+        probe.native_handle = native_handle
+        probe.path = path
+        return probe
+
+
+_WINDOWS_RECORD_CLAIMS: dict[str, list[_WindowsRecordClaimEntry]] = {}
 _WINDOWS_RECORD_CLAIMS_LOCK = threading.RLock()
+_WINDOWS_PROBE_CLAIMS: list[_WindowsProbeFd] = []
+_WINDOWS_PROBE_CLAIMS_LOCK = threading.RLock()
 
 
 def _same_file_identity(left: os.stat_result, right: os.stat_result) -> bool:
@@ -141,14 +193,12 @@ def _windows_open_process_record_handle(
         if error in {2, 3}:  # ERROR_FILE_NOT_FOUND / ERROR_PATH_NOT_FOUND
             raise FileNotFoundError(error, "process record does not exist", os.fspath(path))
         raise OSError(error, f"unable to open process record: {path}")
-    import msvcrt
-
-    try:
-        return int(msvcrt.open_osfhandle(value, descriptor_flags | getattr(os, "O_BINARY", 0)))
-    except BaseException:
-        with contextlib.suppress(BaseException):
-            kernel32.CloseHandle(value)
-        raise
+    return _windows_convert_raw_handle(
+        value,
+        descriptor_flags,
+        duplicate_native_handle=_windows_duplicate_native_handle,
+        close_native_handle=_windows_close_native_handle,
+    )
 
 
 def _windows_open_process_record(
@@ -182,11 +232,18 @@ def _windows_record_claim_key(path: Path) -> str:
     return os.path.normcase(os.path.abspath(os.fspath(path)))
 
 
-def _windows_register_record_claim(path: Path, fd: int, device: int, inode: int) -> None:
+def _windows_register_record_claim(
+    path: Path,
+    fd: int,
+    device: int,
+    inode: int,
+    *,
+    native_handle: int | None = None,
+) -> None:
     key = _windows_record_claim_key(path)
     with _WINDOWS_RECORD_CLAIMS_LOCK:
         entries = _WINDOWS_RECORD_CLAIMS.setdefault(key, [])
-        entry = (fd, device, inode)
+        entry = _WindowsRecordClaimEntry(fd, device, inode, native_handle)
         if entry not in entries:
             entries.append(entry)
 
@@ -197,13 +254,16 @@ def _windows_unregister_record_claim(
     *,
     device: int | None = None,
     inode: int | None = None,
+    native_handle: int | None = None,
 ) -> None:
     key = _windows_record_claim_key(path)
     with _WINDOWS_RECORD_CLAIMS_LOCK:
         entries = _WINDOWS_RECORD_CLAIMS.get(key)
         if not entries:
             return
-        if device is None or inode is None:
+        if native_handle is not None:
+            retained = [entry for entry in entries if entry.native_handle != native_handle]
+        elif device is None or inode is None:
             retained = [entry for entry in entries if entry[0] != fd]
         else:
             target = (fd, device, inode)
@@ -228,44 +288,58 @@ def _windows_duplicate_record_claim(path: Path) -> int | None:
         entries = _WINDOWS_RECORD_CLAIMS.get(key)
         if not entries:
             return None
-        retained: list[tuple[int, int, int]] = []
-        for index, (fd, device, inode) in enumerate(entries):
-            try:
-                metadata = os.fstat(fd)
-            except OSError:
+        retained: list[_WindowsRecordClaimEntry] = []
+        for index, entry in enumerate(entries):
+            fd, device, inode = entry
+            native_handle = entry.native_handle
+            if native_handle is None:
+                retained.append(entry)
                 continue
-            if int(metadata.st_dev) != device or int(metadata.st_ino) != inode:
+            entry_matches = _windows_fd_identity_matches(fd, native_handle)
+            if entry_matches is False:
+                try:
+                    _windows_close_native_handle(native_handle)
+                except BaseException:
+                    retained.append(entry)
                 continue
-            probe_fd: int | None = None
+            if entry_matches is None:
+                retained.append(entry)
+                continue
+            probe_fd: _WindowsProbeFd | None = None
             try:
                 probe_fd = _windows_probe_process_record(path)
                 probe_metadata = os.fstat(probe_fd)
                 if int(probe_metadata.st_dev) != device or int(probe_metadata.st_ino) != inode:
-                    retained.append((fd, device, inode))
+                    retained.append(entry)
                     continue
-                try:
-                    duplicate = os.dup(fd)
-                except OSError:
-                    retained.append((fd, device, inode))
-                    continue
-                retained.append((fd, device, inode))
+                raw_duplicate = _windows_duplicate_native_handle(native_handle)
+                duplicate = _windows_convert_raw_handle(
+                    raw_duplicate,
+                    os.O_RDWR,
+                    duplicate_native_handle=_windows_duplicate_native_handle,
+                    close_native_handle=_windows_close_native_handle,
+                )
+                retained.append(entry)
                 retained.extend(entries[index + 1 :])
                 _WINDOWS_RECORD_CLAIMS[key] = retained
                 return duplicate
-            except OSError:
-                retained.append((fd, device, inode))
+            except FileNotFoundError:
+                retained.append(entry)
+            except BaseException:
+                _WINDOWS_RECORD_CLAIMS[key] = retained + entries[index:]
+                raise
             finally:
                 if probe_fd is not None:
-                    with contextlib.suppress(OSError):
-                        os.close(probe_fd)
+                    with contextlib.suppress(BaseException):
+                        _close_windows_probe(probe_fd)
         _WINDOWS_RECORD_CLAIMS[key] = retained
         return None
 
 
-def _windows_probe_process_record(path: Path) -> int:
+def _windows_probe_process_record(path: Path) -> _WindowsProbeFd:
     """Open a read-only path probe without acquiring record mutation authority."""
 
-    return _windows_open_process_record_handle(
+    fd = _windows_open_process_record_handle(
         path,
         create=False,
         desired_access=_WINDOWS_GENERIC_READ,
@@ -274,6 +348,46 @@ def _windows_probe_process_record(path: Path) -> int:
         ),
         descriptor_flags=os.O_RDONLY,
     )
+    native_handle = getattr(fd, "native_handle", None)
+    if native_handle is None:
+        with contextlib.suppress(BaseException):
+            os.close(int(fd))
+        raise SolverOwnershipError("read-only process-record probe has no exact native guard")
+    return _WindowsProbeFd(int(fd), path, native_handle)
+
+
+def _retain_windows_probe(probe: _WindowsProbeFd) -> None:
+    with _WINDOWS_PROBE_CLAIMS_LOCK:
+        if (probe.handle is not None or probe.native_handle is not None) and not any(
+            held is probe for held in _WINDOWS_PROBE_CLAIMS
+        ):
+            _WINDOWS_PROBE_CLAIMS.append(probe)
+
+
+def _discard_windows_probe(probe: _WindowsProbeFd) -> None:
+    with _WINDOWS_PROBE_CLAIMS_LOCK:
+        _WINDOWS_PROBE_CLAIMS[:] = [held for held in _WINDOWS_PROBE_CLAIMS if held is not probe]
+
+
+def _close_windows_probe(probe: int | _WindowsProbeFd) -> None:
+    if not isinstance(probe, _WindowsProbeFd):
+        os.close(probe)
+        return
+    try:
+        _windows_close_owned_fd(probe, "handle", "native_handle")
+    except BaseException:
+        _retain_windows_probe(probe)
+        raise
+    _discard_windows_probe(probe)
+
+
+def _drain_windows_probe_claims() -> None:
+    with _WINDOWS_PROBE_CLAIMS_LOCK:
+        for probe in tuple(_WINDOWS_PROBE_CLAIMS):
+            try:
+                _close_windows_probe(probe)
+            except BaseException:
+                continue
 
 
 def _write_record_fd(fd: int, content: bytes) -> None:
@@ -769,6 +883,8 @@ class _ProcessRecordClaim:
     handle: int | None = None
     parent_fd: int | None = None
     name: str = _PROCESS_RECORD_NAME
+    native_handle: int | None = None
+    parent_native_handle: int | None = None
 
 
 class _DurableClaimCleanup:
@@ -796,7 +912,7 @@ class _DurableClaimCleanup:
         with self._lock:
             if (
                 runtime_claim is not None
-                and runtime_claim.handle is not None
+                and (runtime_claim.handle is not None or runtime_claim.native_handle is not None)
                 and not any(held is runtime_claim for held in self._runtime_claims)
             ):
                 self._runtime_claims.append(runtime_claim)
@@ -806,64 +922,90 @@ class _DurableClaimCleanup:
             ):
                 if candidate is None:
                     continue
-                if candidate.handle is None and candidate.parent_fd is None:
+                if (
+                    candidate.handle is None
+                    and candidate.parent_fd is None
+                    and candidate.native_handle is None
+                    and candidate.parent_native_handle is None
+                ):
                     continue
                 if not any(held is candidate for held in self._process_record_claims):
                     self._process_record_claims.append(candidate)
 
     def _drain_runtime_claims(self) -> None:
         for claim in tuple(self._runtime_claims):
-            if claim.handle is None:
+            if claim.handle is None and claim.native_handle is None:
                 self._discard_identity(self._runtime_claims, claim)
                 continue
             try:
                 claim.close()
             except BaseException:
                 continue
-            if claim.handle is None:
+            if claim.handle is None and claim.native_handle is None:
                 self._discard_identity(self._runtime_claims, claim)
 
     @staticmethod
     def _close_record_claim_descriptors(claim: _ProcessRecordClaim) -> None:
-        for attribute in ("handle", "parent_fd"):
+        for attribute, native_attribute in (
+            ("handle", "native_handle"),
+            ("parent_fd", "parent_native_handle"),
+        ):
             fd = getattr(claim, attribute)
-            if fd is None:
+            native_handle = getattr(claim, native_attribute)
+            if fd is None and native_handle is None:
+                continue
+            if _NATIVE_WINDOWS:
+                try:
+                    if attribute == "handle":
+                        with _WINDOWS_RECORD_CLAIMS_LOCK:
+                            old_fd = claim.handle
+                            old_native = claim.native_handle
+                            _windows_close_owned_fd(claim, attribute, native_attribute)
+                            _windows_unregister_record_claim(
+                                claim.path,
+                                old_fd if old_fd is not None else -1,
+                                device=claim.device,
+                                inode=claim.inode,
+                                native_handle=old_native,
+                            )
+                    else:
+                        _windows_close_owned_fd(claim, attribute, native_attribute)
+                except BaseException:
+                    continue
                 continue
             try:
-                if attribute == "handle" and _NATIVE_WINDOWS:
-                    # Keep the registry entry in place until this exact handle
-                    # is confirmed closed, while preventing fd reuse from
-                    # interleaving with the close/unregister pair.
-                    with _WINDOWS_RECORD_CLAIMS_LOCK:
-                        os.close(fd)
-                        setattr(claim, attribute, None)
-                        _windows_unregister_record_claim(
-                            claim.path,
-                            fd,
-                            device=claim.device,
-                            inode=claim.inode,
-                        )
-                else:
-                    os.close(fd)
-                    setattr(claim, attribute, None)
+                os.close(fd)
+                setattr(claim, attribute, None)
             except BaseException:
                 continue
 
     def _drain_process_record_claims(self) -> None:
         for claim in tuple(self._process_record_claims):
-            if claim.handle is None and claim.parent_fd is None:
+            if (
+                claim.handle is None
+                and claim.parent_fd is None
+                and claim.native_handle is None
+                and claim.parent_native_handle is None
+            ):
                 self._discard_identity(self._process_record_claims, claim)
                 continue
             self._close_record_claim_descriptors(claim)
-            if claim.handle is None and claim.parent_fd is None:
+            if (
+                claim.handle is None
+                and claim.parent_fd is None
+                and claim.native_handle is None
+                and claim.parent_native_handle is None
+            ):
                 self._discard_identity(self._process_record_claims, claim)
 
     def drain(self) -> None:
         """Retry exact descriptor closes; persistent failures remain owned."""
 
         with self._lock:
+            _drain_runtime_claims()
             self._drain_runtime_claims()
             self._drain_process_record_claims()
+            _drain_windows_probe_claims()
 
 
 _DURABLE_CLAIM_CLEANUP = _DurableClaimCleanup()
@@ -1340,19 +1482,36 @@ class SolverSupervisor:
     ) -> tuple[BaseException, ...]:
         failures: list[BaseException] = []
         if claim is not None:
-            for attribute in ("handle", "parent_fd"):
+            for attribute, native_attribute in (
+                ("handle", "native_handle"),
+                ("parent_fd", "parent_native_handle"),
+            ):
                 fd = getattr(claim, attribute)
-                if fd is not None:
+                native_handle = getattr(claim, native_attribute)
+                if fd is not None or native_handle is not None:
                     try:
-                        if attribute == "handle" and _NATIVE_WINDOWS:
-                            with _WINDOWS_RECORD_CLAIMS_LOCK:
-                                os.close(fd)
-                                setattr(claim, attribute, None)
-                                _windows_unregister_record_claim(
-                                    claim.path,
-                                    fd,
-                                    device=claim.device,
-                                    inode=claim.inode,
+                        if _NATIVE_WINDOWS:
+                            if attribute == "handle":
+                                with _WINDOWS_RECORD_CLAIMS_LOCK:
+                                    old_fd = claim.handle
+                                    old_native = claim.native_handle
+                                    _windows_close_owned_fd(
+                                        claim,
+                                        attribute,
+                                        native_attribute,
+                                    )
+                                    _windows_unregister_record_claim(
+                                        claim.path,
+                                        old_fd if old_fd is not None else -1,
+                                        device=claim.device,
+                                        inode=claim.inode,
+                                        native_handle=old_native,
+                                    )
+                            else:
+                                _windows_close_owned_fd(
+                                    claim,
+                                    attribute,
+                                    native_attribute,
                                 )
                         else:
                             os.close(fd)
@@ -1361,7 +1520,12 @@ class SolverSupervisor:
                     else:
                         if getattr(claim, attribute) == fd:
                             setattr(claim, attribute, None)
-            if claim.handle is None and claim.parent_fd is None:
+            if (
+                claim.handle is None
+                and claim.parent_fd is None
+                and claim.native_handle is None
+                and claim.parent_native_handle is None
+            ):
                 self._process_record_candidates[:] = [
                     candidate
                     for candidate in self._process_record_candidates
@@ -1393,11 +1557,17 @@ class SolverSupervisor:
                 failures.append(error)
         claim = self._process_record_claim
         failures.extend(self._release_process_record_claim(claim))
-        if claim is None or (claim.handle is None and claim.parent_fd is None):
+        if claim is None or (
+            claim.handle is None
+            and claim.parent_fd is None
+            and claim.native_handle is None
+            and claim.parent_native_handle is None
+        ):
             self._process_record_claim = None
         for candidate in tuple(self._process_record_candidates):
             failures.extend(self._release_process_record_claim(candidate))
         failures.extend(self._release_runtime_launch_claim())
+        _drain_runtime_claims()
         if failures:
             raise SolverOwnershipError("authority handles could not be closed") from failures[0]
 
@@ -1555,6 +1725,18 @@ class SolverSupervisor:
         if claim.handle is None:
             return False
         try:
+            if _NATIVE_WINDOWS:
+                if claim.native_handle is None:
+                    raise SolverOwnershipError("owned process record has no exact native guard")
+                exact_match = _windows_fd_identity_matches(
+                    claim.handle,
+                    claim.native_handle,
+                )
+                if exact_match is None:
+                    raise SolverOwnershipError("unable to verify Windows CRT descriptor identity")
+                if not exact_match:
+                    claim.handle = None
+                    return False
             handle_metadata = os.fstat(claim.handle)
             if (
                 not stat.S_ISREG(handle_metadata.st_mode)
@@ -1577,8 +1759,8 @@ class SolverSupervisor:
                 try:
                     return _same_file_identity(handle_metadata, os.fstat(path_fd))
                 finally:
-                    with contextlib.suppress(OSError):
-                        os.close(path_fd)
+                    with contextlib.suppress(BaseException):
+                        _close_windows_probe(path_fd)
             return True
         except FileNotFoundError:
             return False
@@ -2178,28 +2360,44 @@ class SolverSupervisor:
         """Retain a newly opened record descriptor before fallible use."""
 
         path = Path(os.fspath(path))
+        handle_value = int(handle)
+        native_handle = getattr(handle, "native_handle", None)
+        parent_native_handle = getattr(parent_fd, "native_handle", None)
         candidate = _ProcessRecordClaim(
             path=path,
             content=b"",
             device=0,
             inode=0,
             state=None,
-            handle=handle,
-            parent_fd=parent_fd,
+            handle=handle_value,
+            parent_fd=None if parent_fd is None else int(parent_fd),
             name=self.process_record_path.name,
+            native_handle=native_handle,
+            parent_native_handle=parent_native_handle,
         )
         self._process_record_candidates.append(candidate)
-        metadata = os.fstat(handle)
-        if not stat.S_ISREG(metadata.st_mode):
-            raise OSError("process record is not a regular file")
+        try:
+            if _NATIVE_WINDOWS and native_handle is None:
+                raise SolverOwnershipError("process record descriptor has no exact native guard")
+            metadata = os.fstat(handle_value)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise OSError("process record is not a regular file")
+        except BaseException:
+            failures = self._release_process_record_claim(candidate)
+            if failures:
+                raise SolverOwnershipError(
+                    "process record acquisition cleanup failed"
+                ) from failures[0]
+            raise
         candidate.device = int(metadata.st_dev)
         candidate.inode = int(metadata.st_ino)
         if _NATIVE_WINDOWS:
             _windows_register_record_claim(
                 path,
-                handle,
+                handle_value,
                 candidate.device,
                 candidate.inode,
+                native_handle=native_handle,
             )
         return candidate
 
@@ -2225,6 +2423,8 @@ class SolverSupervisor:
                 release_failures
                 or previous_claim.handle is not None
                 or previous_claim.parent_fd is not None
+                or previous_claim.native_handle is not None
+                or previous_claim.parent_native_handle is not None
             ):
                 raise SolverOwnershipError(
                     "previous process record handle could not be closed"
@@ -2276,9 +2476,22 @@ class SolverSupervisor:
             )
         probe_fd = _windows_probe_process_record(claim.path)
         try:
+            if claim.native_handle is None:
+                raise SolverOwnershipError("owned process record has no exact native guard")
+            exact_match = _windows_fd_identity_matches(claim.handle, claim.native_handle)
+            if exact_match is None:
+                raise SolverOwnershipError("unable to verify Windows CRT descriptor identity")
+            if not exact_match:
+                claim.handle = None
+                raise SolverOwnershipError("owned process record was replaced")
+            if not _same_file_identity(
+                os.fstat(claim.handle),
+                os.fstat(probe_fd),
+            ):
+                raise SolverOwnershipError("owned process record was replaced")
             content = _read_record_fd(probe_fd)
         finally:
-            os.close(probe_fd)
+            _close_windows_probe(probe_fd)
         return content.decode(selected_encoding, selected_errors)
 
     def _write_process_record_text(
@@ -2308,6 +2521,8 @@ class SolverSupervisor:
             handle=claim.handle,
             parent_fd=claim.parent_fd,
             name=claim.name,
+            native_handle=claim.native_handle,
+            parent_native_handle=claim.parent_native_handle,
         )
         return len(data)
 
@@ -2360,6 +2575,8 @@ class SolverSupervisor:
                     handle=claim.handle,
                     parent_fd=claim.parent_fd,
                     name=claim.name,
+                    native_handle=claim.native_handle,
+                    parent_native_handle=claim.parent_native_handle,
                 )
                 return
             if os.name == "posix":

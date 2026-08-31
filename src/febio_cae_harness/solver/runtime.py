@@ -2,17 +2,21 @@
 
 from __future__ import annotations
 
+import atexit
 import ctypes
+import errno
 import hashlib
 import math
 import os
 import re
 import stat
 import subprocess
+import threading
+from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final
+from typing import Any, Final, cast
 
 __all__ = [
     "FebioRuntimeDiagnostic",
@@ -33,6 +37,10 @@ _WINDOWS_FILE_SHARE_READ: Final[int] = 0x00000001
 _WINDOWS_OPEN_EXISTING: Final[int] = 3
 _WINDOWS_FILE_ATTRIBUTE_NORMAL: Final[int] = 0x00000080
 _WINDOWS_INVALID_HANDLE_VALUE: Final[int | None] = ctypes.c_void_p(-1).value
+_WINDOWS_DUPLICATE_SAME_ACCESS: Final[int] = 0x00000002
+_WINDOWS_ERROR_INVALID_HANDLE: Final[int] = 6
+_WINDOWS_ERROR_NOT_SAME_OBJECT: Final[int] = 1656
+_WINDOWS_FD_CLOSE_LOCK = threading.RLock()
 
 
 class RuntimeProbeError(RuntimeError):
@@ -101,6 +109,8 @@ class _RuntimeLaunchClaim:
     path: Path
     snapshot: _FileSnapshot
     handle: int | None
+    native_handle: int | None = None
+    raw_handle: int | None = None
 
     def authenticate(self, executable_path: str | Path) -> None:
         if _normalise_path(executable_path) != _normalise_path(self.path):
@@ -112,6 +122,19 @@ class _RuntimeLaunchClaim:
             raise RuntimeProbeError("runtime executable digest or identity changed before resume")
 
     def close(self) -> None:
+        if self.raw_handle is not None:
+            raw_handle = self.raw_handle
+            _windows_close_native_handle(raw_handle)
+            if self.raw_handle == raw_handle:
+                self.raw_handle = None
+        if self.handle is None and self.native_handle is None:
+            return
+        if os.name == "nt" and self.native_handle is not None:
+            try:
+                _windows_close_owned_fd(self, "handle", "native_handle")
+            except BaseException as error:
+                raise RuntimeProbeError("runtime executable claim could not be closed") from error
+            return
         handle = self.handle
         if handle is None:
             return
@@ -123,6 +146,302 @@ class _RuntimeLaunchClaim:
 
 
 _RUNTIME_REGISTRY: dict[int, _RuntimeIssuance] = {}
+
+
+class _WindowsOwnedFd(int):
+    """An int-compatible CRT descriptor paired with its exact native guard."""
+
+    handle: int
+    native_handle: int
+
+    def __new__(cls, handle: int, native_handle: int) -> _WindowsOwnedFd:
+        owned = int.__new__(cls, handle)
+        owned.handle = handle
+        owned.native_handle = native_handle
+        return owned
+
+
+@dataclass(slots=True)
+class _WindowsHandleOwner:
+    """Durable owner while a raw handle is being converted to a CRT descriptor."""
+
+    raw_handle: int | None = None
+    handle: int | None = None
+    native_handle: int | None = None
+    close_native_handle: Callable[[int], None] | None = None
+
+    def close(self) -> None:
+        close_native = self.close_native_handle or _windows_close_native_handle
+        if self.raw_handle is not None:
+            raw_handle = self.raw_handle
+            close_native(raw_handle)
+            if self.raw_handle == raw_handle:
+                self.raw_handle = None
+        if self.handle is not None or self.native_handle is not None:
+            _windows_close_owned_fd(
+                self,
+                "handle",
+                "native_handle",
+                close_native_handle=close_native,
+            )
+
+
+_RUNTIME_DURABLE_CLAIMS: list[object] = []
+
+
+def _claim_has_owned_handles(claim: object) -> bool:
+    return any(
+        getattr(claim, attribute, None) is not None
+        for attribute in ("raw_handle", "handle", "native_handle")
+    )
+
+
+def _retain_runtime_claim(claim: object) -> None:
+    if _claim_has_owned_handles(claim) and not any(
+        held is claim for held in _RUNTIME_DURABLE_CLAIMS
+    ):
+        _RUNTIME_DURABLE_CLAIMS.append(claim)
+
+
+def _discard_runtime_claim(claim: object) -> None:
+    _RUNTIME_DURABLE_CLAIMS[:] = [held for held in _RUNTIME_DURABLE_CLAIMS if held is not claim]
+
+
+def _windows_raw_handle(value: object) -> int:
+    raw_value = value.value if isinstance(value, ctypes.c_void_p) else value
+    try:
+        handle = 0 if raw_value is None else int(cast(Any, raw_value))
+    except (TypeError, ValueError, OverflowError):
+        handle = 0
+    if not handle or handle in {-1, _WINDOWS_INVALID_HANDLE_VALUE}:
+        raise OSError(errno.EBADF, "Windows handle is unavailable")
+    return handle
+
+
+def _windows_native_handle_for_fd(fd: int) -> int:
+    import msvcrt
+
+    try:
+        return _windows_raw_handle(msvcrt.get_osfhandle(fd))
+    except OSError:
+        raise
+    except BaseException as error:
+        raise OSError("Windows CRT descriptor is unavailable") from error
+
+
+def _windows_duplicate_native_handle(native_handle: int) -> int:
+    """Duplicate one native handle into an independently owned native handle."""
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+    kernel32.DuplicateHandle.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_uint32,
+        ctypes.c_int,
+        ctypes.c_uint32,
+    ]
+    kernel32.DuplicateHandle.restype = ctypes.c_int
+    source_process = kernel32.GetCurrentProcess()
+    duplicate = ctypes.c_void_p()
+    ctypes.set_last_error(0)
+    if not kernel32.DuplicateHandle(
+        source_process,
+        ctypes.c_void_p(native_handle),
+        source_process,
+        ctypes.byref(duplicate),
+        0,
+        0,
+        _WINDOWS_DUPLICATE_SAME_ACCESS,
+    ):
+        error = ctypes.get_last_error()
+        raise OSError(error, "unable to duplicate Windows file handle")
+    try:
+        return _windows_raw_handle(duplicate)
+    except BaseException:
+        with suppress(BaseException):
+            kernel32.CloseHandle(duplicate)
+        raise
+
+
+def _windows_duplicate_fd_handle(fd: int) -> int:
+    """Duplicate a CRT descriptor into an independently owned native handle."""
+
+    return _windows_duplicate_native_handle(_windows_native_handle_for_fd(fd))
+
+
+def _windows_close_native_handle(native_handle: int) -> None:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_int
+    ctypes.set_last_error(0)
+    if not kernel32.CloseHandle(ctypes.c_void_p(native_handle)):
+        error = ctypes.get_last_error()
+        raise OSError(error, "unable to close Windows file handle")
+
+
+def _windows_compare_object_handles(first_handle: int, second_handle: int) -> bool | None:
+    """Compare native handles as kernel objects, failing closed if unavailable."""
+
+    compare = None
+    for library_name in ("kernel32", "kernelbase"):
+        try:
+            library = ctypes.WinDLL(library_name, use_last_error=True)
+            compare = library.CompareObjectHandles
+        except (AttributeError, OSError):
+            continue
+        break
+    if compare is None:
+        return None
+    try:
+        compare.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        compare.restype = ctypes.c_int
+        ctypes.set_last_error(0)
+        result = compare(
+            ctypes.c_void_p(first_handle),
+            ctypes.c_void_p(second_handle),
+        )
+        if result:
+            return True
+        error = ctypes.get_last_error()
+        if error in {_WINDOWS_ERROR_NOT_SAME_OBJECT, _WINDOWS_ERROR_INVALID_HANDLE}:
+            return False
+        return None
+    except BaseException:
+        return None
+
+
+def _windows_fd_identity_matches(fd: int, native_handle: int) -> bool | None:
+    """Return false for a retired/reused CRT slot and None for uncertainty."""
+
+    try:
+        current_native = _windows_native_handle_for_fd(fd)
+    except OSError as error:
+        if getattr(error, "winerror", None) == 6 or getattr(error, "errno", None) in {9}:
+            return False
+        return None
+    try:
+        return _windows_compare_object_handles(current_native, native_handle)
+    except BaseException:
+        return None
+
+
+def _windows_close_owned_fd(
+    owner: object,
+    fd_attribute: str,
+    native_attribute: str,
+    *,
+    close_native_handle: Callable[[int], None] | None = None,
+) -> None:
+    """Close an owned CRT slot only while its native object identity is proven."""
+
+    close_native = close_native_handle or _windows_close_native_handle
+    with _WINDOWS_FD_CLOSE_LOCK:
+        fd = getattr(owner, fd_attribute)
+        native_handle = getattr(owner, native_attribute)
+        if fd is None and native_handle is None:
+            return
+        if native_handle is None:
+            if os.name == "nt":
+                raise OSError("Windows CRT descriptor has no exact native guard")
+            if fd is None:
+                return
+            os.close(fd)
+            setattr(owner, fd_attribute, None)
+            return
+        if fd is None:
+            close_native(native_handle)
+            setattr(owner, native_attribute, None)
+            return
+
+        identity_matches = _windows_fd_identity_matches(fd, native_handle)
+        if identity_matches is None:
+            raise OSError("unable to verify Windows CRT descriptor identity")
+        if not identity_matches:
+            setattr(owner, fd_attribute, None)
+            close_native(native_handle)
+            setattr(owner, native_attribute, None)
+            return
+
+        try:
+            os.close(fd)
+        except BaseException:
+            after_close = _windows_fd_identity_matches(fd, native_handle)
+            if after_close is not False:
+                raise
+            setattr(owner, fd_attribute, None)
+            try:
+                close_native(native_handle)
+            except BaseException:
+                raise
+            setattr(owner, native_attribute, None)
+            return
+
+        setattr(owner, fd_attribute, None)
+        close_native(native_handle)
+        setattr(owner, native_attribute, None)
+
+
+def _windows_convert_raw_handle(
+    raw_handle: int,
+    descriptor_flags: int,
+    *,
+    duplicate_native_handle: Callable[[int], int] | None = None,
+    close_native_handle: Callable[[int], None] | None = None,
+) -> _WindowsOwnedFd:
+    """Guard raw H1 as H2 before transferring H1 into the CRT descriptor table."""
+
+    owner = _WindowsHandleOwner(
+        raw_handle=raw_handle,
+        close_native_handle=close_native_handle,
+    )
+    _retain_runtime_claim(owner)
+    duplicate_native = duplicate_native_handle or _windows_duplicate_native_handle
+    try:
+        guard = duplicate_native(raw_handle)
+        owner.native_handle = guard
+        import msvcrt
+
+        opened = msvcrt.open_osfhandle(
+            raw_handle,
+            descriptor_flags | getattr(os, "O_BINARY", 0),
+        )
+        owner.handle = int(opened)
+        owner.raw_handle = None
+        result = _WindowsOwnedFd(owner.handle, guard)
+    except BaseException:
+        try:
+            owner.close()
+        except BaseException:
+            _retain_runtime_claim(owner)
+        else:
+            _discard_runtime_claim(owner)
+        raise
+    _discard_runtime_claim(owner)
+    return result
+
+
+def _drain_runtime_claims(
+    claims: list[object] = _RUNTIME_DURABLE_CLAIMS,
+) -> None:
+    """Retry only exact module-owned conversion and validation claims."""
+
+    for claim in tuple(claims):
+        if not _claim_has_owned_handles(claim):
+            _discard_runtime_claim(claim)
+            continue
+        try:
+            close = cast(Any, claim).close
+            close()
+        except BaseException:
+            continue
+        if not _claim_has_owned_handles(claim):
+            _discard_runtime_claim(claim)
+
+
+atexit.register(_drain_runtime_claims)
 
 
 def _absolute_path(value: str | Path) -> Path:
@@ -247,16 +566,8 @@ def _windows_open_runtime_claim(path: Path) -> int:
     if not value or value in {-1, _WINDOWS_INVALID_HANDLE_VALUE}:
         error = ctypes.get_last_error()
         raise RuntimeProbeError(f"unable to hold FEBio executable identity: {path} ({error})")
-    import msvcrt
-
-    try:
-        descriptor_flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
-        descriptor_flags |= getattr(os, "O_NOINHERIT", 0)
-        return int(msvcrt.open_osfhandle(value, descriptor_flags))
-    except BaseException:
-        with suppress(BaseException):
-            kernel32.CloseHandle(value)
-        raise
+    descriptor_flags = os.O_RDONLY | getattr(os, "O_NOINHERIT", 0)
+    return _windows_convert_raw_handle(value, descriptor_flags)
 
 
 def _validate_timeout(timeout_seconds: float) -> float:
@@ -391,16 +702,25 @@ def _acquire_runtime_launch_claim(value: object) -> _RuntimeLaunchClaim:
     if os.name != "nt" or not hasattr(ctypes, "WinDLL"):
         return _RuntimeLaunchClaim(issuance.path, issuance.after, None)
 
-    handle = _windows_open_runtime_claim(issuance.path)
+    opened = _windows_open_runtime_claim(issuance.path)
+    handle = int(opened)
+    native_handle = getattr(opened, "native_handle", None)
+    if native_handle is None:
+        raise RuntimeProbeError("runtime executable claim has no exact native guard")
+    claim = _RuntimeLaunchClaim(issuance.path, issuance.after, handle, native_handle)
     try:
         current = _snapshot_from_handle(issuance.path, handle)
         if current != issuance.after:
             raise RuntimeProbeError("runtime executable changed before process creation")
     except BaseException:
-        with suppress(OSError):
-            os.close(handle)
+        try:
+            claim.close()
+        except BaseException:
+            _retain_runtime_claim(claim)
+        else:
+            _discard_runtime_claim(claim)
         raise
-    return _RuntimeLaunchClaim(issuance.path, issuance.after, handle)
+    return claim
 
 
 probe_runtime = probe_febio

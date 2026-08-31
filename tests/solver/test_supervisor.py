@@ -565,7 +565,11 @@ def test_windows_active_supervisor_finalizer_releases_process_record_lease(
             assert supervisor_module._read_record_fd(reconnect_fd) == record_content
             supervisor_module._windows_delete_process_record(reconnect_fd)
         finally:
-            os.close(reconnect_fd)
+            supervisor_module._windows_close_owned_fd(
+                reconnect_fd,
+                "handle",
+                "native_handle",
+            )
         assert not record_path.exists()
     finally:
         close_failures = False
@@ -2326,3 +2330,560 @@ def test_failed_start_cleanup_errors_propagate_and_roll_back_owned_state(
     assert events.index("terminate") < events.index("terminate-force")
     assert events.index("terminate-force") < events.index("drain")
     assert events.index("drain") < events.index("close")
+
+
+def test_windows_current_record_partial_close_retires_reused_descriptor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A partial close of the current claim cannot close a reused CRT descriptor."""
+
+    if os.name != "nt":
+        pytest.fail("required Windows record claim test executed on a non-Windows host")
+
+    capability = _capability(tmp_path, monkeypatch, code="import time; time.sleep(30)")
+    supervisor = SolverSupervisor(capability)
+    supervisor.start()
+    process = supervisor._process
+    claim = supervisor._process_record_claim
+    assert process is not None
+    assert claim is not None and claim.handle is not None
+    record_path = Path(os.fspath(supervisor.process_record_path))
+    record_content = supervisor_module._read_record_fd(claim.handle)
+    record_key = supervisor_module._windows_record_claim_key(record_path)
+    target_fd = claim.handle
+    original_close = os.close
+    original_open = os.open
+    unrelated_path = tmp_path / "unrelated-current.bin"
+    unrelated_fd: int | None = None
+
+    def partial_close(fd: int) -> None:
+        nonlocal unrelated_fd
+        if fd == target_fd and unrelated_fd is None:
+            original_close(fd)
+            unrelated_fd = original_open(os.fspath(unrelated_path), os.O_RDWR | os.O_CREAT, 0o600)
+            if unrelated_fd != target_fd:
+                duplicated = os.dup2(unrelated_fd, target_fd)
+                original_close(unrelated_fd)
+                unrelated_fd = duplicated
+            assert unrelated_fd == target_fd
+            raise OSError("synthetic close reported failure after retiring the CRT descriptor")
+        original_close(fd)
+
+    try:
+        with monkeypatch.context() as close_patch:
+            close_patch.setattr(os, "close", partial_close)
+            with contextlib.suppress(SolverOwnershipError):
+                supervisor._close_filesystem_authority()
+
+        assert claim.handle is None
+        assert supervisor._process_record_claim is None
+        assert record_key not in supervisor_module._WINDOWS_RECORD_CLAIMS
+        assert record_path.read_bytes() == record_content
+        assert unrelated_fd is not None
+
+        supervisor._close_filesystem_authority()
+        supervisor_module._drain_durable_cleanup()
+        os.write(unrelated_fd, b"still-owned-by-test")
+        assert process.poll() is None
+    finally:
+        if unrelated_fd is not None:
+            with contextlib.suppress(OSError):
+                original_close(unrelated_fd)
+        if process.poll() is None:
+            with contextlib.suppress(BaseException):
+                cast(subprocess.Popen[bytes], process).kill()
+            with contextlib.suppress(BaseException):
+                process.wait(timeout=5.0)
+        with contextlib.suppress(BaseException):
+            supervisor._close_filesystem_authority()
+
+
+def test_windows_malformed_record_partial_close_retires_reused_descriptor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Malformed candidate cleanup retires a partially closed descriptor and its registry entry."""
+
+    if os.name != "nt":
+        pytest.fail("required Windows record candidate test executed on a non-Windows host")
+
+    capability = _capability(tmp_path, monkeypatch, code="pass")
+    supervisor = SolverSupervisor(capability)
+    record_path = Path(os.fspath(supervisor.process_record_path))
+    record_content = b"{"
+    record_path.write_bytes(record_content)
+    opened: list[int] = []
+    captured_candidates: list[supervisor_module._ProcessRecordClaim] = []
+    original_open_record = supervisor_module._windows_open_process_record
+    original_own_candidate = supervisor._own_process_record_candidate
+    original_close = os.close
+    original_open = os.open
+    unrelated_path = tmp_path / "unrelated-malformed.bin"
+    unrelated_fd: int | None = None
+
+    def capture_open(path: Path, *, create: bool, delete_access: bool = True) -> int:
+        fd = original_open_record(path, create=create, delete_access=delete_access)
+        opened.append(fd)
+        return fd
+
+    def capture_candidate(
+        path: Path, *, handle: int, parent_fd: int | None
+    ) -> supervisor_module._ProcessRecordClaim:
+        candidate = original_own_candidate(path, handle=handle, parent_fd=parent_fd)
+        captured_candidates.append(candidate)
+        return candidate
+
+    def partial_close(fd: int) -> None:
+        nonlocal unrelated_fd
+        if opened and fd == opened[0] and unrelated_fd is None:
+            original_close(fd)
+            unrelated_fd = original_open(os.fspath(unrelated_path), os.O_RDWR | os.O_CREAT, 0o600)
+            if unrelated_fd != opened[0]:
+                duplicated = os.dup2(unrelated_fd, opened[0])
+                original_close(unrelated_fd)
+                unrelated_fd = duplicated
+            assert unrelated_fd == opened[0]
+            raise OSError("synthetic close reported failure after retiring the CRT descriptor")
+        original_close(fd)
+
+    monkeypatch.setattr(supervisor_module, "_windows_open_process_record", capture_open)
+    monkeypatch.setattr(supervisor, "_own_process_record_candidate", capture_candidate)
+    candidate: supervisor_module._ProcessRecordClaim | None = None
+    try:
+        with monkeypatch.context() as close_patch:
+            close_patch.setattr(os, "close", partial_close)
+            with contextlib.suppress(SolverOwnershipError):
+                supervisor._read_process_record()
+
+        assert opened
+        assert captured_candidates
+        candidate = captured_candidates[0]
+        assert candidate.handle is None
+        assert supervisor_module._windows_record_claim_key(record_path) not in (
+            supervisor_module._WINDOWS_RECORD_CLAIMS
+        )
+        assert record_path.read_bytes() == record_content
+        assert unrelated_fd is not None
+
+        supervisor._close_filesystem_authority()
+        supervisor_module._drain_durable_cleanup()
+        os.write(unrelated_fd, b"still-owned-by-test")
+    finally:
+        if unrelated_fd is not None:
+            with contextlib.suppress(OSError):
+                original_close(unrelated_fd)
+        if candidate is not None and candidate.handle is not None:
+            with contextlib.suppress(OSError):
+                original_close(candidate.handle)
+            candidate.handle = None
+        with contextlib.suppress(BaseException):
+            supervisor._close_filesystem_authority()
+        if record_path.exists():
+            with contextlib.suppress(OSError):
+                record_path.unlink()
+
+
+def test_windows_pending_record_partial_close_retires_reused_descriptor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pending claim cleanup has the same partial-close guarantee as current claims."""
+
+    if os.name != "nt":
+        pytest.fail("required Windows pending claim test executed on a non-Windows host")
+
+    capability = _capability(tmp_path, monkeypatch, code="pass")
+    supervisor = SolverSupervisor(capability)
+    record_path = Path(os.fspath(supervisor.process_record_path))
+    record_content = b"{}"
+    record_path.write_bytes(record_content)
+    supervisor._read_process_record()
+    candidate = supervisor._pending_process_record_claim
+    assert candidate is not None and candidate.handle is not None
+    target_fd = candidate.handle
+    record_key = supervisor_module._windows_record_claim_key(record_path)
+    original_close = os.close
+    original_open = os.open
+    unrelated_path = tmp_path / "unrelated-pending.bin"
+    unrelated_fd: int | None = None
+
+    def partial_close(fd: int) -> None:
+        nonlocal unrelated_fd
+        if fd == target_fd and unrelated_fd is None:
+            original_close(fd)
+            unrelated_fd = original_open(os.fspath(unrelated_path), os.O_RDWR | os.O_CREAT, 0o600)
+            if unrelated_fd != target_fd:
+                duplicated = os.dup2(unrelated_fd, target_fd)
+                original_close(unrelated_fd)
+                unrelated_fd = duplicated
+            assert unrelated_fd == target_fd
+            raise OSError("synthetic close reported failure after retiring the CRT descriptor")
+        original_close(fd)
+
+    try:
+        with monkeypatch.context() as close_patch:
+            close_patch.setattr(os, "close", partial_close)
+            failures = supervisor._release_process_record_claim(candidate)
+        assert not failures
+        assert candidate.handle is None
+        assert supervisor._pending_process_record_claim is None
+        assert record_key not in supervisor_module._WINDOWS_RECORD_CLAIMS
+        assert unrelated_fd is not None
+        supervisor._close_filesystem_authority()
+        supervisor_module._drain_durable_cleanup()
+        os.write(unrelated_fd, b"still-owned-by-test")
+    finally:
+        if unrelated_fd is not None:
+            with contextlib.suppress(OSError):
+                original_close(unrelated_fd)
+        with contextlib.suppress(BaseException):
+            supervisor._close_filesystem_authority()
+        if record_path.exists():
+            with contextlib.suppress(OSError):
+                record_path.unlink()
+
+
+def test_windows_replacement_record_partial_close_retires_only_candidate_descriptor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A replacement candidate cannot unregister or close the current claim's object."""
+
+    if os.name != "nt":
+        pytest.fail("required Windows replacement claim test executed on a non-Windows host")
+
+    capability = _capability(tmp_path, monkeypatch, code="pass")
+    supervisor = SolverSupervisor(capability)
+    record_path = Path(os.fspath(supervisor.process_record_path))
+    record_content = b"{}"
+    record_path.write_bytes(record_content)
+    supervisor._read_process_record()
+    supervisor._install_pending_process_record_claim()
+    prior = supervisor._process_record_claim
+    assert prior is not None and prior.handle is not None
+    candidate_fd = supervisor_module._windows_open_process_record(record_path, create=False)
+    candidate = supervisor._own_process_record_candidate(
+        record_path,
+        handle=candidate_fd,
+        parent_fd=None,
+    )
+    candidate.content = record_content
+    candidate.state = None
+    record_key = supervisor_module._windows_record_claim_key(record_path)
+    target_fd = candidate.handle
+    assert target_fd is not None and target_fd != prior.handle
+    original_close = os.close
+    original_open = os.open
+    unrelated_path = tmp_path / "unrelated-replacement.bin"
+    unrelated_fd: int | None = None
+
+    def partial_close(fd: int) -> None:
+        nonlocal unrelated_fd
+        if fd == target_fd and unrelated_fd is None:
+            original_close(fd)
+            unrelated_fd = original_open(os.fspath(unrelated_path), os.O_RDWR | os.O_CREAT, 0o600)
+            if unrelated_fd != target_fd:
+                duplicated = os.dup2(unrelated_fd, target_fd)
+                original_close(unrelated_fd)
+                unrelated_fd = duplicated
+            assert unrelated_fd == target_fd
+            raise OSError("synthetic close reported failure after retiring the CRT descriptor")
+        original_close(fd)
+
+    try:
+        with monkeypatch.context() as close_patch:
+            close_patch.setattr(os, "close", partial_close)
+            failures = supervisor._release_process_record_claim(candidate)
+        assert not failures
+        assert candidate.handle is None
+        assert supervisor._process_record_claim is prior
+        assert prior.handle is not None
+        assert record_key in supervisor_module._WINDOWS_RECORD_CLAIMS
+        assert unrelated_fd is not None
+        assert supervisor_module._read_record_fd(prior.handle) == record_content
+        supervisor_module._drain_durable_cleanup()
+        os.write(unrelated_fd, b"still-owned-by-test")
+    finally:
+        if unrelated_fd is not None:
+            with contextlib.suppress(OSError):
+                original_close(unrelated_fd)
+        with contextlib.suppress(BaseException):
+            supervisor._close_filesystem_authority()
+        if record_path.exists():
+            with contextlib.suppress(OSError):
+                record_path.unlink()
+
+
+@pytest.mark.parametrize("failure_mode", ["before", "partial"])
+def test_windows_read_only_probe_cleanup_retains_or_retires_exact_descriptor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_mode: str
+) -> None:
+    """Read-only probe failures must not leak or retry a reused descriptor."""
+
+    if os.name != "nt":
+        pytest.fail("required Windows read-only probe test executed on a non-Windows host")
+
+    capability = _capability(tmp_path, monkeypatch, code="pass")
+    supervisor = SolverSupervisor(capability)
+    supervisor.start()
+    claim = supervisor._process_record_claim
+    assert claim is not None and claim.handle is not None
+    process = supervisor._process
+    assert process is not None
+    captured: list[supervisor_module._WindowsProbeFd] = []
+    original_probe = supervisor_module._windows_probe_process_record
+    original_close = os.close
+    original_open = os.open
+    unrelated_path = tmp_path / f"unrelated-probe-{failure_mode}.bin"
+    unrelated_fd: int | None = None
+
+    def capture_probe(path: Path) -> supervisor_module._WindowsProbeFd:
+        probe = original_probe(path)
+        captured.append(probe)
+        return probe
+
+    monkeypatch.setattr(supervisor_module, "_windows_probe_process_record", capture_probe)
+
+    try:
+        with monkeypatch.context() as probe_patch:
+            probe_patch.setattr(supervisor_module, "_windows_probe_process_record", capture_probe)
+            with probe_patch.context() as close_patch:
+
+                def failing_close(fd: int) -> None:
+                    nonlocal unrelated_fd
+                    target_fd = int(captured[0])
+                    if fd == target_fd and failure_mode == "before":
+                        raise OSError("synthetic probe close failed before closing")
+                    if fd == target_fd and unrelated_fd is None:
+                        original_close(fd)
+                        unrelated_fd = original_open(
+                            os.fspath(unrelated_path), os.O_RDWR | os.O_CREAT, 0o600
+                        )
+                        assert unrelated_fd == target_fd
+                        raise OSError(
+                            "synthetic probe close reported failure after retiring "
+                            "the CRT descriptor"
+                        )
+                    original_close(fd)
+
+                close_patch.setattr(os, "close", failing_close)
+                with contextlib.suppress(SolverOwnershipError):
+                    supervisor._record_claim_identity_matches(claim)
+
+        assert captured
+        if failure_mode == "before":
+            os.fstat(int(captured[0]))
+            supervisor_module._drain_durable_cleanup()
+            with pytest.raises(OSError):
+                os.fstat(int(captured[0]))
+        else:
+            assert getattr(captured[0], "handle", None) is None
+            supervisor_module._drain_durable_cleanup()
+            assert unrelated_fd is not None
+            os.write(unrelated_fd, b"still-owned-by-test")
+        assert not getattr(supervisor_module, "_WINDOWS_PROBE_CLAIMS", [captured[0]])
+    finally:
+        if unrelated_fd is not None:
+            with contextlib.suppress(OSError):
+                original_close(unrelated_fd)
+        with contextlib.suppress(BaseException):
+            supervisor._close_filesystem_authority()
+        if process.poll() is None:
+            with contextlib.suppress(BaseException):
+                cast(subprocess.Popen[bytes], process).kill()
+            with contextlib.suppress(BaseException):
+                process.wait(timeout=5.0)
+
+
+def test_windows_duplicate_record_claim_returns_exact_guarded_descriptor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reconnect duplication returns a CRT descriptor paired with its own stable guard."""
+
+    if os.name != "nt":
+        pytest.fail("required Windows record duplication test executed on a non-Windows host")
+
+    capability = _capability(tmp_path, monkeypatch, code="pass")
+    supervisor = SolverSupervisor(capability)
+    supervisor.start()
+    duplicate: int | None = None
+    try:
+        record_path = Path(os.fspath(supervisor.process_record_path))
+        duplicate = supervisor_module._windows_duplicate_record_claim(record_path)
+        assert duplicate is not None
+        native_handle = getattr(duplicate, "native_handle", None)
+        assert native_handle is not None
+        assert runtime_module._windows_fd_identity_matches(int(duplicate), native_handle) is True
+    finally:
+        if duplicate is not None:
+            handle = duplicate
+            native_handle = getattr(duplicate, "native_handle", None)
+            if handle is not None:
+                with contextlib.suppress(OSError):
+                    os.close(handle)
+            if native_handle is not None:
+                with contextlib.suppress(OSError):
+                    runtime_module._windows_close_native_handle(native_handle)
+        with contextlib.suppress(BaseException):
+            supervisor.cancel()
+
+
+@pytest.mark.parametrize("failure", ["duplicate", "open_osfhandle"])
+def test_windows_process_record_conversion_failure_retains_exact_raw_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    """Process-record H1/H2 conversion failures retain the exact owner until retry."""
+
+    if os.name != "nt":
+        pytest.fail(
+            "required Windows process-record conversion test executed on a non-Windows host"
+        )
+
+    import msvcrt
+
+    record_path = tmp_path / "process.json"
+    record_path.write_bytes(b"{}")
+    captured: list[int] = []
+    original_duplicate = getattr(supervisor_module, "_windows_duplicate_native_handle", None)
+
+    def fail_duplicate(raw_handle: int) -> int:
+        captured.append(int(raw_handle))
+        raise OSError("synthetic process-record DuplicateHandle failure")
+
+    def fail_open(raw_handle: int, descriptor_flags: int) -> int:
+        captured.append(int(raw_handle))
+        raise OSError("synthetic process-record open_osfhandle failure")
+
+    if failure == "duplicate":
+        monkeypatch.setattr(
+            supervisor_module,
+            "_windows_duplicate_native_handle",
+            fail_duplicate,
+            raising=False,
+        )
+    else:
+        assert original_duplicate is not None
+        monkeypatch.setattr(
+            supervisor_module,
+            "_windows_duplicate_native_handle",
+            original_duplicate,
+            raising=False,
+        )
+        monkeypatch.setattr(msvcrt, "open_osfhandle", fail_open)
+
+    def fail_close(native_handle: int) -> None:
+        del native_handle
+        raise OSError("synthetic process-record CloseHandle failure")
+
+    monkeypatch.setattr(
+        supervisor_module,
+        "_windows_close_native_handle",
+        fail_close,
+        raising=False,
+    )
+    result: int | None = None
+    try:
+        with pytest.raises(OSError, match="failure"):
+            result = supervisor_module._windows_open_process_record_handle(
+                record_path,
+                create=False,
+                desired_access=supervisor_module._WINDOWS_GENERIC_READ,
+                share_mode=(
+                    supervisor_module._WINDOWS_FILE_SHARE_READ
+                    | supervisor_module._WINDOWS_FILE_SHARE_WRITE
+                    | supervisor_module._WINDOWS_FILE_SHARE_DELETE
+                ),
+                descriptor_flags=os.O_RDONLY,
+            )
+        assert captured
+        durable = getattr(runtime_module, "_RUNTIME_DURABLE_CLAIMS", ())
+        assert any(getattr(owner, "raw_handle", None) in captured for owner in durable)
+    finally:
+        if result is not None:
+            with contextlib.suppress(OSError):
+                os.close(result)
+        with contextlib.suppress(BaseException):
+            runtime_module._drain_runtime_claims()
+
+
+def test_windows_read_only_probe_conversion_failure_retains_exact_raw_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A read-only probe retains its raw owner when guard conversion cleanup fails."""
+
+    if os.name != "nt":
+        pytest.fail(
+            "required Windows read-only probe acquisition test executed on a non-Windows host"
+        )
+
+    record_path = tmp_path / "process.json"
+    record_path.write_bytes(b"{}")
+    captured: list[int] = []
+
+    def fail_duplicate(raw_handle: int) -> int:
+        captured.append(int(raw_handle))
+        raise OSError("synthetic probe DuplicateHandle failure")
+
+    def fail_close(native_handle: int) -> None:
+        del native_handle
+        raise OSError("synthetic probe CloseHandle failure")
+
+    monkeypatch.setattr(
+        supervisor_module,
+        "_windows_duplicate_native_handle",
+        fail_duplicate,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        supervisor_module,
+        "_windows_close_native_handle",
+        fail_close,
+        raising=False,
+    )
+    try:
+        with pytest.raises(OSError, match="failure"):
+            supervisor_module._windows_probe_process_record(record_path)
+        assert captured
+        durable = getattr(runtime_module, "_RUNTIME_DURABLE_CLAIMS", ())
+        assert any(getattr(owner, "raw_handle", None) in captured for owner in durable)
+    finally:
+        with contextlib.suppress(BaseException):
+            runtime_module._drain_runtime_claims()
+
+
+def test_windows_owned_process_record_candidate_does_not_duplicate_after_crt_transfer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Candidate adoption consumes the already-guarded descriptor without an acquisition gap."""
+
+    if os.name != "nt":
+        pytest.fail("required Windows process-record ownership test executed on a non-Windows host")
+
+    capability = _capability(tmp_path, monkeypatch, code="pass")
+    supervisor = SolverSupervisor(capability)
+    record_path = Path(os.fspath(supervisor.process_record_path))
+    record_path.write_bytes(b"{}")
+    handle = supervisor_module._windows_open_process_record(record_path, create=False)
+
+    def unexpected_duplicate(fd: int) -> int:
+        del fd
+        raise AssertionError("candidate adoption duplicated after CRT ownership")
+
+    monkeypatch.setattr(supervisor_module, "_windows_duplicate_fd_handle", unexpected_duplicate)
+    candidate: supervisor_module._ProcessRecordClaim | None = None
+    try:
+        candidate = supervisor._own_process_record_candidate(
+            record_path,
+            handle=handle,
+            parent_fd=None,
+        )
+        assert candidate.native_handle is not None
+    finally:
+        if candidate is not None:
+            with contextlib.suppress(BaseException):
+                supervisor._release_process_record_claim(candidate)
+        else:
+            with contextlib.suppress(OSError):
+                os.close(int(handle))
+        with contextlib.suppress(BaseException):
+            supervisor._close_filesystem_authority()
+        if record_path.exists():
+            with contextlib.suppress(OSError):
+                record_path.unlink()
