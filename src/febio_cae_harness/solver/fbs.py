@@ -56,6 +56,7 @@ _WINDOWS_FILE_BEGIN = 0
 _WINDOWS_DUPLICATE_SAME_ACCESS = 0x00000002
 _WINDOWS_OBJ_CASE_INSENSITIVE = 0x00000040
 _WINDOWS_ERROR_INVALID_HANDLE = 6
+_WINDOWS_HANDLE_FLAG_PROTECT_FROM_CLOSE = 0x00000002
 
 
 class _WindowsFileTime(ctypes.Structure):
@@ -209,6 +210,8 @@ class _OwnedHandle:
     final_path: str = ""
     closed: bool = False
     identity_known: bool = True
+    windows_protected: bool = False
+    windows_unprotected_for_close: bool = False
 
 
 _PENDING_CLEANUP: list[_OwnedHandle] = []
@@ -219,6 +222,18 @@ def _retain_cleanup_owner(owner: _OwnedHandle) -> None:
         return
     if not any(existing is owner for existing in _PENDING_CLEANUP):
         _PENDING_CLEANUP.append(owner)
+
+
+def _forget_cleanup_owner(owner: _OwnedHandle) -> None:
+    _PENDING_CLEANUP[:] = [existing for existing in _PENDING_CLEANUP if existing is not owner]
+
+
+def _retire_owned_handle(owner: _OwnedHandle) -> None:
+    owner.closed = True
+    owner.value = None
+    owner.windows_protected = False
+    owner.windows_unprotected_for_close = False
+    _forget_cleanup_owner(owner)
 
 
 def _owned_value(owner: _OwnedHandle) -> int:
@@ -260,6 +275,37 @@ def _windows_close_raw(value: int) -> None:
     close_handle.restype = wintypes.BOOL
     if not close_handle(wintypes.HANDLE(value)):
         raise _windows_error("unable to close native filesystem handle")
+
+
+def _windows_set_close_protection(value: int, protected: bool) -> None:
+    kernel32 = _windows_kernel32()
+    set_handle_information = kernel32.SetHandleInformation
+    set_handle_information.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.DWORD,
+    ]
+    set_handle_information.restype = wintypes.BOOL
+    ctypes.set_last_error(0)
+    flags = _WINDOWS_HANDLE_FLAG_PROTECT_FROM_CLOSE if protected else 0
+    if not set_handle_information(
+        wintypes.HANDLE(value),
+        wintypes.DWORD(_WINDOWS_HANDLE_FLAG_PROTECT_FROM_CLOSE),
+        wintypes.DWORD(flags),
+    ):
+        raise _windows_error("unable to change native filesystem handle close protection")
+
+
+def _windows_handle_flags(value: int) -> int:
+    kernel32 = _windows_kernel32()
+    get_handle_information = kernel32.GetHandleInformation
+    get_handle_information.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    get_handle_information.restype = wintypes.BOOL
+    flags = wintypes.DWORD()
+    ctypes.set_last_error(0)
+    if not get_handle_information(wintypes.HANDLE(value), ctypes.byref(flags)):
+        raise _windows_error("unable to inspect native filesystem handle flags")
+    return int(flags.value)
 
 
 def _windows_file_info(value: int) -> tuple[int, int, int, int]:
@@ -350,6 +396,8 @@ def _windows_open_absolute(
         raise _windows_error("unable to open native filesystem object")
     owner = _OwnedHandle(value, 0, 0, path, True, identity_known=False)
     try:
+        _windows_set_close_protection(value, True)
+        owner.windows_protected = True
         attributes, device, inode, _ = _windows_file_info(value)
         owner.attributes = attributes
         owner.device = device
@@ -425,6 +473,8 @@ def _windows_open_relative(
         raise OSError("NtCreateFile returned an invalid handle")
     owner = _OwnedHandle(value, 0, 0, path, True, identity_known=False)
     try:
+        _windows_set_close_protection(value, True)
+        owner.windows_protected = True
         file_attributes, device, inode, _ = _windows_file_info(value)
         owner.attributes = file_attributes
         owner.device = device
@@ -475,7 +525,15 @@ def _windows_duplicate(owner: _OwnedHandle) -> _OwnedHandle:
         True,
         attributes=owner.attributes,
         final_path=owner.final_path,
+        identity_known=False,
     )
+    try:
+        _windows_set_close_protection(duplicate_value, True)
+        result.windows_protected = True
+        result.identity_known = True
+    except BaseException:
+        _best_effort_close(result)
+        raise
     return result
 
 
@@ -510,70 +568,91 @@ def _close_owned_handle(owner: _OwnedHandle) -> None:
     value = owner.value
     if owner.closed or value is None:
         return
-    if not owner.identity_known:
-        try:
-            if owner.windows:
+    if owner.windows:
+        if not owner.windows_protected:
+            if owner.windows_unprotected_for_close:
+                raise ValueError(
+                    "native filesystem handle close protection is unavailable; retaining owner"
+                )
+            if owner.identity_known:
+                _retire_owned_handle(owner)
+                raise ValueError("native filesystem handle is not protected; refusing close")
+            try:
                 _windows_close_raw(value)
-            else:
-                os.close(value)
+            except OSError as error:
+                if getattr(error, "winerror", error.errno) == _WINDOWS_ERROR_INVALID_HANDLE:
+                    _retire_owned_handle(owner)
+                    return
+                raise
+            _retire_owned_handle(owner)
+            return
+        try:
+            flags = _windows_handle_flags(value)
         except OSError as error:
-            invalid = (
-                getattr(error, "winerror", error.errno) == _WINDOWS_ERROR_INVALID_HANDLE
-                if owner.windows
-                else error.errno == errno.EBADF
-            )
-            if invalid:
-                owner.closed = True
-                owner.value = None
+            if getattr(error, "winerror", error.errno) == _WINDOWS_ERROR_INVALID_HANDLE:
+                _retire_owned_handle(owner)
                 return
             raise
-        owner.closed = True
-        owner.value = None
-        return
-    if owner.windows:
+        if not flags & _WINDOWS_HANDLE_FLAG_PROTECT_FROM_CLOSE:
+            _retire_owned_handle(owner)
+            raise ValueError("native filesystem handle is not protected; refusing close")
         try:
             _, device, inode, _ = _windows_file_info(value)
         except OSError as error:
             if getattr(error, "winerror", error.errno) == _WINDOWS_ERROR_INVALID_HANDLE:
-                owner.closed = True
-                owner.value = None
+                _retire_owned_handle(owner)
                 return
             raise
         if device != owner.device or inode != owner.inode:
-            owner.closed = True
-            owner.value = None
+            _retire_owned_handle(owner)
             raise ValueError("native filesystem handle identity changed; refusing close")
         try:
+            _windows_set_close_protection(value, False)
+            owner.windows_protected = False
+            owner.windows_unprotected_for_close = True
             _windows_close_raw(value)
         except OSError as error:
             if getattr(error, "winerror", error.errno) == _WINDOWS_ERROR_INVALID_HANDLE:
-                owner.closed = True
-                owner.value = None
+                _retire_owned_handle(owner)
                 return
+            try:
+                _windows_set_close_protection(value, True)
+            except BaseException:
+                owner.windows_protected = False
+            else:
+                owner.windows_protected = True
+                owner.windows_unprotected_for_close = False
             raise
-    else:
-        try:
-            metadata = os.fstat(value)
-        except OSError as error:
-            if error.errno == errno.EBADF:
-                owner.closed = True
-                owner.value = None
-                return
-            raise
-        if int(metadata.st_dev) != owner.device or int(metadata.st_ino) != owner.inode:
-            owner.closed = True
-            owner.value = None
-            raise ValueError("descriptor identity changed; refusing close")
+        _retire_owned_handle(owner)
+        return
+    if not owner.identity_known:
         try:
             os.close(value)
         except OSError as error:
             if error.errno == errno.EBADF:
-                owner.closed = True
-                owner.value = None
+                _retire_owned_handle(owner)
                 return
             raise
-    owner.closed = True
-    owner.value = None
+        _retire_owned_handle(owner)
+        return
+    try:
+        metadata = os.fstat(value)
+    except OSError as error:
+        if error.errno == errno.EBADF:
+            _retire_owned_handle(owner)
+            return
+        raise
+    if int(metadata.st_dev) != owner.device or int(metadata.st_ino) != owner.inode:
+        _retire_owned_handle(owner)
+        raise ValueError("descriptor identity changed; refusing close")
+    try:
+        os.close(value)
+    except OSError as error:
+        if error.errno == errno.EBADF:
+            _retire_owned_handle(owner)
+            return
+        raise
+    _retire_owned_handle(owner)
 
 
 def _best_effort_close(owner: _OwnedHandle) -> None:

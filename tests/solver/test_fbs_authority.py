@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import contextlib
 import copy
+import ctypes
 import importlib
 import math
 import os
 import sys
 from collections.abc import Sequence
+from ctypes import wintypes
 from dataclasses import replace
 from pathlib import Path
 from typing import cast
@@ -55,6 +58,25 @@ def make_authority(
     path.write_bytes(b"synthetic-xplt")
     manager = FbsAdapterManager(adapter or MappingAdapter(), "synthetic-runtime", tmp_path)
     return manager.issue_authority(), path
+
+
+def _set_windows_close_protection(value: int, protected: bool) -> None:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    set_handle_information = kernel32.SetHandleInformation
+    set_handle_information.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.DWORD,
+    ]
+    set_handle_information.restype = wintypes.BOOL
+    flag = 0x00000002  # HANDLE_FLAG_PROTECT_FROM_CLOSE
+    ctypes.set_last_error(0)
+    if not set_handle_information(
+        wintypes.HANDLE(value),
+        wintypes.DWORD(flag),
+        wintypes.DWORD(flag if protected else 0),
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
 
 
 def test_public_fbs_surface_contains_only_canonical_names() -> None:
@@ -274,6 +296,86 @@ def test_windows_manager_uses_exact_owned_handle_and_close_revokes_authority(
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows native handle ownership")
+def test_windows_premature_raw_close_is_refused(tmp_path: Path) -> None:
+    root = tmp_path / "attempt"
+    root.mkdir()
+    manager = FbsAdapterManager(MappingAdapter(), "synthetic-runtime", root)
+    binding = object.__getattribute__(manager, "_record").root_binding
+    assert binding is not None and binding.fd is not None
+    owner = binding.fd
+    value = owner.value
+    assert value is not None
+
+    try:
+        with pytest.raises(OSError):
+            fbs_module._windows_close_raw(value)
+        assert not owner.closed
+        assert fbs_module._windows_file_info(value)[1:3] == (owner.device, owner.inode)
+    finally:
+        manager.close()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows native handle ownership")
+def test_windows_same_object_same_value_reuse_never_closes_foreign_handle(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "attempt"
+    root.mkdir()
+    manager = FbsAdapterManager(MappingAdapter(), "synthetic-runtime", root)
+    binding = object.__getattribute__(manager, "_record").root_binding
+    assert binding is not None and binding.fd is not None
+    root_owner = binding.fd
+    owned = fbs_module._windows_duplicate(root_owner)
+    owned_value = owned.value
+    assert owned_value is not None
+
+    foreign: fbs_module._OwnedHandle | None = None
+    try:
+        _set_windows_close_protection(owned_value, False)
+        fbs_module._windows_close_raw(owned_value)
+        for _ in range(256):
+            candidate = fbs_module._windows_open_absolute(
+                root,
+                fbs_module._WINDOWS_FILE_LIST_DIRECTORY
+                | fbs_module._WINDOWS_FILE_READ_ATTRIBUTES
+                | fbs_module._WINDOWS_READ_CONTROL
+                | fbs_module._WINDOWS_SYNCHRONIZE,
+                fbs_module._WINDOWS_FILE_SHARE_READ | fbs_module._WINDOWS_FILE_SHARE_WRITE,
+                fbs_module._WINDOWS_FILE_FLAG_BACKUP_SEMANTICS
+                | fbs_module._WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT,
+            )
+            if candidate.value == owned_value:
+                foreign = candidate
+                break
+            fbs_module._close_owned_handle(candidate)
+        assert foreign is not None, "Windows did not reuse the native handle value"
+        _set_windows_close_protection(owned_value, False)
+
+        with pytest.raises(ValueError, match="refusing close"):
+            fbs_module._close_owned_handle(owned)
+        assert fbs_module._windows_file_info(owned_value)[1:3] == (
+            root_owner.device,
+            root_owner.inode,
+        )
+    finally:
+        if foreign is not None and not foreign.closed and foreign.value is not None:
+            with contextlib.suppress(OSError):
+                _set_windows_close_protection(foreign.value, False)
+            with contextlib.suppress(OSError):
+                fbs_module._windows_close_raw(foreign.value)
+            foreign.closed = True
+            foreign.value = None
+        if not owned.closed and owned.value is not None:
+            with contextlib.suppress(OSError):
+                _set_windows_close_protection(owned.value, False)
+            with contextlib.suppress(OSError):
+                fbs_module._windows_close_raw(owned.value)
+            owned.closed = True
+            owned.value = None
+        manager.close()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows native handle ownership")
 def test_windows_close_failure_retains_exact_owner_for_retry(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -300,6 +402,36 @@ def test_windows_close_failure_retains_exact_owner_for_retry(
     monkeypatch.setattr(fbs_module, "_windows_close_raw", original_close)
     manager.close()
     assert owner.closed and owner.value is None
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows native handle ownership")
+def test_windows_finalizer_requeues_pending_owner_until_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "attempt"
+    root.mkdir()
+    manager = FbsAdapterManager(MappingAdapter(), "synthetic-runtime", root)
+    binding = object.__getattribute__(manager, "_record").root_binding
+    assert binding is not None and binding.fd is not None
+    owner = binding.fd
+    original_value = owner.value
+    original_close = fbs_module._windows_close_raw
+    monkeypatch.setattr(
+        fbs_module,
+        "_windows_close_raw",
+        Mock(side_effect=OSError(32, "synthetic sharing violation")),
+    )
+
+    fbs_module._finalize_root_binding(binding)
+    assert owner.value == original_value and not owner.closed
+    assert any(candidate is owner for candidate in fbs_module._PENDING_CLEANUP)
+
+    monkeypatch.setattr(fbs_module, "_windows_close_raw", original_close)
+    fbs_module._drain_pending_cleanup()
+    assert owner.closed and owner.value is None
+    assert not any(candidate is owner for candidate in fbs_module._PENDING_CLEANUP)
+    manager.close()
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows native handle ownership")
