@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import atexit
 import contextlib
 import ctypes
 import errno
+import hashlib
 import io
 import json
 import math
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -32,7 +35,26 @@ from .fbs import (
     validate_requested_fields,
 )
 from .log import LogValidation, LogValidator, validate_log
-from .process_authority import ProcessAuthority, ProcessAuthorityError
+from .process_authority import (
+    ProcessAuthority,
+    ProcessAuthorityError,
+    _attempt_binding,
+)
+from .runtime import (
+    RuntimeProbeError,
+    _acquire_runtime_launch_claim,
+    _drain_runtime_claims,
+    _FileSnapshot,
+    _RuntimeLaunchClaim,
+    _snapshot_from_fd,
+    _windows_close_native_handle,
+    _windows_close_owned_fd,
+    _windows_compare_object_handles,
+    _windows_convert_raw_handle,
+    _windows_duplicate_fd_handle,  # noqa: F401
+    _windows_duplicate_native_handle,
+    _windows_fd_identity_matches,
+)
 from .types import (
     OutputFreshnessError,
     SolverClassification,
@@ -83,9 +105,78 @@ _WINDOWS_CREATE_NEW = 1
 _WINDOWS_OPEN_EXISTING = 3
 _WINDOWS_FILE_ATTRIBUTE_NORMAL = 0x00000080
 _WINDOWS_FILE_DISPOSITION_INFO = 4
+_WINDOWS_RESUME_TRANSACTION_NAME = ".process.json.resume"
+_WINDOWS_RESUME_TRANSACTION_VERSION = 1
+_WINDOWS_WRITE_DAC = 0x00040000
+_WINDOWS_WRITE_OWNER = 0x00080000
+_WINDOWS_EVENT_MODIFY_STATE = 0x0002
+_WINDOWS_EVENT_QUERY_STATE = 0x0001
+_WINDOWS_EVENT_RECONNECT_ACCESS = _WINDOWS_EVENT_QUERY_STATE | 0x00100000
+_WINDOWS_EVENT_DENIED_ACCESS = (
+    _WINDOWS_DELETE | _WINDOWS_WRITE_DAC | _WINDOWS_WRITE_OWNER | _WINDOWS_EVENT_MODIFY_STATE
+)
+_WINDOWS_EVENT_DACL_SDDL = (
+    f"D:P(D;;0x{_WINDOWS_EVENT_DENIED_ACCESS:08X};;;OW)"
+    f"(A;;0x{_WINDOWS_EVENT_RECONNECT_ACCESS:08X};;;OW)"
+)
+_WINDOWS_WAIT_OBJECT_0 = 0x00000000
+_WINDOWS_WAIT_TIMEOUT = 0x00000102
+_WINDOWS_RESUME_EVENT_RE = re.compile(
+    r"^Local\\febio-cae-resume-"
+    r"(?P<attempt>[0-9a-f]{64})-"
+    r"(?P<context>[0-9a-f]{64})-"
+    r"(?P<device>[0-9a-f]+)-"
+    r"(?P<inode>[0-9a-f]+)-"
+    r"(?P<token>[0-9a-f]{32})$"
+)
 _POSIX_AT_EMPTY_PATH = 0x1000
 _POSIX_RENAME_EXCHANGE = 0x2
-_WINDOWS_RECORD_CLAIMS: dict[str, list[tuple[int, int, int]]] = {}
+
+
+class _WindowsRecordClaimEntry(tuple[int, int, int]):
+    """Tuple-compatible registry entry carrying a stable native identity."""
+
+    native_handle: int | None
+    owner: object | None
+
+    def __new__(
+        cls,
+        fd: int,
+        device: int,
+        inode: int,
+        native_handle: int | None = None,
+        owner: object | None = None,
+    ) -> _WindowsRecordClaimEntry:
+        entry = tuple.__new__(cls, (fd, device, inode))
+        entry.native_handle = native_handle
+        entry.owner = owner
+        return entry
+
+
+class _WindowsProbeFd(int):
+    """Int-compatible read-only probe retaining an independent native handle."""
+
+    handle: int | None
+    native_handle: int | None
+    path: Path
+
+    def __new__(
+        cls,
+        fd: int,
+        path: Path,
+        native_handle: int | None,
+    ) -> _WindowsProbeFd:
+        probe = int.__new__(cls, fd)
+        probe.handle = fd
+        probe.native_handle = native_handle
+        probe.path = path
+        return probe
+
+
+_WINDOWS_RECORD_CLAIMS: dict[str, list[_WindowsRecordClaimEntry]] = {}
+_WINDOWS_RECORD_CLAIMS_LOCK = threading.RLock()
+_WINDOWS_PROBE_CLAIMS: list[_WindowsProbeFd] = []
+_WINDOWS_PROBE_CLAIMS_LOCK = threading.RLock()
 
 
 def _same_file_identity(left: os.stat_result, right: os.stat_result) -> bool:
@@ -138,14 +229,12 @@ def _windows_open_process_record_handle(
         if error in {2, 3}:  # ERROR_FILE_NOT_FOUND / ERROR_PATH_NOT_FOUND
             raise FileNotFoundError(error, "process record does not exist", os.fspath(path))
         raise OSError(error, f"unable to open process record: {path}")
-    import msvcrt
-
-    try:
-        return int(msvcrt.open_osfhandle(value, descriptor_flags | getattr(os, "O_BINARY", 0)))
-    except BaseException:
-        with contextlib.suppress(BaseException):
-            kernel32.CloseHandle(value)
-        raise
+    return _windows_convert_raw_handle(
+        value,
+        descriptor_flags,
+        duplicate_native_handle=_windows_duplicate_native_handle,
+        close_native_handle=_windows_close_native_handle,
+    )
 
 
 def _windows_open_process_record(
@@ -179,71 +268,147 @@ def _windows_record_claim_key(path: Path) -> str:
     return os.path.normcase(os.path.abspath(os.fspath(path)))
 
 
-def _windows_register_record_claim(path: Path, fd: int, device: int, inode: int) -> None:
+def _windows_register_record_claim(
+    path: Path,
+    fd: int,
+    device: int,
+    inode: int,
+    *,
+    native_handle: int | None = None,
+    owner: object | None = None,
+) -> None:
     key = _windows_record_claim_key(path)
-    entries = _WINDOWS_RECORD_CLAIMS.setdefault(key, [])
-    entry = (fd, device, inode)
-    if entry not in entries:
-        entries.append(entry)
+    with _WINDOWS_RECORD_CLAIMS_LOCK:
+        entries = _WINDOWS_RECORD_CLAIMS.setdefault(key, [])
+        entry = _WindowsRecordClaimEntry(fd, device, inode, native_handle, owner)
+        if entry not in entries:
+            entries.append(entry)
 
 
-def _windows_unregister_record_claim(path: Path, fd: int) -> None:
+def _windows_unregister_record_claim(
+    path: Path,
+    fd: int,
+    *,
+    device: int | None = None,
+    inode: int | None = None,
+    native_handle: int | None = None,
+    owner: object | None = None,
+) -> None:
     key = _windows_record_claim_key(path)
-    entries = _WINDOWS_RECORD_CLAIMS.get(key)
-    if not entries:
-        return
-    retained = [entry for entry in entries if entry[0] != fd]
-    if retained:
-        _WINDOWS_RECORD_CLAIMS[key] = retained
-    else:
-        _WINDOWS_RECORD_CLAIMS.pop(key, None)
+    with _WINDOWS_RECORD_CLAIMS_LOCK:
+        entries = _WINDOWS_RECORD_CLAIMS.get(key)
+        if not entries:
+            return
+        if owner is not None:
+            retained = [entry for entry in entries if entry.owner is not owner]
+        elif native_handle is not None:
+            retained = [entry for entry in entries if entry.native_handle != native_handle]
+        elif device is None or inode is None:
+            retained = [entry for entry in entries if entry[0] != fd]
+        else:
+            target = (fd, device, inode)
+            removed = False
+            retained = []
+            for entry in entries:
+                if not removed and entry == target:
+                    removed = True
+                else:
+                    retained.append(entry)
+        if retained:
+            _WINDOWS_RECORD_CLAIMS[key] = retained
+        else:
+            _WINDOWS_RECORD_CLAIMS.pop(key, None)
 
 
 def _windows_duplicate_record_claim(path: Path) -> int | None:
-    """Duplicate an in-process claim for reconnect before opening a new object."""
+    """Duplicate an in-process claim without losing its owning claim object."""
 
     key = _windows_record_claim_key(path)
-    entries = _WINDOWS_RECORD_CLAIMS.get(key)
-    if not entries:
-        return None
-    retained: list[tuple[int, int, int]] = []
-    for index, (fd, device, inode) in enumerate(entries):
-        try:
-            metadata = os.fstat(fd)
-        except OSError:
-            continue
-        if int(metadata.st_dev) != device or int(metadata.st_ino) != inode:
-            continue
-        probe_fd: int | None = None
-        try:
-            probe_fd = _windows_probe_process_record(path)
-            probe_metadata = os.fstat(probe_fd)
-            if int(probe_metadata.st_dev) != device or int(probe_metadata.st_ino) != inode:
-                retained.append((fd, device, inode))
-                continue
+    with _WINDOWS_RECORD_CLAIMS_LOCK:
+        entries = _WINDOWS_RECORD_CLAIMS.get(key)
+        if not entries:
+            return None
+        retained: list[_WindowsRecordClaimEntry] = []
+        for index, entry in enumerate(entries):
+            fd, device, inode = entry
+            native_handle = entry.native_handle
+            owner = entry.owner
+            if owner is None:
+                raise SolverOwnershipError("process record registry owner is unavailable")
+            owner_fd = getattr(owner, "handle", None)
+            owner_native = getattr(owner, "native_handle", None)
+            if (
+                owner_fd is None
+                or owner_native is None
+                or owner_fd != fd
+                or native_handle is None
+                or owner_native != native_handle
+            ):
+                raise SolverOwnershipError("process record registry claim ownership is uncertain")
+            entry_matches = _windows_fd_identity_matches(owner_fd, owner_native)
+            if entry_matches is not True:
+                raise SolverOwnershipError("process record registry claim identity is uncertain")
+            probe_fd: _WindowsProbeFd | None = None
+            duplicate_owner: _ProcessRecordClaim | None = None
+            duplicate_owner_adopted = False
             try:
-                duplicate = os.dup(fd)
-            except OSError:
-                retained.append((fd, device, inode))
-                continue
-            retained.append((fd, device, inode))
-            retained.extend(entries[index + 1 :])
-            _WINDOWS_RECORD_CLAIMS[key] = retained
-            return duplicate
-        except OSError:
-            retained.append((fd, device, inode))
-        finally:
-            if probe_fd is not None:
-                with contextlib.suppress(OSError):
-                    os.close(probe_fd)
-    _WINDOWS_RECORD_CLAIMS[key] = retained
-    return None
+                probe_fd = _windows_probe_process_record(path)
+                probe_metadata = os.fstat(probe_fd)
+                if int(probe_metadata.st_dev) != device or int(probe_metadata.st_ino) != inode:
+                    raise SolverOwnershipError("process record registry path identity changed")
+                raw_duplicate = _windows_duplicate_native_handle(owner_native)
+                duplicate = _windows_convert_raw_handle(
+                    raw_duplicate,
+                    os.O_RDWR,
+                    duplicate_native_handle=_windows_duplicate_native_handle,
+                    close_native_handle=_windows_close_native_handle,
+                )
+                duplicate_native = getattr(duplicate, "native_handle", None)
+                if duplicate_native is None:
+                    raise SolverOwnershipError(
+                        "duplicated process record has no exact native guard"
+                    )
+                duplicate_owner = _ProcessRecordClaim(
+                    path=path,
+                    content=b"",
+                    device=device,
+                    inode=inode,
+                    state=None,
+                    handle=int(duplicate),
+                    name=path.name,
+                    native_handle=duplicate_native,
+                )
+                retained.append(entry)
+                retained.extend(entries[index + 1 :])
+                _WINDOWS_RECORD_CLAIMS[key] = retained
+                return duplicate
+            except FileNotFoundError as error:
+                if duplicate_owner is not None:
+                    _DURABLE_CLAIM_CLEANUP.adopt(None, None, (duplicate_owner,))
+                    duplicate_owner_adopted = True
+                raise SolverOwnershipError("process record registry path is unavailable") from error
+            except BaseException:
+                if duplicate_owner is not None:
+                    _DURABLE_CLAIM_CLEANUP.adopt(None, None, (duplicate_owner,))
+                    duplicate_owner_adopted = True
+                _WINDOWS_RECORD_CLAIMS[key] = retained + entries[index:]
+                raise
+            finally:
+                if probe_fd is not None:
+                    try:
+                        _close_windows_probe(probe_fd)
+                    except BaseException:
+                        if duplicate_owner is not None and not duplicate_owner_adopted:
+                            _DURABLE_CLAIM_CLEANUP.adopt(None, None, (duplicate_owner,))
+                        raise
+        _WINDOWS_RECORD_CLAIMS[key] = retained
+        return None
 
 
-def _windows_probe_process_record(path: Path) -> int:
+def _windows_probe_process_record(path: Path) -> _WindowsProbeFd:
     """Open a read-only path probe without acquiring record mutation authority."""
 
-    return _windows_open_process_record_handle(
+    fd = _windows_open_process_record_handle(
         path,
         create=False,
         desired_access=_WINDOWS_GENERIC_READ,
@@ -252,6 +417,46 @@ def _windows_probe_process_record(path: Path) -> int:
         ),
         descriptor_flags=os.O_RDONLY,
     )
+    native_handle = getattr(fd, "native_handle", None)
+    if native_handle is None:
+        with contextlib.suppress(BaseException):
+            os.close(int(fd))
+        raise SolverOwnershipError("read-only process-record probe has no exact native guard")
+    return _WindowsProbeFd(int(fd), path, native_handle)
+
+
+def _retain_windows_probe(probe: _WindowsProbeFd) -> None:
+    with _WINDOWS_PROBE_CLAIMS_LOCK:
+        if (probe.handle is not None or probe.native_handle is not None) and not any(
+            held is probe for held in _WINDOWS_PROBE_CLAIMS
+        ):
+            _WINDOWS_PROBE_CLAIMS.append(probe)
+
+
+def _discard_windows_probe(probe: _WindowsProbeFd) -> None:
+    with _WINDOWS_PROBE_CLAIMS_LOCK:
+        _WINDOWS_PROBE_CLAIMS[:] = [held for held in _WINDOWS_PROBE_CLAIMS if held is not probe]
+
+
+def _close_windows_probe(probe: int | _WindowsProbeFd) -> None:
+    if not isinstance(probe, _WindowsProbeFd):
+        os.close(probe)
+        return
+    try:
+        _windows_close_owned_fd(probe, "handle", "native_handle")
+    except BaseException:
+        _retain_windows_probe(probe)
+        raise
+    _discard_windows_probe(probe)
+
+
+def _drain_windows_probe_claims() -> None:
+    with _WINDOWS_PROBE_CLAIMS_LOCK:
+        for probe in tuple(_WINDOWS_PROBE_CLAIMS):
+            try:
+                _close_windows_probe(probe)
+            except BaseException:
+                continue
 
 
 def _write_record_fd(fd: int, content: bytes) -> None:
@@ -306,6 +511,231 @@ def _windows_delete_process_record(fd: int) -> None:
     ):
         error = ctypes.get_last_error()
         raise OSError(error, "unable to remove exact process record handle")
+
+
+class _WindowsEventSecurityAttributes(ctypes.Structure):
+    _fields_ = [
+        ("nLength", ctypes.c_uint32),
+        ("lpSecurityDescriptor", ctypes.c_void_p),
+        ("bInheritHandle", ctypes.c_int),
+    ]
+
+
+def _windows_create_resume_event(name: str) -> int:
+    """Create a new restricted event while retaining creator signal authority."""
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_uint32),
+    ]
+    advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = ctypes.c_int
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateEventW.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_wchar_p,
+    ]
+    kernel32.CreateEventW.restype = ctypes.c_void_p
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_int
+    # LocalFree is exported by kernel32 for the descriptor returned by the
+    # ConvertStringSecurityDescriptorToSecurityDescriptorW contract.
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+
+    descriptor = ctypes.c_void_p()
+    raw_handle: int | None = None
+    completed = False
+    ctypes.set_last_error(0)
+    try:
+        if (
+            not advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                _WINDOWS_EVENT_DACL_SDDL,
+                1,
+                ctypes.byref(descriptor),
+                None,
+            )
+            or not descriptor.value
+        ):
+            raise SolverOwnershipError(
+                "unable to create restricted resume event security descriptor"
+            )
+        security = _WindowsEventSecurityAttributes(
+            ctypes.sizeof(_WindowsEventSecurityAttributes),
+            descriptor,
+            0,
+        )
+        created = kernel32.CreateEventW(ctypes.byref(security), False, False, name)
+        raw_value = created.value if isinstance(created, ctypes.c_void_p) else created
+        if raw_value:
+            raw_handle = int(raw_value)
+        create_error = ctypes.get_last_error()
+        if raw_handle is None:
+            raise SolverOwnershipError("unable to create resume event")
+        if create_error == 183:  # ERROR_ALREADY_EXISTS
+            raise SolverOwnershipError("resume event claim already exists")
+        completed = True
+        return raw_handle
+    finally:
+        released = kernel32.LocalFree(descriptor)
+        if released:
+            if raw_handle is not None:
+                with contextlib.suppress(BaseException):
+                    kernel32.CloseHandle(ctypes.c_void_p(raw_handle))
+            raise SolverOwnershipError("unable to release resume event security descriptor")
+        if not completed and raw_handle is not None:
+            with contextlib.suppress(BaseException):
+                kernel32.CloseHandle(ctypes.c_void_p(raw_handle))
+
+
+def _windows_duplicate_resume_event_handle(handle: int) -> int:
+    """Duplicate only synchronize/query rights for the suspended child."""
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetCurrentProcess.argtypes = []
+    kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+    kernel32.DuplicateHandle.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_uint32,
+        ctypes.c_int,
+        ctypes.c_uint32,
+    ]
+    kernel32.DuplicateHandle.restype = ctypes.c_int
+    current = kernel32.GetCurrentProcess()
+    duplicate = ctypes.c_void_p()
+    if (
+        not kernel32.DuplicateHandle(
+            current,
+            ctypes.c_void_p(handle),
+            current,
+            ctypes.byref(duplicate),
+            _WINDOWS_EVENT_RECONNECT_ACCESS,
+            True,
+            0,
+        )
+        or not duplicate.value
+    ):
+        raise SolverOwnershipError("unable to create inheritable resume event lifetime handle")
+    return int(duplicate.value)
+
+
+def _windows_open_resume_event(name: str) -> int:
+    """Open exactly one event with query/synchronize rights and require signaled state."""
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenEventW.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_wchar_p]
+    kernel32.OpenEventW.restype = ctypes.c_void_p
+    kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    kernel32.WaitForSingleObject.restype = ctypes.c_uint32
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_int
+    ctypes.set_last_error(0)
+    handle = kernel32.OpenEventW(_WINDOWS_EVENT_RECONNECT_ACCESS, False, name)
+    raw_value = handle.value if isinstance(handle, ctypes.c_void_p) else handle
+    if not raw_value:
+        raise SolverOwnershipError("resume event authority is unavailable")
+    raw_handle = int(raw_value)
+    wait_result = kernel32.WaitForSingleObject(ctypes.c_void_p(raw_handle), 0)
+    if wait_result != _WINDOWS_WAIT_OBJECT_0:
+        with contextlib.suppress(BaseException):
+            kernel32.CloseHandle(ctypes.c_void_p(raw_handle))
+        if wait_result == _WINDOWS_WAIT_TIMEOUT:
+            raise SolverOwnershipError("resume event is not signaled")
+        raise SolverOwnershipError("unable to query resume event state")
+    return raw_handle
+
+
+def _windows_signal_resume_event(handle: int) -> None:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.SetEvent.argtypes = [ctypes.c_void_p]
+    kernel32.SetEvent.restype = ctypes.c_int
+    if not kernel32.SetEvent(ctypes.c_void_p(handle)):
+        raise SolverOwnershipError("unable to signal resume event")
+
+
+def _windows_resume_event_name(
+    attempt_root: Path,
+    context_digest: str,
+    device: int,
+    inode: int,
+    token: str,
+) -> str:
+    return (
+        f"Local\\febio-cae-resume-{_attempt_binding(attempt_root)}-"
+        f"{context_digest}-{device:x}-{inode:x}-{token}"
+    )
+
+
+def _windows_resume_event_binding(
+    name: object,
+    attempt_root: Path,
+    context_digest: str,
+    device: int,
+    inode: int,
+) -> bool:
+    return (
+        _windows_resume_event_parts(name, attempt_root, context_digest, device, inode) is not None
+    )
+
+
+def _windows_resume_event_parts(
+    name: object,
+    attempt_root: Path,
+    context_digest: str,
+    device: int,
+    inode: int,
+) -> tuple[int, int, str] | None:
+    """Parse an event name only after checking every immutable binding."""
+
+    if not isinstance(name, str):
+        return None
+    match = _WINDOWS_RESUME_EVENT_RE.fullmatch(name)
+    if match is None:
+        return None
+    parsed_device = int(match.group("device"), 16)
+    parsed_inode = int(match.group("inode"), 16)
+    token = match.group("token")
+    if (
+        match.group("attempt") != _attempt_binding(attempt_root)
+        or match.group("context") != context_digest
+        or parsed_device != device
+        or parsed_inode != inode
+    ):
+        return None
+    if name != _windows_resume_event_name(
+        attempt_root,
+        context_digest,
+        parsed_device,
+        parsed_inode,
+        token,
+    ):
+        return None
+    return parsed_device, parsed_inode, token
+
+
+def _windows_close_resume_event_handles(
+    claim: _WindowsResumeTransactionClaim,
+) -> tuple[BaseException, ...]:
+    failures: list[BaseException] = []
+    for attribute in ("child_handle", "event_handle"):
+        handle = getattr(claim, attribute)
+        if handle is None:
+            continue
+        try:
+            _windows_close_native_handle(handle)
+        except BaseException as error:
+            failures.append(error)
+        else:
+            setattr(claim, attribute, None)
+    return tuple(failures)
 
 
 @contextlib.contextmanager
@@ -393,6 +823,176 @@ def _posix_unlink(parent_fd: int, name: str) -> None:
         raise OSError(error, "unable to unlink process record entry")
 
 
+def _input_identity(metadata: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        int(metadata.st_dev),
+        int(metadata.st_ino),
+        int(metadata.st_nlink),
+        int(metadata.st_size),
+        int(metadata.st_mtime_ns),
+    )
+
+
+def _posix_fcntl() -> Any:
+    try:
+        import fcntl
+    except (ImportError, OSError) as error:
+        raise SolverOwnershipError("POSIX input sealing is unavailable") from error
+    return fcntl
+
+
+def _posix_seal_configuration() -> tuple[Any, int]:
+    try:
+        fcntl = _posix_fcntl()
+    except (ImportError, OSError) as error:
+        raise SolverOwnershipError("POSIX input sealing is unavailable") from error
+    try:
+        add_seals = fcntl.F_ADD_SEALS
+        get_seals = fcntl.F_GET_SEALS
+        required = fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL
+    except (AttributeError, TypeError, ValueError) as error:
+        raise SolverOwnershipError("POSIX input sealing is unavailable") from error
+    if (
+        isinstance(add_seals, bool)
+        or not isinstance(add_seals, int)
+        or isinstance(get_seals, bool)
+        or not isinstance(get_seals, int)
+        or isinstance(required, bool)
+        or not isinstance(required, int)
+        or required <= 0
+    ):
+        raise SolverOwnershipError("POSIX input sealing is unavailable")
+    return (fcntl, required)
+
+
+def _posix_verify_seals(fd: int) -> None:
+    fcntl, required = _posix_seal_configuration()
+    try:
+        observed = fcntl.fcntl(fd, fcntl.F_GET_SEALS)
+    except (AttributeError, OSError, TypeError, ValueError) as error:
+        raise SolverOwnershipError("unable to verify POSIX input seals") from error
+    if (
+        isinstance(observed, bool)
+        or not isinstance(observed, int)
+        or observed & required != required
+    ):
+        raise SolverOwnershipError("POSIX input seals could not be verified")
+
+
+def _posix_seal_fd(fd: int) -> None:
+    fcntl, required = _posix_seal_configuration()
+    try:
+        fcntl.fcntl(fd, fcntl.F_ADD_SEALS, required)
+    except (AttributeError, OSError, TypeError, ValueError) as error:
+        raise SolverOwnershipError("unable to apply POSIX input seals") from error
+    _posix_verify_seals(fd)
+
+
+def _posix_create_input_snapshot(
+    source_fd: int,
+    expected_sha256: str,
+    expected_identity: tuple[int, int, int, int, int],
+) -> tuple[int, tuple[int, int, int, int, int]]:
+    """Copy one source descriptor into an anonymous, sealed child object."""
+
+    if not Path("/proc/self/fd").is_dir():
+        raise SolverOwnershipError("POSIX /proc descriptor path is unavailable")
+    try:
+        source_initial = os.fstat(source_fd)
+    except OSError as error:
+        raise SolverOwnershipError("solver input source descriptor is unavailable") from error
+    source_initial_identity = _input_identity(source_initial)
+    if not stat.S_ISREG(source_initial.st_mode):
+        raise SolverOwnershipError("solver input source is not a regular file")
+    if source_initial_identity != expected_identity:
+        raise SolverOwnershipError("solver input source identity changed")
+
+    memfd_create = getattr(os, "memfd_create", None)
+    sealing_flag = getattr(os, "MFD_ALLOW_SEALING", None)
+    if (
+        not callable(memfd_create)
+        or isinstance(sealing_flag, bool)
+        or not isinstance(sealing_flag, int)
+    ):
+        raise SolverOwnershipError("POSIX anonymous input sealing is unavailable")
+    cloexec_flag = getattr(os, "MFD_CLOEXEC", 0)
+    if isinstance(cloexec_flag, bool) or not isinstance(cloexec_flag, int):
+        raise SolverOwnershipError("POSIX anonymous input descriptor is unavailable")
+    snapshot_flags = sealing_flag | cloexec_flag
+
+    snapshot_fd: int | None = None
+    completed = False
+    try:
+        try:
+            created = memfd_create("febio-cae-input", snapshot_flags)
+        except (OSError, TypeError, ValueError) as error:
+            raise SolverOwnershipError("unable to create POSIX anonymous input snapshot") from error
+        if isinstance(created, bool) or not isinstance(created, int) or created < 0:
+            raise SolverOwnershipError("POSIX anonymous input snapshot descriptor is invalid")
+        snapshot_fd = created
+        try:
+            os.set_inheritable(snapshot_fd, False)
+        except (AttributeError, OSError, TypeError, ValueError) as error:
+            raise SolverOwnershipError("POSIX anonymous input descriptor is unavailable") from error
+
+        try:
+            os.lseek(source_fd, 0, os.SEEK_SET)
+            digest_state = hashlib.sha256()
+            while chunk := os.read(source_fd, 1024 * 1024):
+                digest_state.update(chunk)
+                offset = 0
+                while offset < len(chunk):
+                    written = os.write(snapshot_fd, chunk[offset:])
+                    if written <= 0:
+                        raise OSError("unable to write POSIX input snapshot")
+                    offset += written
+            source_finished = os.fstat(source_fd)
+        except OSError as error:
+            raise SolverOwnershipError("unable to copy POSIX solver input") from error
+        if _input_identity(source_finished) != expected_identity:
+            raise SolverOwnershipError("solver input source changed while copying")
+        if digest_state.hexdigest() != expected_sha256:
+            raise SolverOwnershipError("solver input source bytes changed while copying")
+
+        try:
+            snapshot_metadata = os.fstat(snapshot_fd)
+        except OSError as error:
+            raise SolverOwnershipError("POSIX input snapshot is unavailable") from error
+        if not stat.S_ISREG(snapshot_metadata.st_mode):
+            raise SolverOwnershipError("POSIX input snapshot is not a regular file")
+        if int(snapshot_metadata.st_size) != expected_identity[3]:
+            raise SolverOwnershipError("POSIX input snapshot size changed")
+        _posix_seal_fd(snapshot_fd)
+        _posix_verify_seals(snapshot_fd)
+        try:
+            sealed_metadata = os.fstat(snapshot_fd)
+        except OSError as error:
+            raise SolverOwnershipError("sealed POSIX input snapshot is unavailable") from error
+        if not stat.S_ISREG(sealed_metadata.st_mode):
+            raise SolverOwnershipError("sealed POSIX input snapshot is not a regular file")
+        if int(sealed_metadata.st_size) != expected_identity[3]:
+            raise SolverOwnershipError("sealed POSIX input snapshot size changed")
+        sealed_identity = _input_identity(sealed_metadata)
+        completed = True
+        return snapshot_fd, sealed_identity
+    except SolverOwnershipError:
+        raise
+    except (OSError, TypeError, ValueError) as error:
+        raise SolverOwnershipError("unable to create sealed POSIX input snapshot") from error
+    finally:
+        if snapshot_fd is not None and not completed:
+            try:
+                os.close(snapshot_fd)
+            except BaseException:
+                orphan = _InputLease(
+                    path=Path("."),
+                    expected_sha256=expected_sha256,
+                    expected_identity=expected_identity,
+                    handle=snapshot_fd,
+                )
+                _DURABLE_CLAIM_CLEANUP.adopt(None, None, (), input_lease=orphan)
+
+
 @dataclass(frozen=True, slots=True)
 class _FilesystemIdentity:
     path: Path
@@ -401,10 +1001,134 @@ class _FilesystemIdentity:
 
 
 @dataclass(slots=True)
+class _InputLease:
+    """Hold the exact launch input object until its child has consumed it."""
+
+    path: Path
+    expected_sha256: str
+    expected_identity: tuple[int, int, int, int, int]
+    handle: int | None
+    native_handle: int | None = None
+    source_handle: int | None = None
+    object_identity: tuple[int, int, int, int, int] | None = None
+
+    @property
+    def child_path(self) -> Path:
+        if os.name == "posix":
+            if self.handle is None:
+                raise SolverOwnershipError("solver input lease is unavailable")
+            proc_fd = Path("/proc/self/fd")
+            if not proc_fd.is_dir():
+                raise SolverOwnershipError("POSIX /proc descriptor path is unavailable")
+            return proc_fd / str(self.handle)
+        return self.path
+
+    @property
+    def child_pass_fds(self) -> tuple[int, ...]:
+        if os.name != "posix" or self.handle is None:
+            return ()
+        return (self.handle,)
+
+    @property
+    def child_handle(self) -> int | None:
+        return self.native_handle if _NATIVE_WINDOWS else None
+
+    def prepare_child_handle(self) -> int | None:
+        child_handle = self.child_handle
+        if child_handle is None:
+            return None
+        _windows_set_handle_inheritable(child_handle, True)
+        return child_handle
+
+    def clear_child_handle(self) -> None:
+        child_handle = self.child_handle
+        if child_handle is not None:
+            _windows_set_handle_inheritable(child_handle, False)
+
+    def verify(self, *, digest: bool = False) -> None:
+        if self.handle is None:
+            raise SolverOwnershipError("solver input lease is unavailable")
+        try:
+            metadata = os.fstat(self.handle)
+        except OSError as error:
+            raise SolverOwnershipError("solver input lease is unavailable") from error
+        if not stat.S_ISREG(metadata.st_mode):
+            raise SolverOwnershipError("solver input lease is not a regular file")
+        current_identity = _input_identity(metadata)
+        if os.name == "posix":
+            if self.object_identity is None:
+                raise SolverOwnershipError("sealed POSIX input identity is unavailable")
+            if current_identity != self.object_identity:
+                raise SolverOwnershipError("sealed POSIX input identity changed")
+            if current_identity[3] != self.expected_identity[3]:
+                raise SolverOwnershipError("sealed POSIX input size changed")
+            _posix_verify_seals(self.handle)
+        elif current_identity != self.expected_identity:
+            raise SolverOwnershipError("solver input lease identity changed")
+        if not digest:
+            return
+        try:
+            os.lseek(self.handle, 0, os.SEEK_SET)
+            digest_state = hashlib.sha256()
+            while chunk := os.read(self.handle, 1024 * 1024):
+                digest_state.update(chunk)
+            finished = os.fstat(self.handle)
+            finished_identity = _input_identity(finished)
+            if os.name == "posix":
+                if self.object_identity is None or finished_identity != self.object_identity:
+                    raise SolverOwnershipError("sealed POSIX input changed while reading")
+            elif finished_identity != self.expected_identity:
+                raise SolverOwnershipError("solver input lease changed while reading")
+            if digest_state.hexdigest() != self.expected_sha256:
+                raise SolverOwnershipError("solver input lease bytes changed")
+            os.lseek(self.handle, 0, os.SEEK_SET)
+        except SolverOwnershipError:
+            raise
+        except OSError as error:
+            raise SolverOwnershipError("unable to verify solver input lease bytes") from error
+
+    def close(self) -> None:
+        if self.handle is None and self.native_handle is None and self.source_handle is None:
+            return
+        if _NATIVE_WINDOWS:
+            _windows_close_owned_fd(self, "handle", "native_handle")
+            return
+        failures: list[BaseException] = []
+        for attribute in ("handle", "source_handle"):
+            handle = getattr(self, attribute)
+            if handle is None:
+                continue
+            try:
+                os.close(handle)
+            except BaseException as error:
+                failures.append(error)
+            else:
+                if getattr(self, attribute) == handle:
+                    setattr(self, attribute, None)
+        if failures:
+            raise SolverOwnershipError(
+                "solver input lease handles could not be closed"
+            ) from failures[0]
+
+    def close_source(self) -> None:
+        handle = self.source_handle
+        if handle is None:
+            return
+        try:
+            os.close(handle)
+        except OSError as error:
+            raise SolverOwnershipError("solver input source handle could not be closed") from error
+        if self.source_handle == handle:
+            self.source_handle = None
+
+
+@dataclass(slots=True)
 class _WindowsDirectoryHandle:
     value: int
     volume_serial: int
     file_index: int
+    native_handle: int | None = None
+    closed: bool = False
 
 
 class _WindowsFileInformation(ctypes.Structure):
@@ -483,29 +1207,68 @@ def _windows_open_directory(path: Path) -> _WindowsDirectoryHandle:
     if not raw_value_int or raw_value_int in {-1, _WINDOWS_INVALID_HANDLE_VALUE}:
         error = ctypes.get_last_error()
         raise OSError(error, f"unable to hold directory authority: {path}")
-    value = raw_value_int
-    try:
-        information = _windows_directory_information(value)
-    except BaseException:
-        with contextlib.suppress(BaseException):
-            kernel32.CloseHandle(value)
-        raise
-    file_index = (int(information.nFileIndexHigh) << 32) | int(information.nFileIndexLow)
-    return _WindowsDirectoryHandle(
-        value=value,
-        volume_serial=int(information.dwVolumeSerialNumber),
-        file_index=file_index,
+    held = _WindowsDirectoryHandle(
+        value=raw_value_int,
+        volume_serial=0,
+        file_index=0,
     )
+    _DURABLE_CLAIM_CLEANUP.adopt_directory_handle(held)
+    try:
+        held.native_handle = _windows_duplicate_native_handle(raw_value_int)
+        information = _windows_directory_information(raw_value_int)
+        held.volume_serial = int(information.dwVolumeSerialNumber)
+        held.file_index = (int(information.nFileIndexHigh) << 32) | int(information.nFileIndexLow)
+    except BaseException:
+        try:
+            _windows_close_directory(held)
+        except BaseException:
+            pass
+        else:
+            _DURABLE_CLAIM_CLEANUP.discard_directory_handle(held)
+        raise
+    _DURABLE_CLAIM_CLEANUP.discard_directory_handle(held)
+    return held
 
 
 def _windows_close_directory(handle: _WindowsDirectoryHandle) -> None:
+    value = handle.value
+    native_handle = handle.native_handle
+    if handle.closed:
+        if native_handle is None:
+            return
+        _windows_close_native_handle(native_handle)
+        handle.native_handle = None
+        return
+    if native_handle is None:
+        raise OSError("filesystem authority handle has no exact native guard")
+    identity_matches = _windows_compare_object_handles(value, native_handle)
+    if identity_matches is None:
+        raise OSError("unable to verify filesystem authority handle identity")
+    if not identity_matches:
+        handle.closed = True
+        _windows_close_native_handle(native_handle)
+        handle.native_handle = None
+        return
+
     kernel32 = _windows_kernel32()
-    if not kernel32.CloseHandle(handle.value):
+    ctypes.set_last_error(0)
+    if not kernel32.CloseHandle(ctypes.c_void_p(value)):
         error = ctypes.get_last_error()
+        after_close = _windows_compare_object_handles(value, native_handle)
+        if after_close is False:
+            handle.closed = True
+            _windows_close_native_handle(native_handle)
+            handle.native_handle = None
+            return
         raise OSError(error, "unable to close filesystem authority handle")
+    handle.closed = True
+    _windows_close_native_handle(native_handle)
+    handle.native_handle = None
 
 
 def _windows_verify_directory(handle: _WindowsDirectoryHandle) -> None:
+    if handle.closed:
+        raise SolverOwnershipError("filesystem authority handle is unavailable")
     try:
         information = _windows_directory_information(handle.value)
     except SolverOwnershipError:
@@ -520,6 +1283,53 @@ def _windows_verify_directory(handle: _WindowsDirectoryHandle) -> None:
         raise SolverOwnershipError("filesystem authority handle identity changed")
 
 
+def _windows_set_handle_inheritable(native_handle: int, inheritable: bool) -> None:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.SetHandleInformation.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32]
+    kernel32.SetHandleInformation.restype = ctypes.c_int
+    ctypes.set_last_error(0)
+    if not kernel32.SetHandleInformation(
+        ctypes.c_void_p(native_handle),
+        ctypes.c_uint32(0x00000001),
+        ctypes.c_uint32(0x00000001 if inheritable else 0),
+    ):
+        error = ctypes.get_last_error()
+        raise OSError(error, "unable to configure solver input handle inheritance")
+
+
+def _windows_open_input(path: Path) -> int:
+    """Open the exact solver input with read-only, replacement-blocking sharing."""
+
+    kernel32 = _windows_kernel32()
+    ctypes.set_last_error(0)
+    raw_handle = kernel32.CreateFileW(
+        os.fspath(path),
+        _WINDOWS_GENERIC_READ,
+        _WINDOWS_FILE_SHARE_READ,
+        None,
+        _WINDOWS_OPEN_EXISTING,
+        _WINDOWS_FILE_ATTRIBUTE_NORMAL | _WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT,
+        None,
+    )
+    raw_value = raw_handle.value if isinstance(raw_handle, ctypes.c_void_p) else raw_handle
+    try:
+        value = 0 if raw_value is None else int(cast(int, raw_value))
+    except (TypeError, ValueError, OverflowError):
+        value = 0
+    if not value or value in {-1, _WINDOWS_INVALID_HANDLE_VALUE}:
+        error = ctypes.get_last_error()
+        raise OSError(error, f"unable to hold solver input authority: {path}")
+    return cast(
+        int,
+        _windows_convert_raw_handle(
+            value,
+            os.O_RDONLY,
+            duplicate_native_handle=_windows_duplicate_native_handle,
+            close_native_handle=_windows_close_native_handle,
+        ),
+    )
+
+
 class _FilesystemAuthority:
     """Keep the attempt path and every ancestor bound to stable identities."""
 
@@ -530,6 +1340,7 @@ class _FilesystemAuthority:
         ] = ()
         self._root_fd: int | None = None
         self._closed = False
+        self._close_pending = False
         entries: list[tuple[_FilesystemIdentity, int | _WindowsDirectoryHandle | None]] = []
         try:
             paths: list[Path] = []
@@ -585,8 +1396,10 @@ class _FilesystemAuthority:
                         )
                     except BaseException:
                         if isinstance(held, _WindowsDirectoryHandle):
-                            with contextlib.suppress(BaseException):
+                            try:
                                 _windows_close_directory(held)
+                            except BaseException:
+                                _DURABLE_CLAIM_CLEANUP.adopt_directory_handle(held)
                         raise
                 else:
                     metadata = os.lstat(os.fspath(path))
@@ -607,8 +1420,15 @@ class _FilesystemAuthority:
             self.verify()
         except BaseException:
             self._entries = tuple(entries)
-            with contextlib.suppress(BaseException):
+            try:
                 self.close()
+            except BaseException:
+                _DURABLE_CLAIM_CLEANUP.adopt(
+                    None,
+                    None,
+                    (),
+                    filesystem_authority=self,
+                )
             raise
 
     @property
@@ -624,7 +1444,7 @@ class _FilesystemAuthority:
         return tuple(identity for identity, _fd in self._entries)
 
     def verify(self) -> None:
-        if self._closed:
+        if self._closed or self._close_pending:
             raise SolverOwnershipError("filesystem authority is closed")
         for identity, held in self._entries:
             if os.name == "posix" and isinstance(held, int):
@@ -719,25 +1539,39 @@ class _FilesystemAuthority:
     def close(self) -> None:
         if self._closed:
             return
-        self._closed = True
         failures: list[BaseException] = []
-        for _identity, held in self._entries:
+        remaining: list[tuple[_FilesystemIdentity, int | _WindowsDirectoryHandle | None]] = []
+        for identity, held in self._entries:
             if os.name == "posix" and isinstance(held, int):
                 try:
                     os.close(held)
                 except BaseException as error:
                     failures.append(error)
+                    remaining.append((identity, held))
             elif os.name == "nt" and isinstance(held, _WindowsDirectoryHandle):
                 try:
                     _windows_close_directory(held)
                 except BaseException as error:
                     failures.append(error)
-        self._root_fd = None
+                    remaining.append((identity, held))
+        self._entries = tuple(remaining)
+        self._root_fd = next(
+            (
+                held
+                for identity, held in remaining
+                if identity.path == self.root and isinstance(held, int)
+            ),
+            None,
+        )
         if failures:
+            self._close_pending = True
             raise SolverOwnershipError("filesystem authority could not be closed") from failures[0]
+        self._root_fd = None
+        self._close_pending = False
+        self._closed = True
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class _ProcessRecordClaim:
     path: Path
     content: bytes
@@ -747,6 +1581,291 @@ class _ProcessRecordClaim:
     handle: int | None = None
     parent_fd: int | None = None
     name: str = _PROCESS_RECORD_NAME
+    native_handle: int | None = None
+    parent_native_handle: int | None = None
+
+
+@dataclass(slots=True)
+class _WindowsResumeTransactionClaim:
+    """Held authority for the crash-recovery transition journal."""
+
+    path: Path
+    content: bytes
+    device: int
+    inode: int
+    handle: int | None
+    native_handle: int | None
+    event_name: str = ""
+    event_token: str = ""
+    event_handle: int | None = None
+    child_handle: int | None = None
+
+
+class _DurableClaimCleanup:
+    """Retain only exact claim objects whose descriptors could not be closed."""
+
+    __slots__ = (
+        "_lock",
+        "_directory_handles",
+        "_filesystem_authorities",
+        "_input_leases",
+        "_runtime_claims",
+        "_process_authorities",
+        "_process_record_claims",
+        "_resume_transaction_claims",
+    )
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._directory_handles: list[_WindowsDirectoryHandle] = []
+        self._filesystem_authorities: list[_FilesystemAuthority] = []
+        self._input_leases: list[_InputLease] = []
+        self._runtime_claims: list[_RuntimeLaunchClaim] = []
+        self._process_authorities: list[ProcessAuthority] = []
+        self._process_record_claims: list[_ProcessRecordClaim] = []
+        self._resume_transaction_claims: list[_WindowsResumeTransactionClaim] = []
+
+    @staticmethod
+    def _discard_identity(entries: list[Any], target: Any) -> None:
+        entries[:] = [entry for entry in entries if entry is not target]
+
+    def adopt_directory_handle(self, handle: _WindowsDirectoryHandle) -> None:
+        """Retain one exact raw directory handle until it can be closed."""
+
+        with self._lock:
+            if (not handle.closed or handle.native_handle is not None) and not any(
+                held is handle for held in self._directory_handles
+            ):
+                self._directory_handles.append(handle)
+
+    def discard_directory_handle(self, handle: _WindowsDirectoryHandle) -> None:
+        with self._lock:
+            self._discard_identity(self._directory_handles, handle)
+
+    def adopt(
+        self,
+        runtime_claim: _RuntimeLaunchClaim | None,
+        process_record_claim: _ProcessRecordClaim | None,
+        candidates: Iterable[_ProcessRecordClaim],
+        *,
+        process_authority: ProcessAuthority | None = None,
+        filesystem_authority: _FilesystemAuthority | None = None,
+        input_lease: _InputLease | None = None,
+        resume_transaction: _WindowsResumeTransactionClaim | None = None,
+    ) -> None:
+        """Adopt still-live claims without retaining their supervisor owner."""
+
+        with self._lock:
+            if (
+                filesystem_authority is not None
+                and not filesystem_authority._closed
+                and not any(held is filesystem_authority for held in self._filesystem_authorities)
+            ):
+                self._filesystem_authorities.append(filesystem_authority)
+            if (
+                input_lease is not None
+                and (
+                    input_lease.handle is not None
+                    or input_lease.native_handle is not None
+                    or input_lease.source_handle is not None
+                )
+                and not any(held is input_lease for held in self._input_leases)
+            ):
+                self._input_leases.append(input_lease)
+            if (
+                runtime_claim is not None
+                and (
+                    runtime_claim.handle is not None
+                    or runtime_claim.native_handle is not None
+                    or runtime_claim.source_handle is not None
+                )
+                and not any(held is runtime_claim for held in self._runtime_claims)
+            ):
+                self._runtime_claims.append(runtime_claim)
+            if process_authority is not None and not any(
+                held is process_authority for held in self._process_authorities
+            ):
+                self._process_authorities.append(process_authority)
+            for candidate in (
+                process_record_claim,
+                *tuple(candidates),
+            ):
+                if candidate is None:
+                    continue
+                if (
+                    candidate.handle is None
+                    and candidate.parent_fd is None
+                    and candidate.native_handle is None
+                    and candidate.parent_native_handle is None
+                ):
+                    continue
+                if not any(held is candidate for held in self._process_record_claims):
+                    self._process_record_claims.append(candidate)
+            if (
+                resume_transaction is not None
+                and (
+                    resume_transaction.handle is not None
+                    or resume_transaction.native_handle is not None
+                    or resume_transaction.event_handle is not None
+                    or resume_transaction.child_handle is not None
+                )
+                and not any(held is resume_transaction for held in self._resume_transaction_claims)
+            ):
+                self._resume_transaction_claims.append(resume_transaction)
+
+    def _drain_runtime_claims(self) -> None:
+        for claim in tuple(self._runtime_claims):
+            if claim.handle is None and claim.native_handle is None and claim.source_handle is None:
+                self._discard_identity(self._runtime_claims, claim)
+                continue
+            try:
+                claim.close()
+            except BaseException:
+                continue
+            if claim.handle is None and claim.native_handle is None and claim.source_handle is None:
+                self._discard_identity(self._runtime_claims, claim)
+
+    def _drain_process_authorities(self) -> None:
+        for authority in tuple(self._process_authorities):
+            try:
+                authority.close()
+            except BaseException:
+                continue
+            self._discard_identity(self._process_authorities, authority)
+
+    @staticmethod
+    def _close_record_claim_descriptors(claim: _ProcessRecordClaim) -> None:
+        for attribute, native_attribute in (
+            ("handle", "native_handle"),
+            ("parent_fd", "parent_native_handle"),
+        ):
+            fd = getattr(claim, attribute)
+            native_handle = getattr(claim, native_attribute)
+            if fd is None and native_handle is None:
+                continue
+            if _NATIVE_WINDOWS:
+                try:
+                    if attribute == "handle":
+                        with _WINDOWS_RECORD_CLAIMS_LOCK:
+                            old_fd = claim.handle
+                            old_native = claim.native_handle
+                            _windows_close_owned_fd(claim, attribute, native_attribute)
+                            _windows_unregister_record_claim(
+                                claim.path,
+                                old_fd if old_fd is not None else -1,
+                                device=claim.device,
+                                inode=claim.inode,
+                                native_handle=old_native,
+                                owner=claim,
+                            )
+                    else:
+                        _windows_close_owned_fd(claim, attribute, native_attribute)
+                except BaseException:
+                    continue
+                continue
+            try:
+                os.close(fd)
+                setattr(claim, attribute, None)
+            except BaseException:
+                continue
+
+    def _drain_process_record_claims(self) -> None:
+        for claim in tuple(self._process_record_claims):
+            if (
+                claim.handle is None
+                and claim.parent_fd is None
+                and claim.native_handle is None
+                and claim.parent_native_handle is None
+            ):
+                self._discard_identity(self._process_record_claims, claim)
+                continue
+            self._close_record_claim_descriptors(claim)
+            if (
+                claim.handle is None
+                and claim.parent_fd is None
+                and claim.native_handle is None
+                and claim.parent_native_handle is None
+            ):
+                self._discard_identity(self._process_record_claims, claim)
+
+    def _drain_resume_transaction_claims(self) -> None:
+        for claim in tuple(self._resume_transaction_claims):
+            if (
+                claim.handle is None
+                and claim.native_handle is None
+                and claim.event_handle is None
+                and claim.child_handle is None
+            ):
+                self._discard_identity(self._resume_transaction_claims, claim)
+                continue
+            _windows_close_resume_event_handles(claim)
+            try:
+                if claim.handle is not None or claim.native_handle is not None:
+                    _windows_close_owned_fd(claim, "handle", "native_handle")
+            except BaseException:
+                continue
+            if (
+                claim.handle is None
+                and claim.native_handle is None
+                and claim.event_handle is None
+                and claim.child_handle is None
+            ):
+                self._discard_identity(self._resume_transaction_claims, claim)
+
+    def _drain_filesystem_authorities(self) -> None:
+        for authority in tuple(self._filesystem_authorities):
+            try:
+                authority.close()
+            except BaseException:
+                continue
+            self._discard_identity(self._filesystem_authorities, authority)
+
+    def _drain_directory_handles(self) -> None:
+        for handle in tuple(self._directory_handles):
+            try:
+                _windows_close_directory(handle)
+            except BaseException:
+                continue
+            if handle.closed and handle.native_handle is None:
+                self._discard_identity(self._directory_handles, handle)
+
+    def _drain_input_leases(self) -> None:
+        for lease in tuple(self._input_leases):
+            try:
+                lease.close()
+            except BaseException:
+                continue
+            if lease.handle is None and lease.native_handle is None and lease.source_handle is None:
+                self._discard_identity(self._input_leases, lease)
+
+    def drain(self) -> None:
+        """Retry exact descriptor closes; persistent failures remain owned."""
+
+        with self._lock:
+            self._drain_directory_handles()
+            self._drain_filesystem_authorities()
+            self._drain_input_leases()
+            _drain_runtime_claims()
+            self._drain_runtime_claims()
+            self._drain_process_authorities()
+            self._drain_process_record_claims()
+            self._drain_resume_transaction_claims()
+            _drain_windows_probe_claims()
+
+
+_DURABLE_CLAIM_CLEANUP = _DurableClaimCleanup()
+
+
+def _drain_durable_cleanup(
+    owner: _DurableClaimCleanup = _DURABLE_CLAIM_CLEANUP,
+) -> None:
+    """Opportunistically retry durable claim cleanup without raising."""
+
+    with contextlib.suppress(BaseException):
+        owner.drain()
+
+
+atexit.register(_drain_durable_cleanup)
 
 
 class _ProcessRecordPath(type(Path())):  # type: ignore[misc]
@@ -832,6 +1951,7 @@ class _ProcessMetadata:
     alive: bool
     return_code: int | None
     started_at: datetime | None = None
+    executable_snapshot: _FileSnapshot | None = None
 
 
 def _normalise_executable(path: str | Path) -> str:
@@ -875,12 +1995,16 @@ def _windows_process_metadata(pid: int) -> _ProcessMetadata:
 
 def _posix_process_metadata(pid: int) -> _ProcessMetadata:
     proc_root = Path("/proc") / str(pid)
+    if not Path("/proc").is_dir() or not proc_root.is_dir():
+        raise ProcessLookupError(pid)
     try:
         stat_line = (proc_root / "stat").read_text(encoding="utf-8")
         stat_fields = stat_line.rpartition(")")[2].split()
         executable_path = os.readlink(os.fspath(proc_root / "exe"))
-    except OSError as error:
+    except (OSError, TypeError, ValueError) as error:
         raise ProcessLookupError(pid) from error
+    if not isinstance(executable_path, str) or not executable_path:
+        raise ProcessLookupError(pid)
     if len(stat_fields) < 20:
         raise OSError("unable to read process start identity")
     state = stat_fields[0]
@@ -902,12 +2026,35 @@ def _posix_process_metadata(pid: int) -> _ProcessMetadata:
         )
     except (OSError, StopIteration, ValueError, TypeError, OverflowError) as error:
         raise OSError("unable to read process start identity") from error
+    executable_fd: int | None = None
+    try:
+        close_on_exec = getattr(os, "O_CLOEXEC", None)
+        if (
+            isinstance(close_on_exec, bool)
+            or not isinstance(close_on_exec, int)
+            or close_on_exec <= 0
+        ):
+            raise OSError("process executable descriptor primitive is unavailable")
+        executable_fd = os.open(
+            os.fspath(proc_root / "exe"),
+            os.O_RDONLY | close_on_exec,
+        )
+        executable_snapshot = _snapshot_from_fd(executable_fd)
+    except (AttributeError, OSError, RuntimeProbeError, TypeError, ValueError) as error:
+        raise OSError("unable to read process executable image") from error
+    finally:
+        if executable_fd is not None:
+            try:
+                os.close(executable_fd)
+            except (AttributeError, OSError, TypeError, ValueError) as error:
+                raise OSError("unable to close process executable descriptor") from error
     return _ProcessMetadata(
         executable_path=executable_path,
         creation_identity=f"posix:{stat_fields[19]}",
         alive=state not in {"Z", "X"},
         return_code=None if state not in {"Z", "X"} else 0,
         started_at=started_at,
+        executable_snapshot=executable_snapshot,
     )
 
 
@@ -923,6 +2070,19 @@ def _process_action(process: subprocess.Popen[bytes] | _ReconnectedProcess, acti
     getattr(process, action)()
 
 
+def _detach_windows_process_for_finalizer(process: object) -> None:
+    """Release one live Popen wrapper without inspecting or acting on its child."""
+
+    if not _NATIVE_WINDOWS or not isinstance(process, subprocess.Popen):
+        return
+    if getattr(process, "_child_created", False) and getattr(process, "returncode", None) is None:
+        # Popen.__del__ otherwise emits a warning and polls the child.  The
+        # supervisor finalizer is only allowed to release this object's own
+        # runtime handle; reconnect retains the durable process record and
+        # process authority for a later owner.
+        cast(Any, process)._child_created = False
+
+
 class _ReconnectedProcess:
     """Small process handle for a process that is not this client's child."""
 
@@ -932,11 +2092,13 @@ class _ReconnectedProcess:
         executable_path: str,
         creation_identity: str,
         authority: ProcessAuthority,
+        executable_snapshot: _FileSnapshot | None = None,
     ) -> None:
         self.pid = pid
         self._executable_path = executable_path
         self._creation_identity = creation_identity
         self._authority = authority
+        self._executable_snapshot = executable_snapshot
 
     def poll(self) -> int | None:
         try:
@@ -945,12 +2107,19 @@ class _ReconnectedProcess:
             return 1
         if not metadata.alive:
             return metadata.return_code
-        if metadata.alive and (
-            _normalise_executable(metadata.executable_path)
-            != _normalise_executable(self._executable_path)
-            or metadata.creation_identity != self._creation_identity
-        ):
+        if metadata.alive and metadata.creation_identity != self._creation_identity:
             raise SolverOwnershipError("reconnected process identity no longer matches")
+        if metadata.alive:
+            if os.name == "posix":
+                if (
+                    self._executable_snapshot is None
+                    or metadata.executable_snapshot != self._executable_snapshot
+                ):
+                    raise SolverOwnershipError("reconnected process image no longer matches")
+            elif _normalise_executable(metadata.executable_path) != _normalise_executable(
+                self._executable_path
+            ):
+                raise SolverOwnershipError("reconnected process identity no longer matches")
         try:
             self._authority.verify(self.pid)
         except ProcessAuthorityError as error:
@@ -996,6 +2165,7 @@ class SolverSupervisor:
             launch_context_digest,
         ) = _validate_launch_capability(launch_capability)
         self._launch_capability = launch_capability
+        self._runtime_diagnostic = _capability_record.runtime_diagnostic
         self.spec = _capability_record.spec
         self._case_id = case_id
         self._intent_id = intent_id
@@ -1025,7 +2195,14 @@ class SolverSupervisor:
         self._result: SolverRunResult | None = None
         self._process_record: dict[str, object] | None = None
         self._process_record_claim: _ProcessRecordClaim | None = None
+        self._process_record_candidates: list[_ProcessRecordClaim] = []
+        self._pending_process_record_claim: _ProcessRecordClaim | None = None
+        self._resume_transaction_claim: _WindowsResumeTransactionClaim | None = None
+        self._runtime_launch_claim: _RuntimeLaunchClaim | None = None
+        self._runtime_image_snapshot: _FileSnapshot | None = None
+        self._input_lease: _InputLease | None = None
         self._record_owner_token = self._owner_token
+        _drain_durable_cleanup()
         filesystem_authority = _FilesystemAuthority(self.spec.attempt_root)
         try:
             self._filesystem_authority: _FilesystemAuthority | None = filesystem_authority
@@ -1056,14 +2233,61 @@ class SolverSupervisor:
                     raise SolverConfigurationError("fbs adapter root authority does not match")
             self._revalidate_launch_binding()
         except BaseException:
-            filesystem_authority.close()
+            try:
+                filesystem_authority.close()
+            except BaseException:
+                _DURABLE_CLAIM_CLEANUP.adopt(
+                    None,
+                    None,
+                    (),
+                    filesystem_authority=filesystem_authority,
+                )
             raise
 
     def __del__(self) -> None:
-        authority = getattr(self, "_filesystem_authority", None)
-        if authority is not None:
+        process = getattr(self, "_process", None)
+        try:
             with contextlib.suppress(BaseException):
+                # Finalization releases this supervisor's filesystem, record,
+                # runtime, input, and resume claims.  A failed close leaves
+                # only the exact residual claims for durable cleanup.
                 self._close_filesystem_authority()
+            process_authority = getattr(self, "_process_authority", None)
+            if process_authority is not None:
+                try:
+                    # Closing this supervisor's authority only releases its
+                    # own handles; it must never drain, terminate, reap, or
+                    # mutate the live child or its reconnect record.
+                    process_authority.close()
+                except BaseException:
+                    _DURABLE_CLAIM_CLEANUP.adopt(
+                        None,
+                        None,
+                        (),
+                        process_authority=process_authority,
+                    )
+                self._process_authority = None
+            pending = getattr(self, "_pending_process_record_claim", None)
+            candidate_values = tuple(getattr(self, "_process_record_candidates", ()))
+            if pending is not None:
+                candidate_values += (pending,)
+            # Any failed close above remains attached to its exact claim object;
+            # this finalizer never reopens authority by path.
+            _DURABLE_CLAIM_CLEANUP.adopt(
+                getattr(self, "_runtime_launch_claim", None),
+                getattr(self, "_process_record_claim", None),
+                candidate_values,
+                filesystem_authority=getattr(self, "_filesystem_authority", None),
+                input_lease=getattr(self, "_input_lease", None),
+                resume_transaction=getattr(self, "_resume_transaction_claim", None),
+            )
+        except BaseException:
+            # Finalization must not surface an unraisable exception. Claims
+            # already adopted above remain owned by the process-lifetime owner.
+            pass
+        finally:
+            with contextlib.suppress(BaseException):
+                _detach_windows_process_for_finalizer(process)
 
     @property
     def state(self) -> SolverState:
@@ -1102,6 +2326,7 @@ class SolverSupervisor:
             return latch
 
     def _acquire_filesystem_authority(self) -> None:
+        _drain_durable_cleanup()
         if self._filesystem_authority is None:
             self._filesystem_authority = _FilesystemAuthority(self.spec.attempt_root)
         self._filesystem_authority.verify()
@@ -1111,6 +2336,120 @@ class SolverSupervisor:
         if authority is None:
             raise SolverOwnershipError("filesystem authority is unavailable")
         authority.verify()
+        self._verify_input_lease()
+
+    def _recorded_input_binding(self) -> tuple[str, tuple[int, int, int, int, int]]:
+        expected_path = self._launch_context.get("input_path")
+        expected_sha256 = self._launch_context.get("input_sha256")
+        identity_value = self._launch_context.get("input_identity")
+        if not isinstance(expected_path, str) or not expected_path:
+            raise SolverOwnershipError("solver input path binding is invalid")
+        canonical_path = os.path.normcase(
+            os.path.realpath(os.path.abspath(os.fspath(self.spec.input_path)))
+        )
+        if expected_path != canonical_path:
+            raise SolverOwnershipError("solver input path binding is invalid")
+        if not isinstance(expected_sha256, str) or not expected_sha256:
+            raise SolverOwnershipError("solver input SHA256 binding is invalid")
+        if not isinstance(identity_value, dict):
+            raise SolverOwnershipError("solver input identity binding is invalid")
+        identity: list[int] = []
+        for name in ("device", "inode", "nlink", "size", "mtime_ns"):
+            value = identity_value.get(name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise SolverOwnershipError("solver input identity binding is invalid")
+            identity.append(value)
+        return expected_sha256, cast(tuple[int, int, int, int, int], tuple(identity))
+
+    def _acquire_input_lease(self) -> None:
+        if self._input_lease is not None:
+            self._input_lease.verify()
+            return
+        expected_sha256, expected_identity = self._recorded_input_binding()
+        input_path = self.spec.input_path
+        handle: int
+        native_handle: int | None = None
+        object_identity: tuple[int, int, int, int, int] | None = None
+        source_fd: int | None = None
+        if os.name == "posix":
+            authority = self._filesystem_authority
+            if authority is None:
+                raise SolverOwnershipError("filesystem authority is unavailable")
+            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+            try:
+                with authority.open_directory(input_path.parent) as parent_fd:
+                    source_fd = os.open(input_path.name, flags, dir_fd=parent_fd)
+            except OSError as error:
+                raise SolverOwnershipError("unable to hold exact solver input") from error
+            try:
+                handle, object_identity = _posix_create_input_snapshot(
+                    source_fd,
+                    expected_sha256,
+                    expected_identity,
+                )
+            except BaseException:
+                try:
+                    os.close(source_fd)
+                except BaseException:
+                    orphan = _InputLease(
+                        path=input_path,
+                        expected_sha256=expected_sha256,
+                        expected_identity=expected_identity,
+                        handle=None,
+                        source_handle=source_fd,
+                    )
+                    _DURABLE_CLAIM_CLEANUP.adopt(None, None, (), input_lease=orphan)
+                raise
+        elif os.name == "nt" and _NATIVE_WINDOWS:
+            try:
+                opened = _windows_open_input(input_path)
+            except OSError as error:
+                raise SolverOwnershipError("unable to hold exact solver input") from error
+            handle = int(opened)
+            native_handle = getattr(opened, "native_handle", None)
+            if not isinstance(native_handle, int) or isinstance(native_handle, bool):
+                with contextlib.suppress(BaseException):
+                    os.close(handle)
+                raise SolverOwnershipError("exact solver input has no native handle")
+        else:
+            raise SolverOwnershipError("exact solver input leases are unsupported")
+
+        lease = _InputLease(
+            path=input_path,
+            expected_sha256=expected_sha256,
+            expected_identity=expected_identity,
+            handle=handle,
+            native_handle=native_handle,
+            source_handle=source_fd,
+            object_identity=object_identity,
+        )
+        source_fd = None
+        try:
+            lease.close_source()
+            lease.verify(digest=True)
+        except BaseException:
+            try:
+                lease.close()
+            except BaseException:
+                _DURABLE_CLAIM_CLEANUP.adopt(None, None, (), input_lease=lease)
+            raise
+        self._input_lease = lease
+
+    def _verify_input_lease(self, *, digest: bool = False) -> None:
+        lease = self._input_lease
+        if lease is not None:
+            lease.verify(digest=digest)
+
+    def _release_input_lease(self) -> tuple[BaseException, ...]:
+        lease = self._input_lease
+        if lease is None:
+            return ()
+        try:
+            lease.close()
+        except BaseException as error:
+            return (error,)
+        self._input_lease = None
+        return ()
 
     def _filesystem_identities(self) -> tuple[_FilesystemIdentity, ...]:
         authority = self._filesystem_authority
@@ -1180,28 +2519,138 @@ class SolverSupervisor:
     ) -> tuple[BaseException, ...]:
         failures: list[BaseException] = []
         if claim is not None:
-            if _NATIVE_WINDOWS and claim.handle is not None:
-                _windows_unregister_record_claim(claim.path, claim.handle)
-            for fd in (claim.handle, claim.parent_fd):
-                if fd is not None:
+            for attribute, native_attribute in (
+                ("handle", "native_handle"),
+                ("parent_fd", "parent_native_handle"),
+            ):
+                fd = getattr(claim, attribute)
+                native_handle = getattr(claim, native_attribute)
+                if fd is not None or native_handle is not None:
                     try:
-                        os.close(fd)
+                        if _NATIVE_WINDOWS:
+                            if attribute == "handle":
+                                with _WINDOWS_RECORD_CLAIMS_LOCK:
+                                    old_fd = claim.handle
+                                    old_native = claim.native_handle
+                                    _windows_close_owned_fd(
+                                        claim,
+                                        attribute,
+                                        native_attribute,
+                                    )
+                                    _windows_unregister_record_claim(
+                                        claim.path,
+                                        old_fd if old_fd is not None else -1,
+                                        device=claim.device,
+                                        inode=claim.inode,
+                                        native_handle=old_native,
+                                        owner=claim,
+                                    )
+                            else:
+                                _windows_close_owned_fd(
+                                    claim,
+                                    attribute,
+                                    native_attribute,
+                                )
+                        else:
+                            os.close(fd)
                     except BaseException as error:
                         failures.append(error)
+                    else:
+                        if getattr(claim, attribute) == fd:
+                            setattr(claim, attribute, None)
+            if (
+                claim.handle is None
+                and claim.parent_fd is None
+                and claim.native_handle is None
+                and claim.parent_native_handle is None
+            ):
+                if _NATIVE_WINDOWS:
+                    _windows_unregister_record_claim(
+                        claim.path,
+                        -1,
+                        owner=claim,
+                    )
+                self._process_record_candidates[:] = [
+                    candidate
+                    for candidate in self._process_record_candidates
+                    if candidate is not claim
+                ]
+                if self._pending_process_record_claim is claim:
+                    self._pending_process_record_claim = None
+        return tuple(failures)
+
+    def _release_runtime_launch_claim(self) -> tuple[BaseException, ...]:
+        claim = self._runtime_launch_claim
+        if claim is None:
+            return ()
+        try:
+            claim.close()
+        except BaseException as error:
+            return (error,)
+        self._runtime_launch_claim = None
+        return ()
+
+    def _release_resume_transaction_claim(self) -> tuple[BaseException, ...]:
+        claim = self._resume_transaction_claim
+        if claim is None:
+            return ()
+        failures = list(_windows_close_resume_event_handles(claim))
+        if claim.handle is not None or claim.native_handle is not None:
+            try:
+                _windows_close_owned_fd(claim, "handle", "native_handle")
+            except BaseException as error:
+                failures.append(error)
+        if (
+            claim.handle is None
+            and claim.native_handle is None
+            and claim.event_handle is None
+            and claim.child_handle is None
+        ):
+            self._resume_transaction_claim = None
+        return tuple(failures)
+
+    def _delete_resume_transaction(self) -> tuple[BaseException, ...]:
+        """Delete only the exact held transition journal, then release it."""
+
+        claim = self._resume_transaction_claim
+        if claim is None:
+            return ()
+        failures: list[BaseException] = []
+        if claim.handle is None:
+            failures.append(SolverOwnershipError("resume transaction handle is unavailable"))
+        else:
+            try:
+                _windows_delete_process_record(claim.handle)
+            except BaseException as error:
+                failures.append(error)
+        failures.extend(self._release_resume_transaction_claim())
         return tuple(failures)
 
     def _close_filesystem_authority(self) -> None:
         authority = self._filesystem_authority
-        self._filesystem_authority = None
         failures: list[BaseException] = []
         if authority is not None:
             try:
                 authority.close()
             except BaseException as error:
                 failures.append(error)
+            else:
+                self._filesystem_authority = None
         claim = self._process_record_claim
-        self._process_record_claim = None
         failures.extend(self._release_process_record_claim(claim))
+        if claim is None or (
+            claim.handle is None
+            and claim.parent_fd is None
+            and claim.native_handle is None
+            and claim.parent_native_handle is None
+        ):
+            self._process_record_claim = None
+        for candidate in tuple(self._process_record_candidates):
+            failures.extend(self._release_process_record_claim(candidate))
+        failures.extend(self._release_resume_transaction_claim())
+        failures.extend(self._release_input_lease())
+        failures.extend(self._release_runtime_launch_claim())
+        _drain_runtime_claims()
         if failures:
             raise SolverOwnershipError("authority handles could not be closed") from failures[0]
 
@@ -1258,12 +2707,20 @@ class SolverSupervisor:
 
     def _child_command(self) -> tuple[str, ...]:
         root = self.spec.attempt_root
+        input_lease = self._input_lease
         command: list[str] = []
         for value in self.spec.command:
             try:
                 candidate = Path(value)
             except (TypeError, ValueError):
                 command.append(value)
+                continue
+            runtime_claim = self._runtime_launch_claim
+            if runtime_claim is not None and candidate == self.spec.executable:
+                command.append(os.fspath(runtime_claim.child_path))
+                continue
+            if input_lease is not None and candidate == self.spec.input_path:
+                command.append(os.fspath(input_lease.child_path))
                 continue
             if candidate.is_absolute() and candidate.is_relative_to(root):
                 command.append(os.fspath(self._path_for_io(candidate)))
@@ -1359,6 +2816,18 @@ class SolverSupervisor:
         if claim.handle is None:
             return False
         try:
+            if _NATIVE_WINDOWS:
+                if claim.native_handle is None:
+                    raise SolverOwnershipError("owned process record has no exact native guard")
+                exact_match = _windows_fd_identity_matches(
+                    claim.handle,
+                    claim.native_handle,
+                )
+                if exact_match is None:
+                    raise SolverOwnershipError("unable to verify Windows CRT descriptor identity")
+                if not exact_match:
+                    claim.handle = None
+                    return False
             handle_metadata = os.fstat(claim.handle)
             if (
                 not stat.S_ISREG(handle_metadata.st_mode)
@@ -1381,8 +2850,8 @@ class SolverSupervisor:
                 try:
                     return _same_file_identity(handle_metadata, os.fstat(path_fd))
                 finally:
-                    with contextlib.suppress(OSError):
-                        os.close(path_fd)
+                    with contextlib.suppress(BaseException):
+                        _close_windows_probe(path_fd)
             return True
         except FileNotFoundError:
             return False
@@ -1392,9 +2861,22 @@ class SolverSupervisor:
     def _rollback_process_record(self) -> tuple[BaseException, ...]:
         """Remove only the exact record object this owner published."""
 
+        failures: list[BaseException] = []
+        if self._resume_transaction_claim is not None:
+            failures.extend(self._delete_resume_transaction())
         claim = self._process_record_claim
         if claim is None or claim.handle is None:
-            return ()
+            claim = next(
+                (
+                    candidate
+                    for candidate in reversed(self._process_record_candidates)
+                    if candidate.handle is not None
+                    and candidate.state in {"BOUND_SUSPENDED", SolverState.RUNNING.value}
+                ),
+                None,
+            )
+        if claim is None or claim.handle is None:
+            return tuple(failures)
         try:
             if _NATIVE_WINDOWS:
                 _windows_delete_process_record(claim.handle)
@@ -1405,15 +2887,17 @@ class SolverSupervisor:
                 self._rollback_posix_process_record(claim)
         except FileNotFoundError as error:
             if not _NATIVE_WINDOWS:
-                return ()
+                return tuple(failures)
             failure = SolverOwnershipError("unable to roll back the owned process record")
             failure.__cause__ = error
-            return (failure,)
+            failures.append(failure)
+            return tuple(failures)
         except BaseException as error:
             failure = SolverOwnershipError("unable to roll back the owned process record")
             failure.__cause__ = error
-            return (failure,)
-        return ()
+            failures.append(failure)
+            return tuple(failures)
+        return tuple(failures)
 
     def _rollback_posix_process_record(self, claim: _ProcessRecordClaim) -> None:
         """CAS-remove a held record, preserving any name replacement."""
@@ -1607,6 +3091,7 @@ class SolverSupervisor:
 
             authority: ProcessAuthority | None = None
             process: subprocess.Popen[bytes] | None = None
+            runtime_claim: _RuntimeLaunchClaim | None = None
             bound = False
             try:
                 self._acquire_filesystem_authority()
@@ -1616,10 +3101,21 @@ class SolverSupervisor:
                 self._revalidate_launch_binding()
                 if not self._input_is_regular():
                     raise FileNotFoundError(f"solver input does not exist: {self.spec.input_path}")
+                self._acquire_input_lease()
+                self._verify_input_lease(digest=True)
                 authority = ProcessAuthority.create(
                     self.spec.attempt_root, self._launch_context_digest
                 )
                 self._verify_filesystem_authority()
+                try:
+                    runtime_claim = _acquire_runtime_launch_claim(self._runtime_diagnostic)
+                except RuntimeProbeError as error:
+                    raise SolverLaunchError(
+                        "unable to hold the probed runtime executable identity"
+                    ) from error
+                self._runtime_launch_claim = runtime_claim
+                if os.name == "nt":
+                    self._reserve_windows_resume_transaction()
                 environment = self._child_environment()
                 environment.update(authority.child_environment())
                 command = self._child_command()
@@ -1632,29 +3128,54 @@ class SolverSupervisor:
                     child_handle = authority.child_handle()
                     if child_handle is None:
                         raise ProcessAuthorityError("process attestation handle is unavailable")
+                    input_lease = self._input_lease
+                    if input_lease is None:
+                        raise SolverOwnershipError("solver input lease is unavailable")
+                    input_child_handle = input_lease.prepare_child_handle()
+                    if input_child_handle is None:
+                        raise SolverOwnershipError("solver input child handle is unavailable")
+                    transaction_claim = self._resume_transaction_claim
+                    if transaction_claim is None or transaction_claim.child_handle is None:
+                        raise SolverOwnershipError("resume transaction child handle is unavailable")
                     startup_info = subprocess.STARTUPINFO()
-                    startup_info.lpAttributeList = {"handle_list": [child_handle]}
-                    self._revalidate_launch_binding()
-                    self._verify_filesystem_authority()
-                    process = subprocess.Popen(
-                        command,
-                        cwd=cwd,
-                        env=environment,
-                        shell=False,
-                        stdin=subprocess.DEVNULL,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        creationflags=creation_flags,
-                        close_fds=True,
-                        startupinfo=startup_info,
-                    )
+                    startup_info.lpAttributeList = {
+                        "handle_list": [
+                            child_handle,
+                            input_child_handle,
+                            transaction_claim.child_handle,
+                        ]
+                    }
+                    try:
+                        self._revalidate_launch_binding()
+                        self._verify_filesystem_authority()
+                        process = subprocess.Popen(
+                            command,
+                            cwd=cwd,
+                            env=environment,
+                            shell=False,
+                            stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            creationflags=creation_flags,
+                            close_fds=True,
+                            startupinfo=startup_info,
+                        )
+                    finally:
+                        input_lease.clear_child_handle()
+                        self._clear_resume_transaction_child_handle()
                 else:
                     filesystem_authority = self._filesystem_authority
                     if filesystem_authority is None:  # pragma: no cover - state guard
                         raise SolverOwnershipError("filesystem authority is unavailable")
+                    input_lease = self._input_lease
+                    if input_lease is None:
+                        raise SolverOwnershipError("solver input lease is unavailable")
                     pass_fds = tuple(
                         dict.fromkeys(
-                            authority.child_pass_fds() + filesystem_authority.child_pass_fds
+                            authority.child_pass_fds()
+                            + filesystem_authority.child_pass_fds
+                            + (() if runtime_claim is None else runtime_claim.child_pass_fds)
+                            + input_lease.child_pass_fds
                         )
                     )
                     self._revalidate_launch_binding()
@@ -1672,6 +3193,11 @@ class SolverSupervisor:
                     )
                 self._verify_filesystem_authority()
                 metadata = _process_metadata(process.pid)
+                if runtime_claim is not None:
+                    runtime_claim.authenticate(
+                        metadata.executable_path,
+                        image_snapshot=metadata.executable_snapshot,
+                    )
                 authority.bind(process.pid, metadata.creation_identity)
                 bound = True
                 self._verify_filesystem_authority()
@@ -1683,7 +3209,25 @@ class SolverSupervisor:
                     raise ProcessAuthorityError(
                         "process creation identity changed during assignment"
                     )
+                if runtime_claim is not None:
+                    runtime_claim.authenticate(
+                        bound_metadata.executable_path,
+                        image_snapshot=bound_metadata.executable_snapshot,
+                    )
                 metadata = bound_metadata
+                if runtime_claim is not None:
+                    if os.name == "posix":
+                        if (
+                            metadata.executable_snapshot is None
+                            or metadata.executable_snapshot != runtime_claim.snapshot
+                            or metadata.executable_snapshot.nlink != 0
+                        ):
+                            raise ProcessAuthorityError(
+                                "executed POSIX runtime image attestation is unavailable"
+                            )
+                        self._runtime_image_snapshot = metadata.executable_snapshot
+                    else:
+                        self._runtime_image_snapshot = runtime_claim.snapshot
                 if metadata.started_at is None:
                     raise ProcessAuthorityError("process start identity is unavailable")
                 started_at = metadata.started_at
@@ -1707,9 +3251,42 @@ class SolverSupervisor:
                         raise SolverOwnershipError(
                             "BOUND_SUSPENDED process record binding changed before resume"
                         )
+                    running_record = self._make_process_record(
+                        process.pid,
+                        metadata,
+                        started_at,
+                        authority,
+                        state=SolverState.RUNNING.value,
+                    )
+                    self._prepare_windows_resume_transaction(bound_record, running_record)
+                    resume_metadata = _process_metadata(process.pid)
+                    if (
+                        not resume_metadata.alive
+                        or resume_metadata.creation_identity != metadata.creation_identity
+                    ):
+                        raise ProcessAuthorityError(
+                            "process creation identity changed before resume"
+                        )
+                    if runtime_claim is not None:
+                        runtime_claim.authenticate(resume_metadata.executable_path)
+                    self._signal_windows_resume_transaction()
                     authority.resume(process.pid)
                     self._revalidate_launch_binding()
                     self._verify_filesystem_authority()
+                    if runtime_claim is not None:
+                        release_failures = self._release_runtime_launch_claim()
+                        if release_failures:
+                            raise SolverOwnershipError(
+                                "runtime executable claim could not be closed"
+                            ) from release_failures[0]
+                        runtime_claim = None
+                elif runtime_claim is not None:
+                    release_failures = self._release_runtime_launch_claim()
+                    if release_failures:
+                        raise SolverOwnershipError(
+                            "runtime executable claim could not be closed"
+                        ) from release_failures[0]
+                    runtime_claim = None
                 running_record = self._make_process_record(
                     process.pid, metadata, started_at, authority, state=SolverState.RUNNING.value
                 )
@@ -1723,8 +3300,16 @@ class SolverSupervisor:
                 # process and filesystem authorities are released.
                 self._revalidate_launch_binding()
                 self._verify_filesystem_authority()
+                if os.name == "nt":
+                    transaction_failures = self._delete_resume_transaction()
+                    if transaction_failures:
+                        raise SolverOwnershipError(
+                            "resume transaction could not be finalized"
+                        ) from transaction_failures[0]
             except BaseException as error:
-                cleanup_failures = list(self._cleanup_failed_start(process, authority, bound))
+                cleanup_failures: list[BaseException] = []
+                cleanup_failures.extend(self._release_runtime_launch_claim())
+                cleanup_failures.extend(self._cleanup_failed_start(process, authority, bound))
                 cleanup_failures.extend(self._rollback_process_record())
                 self._process = None
                 self._started_at = None
@@ -1783,18 +3368,95 @@ class SolverSupervisor:
         authority: ProcessAuthority | None = None
         try:
             supervisor._acquire_filesystem_authority()
+            if os.name != "posix":
+                supervisor._acquire_input_lease()
             record = supervisor._read_process_record()
             supervisor._revalidate_launch_binding()
-            metadata, started_at, authority = supervisor._validate_process_record(record)
+            transition: tuple[dict[str, object], dict[str, object]] | None = None
+            recovering_transition = False
+            if _NATIVE_WINDOWS:
+                pending_claim = supervisor._pending_process_record_claim
+                if pending_claim is None:
+                    raise SolverOwnershipError("process record candidate is unavailable")
+                if record.get("state") == "BOUND_SUSPENDED":
+                    if not supervisor._resume_transaction_path().is_file():
+                        raise SolverOwnershipError(
+                            "BOUND_SUSPENDED process record is not a reconnectable RUNNING state "
+                            "and has no recoverable transaction"
+                        )
+                    # Authenticate the live process, deterministic Job, and
+                    # exact current record binding before opening the journal
+                    # or trusting its event name.
+                    authenticated_record = dict(record)
+                    authenticated_record["state"] = SolverState.RUNNING.value
+                    metadata, started_at, authority = supervisor._validate_process_record(
+                        authenticated_record
+                    )
+                    expected_binding = supervisor._parse_resume_transaction_record_binding(
+                        authenticated_record
+                    )
+                    try:
+                        transition = supervisor._read_windows_resume_transaction(
+                            pending_claim,
+                            expected_binding,
+                        )
+                    except FileNotFoundError as error:
+                        raise SolverOwnershipError(
+                            "BOUND_SUSPENDED process record is not a reconnectable RUNNING state "
+                            "and has no recoverable transaction"
+                        ) from error
+                    supervisor._validate_windows_resume_transaction(
+                        transition[0], transition[1], record
+                    )
+                    recovering_transition = True
+                    record = transition[1]
+                elif record.get("state") == SolverState.RUNNING.value:
+                    metadata, started_at, authority = supervisor._validate_process_record(record)
+                    expected_binding = supervisor._parse_resume_transaction_record_binding(record)
+                    try:
+                        transition = supervisor._read_windows_resume_transaction(
+                            pending_claim,
+                            expected_binding,
+                        )
+                    except FileNotFoundError:
+                        transition = None
+                    else:
+                        supervisor._validate_windows_resume_transaction(
+                            transition[0], transition[1], record
+                        )
+                        recovering_transition = True
+                else:
+                    metadata, started_at, authority = supervisor._validate_process_record(record)
+            else:
+                metadata, started_at, authority = supervisor._validate_process_record(record)
+            if os.name == "posix":
+                supervisor._acquire_reconnected_posix_input_lease(record, metadata, authority)
             supervisor._revalidate_launch_binding()
             supervisor._verify_filesystem_authority()
+            if recovering_transition:
+                authority.resume(cast(int, record["pid"]))
+                candidate = supervisor._pending_process_record_claim
+                if candidate is None:
+                    raise SolverOwnershipError("process record candidate is unavailable")
+                supervisor._repair_process_record_from_resume_transaction(record, candidate)
+            supervisor._install_pending_process_record_claim()
+            if transition is not None:
+                transaction_failures = supervisor._delete_resume_transaction()
+                if transaction_failures:
+                    raise SolverOwnershipError(
+                        "resume transaction could not be finalized"
+                    ) from transaction_failures[0]
             owner_token = record.get("owner_token")
             if isinstance(owner_token, str) and owner_token:
                 supervisor._record_owner_token = owner_token
             supervisor._process_record = record
             pid = cast(int, record["pid"])
             supervisor._process = _ReconnectedProcess(
-                pid, metadata.executable_path, metadata.creation_identity, authority
+                pid,
+                metadata.executable_path,
+                metadata.creation_identity,
+                authority,
+                metadata.executable_snapshot,
             )
             supervisor._process_authority = authority
             supervisor._started_at = started_at
@@ -1890,6 +3552,556 @@ class SolverSupervisor:
             self._fail_terminal_operation(error)
         return self._complete(SolverState.CANCELLED, process.poll())
 
+    def _make_input_lease_record(self) -> dict[str, object]:
+        lease = self._input_lease
+        if lease is None or lease.handle is None or lease.object_identity is None:
+            raise SolverOwnershipError("sealed POSIX input lease is unavailable")
+        lease.verify(digest=True)
+        device, inode, nlink, size, mtime_ns = lease.object_identity
+        return {
+            "fd": lease.handle,
+            "sha256": lease.expected_sha256,
+            "identity": {
+                "device": device,
+                "inode": inode,
+                "nlink": nlink,
+                "size": size,
+                "mtime_ns": mtime_ns,
+            },
+        }
+
+    def _parse_posix_input_lease_record(
+        self, record: dict[str, object]
+    ) -> tuple[int, str, tuple[int, int, int, int, int]]:
+        value = record.get("input_lease")
+        if not isinstance(value, dict):
+            raise SolverOwnershipError("process record sealed input lease is invalid")
+        fd = value.get("fd")
+        sha256 = value.get("sha256")
+        identity_value = value.get("identity")
+        if (
+            isinstance(fd, bool)
+            or not isinstance(fd, int)
+            or fd < 0
+            or not isinstance(sha256, str)
+            or len(sha256) != 64
+            or any(character not in "0123456789abcdef" for character in sha256)
+            or not isinstance(identity_value, dict)
+        ):
+            raise SolverOwnershipError("process record sealed input lease is invalid")
+        expected_sha256, _expected_identity = self._recorded_input_binding()
+        if sha256 != expected_sha256:
+            raise SolverOwnershipError("process record sealed input digest does not match")
+        identity: list[int] = []
+        for name in ("device", "inode", "nlink", "size", "mtime_ns"):
+            item = identity_value.get(name)
+            if isinstance(item, bool) or not isinstance(item, int):
+                raise SolverOwnershipError("process record sealed input identity is invalid")
+            identity.append(item)
+        if any(value < 0 for value in identity) or identity[2] != 0:
+            raise SolverOwnershipError("process record sealed input identity is invalid")
+        return fd, sha256, cast(tuple[int, int, int, int, int], tuple(identity))
+
+    def _resume_transaction_path(self) -> Path:
+        return self._path_for_io(self.spec.attempt_root / _WINDOWS_RESUME_TRANSACTION_NAME)
+
+    def _resume_transaction_record_binding(self) -> dict[str, object]:
+        """Return the pre-authenticated journal/event binding for a new record."""
+
+        claim = self._resume_transaction_claim
+        if (
+            claim is None
+            or claim.handle is None
+            or claim.native_handle is None
+            or not claim.event_name
+            or not claim.event_token
+        ):
+            raise SolverOwnershipError("resume transaction authority is unavailable")
+        parts = _windows_resume_event_parts(
+            claim.event_name,
+            self.spec.attempt_root,
+            self._launch_context_digest,
+            claim.device,
+            claim.inode,
+        )
+        if parts != (claim.device, claim.inode, claim.event_token):
+            raise SolverOwnershipError("resume event binding is invalid")
+        return {
+            "journal_identity": {
+                "device": claim.device,
+                "inode": claim.inode,
+            },
+            "event_name": claim.event_name,
+            "event_token": claim.event_token,
+        }
+
+    def _parse_resume_transaction_record_binding(
+        self, record: dict[str, object]
+    ) -> tuple[int, int, str, str]:
+        """Validate the journal/event binding carried by an authenticated record."""
+
+        value = record.get("resume_transaction")
+        if not isinstance(value, dict):
+            raise SolverOwnershipError("process record resume transaction binding is invalid")
+        identity = value.get("journal_identity")
+        if not isinstance(identity, dict):
+            raise SolverOwnershipError("process record journal identity is invalid")
+        device = identity.get("device")
+        inode = identity.get("inode")
+        if (
+            isinstance(device, bool)
+            or not isinstance(device, int)
+            or device < 0
+            or isinstance(inode, bool)
+            or not isinstance(inode, int)
+            or inode < 0
+        ):
+            raise SolverOwnershipError("process record journal identity is invalid")
+        event_name = value.get("event_name")
+        event_token = value.get("event_token")
+        if (
+            not isinstance(event_name, str)
+            or not isinstance(event_token, str)
+            or re.fullmatch(r"[0-9a-f]{32}", event_token) is None
+        ):
+            raise SolverOwnershipError("process record resume event binding is invalid")
+        parts = _windows_resume_event_parts(
+            event_name,
+            self.spec.attempt_root,
+            self._launch_context_digest,
+            device,
+            inode,
+        )
+        if parts != (device, inode, event_token):
+            raise SolverOwnershipError("process record resume event binding is invalid")
+        return device, inode, event_name, event_token
+
+    @staticmethod
+    def _record_content(record: dict[str, object]) -> bytes:
+        try:
+            return json.dumps(record, indent=2, sort_keys=True).encode("utf-8")
+        except (TypeError, ValueError) as error:
+            raise SolverOwnershipError("process record content is not serializable") from error
+
+    def _own_resume_transaction_claim(
+        self, handle: int, path: Path, content: bytes
+    ) -> _WindowsResumeTransactionClaim:
+        native_handle = getattr(handle, "native_handle", None)
+        if _NATIVE_WINDOWS and native_handle is None:
+            raise SolverOwnershipError("resume transaction has no exact native guard")
+        metadata = os.fstat(handle)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise SolverOwnershipError("resume transaction is not a regular file")
+        return _WindowsResumeTransactionClaim(
+            path=path,
+            content=content,
+            device=int(metadata.st_dev),
+            inode=int(metadata.st_ino),
+            handle=int(handle),
+            native_handle=native_handle,
+        )
+
+    def _reserve_windows_resume_transaction(self) -> None:
+        """Pre-create the exact journal and its crash-surviving resume event."""
+
+        if not _NATIVE_WINDOWS:
+            return
+        if self._resume_transaction_claim is not None:
+            raise SolverOwnershipError("resume transaction is already owned")
+        path = self._resume_transaction_path()
+        handle: int | None = None
+        try:
+            handle = _windows_open_process_record_handle(
+                path,
+                create=True,
+                desired_access=_WINDOWS_GENERIC_READ | _WINDOWS_GENERIC_WRITE | _WINDOWS_DELETE,
+                share_mode=_WINDOWS_FILE_SHARE_READ,
+                descriptor_flags=os.O_RDWR,
+            )
+            claim = self._own_resume_transaction_claim(handle, path, b"")
+            self._resume_transaction_claim = claim
+            token = uuid.uuid4().hex
+            claim.event_name = _windows_resume_event_name(
+                self.spec.attempt_root,
+                self._launch_context_digest,
+                claim.device,
+                claim.inode,
+                token,
+            )
+            claim.event_token = token
+            claim.event_handle = _windows_create_resume_event(claim.event_name)
+            claim.child_handle = _windows_duplicate_resume_event_handle(claim.event_handle)
+        except BaseException:
+            if self._resume_transaction_claim is None and handle is not None:
+                temporary_claim = _WindowsResumeTransactionClaim(
+                    path=path,
+                    content=b"",
+                    device=0,
+                    inode=0,
+                    handle=int(handle),
+                    native_handle=getattr(handle, "native_handle", None),
+                )
+                with contextlib.suppress(BaseException):
+                    _windows_close_owned_fd(temporary_claim, "handle", "native_handle")
+            raise
+
+    def _resume_transaction_identity_matches(self, claim: _WindowsResumeTransactionClaim) -> bool:
+        """Verify both the held journal object and its current directory entry."""
+
+        if claim.handle is None or claim.native_handle is None:
+            return False
+        exact_match = _windows_fd_identity_matches(claim.handle, claim.native_handle)
+        if exact_match is not True:
+            return False
+        try:
+            metadata = os.fstat(claim.handle)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or int(metadata.st_dev) != claim.device
+                or int(metadata.st_ino) != claim.inode
+            ):
+                return False
+            probe = _windows_probe_process_record(claim.path)
+        except FileNotFoundError:
+            return False
+        try:
+            return _same_file_identity(metadata, os.fstat(probe))
+        finally:
+            with contextlib.suppress(BaseException):
+                _close_windows_probe(probe)
+
+    def _clear_resume_transaction_child_handle(self) -> None:
+        claim = self._resume_transaction_claim
+        if claim is None or claim.child_handle is None:
+            return
+        child_handle = claim.child_handle
+        try:
+            _windows_close_native_handle(child_handle)
+        except BaseException:
+            raise
+        claim.child_handle = None
+
+    def _prepare_windows_resume_transaction(
+        self,
+        bound_record: dict[str, object],
+        running_record: dict[str, object],
+    ) -> None:
+        """Durably journal the exact record to publish after a native resume."""
+
+        if not _NATIVE_WINDOWS:
+            return
+        claim = self._resume_transaction_claim
+        if claim is None:
+            self._reserve_windows_resume_transaction()
+            claim = self._resume_transaction_claim
+        if (
+            claim is None
+            or claim.handle is None
+            or claim.event_handle is None
+            or not claim.event_name
+            or not claim.event_token
+        ):
+            raise SolverOwnershipError("resume transaction authority is unavailable")
+        process_claim = self._process_record_claim
+        if process_claim is None or process_claim.handle is None:
+            raise SolverOwnershipError("process record handle is unavailable")
+        if not self._record_claim_matches(process_claim):
+            raise SolverOwnershipError("owned process record was replaced")
+        expected_binding = (
+            claim.device,
+            claim.inode,
+            claim.event_name,
+            claim.event_token,
+        )
+        if (
+            self._parse_resume_transaction_record_binding(bound_record) != expected_binding
+            or self._parse_resume_transaction_record_binding(running_record) != expected_binding
+        ):
+            raise SolverOwnershipError("resume transaction record binding is invalid")
+        transaction: dict[str, object] = {
+            "version": _WINDOWS_RESUME_TRANSACTION_VERSION,
+            "kind": "windows-resume-transaction",
+            "event_name": claim.event_name,
+            "event_token": claim.event_token,
+            "journal_identity": {
+                "device": claim.device,
+                "inode": claim.inode,
+            },
+            "record_path": os.fspath(self.process_record_path),
+            "record_identity": {
+                "device": process_claim.device,
+                "inode": process_claim.inode,
+            },
+            "bound_digest": _json_digest(bound_record),
+            "bound_record": bound_record,
+            "running_digest": _json_digest(running_record),
+            "running_record": running_record,
+        }
+        content = self._record_content(transaction)
+        transaction_handle = claim.handle
+        _write_record_fd(transaction_handle, content)
+        if _read_record_fd(transaction_handle) != content:
+            raise SolverOwnershipError("resume transaction changed during publication")
+        claim.content = content
+        if not self._resume_transaction_identity_matches(claim):
+            raise SolverOwnershipError("resume transaction directory entry changed")
+        if not self._record_claim_matches(process_claim):
+            raise SolverOwnershipError("owned process record changed before resume")
+        self._verify_filesystem_authority()
+
+    def _signal_windows_resume_transaction(self) -> None:
+        """Publish the crash transition only after both exact file claims pass."""
+
+        if not _NATIVE_WINDOWS:
+            return
+        claim = self._resume_transaction_claim
+        process_claim = self._process_record_claim
+        if (
+            claim is None
+            or claim.event_handle is None
+            or not claim.event_name
+            or process_claim is None
+        ):
+            raise SolverOwnershipError("resume transaction authority is unavailable")
+        if not self._resume_transaction_identity_matches(claim):
+            raise SolverOwnershipError("resume transaction directory entry changed")
+        if not _windows_resume_event_binding(
+            claim.event_name,
+            self.spec.attempt_root,
+            self._launch_context_digest,
+            claim.device,
+            claim.inode,
+        ):
+            raise SolverOwnershipError("resume event binding is invalid")
+        if not self._record_claim_matches(process_claim):
+            raise SolverOwnershipError("owned process record changed before resume")
+        process_handle = process_claim.handle
+        if process_handle is None:  # pragma: no cover - state guard
+            raise SolverOwnershipError("process record handle is unavailable")
+        try:
+            current_record = json.loads(_read_record_fd(process_handle).decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError, ValueError) as error:
+            raise SolverOwnershipError("owned process record is invalid before resume") from error
+        if (
+            not isinstance(current_record, dict)
+            or current_record.get("state") != "BOUND_SUSPENDED"
+            or self._parse_resume_transaction_record_binding(current_record)
+            != (claim.device, claim.inode, claim.event_name, claim.event_token)
+        ):
+            raise SolverOwnershipError("owned process record binding changed before resume")
+        self._verify_filesystem_authority()
+        _windows_signal_resume_event(claim.event_handle)
+
+    def _parse_windows_resume_transaction(
+        self,
+        content: bytes,
+        process_claim: _ProcessRecordClaim,
+        expected_binding: tuple[int, int, str, str],
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        try:
+            value = json.loads(content.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError, ValueError) as error:
+            raise SolverOwnershipError("resume transaction is torn or invalid") from error
+        if not isinstance(value, dict):
+            raise SolverOwnershipError("resume transaction is invalid")
+        version = value.get("version")
+        if (
+            isinstance(version, bool)
+            or not isinstance(version, int)
+            or version != _WINDOWS_RESUME_TRANSACTION_VERSION
+            or value.get("kind") != "windows-resume-transaction"
+        ):
+            raise SolverOwnershipError("resume transaction version is invalid")
+        transaction_claim = self._resume_transaction_claim
+        if transaction_claim is None:
+            raise SolverOwnershipError("resume transaction authority is unavailable")
+        expected_device, expected_inode, expected_event_name, expected_event_token = (
+            expected_binding
+        )
+        if (transaction_claim.device, transaction_claim.inode) != (
+            expected_device,
+            expected_inode,
+        ):
+            raise SolverOwnershipError("resume transaction journal identity changed")
+        event_name = value.get("event_name")
+        event_token = value.get("event_token")
+        if event_name != expected_event_name or event_token != expected_event_token:
+            raise SolverOwnershipError("resume event binding does not match process record")
+        if _windows_resume_event_parts(
+            event_name,
+            self.spec.attempt_root,
+            self._launch_context_digest,
+            expected_device,
+            expected_inode,
+        ) != expected_binding[:2] + (expected_event_token,):
+            raise SolverOwnershipError("resume event binding is invalid")
+        journal_identity = value.get("journal_identity")
+        if not isinstance(journal_identity, dict):
+            raise SolverOwnershipError("resume transaction journal identity is invalid")
+        journal_device = journal_identity.get("device")
+        journal_inode = journal_identity.get("inode")
+        if (
+            isinstance(journal_device, bool)
+            or not isinstance(journal_device, int)
+            or journal_device < 0
+            or isinstance(journal_inode, bool)
+            or not isinstance(journal_inode, int)
+            or journal_inode < 0
+            or (journal_device, journal_inode) != (expected_device, expected_inode)
+        ):
+            raise SolverOwnershipError("resume transaction journal identity changed")
+        if not isinstance(event_name, str) or not isinstance(event_token, str):
+            raise SolverOwnershipError("resume event binding is invalid")
+        record_path = value.get("record_path")
+        if (
+            not isinstance(record_path, str)
+            or not Path(record_path).is_absolute()
+            or os.path.normcase(os.path.abspath(record_path))
+            != os.path.normcase(os.path.abspath(os.fspath(self.process_record_path)))
+        ):
+            raise SolverOwnershipError("resume transaction record binding is invalid")
+        record_identity = value.get("record_identity")
+        if not isinstance(record_identity, dict):
+            raise SolverOwnershipError("resume transaction record identity is invalid")
+        device = record_identity.get("device")
+        inode = record_identity.get("inode")
+        if (
+            isinstance(device, bool)
+            or not isinstance(device, int)
+            or device < 0
+            or isinstance(inode, bool)
+            or not isinstance(inode, int)
+            or inode < 0
+        ):
+            raise SolverOwnershipError("resume transaction record identity is invalid")
+        if device != process_claim.device or inode != process_claim.inode:
+            raise SolverOwnershipError("resume transaction process record identity changed")
+        bound_record = value.get("bound_record")
+        running_record = value.get("running_record")
+        if not isinstance(bound_record, dict) or not isinstance(running_record, dict):
+            raise SolverOwnershipError("resume transaction records are invalid")
+        if bound_record.get("state") != "BOUND_SUSPENDED":
+            raise SolverOwnershipError("resume transaction bound state is invalid")
+        if running_record.get("state") != SolverState.RUNNING.value:
+            raise SolverOwnershipError("resume transaction running state is invalid")
+        if (
+            self._parse_resume_transaction_record_binding(bound_record) != expected_binding
+            or self._parse_resume_transaction_record_binding(running_record) != expected_binding
+        ):
+            raise SolverOwnershipError("resume transaction record binding is invalid")
+        try:
+            bound_digest = _json_digest(bound_record)
+            running_digest = _json_digest(running_record)
+        except SolverConfigurationError as error:
+            raise SolverOwnershipError("resume transaction records are invalid") from error
+        if (
+            value.get("bound_digest") != bound_digest
+            or value.get("running_digest") != running_digest
+        ):
+            raise SolverOwnershipError("resume transaction digest is invalid")
+        equivalent_bound = dict(running_record)
+        equivalent_bound["state"] = "BOUND_SUSPENDED"
+        if equivalent_bound != bound_record:
+            raise SolverOwnershipError("resume transaction record transition is invalid")
+        return bound_record, running_record
+
+    def _read_windows_resume_transaction(
+        self,
+        process_claim: _ProcessRecordClaim,
+        expected_binding: tuple[int, int, str, str],
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        if not _NATIVE_WINDOWS:
+            raise SolverOwnershipError("Windows resume transaction is unsupported")
+        if self._resume_transaction_claim is not None:
+            raise SolverOwnershipError("resume transaction is already owned")
+        path = self._resume_transaction_path()
+        handle: int | None = None
+        try:
+            handle = _windows_open_process_record_handle(
+                path,
+                create=False,
+                # Reconnect must be able to delete only this exact journal
+                # handle after recovery, without acquiring write authority.
+                desired_access=_WINDOWS_GENERIC_READ | _WINDOWS_DELETE,
+                share_mode=(
+                    _WINDOWS_FILE_SHARE_READ
+                    | _WINDOWS_FILE_SHARE_WRITE
+                    | _WINDOWS_FILE_SHARE_DELETE
+                ),
+                descriptor_flags=os.O_RDONLY,
+            )
+            claim = self._own_resume_transaction_claim(handle, path, b"")
+            self._resume_transaction_claim = claim
+            if (claim.device, claim.inode) != expected_binding[:2]:
+                raise SolverOwnershipError("resume transaction journal identity changed")
+            if not self._record_claim_matches(process_claim):
+                raise SolverOwnershipError("owned process record changed before recovery")
+            if not self._resume_transaction_identity_matches(claim):
+                raise SolverOwnershipError("resume transaction directory entry changed")
+            transaction_handle = claim.handle
+            if transaction_handle is None:  # pragma: no cover - state guard
+                raise SolverOwnershipError("resume transaction handle is unavailable")
+            content = _read_record_fd(transaction_handle)
+            claim.content = content
+            parsed = self._parse_windows_resume_transaction(
+                content,
+                process_claim,
+                expected_binding,
+            )
+            if not self._resume_transaction_identity_matches(claim):
+                raise SolverOwnershipError("resume transaction directory entry changed")
+            if not self._record_claim_matches(process_claim):
+                raise SolverOwnershipError("owned process record changed during recovery")
+            claim.event_name = expected_binding[2]
+            claim.event_token = expected_binding[3]
+            claim.event_handle = _windows_open_resume_event(expected_binding[2])
+            return parsed
+        except BaseException:
+            failures = self._release_resume_transaction_claim()
+            if failures:
+                raise SolverOwnershipError(
+                    "resume transaction handle could not be closed"
+                ) from failures[0]
+            raise
+
+    def _validate_windows_resume_transaction(
+        self,
+        bound_record: dict[str, object],
+        running_record: dict[str, object],
+        current_record: dict[str, object] | None,
+    ) -> None:
+        if current_record is None:
+            return
+        if current_record.get("state") == "BOUND_SUSPENDED":
+            expected = bound_record
+        elif current_record.get("state") == SolverState.RUNNING.value:
+            expected = running_record
+        else:
+            raise SolverOwnershipError("process record transition state is invalid")
+        if current_record != expected:
+            raise SolverOwnershipError("process record transition does not match its journal")
+        expected_binding = self._parse_resume_transaction_record_binding(current_record)
+        if (
+            self._parse_resume_transaction_record_binding(bound_record) != expected_binding
+            or self._parse_resume_transaction_record_binding(running_record) != expected_binding
+        ):
+            raise SolverOwnershipError("process record transition binding does not match")
+
+    def _repair_process_record_from_resume_transaction(
+        self,
+        running_record: dict[str, object],
+        candidate: _ProcessRecordClaim,
+    ) -> None:
+        if candidate.handle is None or not self._record_claim_identity_matches(candidate):
+            raise SolverOwnershipError("owned process record binding changed during recovery")
+        record_handle = candidate.handle
+        content = self._record_content(running_record)
+        _write_record_fd(record_handle, content)
+        if _read_record_fd(record_handle) != content:
+            raise SolverOwnershipError("process record changed during recovery")
+        candidate.content = content
+        candidate.state = SolverState.RUNNING.value
+
     def _make_process_record(
         self,
         pid: int,
@@ -1909,13 +4121,40 @@ class SolverSupervisor:
             raise ProcessAuthorityError(
                 "process authority root creation identity binding is invalid"
             )
-        return {
+        if os.name == "nt":
+            thread_id = claim.get("root_thread_id")
+            thread_identity = claim.get("root_thread_creation_identity")
+            if (
+                isinstance(thread_id, bool)
+                or not isinstance(thread_id, int)
+                or thread_id <= 0
+                or not isinstance(thread_identity, str)
+                or not thread_identity.startswith("windows:")
+            ):
+                raise ProcessAuthorityError("process authority primary thread binding is invalid")
+        executable_snapshot = self._runtime_image_snapshot
+        if executable_snapshot is None:
+            raise ProcessAuthorityError("runtime executable image binding is unavailable")
+        if executable_snapshot.sha256 != self._launch_context.get("runtime_sha256"):
+            raise ProcessAuthorityError("runtime executable image digest binding is invalid")
+        if os.name == "posix" and executable_snapshot.nlink != 0:
+            raise ProcessAuthorityError("runtime executable image is not anonymous")
+        record: dict[str, object] = {
             "case_id": self._case_id,
             "intent_id": self._intent_id,
             "attempt_id": self._attempt_id,
             "state": state,
             "owner_token": self._record_owner_token,
             "executable_path": str(self.spec.executable),
+            "executable_image": {
+                "sha256": executable_snapshot.sha256,
+                "identity": {
+                    "device": executable_snapshot.device,
+                    "inode": executable_snapshot.inode,
+                    "nlink": executable_snapshot.nlink,
+                    "size": executable_snapshot.size,
+                },
+            },
             "pid": pid,
             "process_creation_identity": metadata.creation_identity,
             "start_time": started_at.isoformat(),
@@ -1928,6 +4167,108 @@ class SolverSupervisor:
             "launch_context_digest": self._launch_context_digest,
             "process_authority": claim,
         }
+        if _NATIVE_WINDOWS:
+            # The record is the authenticated source of truth for the exact
+            # journal object and event.  Reconnect must not learn either
+            # identity from a path-opened replacement journal.
+            record["resume_transaction"] = self._resume_transaction_record_binding()
+        if os.name == "posix":
+            record["input_lease"] = self._make_input_lease_record()
+        return record
+
+    def _own_process_record_candidate(
+        self,
+        path: Path,
+        *,
+        handle: int,
+        parent_fd: int | None,
+    ) -> _ProcessRecordClaim:
+        """Retain a newly opened record descriptor before fallible use."""
+
+        path = Path(os.fspath(path))
+        handle_value = int(handle)
+        native_handle = getattr(handle, "native_handle", None)
+        parent_native_handle = getattr(parent_fd, "native_handle", None)
+        candidate = _ProcessRecordClaim(
+            path=path,
+            content=b"",
+            device=0,
+            inode=0,
+            state=None,
+            handle=handle_value,
+            parent_fd=None if parent_fd is None else int(parent_fd),
+            name=self.process_record_path.name,
+            native_handle=native_handle,
+            parent_native_handle=parent_native_handle,
+        )
+        self._process_record_candidates.append(candidate)
+        try:
+            if _NATIVE_WINDOWS and native_handle is None:
+                raise SolverOwnershipError("process record descriptor has no exact native guard")
+            metadata = os.fstat(handle_value)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise OSError("process record is not a regular file")
+        except BaseException:
+            failures = self._release_process_record_claim(candidate)
+            if failures:
+                raise SolverOwnershipError(
+                    "process record acquisition cleanup failed"
+                ) from failures[0]
+            raise
+        candidate.device = int(metadata.st_dev)
+        candidate.inode = int(metadata.st_ino)
+        if _NATIVE_WINDOWS:
+            _windows_register_record_claim(
+                path,
+                handle_value,
+                candidate.device,
+                candidate.inode,
+                native_handle=native_handle,
+                owner=candidate,
+            )
+        return candidate
+
+    @staticmethod
+    def _update_process_record_candidate(
+        candidate: _ProcessRecordClaim,
+        content: bytes,
+        record: dict[str, object],
+    ) -> None:
+        candidate.content = content
+        record_state = record.get("state")
+        candidate.state = record_state if isinstance(record_state, str) else None
+
+    def _install_process_record_candidate(self, candidate: _ProcessRecordClaim) -> None:
+        if not any(owned is candidate for owned in self._process_record_candidates):
+            raise SolverOwnershipError("process record candidate is not owned")
+        if candidate.handle is None or not self._record_claim_matches(candidate):
+            raise SolverOwnershipError("process record candidate changed before install")
+        previous_claim = self._process_record_claim
+        if previous_claim is not None and previous_claim is not candidate:
+            release_failures = self._release_process_record_claim(previous_claim)
+            if (
+                release_failures
+                or previous_claim.handle is not None
+                or previous_claim.parent_fd is not None
+                or previous_claim.native_handle is not None
+                or previous_claim.parent_native_handle is not None
+            ):
+                raise SolverOwnershipError(
+                    "previous process record handle could not be closed"
+                ) from (release_failures[0] if release_failures else None)
+            self._process_record_claim = None
+        self._process_record_claim = candidate
+        self._process_record_candidates[:] = [
+            owned for owned in self._process_record_candidates if owned is not candidate
+        ]
+        if self._pending_process_record_claim is candidate:
+            self._pending_process_record_claim = None
+
+    def _install_pending_process_record_claim(self) -> None:
+        candidate = self._pending_process_record_claim
+        if candidate is None:
+            raise SolverOwnershipError("process record candidate is unavailable")
+        self._install_process_record_candidate(candidate)
 
     def _set_process_record_claim(
         self,
@@ -1938,35 +4279,13 @@ class SolverSupervisor:
         handle: int,
         parent_fd: int | None,
     ) -> None:
-        metadata = os.fstat(handle)
-        if not stat.S_ISREG(metadata.st_mode):
-            raise OSError("process record is not a regular file")
-        record_state = record.get("state")
-        previous_claim = self._process_record_claim
-        if previous_claim is not None and previous_claim.handle != handle:
-            self._process_record_claim = None
-            release_failures = self._release_process_record_claim(previous_claim)
-            if release_failures:
-                raise SolverOwnershipError(
-                    "previous process record handle could not be closed"
-                ) from release_failures[0]
-        self._process_record_claim = _ProcessRecordClaim(
-            path=path,
-            content=content,
-            device=int(metadata.st_dev),
-            inode=int(metadata.st_ino),
-            state=record_state if isinstance(record_state, str) else None,
+        candidate = self._own_process_record_candidate(
+            path,
             handle=handle,
             parent_fd=parent_fd,
-            name=self.process_record_path.name,
         )
-        if _NATIVE_WINDOWS:
-            _windows_register_record_claim(
-                path,
-                handle,
-                int(metadata.st_dev),
-                int(metadata.st_ino),
-            )
+        self._update_process_record_candidate(candidate, content, record)
+        self._install_process_record_candidate(candidate)
 
     def _read_process_record_text(
         self,
@@ -1984,9 +4303,22 @@ class SolverSupervisor:
             )
         probe_fd = _windows_probe_process_record(claim.path)
         try:
+            if claim.native_handle is None:
+                raise SolverOwnershipError("owned process record has no exact native guard")
+            exact_match = _windows_fd_identity_matches(claim.handle, claim.native_handle)
+            if exact_match is None:
+                raise SolverOwnershipError("unable to verify Windows CRT descriptor identity")
+            if not exact_match:
+                claim.handle = None
+                raise SolverOwnershipError("owned process record was replaced")
+            if not _same_file_identity(
+                os.fstat(claim.handle),
+                os.fstat(probe_fd),
+            ):
+                raise SolverOwnershipError("owned process record was replaced")
             content = _read_record_fd(probe_fd)
         finally:
-            os.close(probe_fd)
+            _close_windows_probe(probe_fd)
         return content.decode(selected_encoding, selected_errors)
 
     def _write_process_record_text(
@@ -2007,16 +4339,7 @@ class SolverSupervisor:
         _write_record_fd(claim.handle, content)
         if not self._record_claim_matches(claim, content=content):
             raise SolverOwnershipError("owned process record changed during update")
-        self._process_record_claim = _ProcessRecordClaim(
-            path=claim.path,
-            content=content,
-            device=claim.device,
-            inode=claim.inode,
-            state=claim.state,
-            handle=claim.handle,
-            parent_fd=claim.parent_fd,
-            name=claim.name,
-        )
+        claim.content = content
         return len(data)
 
     def _unlink_process_record_path(self, *, missing_ok: bool) -> None:
@@ -2059,16 +4382,8 @@ class SolverSupervisor:
                             raise SolverOwnershipError("owned process record was replaced")
                         _write_record_fd(claim.handle, content)
                 record_state = record.get("state")
-                self._process_record_claim = _ProcessRecordClaim(
-                    path=claim.path,
-                    content=content,
-                    device=claim.device,
-                    inode=claim.inode,
-                    state=record_state if isinstance(record_state, str) else None,
-                    handle=claim.handle,
-                    parent_fd=claim.parent_fd,
-                    name=claim.name,
-                )
+                claim.content = content
+                claim.state = record_state if isinstance(record_state, str) else None
                 return
             if os.name == "posix":
                 authority = self._filesystem_authority
@@ -2078,8 +4393,7 @@ class SolverSupervisor:
                     self.process_record_path.parent, create=True
                 ) as parent_fd:
                     temp_fd: int | None = None
-                    claim_parent_fd: int | None = None
-                    claim_installed = False
+                    candidate: _ProcessRecordClaim | None = None
                     flags = (
                         os.O_WRONLY
                         | os.O_CREAT
@@ -2087,52 +4401,39 @@ class SolverSupervisor:
                         | getattr(os, "O_CLOEXEC", 0)
                         | getattr(os, "O_NOFOLLOW", 0)
                     )
-                    try:
-                        with _posix_record_lock(parent_fd):
-                            temp_fd = os.open(temporary.name, flags, 0o600, dir_fd=parent_fd)
-                            _write_record_fd(temp_fd, content)
-                            claim_parent_fd = os.dup(parent_fd)
-                            self._set_process_record_claim(
-                                path,
-                                content,
-                                record,
-                                handle=temp_fd,
-                                parent_fd=claim_parent_fd,
-                            )
-                            claim_installed = True
-                            # A create-new hard link publishes the record without
-                            # replacing a foreign file that won the name race.
-                            _posix_link_fd(temp_fd, parent_fd, path.name)
-                            _posix_unlink(parent_fd, temporary.name)
-                            os.fsync(parent_fd)
-                    finally:
-                        if not claim_installed:
-                            if temp_fd is not None:
-                                with contextlib.suppress(OSError):
-                                    os.close(temp_fd)
-                            if claim_parent_fd is not None:
-                                with contextlib.suppress(OSError):
-                                    os.close(claim_parent_fd)
+                    with _posix_record_lock(parent_fd):
+                        temp_fd = os.open(temporary.name, flags, 0o600, dir_fd=parent_fd)
+                        candidate = self._own_process_record_candidate(
+                            path,
+                            handle=temp_fd,
+                            parent_fd=None,
+                        )
+                        record_state = record.get("state")
+                        candidate.state = record_state if isinstance(record_state, str) else None
+                        _write_record_fd(temp_fd, content)
+                        candidate.parent_fd = os.dup(parent_fd)
+                        # A create-new hard link publishes the record without
+                        # replacing a foreign file that won the name race.
+                        _posix_link_fd(temp_fd, parent_fd, path.name)
+                        _posix_unlink(parent_fd, temporary.name)
+                        os.fsync(parent_fd)
+                        self._update_process_record_candidate(candidate, content, record)
+                        self._install_process_record_candidate(candidate)
             elif _NATIVE_WINDOWS:
                 record_fd = _windows_open_process_record(path, create=True)
-                record_claim_installed = False
-                try:
-                    _write_record_fd(record_fd, content)
-                    self._set_process_record_claim(
-                        path,
-                        content,
-                        record,
-                        handle=record_fd,
-                        parent_fd=None,
-                    )
-                    record_claim_installed = True
-                    claim = self._process_record_claim
-                    if claim is None or not self._record_claim_matches(claim):
-                        raise SolverOwnershipError("owned process record changed during create")
-                finally:
-                    if not record_claim_installed:
-                        with contextlib.suppress(OSError):
-                            os.close(record_fd)
+                candidate = self._own_process_record_candidate(
+                    path,
+                    handle=record_fd,
+                    parent_fd=None,
+                )
+                record_state = record.get("state")
+                candidate.state = record_state if isinstance(record_state, str) else None
+                _write_record_fd(record_fd, content)
+                self._update_process_record_candidate(candidate, content, record)
+                self._install_process_record_candidate(candidate)
+                claim = self._process_record_claim
+                if claim is None or not self._record_claim_matches(claim):
+                    raise SolverOwnershipError("owned process record changed during create")
             else:
                 with temporary.open("x", encoding="utf-8", newline="") as stream:
                     stream.write(content.decode("utf-8"))
@@ -2140,13 +4441,13 @@ class SolverSupervisor:
                     os.fsync(stream.fileno())
                 os.replace(os.fspath(temporary), os.fspath(path))
                 record_fd = os.open(os.fspath(path), os.O_RDWR)
-                self._set_process_record_claim(
+                candidate = self._own_process_record_candidate(
                     path,
-                    content,
-                    record,
                     handle=record_fd,
                     parent_fd=None,
                 )
+                self._update_process_record_candidate(candidate, content, record)
+                self._install_process_record_candidate(candidate)
         except (OSError, SolverOwnershipError, TypeError, ValueError) as error:
             if os.name == "posix":
                 with contextlib.suppress(OSError):
@@ -2183,7 +4484,7 @@ class SolverSupervisor:
             return record
 
         record_fd: int | None = None
-        parent_fd: int | None = None
+        candidate: _ProcessRecordClaim | None = None
         try:
             if os.name == "posix":
                 authority = self._filesystem_authority
@@ -2195,57 +4496,61 @@ class SolverSupervisor:
                         os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
                         dir_fd=opened_parent,
                     )
-                    parent_fd = os.dup(opened_parent)
+                    candidate = self._own_process_record_candidate(
+                        path,
+                        handle=record_fd,
+                        parent_fd=None,
+                    )
+                    candidate.parent_fd = os.dup(opened_parent)
                     content = _read_record_fd(record_fd)
             elif _NATIVE_WINDOWS:
                 record_fd = _windows_open_process_record(path, create=False)
+                candidate = self._own_process_record_candidate(
+                    path,
+                    handle=record_fd,
+                    parent_fd=None,
+                )
                 content = _read_record_fd(record_fd)
             else:
                 record_fd = os.open(os.fspath(path), os.O_RDWR)
+                candidate = self._own_process_record_candidate(
+                    path,
+                    handle=record_fd,
+                    parent_fd=None,
+                )
                 content = _read_record_fd(record_fd)
+            if candidate is None:  # pragma: no cover - defensive state guard
+                raise SolverOwnershipError("process record candidate is unavailable")
+            candidate.content = content
             record = json.loads(content.decode("utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
-            if record_fd is not None:
-                with contextlib.suppress(OSError):
-                    os.close(record_fd)
-            if parent_fd is not None:
-                with contextlib.suppress(OSError):
-                    os.close(parent_fd)
+            release_failures = self._release_process_record_claim(candidate)
+            if release_failures:
+                raise SolverOwnershipError(
+                    "process record candidate handles could not be closed"
+                ) from release_failures[0]
             raise SolverOwnershipError(f"invalid process record: {path}") from error
         if not isinstance(record, dict):
-            if record_fd is not None:
-                with contextlib.suppress(OSError):
-                    os.close(record_fd)
-            if parent_fd is not None:
-                with contextlib.suppress(OSError):
-                    os.close(parent_fd)
+            release_failures = self._release_process_record_claim(candidate)
+            if release_failures:
+                raise SolverOwnershipError(
+                    "process record candidate handles could not be closed"
+                ) from release_failures[0]
             raise SolverOwnershipError("process record must be a JSON object")
         try:
             self._verify_filesystem_authority()
-            if record_fd is None:
+            if candidate is None or candidate.handle is None:
                 raise SolverOwnershipError("process record handle is unavailable")
-            self._set_process_record_claim(
-                path,
-                content,
-                record,
-                handle=record_fd,
-                parent_fd=parent_fd,
-            )
-            claim = self._process_record_claim
-            if claim is None or not self._record_claim_identity_matches(claim):
+            self._update_process_record_candidate(candidate, content, record)
+            if not self._record_claim_matches(candidate, content=content):
                 raise SolverOwnershipError("process record changed during read")
+            self._pending_process_record_claim = candidate
         except BaseException:
-            claim = self._process_record_claim
-            if claim is not None and claim.handle == record_fd:
-                self._process_record_claim = None
-                if _NATIVE_WINDOWS:
-                    _windows_unregister_record_claim(claim.path, record_fd)
-            if record_fd is not None:
-                with contextlib.suppress(OSError):
-                    os.close(record_fd)
-            if parent_fd is not None:
-                with contextlib.suppress(OSError):
-                    os.close(parent_fd)
+            release_failures = self._release_process_record_claim(candidate)
+            if release_failures:
+                raise SolverOwnershipError(
+                    "process record candidate handles could not be closed"
+                ) from release_failures[0]
             raise
         return record
 
@@ -2260,6 +4565,116 @@ class SolverSupervisor:
             or not Path(os.path.realpath(candidate)).is_relative_to(root)
         ):
             raise SolverOwnershipError(f"{label} escapes the attempt root")
+
+    def _parse_executable_image_record(self, record: dict[str, object]) -> _FileSnapshot:
+        value = record.get("executable_image")
+        if not isinstance(value, dict):
+            raise SolverOwnershipError("process record executable image is invalid")
+        sha256 = value.get("sha256")
+        identity_value = value.get("identity")
+        expected_sha256 = self._launch_context.get("runtime_sha256")
+        if (
+            not isinstance(sha256, str)
+            or len(sha256) != 64
+            or any(character not in "0123456789abcdef" for character in sha256)
+            or sha256 != expected_sha256
+            or not isinstance(identity_value, dict)
+        ):
+            raise SolverOwnershipError("process record executable image is invalid")
+        identity: list[int] = []
+        for name in ("device", "inode", "nlink", "size"):
+            item = identity_value.get(name)
+            if isinstance(item, bool) or not isinstance(item, int) or item < 0:
+                raise SolverOwnershipError("process record executable image identity is invalid")
+            identity.append(item)
+        if os.name == "posix" and identity[2] != 0:
+            raise SolverOwnershipError("process record executable image identity is not anonymous")
+        return _FileSnapshot(
+            device=identity[0],
+            inode=identity[1],
+            nlink=identity[2],
+            size=identity[3],
+            sha256=sha256,
+        )
+
+    def _acquire_reconnected_posix_input_lease(
+        self,
+        record: dict[str, object],
+        metadata: _ProcessMetadata,
+        authority: ProcessAuthority,
+    ) -> None:
+        recorded_fd, expected_sha256, object_identity = self._parse_posix_input_lease_record(record)
+        pid = record.get("pid")
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+            raise SolverOwnershipError("process record PID is invalid")
+        proc_root = Path("/proc") / str(pid)
+        proc_fd_directory = proc_root / "fd"
+        if not proc_fd_directory.is_dir():
+            raise SolverOwnershipError("POSIX child descriptor path is unavailable")
+        try:
+            authority.verify(pid)
+        except ProcessAuthorityError as error:
+            raise SolverOwnershipError("reconnect process authority is no longer valid") from error
+
+        child_fd_path = proc_fd_directory / str(recorded_fd)
+        try:
+            handle = os.open(
+                os.fspath(child_fd_path),
+                os.O_RDONLY | getattr(os, "O_CLOEXEC", 0),
+            )
+        except OSError as error:
+            raise SolverOwnershipError(
+                "recorded POSIX child input descriptor is unavailable"
+            ) from error
+        _expected_source_sha256, expected_source_identity = self._recorded_input_binding()
+        lease = _InputLease(
+            path=self.spec.input_path,
+            expected_sha256=expected_sha256,
+            expected_identity=expected_source_identity,
+            handle=handle,
+            object_identity=object_identity,
+        )
+        try:
+            try:
+                authority.verify(pid)
+                current = _process_metadata(pid)
+            except (OSError, ProcessAuthorityError) as error:
+                raise SolverOwnershipError("reconnected process is no longer valid") from error
+            if (
+                not current.alive
+                or current.creation_identity != metadata.creation_identity
+                or current.started_at != metadata.started_at
+                or (
+                    current.executable_snapshot is None
+                    or metadata.executable_snapshot is None
+                    or current.executable_snapshot != metadata.executable_snapshot
+                )
+            ):
+                raise SolverOwnershipError("reconnected process identity changed")
+            lease.verify(digest=True)
+            try:
+                authority.verify(pid)
+                current = _process_metadata(pid)
+            except (OSError, ProcessAuthorityError) as error:
+                raise SolverOwnershipError("reconnected process is no longer valid") from error
+            if (
+                not current.alive
+                or current.creation_identity != metadata.creation_identity
+                or current.started_at != metadata.started_at
+                or (
+                    current.executable_snapshot is None
+                    or metadata.executable_snapshot is None
+                    or current.executable_snapshot != metadata.executable_snapshot
+                )
+            ):
+                raise SolverOwnershipError("reconnected process identity changed")
+        except BaseException:
+            try:
+                lease.close()
+            except BaseException:
+                _DURABLE_CLAIM_CLEANUP.adopt(None, None, (), input_lease=lease)
+            raise
+        self._input_lease = lease
 
     def _validate_process_record(
         self, record: dict[str, object]
@@ -2297,6 +4712,13 @@ class SolverSupervisor:
             or context != self._launch_context
         ):
             raise SolverOwnershipError("process record launch context does not match")
+        if _NATIVE_WINDOWS:
+            # Keep the journal object identity and event token inside the
+            # record validation boundary.  Reconnect may use them only after
+            # the process authority below authenticates the live Job member.
+            self._parse_resume_transaction_record_binding(record)
+        if os.name == "posix":
+            self._parse_posix_input_lease_record(record)
 
         authority_claim = record.get("process_authority")
         if (
@@ -2313,6 +4735,7 @@ class SolverSupervisor:
             raise SolverOwnershipError("process record executable must be absolute")
         if _normalise_executable(executable_value) != _normalise_executable(self.spec.executable):
             raise SolverOwnershipError("process record executable does not match")
+        executable_snapshot = self._parse_executable_image_record(record)
 
         pid = record.get("pid")
         if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
@@ -2357,7 +4780,12 @@ class SolverSupervisor:
         if not metadata.alive:
             authority.close()
             raise SolverOwnershipError("recorded process is not live")
-        if _normalise_executable(metadata.executable_path) != _normalise_executable(
+        if os.name == "posix":
+            current_snapshot = metadata.executable_snapshot
+            if current_snapshot is None or current_snapshot != executable_snapshot:
+                authority.close()
+                raise SolverOwnershipError("current process executable image does not match")
+        elif _normalise_executable(metadata.executable_path) != _normalise_executable(
             executable_value
         ):
             authority.close()
@@ -2370,6 +4798,7 @@ class SolverSupervisor:
             raise SolverOwnershipError("current process start time does not match")
         if authority is None:  # pragma: no cover - defensive type/state guard
             raise SolverOwnershipError("recorded process authority is unavailable")
+        self._runtime_image_snapshot = executable_snapshot
         self._verify_filesystem_authority()
         return metadata, metadata.started_at, authority
 
@@ -2672,6 +5101,7 @@ class SolverSupervisor:
                 if state is not SolverState.CANCELLED:
                     self._revalidate_launch_binding()
                 self._verify_filesystem_authority()
+                self._verify_input_lease(digest=True)
                 started_at = self._started_at
                 pid = self._process.pid if self._process is not None else None
                 outputs = self.spec.expected_outputs

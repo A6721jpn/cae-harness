@@ -67,6 +67,8 @@ class _FakeWindowsAuthority:
             "context_digest": self._context_digest,
             "root_pid": None if self._process is None else self._process.pid,
             "root_creation_identity": "windows:test",
+            "root_thread_id": 4243,
+            "root_thread_creation_identity": "windows:4243",
         }
 
     def child_environment(self) -> dict[str, str]:
@@ -722,6 +724,8 @@ def _windows_claim(root: Path, digest: str, name: str) -> dict[str, object]:
         "context_digest": digest,
         "root_pid": 101,
         "root_creation_identity": "windows:1001",
+        "root_thread_id": 202,
+        "root_thread_creation_identity": "windows:2002",
     }
 
 
@@ -851,6 +855,7 @@ def test_windows_reconnect_limited_authority_terminates_only_its_native_job_memb
     root = subprocess.Popen(
         [sys.executable, "-c", "import time; time.sleep(30)"],
         close_fds=True,
+        creationflags=supervisor_module._CREATE_SUSPENDED,
         startupinfo=startup_info,
     )
     unrelated = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
@@ -858,6 +863,7 @@ def test_windows_reconnect_limited_authority_terminates_only_its_native_job_memb
     try:
         identity = supervisor_module._process_metadata(root.pid).creation_identity
         creator.bind(root.pid, identity)
+        creator.resume(root.pid)
         claim = creator.claim
         creator.close()
         limited = ProcessAuthority.from_claim(tmp_path, claim, digest)
@@ -908,6 +914,182 @@ def test_windows_binding_rejects_creation_identity_changed_before_assignment(
 
     assert kernel.opened_pids == [101]
     assert kernel.terminated == []
+
+
+def test_windows_claim_persists_exact_primary_thread_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    capability = _capability(tmp_path, monkeypatch, code="import time; time.sleep(30)")
+    supervisor = SolverSupervisor(capability)
+    try:
+        supervisor.start()
+        authority = supervisor._process_authority
+        assert authority is not None
+        claim = authority.claim
+        thread_id = claim.get("root_thread_id")
+        thread_identity = claim.get("root_thread_creation_identity")
+        assert isinstance(thread_id, int) and thread_id > 0
+        assert isinstance(thread_identity, str)
+        assert thread_identity.startswith("windows:")
+    finally:
+        if supervisor.process_id is not None:
+            supervisor.cancel()
+
+
+def test_windows_resume_recovery_accepts_already_resumed_primary_thread(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    capability = _capability(tmp_path, monkeypatch, code="import time; time.sleep(30)")
+    supervisor = SolverSupervisor(capability)
+    try:
+        supervisor.start()
+        process_id = supervisor.process_id
+        authority = supervisor._process_authority
+        assert process_id is not None
+        assert authority is not None
+        authority.resume(process_id)
+        assert supervisor.poll() is None
+    finally:
+        if supervisor.process_id is not None:
+            supervisor.cancel()
+
+
+def test_windows_reconnect_rejects_foreign_primary_thread_identity_without_termination(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    capability = _capability(tmp_path, monkeypatch, code="import time; time.sleep(30)")
+    supervisor = SolverSupervisor(capability)
+    supervisor.start()
+    process_id = supervisor.process_id
+    authority = supervisor._process_authority
+    assert process_id is not None
+    assert authority is not None
+    claim = dict(authority.claim)
+    thread_id = claim.get("root_thread_id")
+    assert isinstance(thread_id, int)
+    claim["root_thread_id"] = thread_id + 1
+    foreign_authority: ProcessAuthority | None = None
+    try:
+        foreign_authority = ProcessAuthority.from_claim(
+            capability.spec.attempt_root,
+            claim,
+            supervisor._launch_context_digest,
+        )
+        with pytest.raises(ProcessAuthorityError, match="thread|identity|missing"):
+            foreign_authority.verify(process_id)
+        assert supervisor.poll() is None
+    finally:
+        if foreign_authority is not None:
+            foreign_authority.close()
+        if supervisor.process_id is not None:
+            supervisor.cancel()
+
+
+def test_windows_primary_thread_binding_requires_one_suspended_thread(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class _ThreadKernel:
+        def __init__(self, suspend_count: int) -> None:
+            self.suspend_count = suspend_count
+            self.suspend_calls: list[int] = []
+            self.resume_calls: list[int] = []
+
+        def OpenThread(self, access: int, inherit: bool, thread_id: int) -> int:
+            del access, inherit
+            assert thread_id == 202
+            return 303
+
+        def GetProcessIdOfThread(self, handle: int) -> int:
+            assert handle == 303
+            return 101
+
+        def GetExitCodeThread(self, handle: int, value: Any) -> int:
+            assert handle == 303
+            value._obj.value = authority_module._WindowsProcessAuthority._STILL_ACTIVE
+            return 1
+
+        def SuspendThread(self, handle: int) -> int:
+            assert handle == 303
+            self.suspend_calls.append(handle)
+            return self.suspend_count
+
+        def ResumeThread(self, handle: int) -> int:
+            assert handle == 303
+            self.resume_calls.append(handle)
+            return self.suspend_count + 1
+
+        def CloseHandle(self, handle: int) -> int:
+            assert handle == 303
+            return 1
+
+    for suspend_count in (0, 2):
+        kernel = _ThreadKernel(suspend_count)
+        authority = authority_module._WindowsProcessAuthority(
+            tmp_path,
+            name="Local\\febio-cae-thread-binding",
+            handle=700,
+            context_digest="e" * 64,
+        )
+        monkeypatch.setattr(
+            authority_module._WindowsProcessAuthority,
+            "_kernel32",
+            staticmethod(lambda kernel=kernel: kernel),
+        )
+        monkeypatch.setattr(authority, "_process_thread_ids", lambda pid: (202,))
+        monkeypatch.setattr(
+            authority,
+            "_thread_creation_identity_from_handle",
+            lambda handle: "windows:3030",
+        )
+
+        with pytest.raises(ProcessAuthorityError, match="suspended exactly once"):
+            authority._capture_primary_thread(101)
+        assert kernel.suspend_calls == [303]
+        assert kernel.resume_calls == [303]
+
+    kernel = _ThreadKernel(1)
+    authority = authority_module._WindowsProcessAuthority(
+        tmp_path,
+        name="Local\\febio-cae-thread-binding-valid",
+        handle=700,
+        context_digest="e" * 64,
+    )
+    monkeypatch.setattr(
+        authority_module._WindowsProcessAuthority,
+        "_kernel32",
+        staticmethod(lambda: kernel),
+    )
+    monkeypatch.setattr(authority, "_process_thread_ids", lambda pid: (202,))
+    monkeypatch.setattr(
+        authority,
+        "_thread_creation_identity_from_handle",
+        lambda handle: "windows:3030",
+    )
+    assert authority._capture_primary_thread(101) == (202, "windows:3030")
+    assert kernel.suspend_calls == [303]
+    assert kernel.resume_calls == [303]
+
+
+def test_windows_root_binding_uses_exact_bound_job_member_not_earliest_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    authority = authority_module._WindowsProcessAuthority(
+        tmp_path,
+        name="Local\\febio-cae-root-binding",
+        handle=700,
+        context_digest="f" * 64,
+        bound_pid=101,
+        bound_creation_identity="windows:1001",
+    )
+    monkeypatch.setattr(
+        authority,
+        "_job_members",
+        lambda: ((101, "windows:1001"), (202, "windows:999")),
+    )
+
+    authority._verify_root_process(101, "windows:1001")
+
+    assert authority._root_checked
 
 
 class _FakeProcFile:
