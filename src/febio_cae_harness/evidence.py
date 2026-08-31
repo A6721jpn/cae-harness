@@ -548,31 +548,6 @@ def _validate_digest(value: object, label: str) -> str:
     return value.casefold()
 
 
-def _file_digest(path: Path) -> str:
-    digest = hashlib.sha256()
-    try:
-        path = _reject_reparse_alias(path, "evidence file")
-        if not stat.S_ISREG(path.stat().st_mode):
-            raise EvidenceIntegrityError(f"evidence file is not regular: {path}")
-        with path.open("rb") as stream:
-            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                digest.update(chunk)
-    except (OSError, WorkspaceBoundaryError, EvidenceIntegrityError) as error:
-        raise EvidenceIntegrityError(f"cannot read evidence file: {path}") from error
-    return digest.hexdigest()
-
-
-def _file_identity(path: Path) -> tuple[int, int, int, int]:
-    try:
-        path = _reject_reparse_alias(path, "evidence file")
-        metadata = path.stat()
-    except (OSError, WorkspaceBoundaryError) as error:
-        raise EvidenceIntegrityError(f"cannot stat evidence file: {path}") from error
-    if not stat.S_ISREG(metadata.st_mode):
-        raise EvidenceIntegrityError(f"evidence file is not regular: {path}")
-    return (metadata.st_dev, metadata.st_ino, metadata.st_size, metadata.st_mtime_ns)
-
-
 def _json_text(value: object) -> str:
     return _canonical_bytes(value).decode("utf-8") + "\n"
 
@@ -1002,8 +977,12 @@ class EvidenceStore:
             record = dict(body)
             record["sha256"] = _digest(body)
 
-            attempt = self.case_workspace.allocate_attempt(attempt_id)
-            attempt.write_text(ATTEMPT_FILE, _json_text(record))
+            attempt_root = f"90_Temporary/attempts/{attempt_id}"
+            self._exact().make_directory(attempt_root)
+            self._exact().replace_bytes(
+                f"{attempt_root}/{ATTEMPT_FILE}",
+                _json_text(record).encode("utf-8"),
+            )
             self._append_event(
                 "attempt_recorded", {"attempt_id": attempt_id, "sha256": record["sha256"]}
             )
@@ -1037,7 +1016,7 @@ class EvidenceStore:
 
             record: dict[str, object] = {
                 "path": relative,
-                "sha256": _file_digest(artifact_path),
+                "sha256": self._exact().digest(relative),
                 "attempt_id": attempt_id,
             }
             existing = self._artifacts.get(relative)
@@ -1072,8 +1051,9 @@ class EvidenceStore:
 
             source_path, source_relative = self._verification_source(source, attempt_id)
             _, destination_relative = self._verification_destination(destination)
-            source_identity = _file_identity(source_path)
-            source_sha256 = _file_digest(source_path)
+            exact = self._exact()
+            source_identity = exact.identity(source_relative)
+            source_sha256 = exact.digest(source_relative)
             manager = self._bound_authority_manager()
             if authority is None:
                 if _STORE_BINDINGS[id(self)][3]:
@@ -1081,8 +1061,13 @@ class EvidenceStore:
                 execution = ValidatorExecution("unverified", "phase1", False)
             else:
                 execution = manager._execute(authority, source_path)
-            after_identity = _file_identity(source_path)
-            after_sha256 = _file_digest(source_path)
+            try:
+                after_identity = exact.identity(source_relative)
+                after_sha256 = exact.digest(source_relative)
+            except WorkspaceBoundaryError as error:
+                raise EvidenceIntegrityError(
+                    "verification source mutated during validation"
+                ) from error
             if source_identity != after_identity or source_sha256 != after_sha256:
                 raise EvidenceIntegrityError("verification source mutated during validation")
             if type(execution.result) is not bool:
@@ -1144,10 +1129,10 @@ class EvidenceStore:
                 raise EvidenceIntegrityError("verification attempt identity changed")
             if source_relative != receipt_state.source:
                 raise EvidenceIntegrityError("verification source binding changed")
-            if _file_identity(source_path) != receipt_state.source_identity:
+            if self._exact().identity(source_relative) != receipt_state.source_identity:
                 raise EvidenceIntegrityError("verification source identity changed")
             if (
-                _file_digest(source_path) != expected_sha256
+                self._exact().digest(source_relative) != expected_sha256
                 or expected_sha256 != receipt_state.source_sha256
             ):
                 raise EvidenceIntegrityError("verification source digest changed")
@@ -1161,18 +1146,18 @@ class EvidenceStore:
             evidence_digest = receipt_state.evidence_digest
             consumed = self._find_consumed(evidence_digest)
             if consumed:
-                if not destination_path.exists() and not destination_path.is_symlink():
+                if not self._exact().exists(destination_relative):
                     raise EvidenceIntegrityError("verification receipt has already been consumed")
-                if destination_path.is_file() and _file_digest(destination_path) != expected_sha256:
+                if self._exact().digest(destination_relative) != expected_sha256:
                     raise EvidenceIntegrityError("promoted destination changed")
                 raise FileExistsError(destination_path)
-            if destination_path.exists() or destination_path.is_symlink():
+            if self._exact().exists(destination_relative):
                 raise FileExistsError(destination_path)
             self._append_event(_PROMOTION_CONSUMED_EVENT, verification)
-            return self.case_workspace._copy_create_new(
-                source_path,
-                destination,
-                expected_sha256=expected_sha256,
+            return self._exact().copy_create_new(
+                source_relative,
+                destination_relative,
+                expected_sha256,
             )
 
     def _bound_authority_manager(self) -> ValidatorAuthorityManager:
@@ -1209,19 +1194,7 @@ class EvidenceStore:
         return exact
 
     @contextmanager
-    def _event_lock(
-        self,
-        exact: _ExactCaseTransaction | None = None,
-    ) -> Iterator[None]:
-        if exact is None:
-            with self.case_workspace._exact_transaction() as owned:
-                token = _ACTIVE_EXACT_TRANSACTION.set((self, owned))
-                try:
-                    with self._event_lock(owned):
-                        yield
-                finally:
-                    _ACTIVE_EXACT_TRANSACTION.reset(token)
-            return
+    def _event_lock(self, exact: _ExactCaseTransaction) -> Iterator[None]:
         case_identity = _event_lock_identity(exact.root, self.case_workspace.case_id)
         with _exclusive_event_lock(exact, case_identity=case_identity):
             yield
@@ -1320,8 +1293,9 @@ class EvidenceStore:
         return registration
 
     def _attempt_record_identity(self, attempt_id: str) -> tuple[int, int, int, int]:
-        record = self._safe_case_file(f"90_Temporary/attempts/{attempt_id}/{ATTEMPT_FILE}")
-        return _file_identity(record)
+        relative = f"90_Temporary/attempts/{attempt_id}/{ATTEMPT_FILE}"
+        self._safe_case_file(relative)
+        return self._exact().identity(relative)
 
     def _receipt_digest(self, receipt: VerificationReceipt) -> str:
         return self._receipt_state(receipt).evidence_digest
