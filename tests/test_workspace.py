@@ -691,7 +691,7 @@ def test_write_rejects_case_substitution_at_temporary_open(
     assert not (case_a.case_root / "90_Temporary" / "open-race.txt").exists()
 
 
-def test_write_rejects_case_substitution_at_atomic_replace(
+def test_write_does_not_reopen_case_path_at_atomic_replace(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -709,10 +709,10 @@ def test_write_rejects_case_substitution_at_atomic_replace(
         original_replace(source, target)
 
     monkeypatch.setattr(os, "replace", swap_before_replace)
-    with pytest.raises(WorkspaceBoundaryError):
-        case_a.write_text(Path("90_Temporary") / "replace-race.txt", "must reject")
+    written = case_a.write_text(Path("90_Temporary") / "replace-race.txt", "owned")
 
-    assert swapped
+    assert not swapped
+    assert written.read_text(encoding="utf-8") == "owned"
     assert not (case_b.case_root / "90_Temporary" / "replace-race.txt").exists()
 
 
@@ -1307,10 +1307,8 @@ def test_exact_replacement_never_installs_substituted_source_or_leaks_owned_temp
         exact.replace_bytes("90_Temporary/value.txt", b"before")
 
     def substitute_source_before_path_replace(
-        source: str | bytes | Path,
-        destination: str | bytes | Path,
-        *args: object,
-        **kwargs: object,
+        source: str | Path,
+        destination: str | Path,
     ) -> None:
         nonlocal attacked
         source_path = Path(source)
@@ -1319,7 +1317,7 @@ def test_exact_replacement_never_installs_substituted_source_or_leaks_owned_temp
             attacked = True
             source_path.rename(owned_recovery)
             os.link(outside, source_path)
-        original_replace(source, destination, *args, **kwargs)
+        original_replace(source, destination)
 
     monkeypatch.setattr(os, "replace", substitute_source_before_path_replace)
 
@@ -1347,10 +1345,8 @@ def test_atomic_replace_never_mutates_a_substituted_foreign_hard_link(
     attacked = False
 
     def substitute_before_path_chmod(
-        path: str | bytes | Path,
+        path: str | Path,
         mode: int,
-        *args: object,
-        **kwargs: object,
     ) -> None:
         nonlocal attacked
         candidate = Path(path)
@@ -1358,7 +1354,7 @@ def test_atomic_replace_never_mutates_a_substituted_foreign_hard_link(
             attacked = True
             candidate.unlink()
             os.link(outside, candidate)
-        original_chmod(path, mode, *args, **kwargs)
+        original_chmod(path, mode)
 
     monkeypatch.setattr(os, "chmod", substitute_before_path_chmod)
 
@@ -1427,33 +1423,46 @@ def test_allocate_attempt_rejects_substituted_root_before_issuance(
     displaced = case_a.temporary_root / "attempts" / "attempt-1-owned"
     original_factory = AttemptWorkspace._from_manager
     substituted = False
+    blocked = False
 
     def substitute_before_issue(
         cls: type[AttemptWorkspace],
+        /,
         case_workspace: CaseWorkspace,
         attempt_id: str,
         root: Path,
-        *args: object,
-        **kwargs: object,
+        expected_root_stamp: tuple[int, int] | None = None,
     ) -> AttemptWorkspace:
         del cls
-        nonlocal substituted
+        nonlocal blocked, substituted
         if not substituted:
-            substituted = True
-            root.rename(displaced)
-            foreign.rename(root)
-        return original_factory(case_workspace, attempt_id, root, *args, **kwargs)
+            try:
+                root.rename(displaced)
+            except OSError:
+                blocked = True
+            else:
+                substituted = True
+                foreign.rename(root)
+        return original_factory(case_workspace, attempt_id, root, expected_root_stamp)
 
     monkeypatch.setattr(AttemptWorkspace, "_from_manager", classmethod(substitute_before_issue))
 
-    with pytest.raises(WorkspaceBoundaryError):
-        case_a.allocate_attempt("attempt-1")
+    try:
+        attempt = case_a.allocate_attempt("attempt-1")
+    except WorkspaceBoundaryError:
+        attempt = None
 
-    assert substituted
-    assert (case_a.temporary_root / "attempts" / "attempt-1" / "foreign.txt").read_text(
-        encoding="utf-8"
-    ) == "foreign"
-    assert tuple(displaced.iterdir()) == ()
+    assert blocked or (substituted and attempt is None)
+    if blocked:
+        assert attempt is not None
+        assert attempt.root == case_a.temporary_root / "attempts" / "attempt-1"
+        assert not displaced.exists()
+        assert foreign.joinpath("foreign.txt").read_text(encoding="utf-8") == "foreign"
+    else:
+        assert (case_a.temporary_root / "attempts" / "attempt-1" / "foreign.txt").read_text(
+            encoding="utf-8"
+        ) == "foreign"
+        assert tuple(displaced.iterdir()) == ()
 
 
 def test_exact_owner_never_retries_ambiguous_close_with_same_identity() -> None:

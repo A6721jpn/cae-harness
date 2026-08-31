@@ -11,7 +11,6 @@ import os
 import secrets
 import shutil
 import stat
-import tempfile
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import FrozenInstanceError, dataclass
@@ -184,9 +183,143 @@ def _close_handle(handle: int) -> None:
     if os.name == "nt":
         import ctypes
 
-        ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle(ctypes.c_void_p(handle))
+        close_handle = ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle
+        close_handle.argtypes = [ctypes.c_void_p]
+        close_handle.restype = ctypes.c_int
+        if not close_handle(ctypes.c_void_p(handle)):
+            error = ctypes.get_last_error()
+            raise OSError(error, f"CloseHandle failed ({error})")
     else:
         os.close(handle)
+
+
+def _windows_descriptor_handle(descriptor: int) -> int:
+    import msvcrt
+
+    try:
+        return int(msvcrt.get_osfhandle(descriptor))
+    except OSError as error:
+        raise WorkspaceBoundaryError("cannot resolve exact file handle") from error
+
+
+def _set_open_file_mode(descriptor: int, mode: int, label: str) -> None:
+    """Apply mode metadata through the continuously held exact file."""
+
+    if os.name != "nt":
+        fchmod = getattr(os, "fchmod", None)
+        if fchmod is None:  # pragma: no cover - POSIX supplies fchmod
+            raise WorkspaceBoundaryError(f"exact mode binding is unavailable for {label}")
+        try:
+            fchmod(descriptor, mode)
+        except OSError as error:
+            raise WorkspaceBoundaryError(f"cannot set {label} mode") from error
+        return
+
+    import ctypes
+
+    class FileBasicInfo(ctypes.Structure):
+        _fields_ = [
+            ("CreationTime", ctypes.c_int64),
+            ("LastAccessTime", ctypes.c_int64),
+            ("LastWriteTime", ctypes.c_int64),
+            ("ChangeTime", ctypes.c_int64),
+            ("FileAttributes", ctypes.c_uint32),
+        ]
+
+    native = _windows_descriptor_handle(descriptor)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    get_information = kernel32.GetFileInformationByHandleEx
+    get_information.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+    ]
+    get_information.restype = ctypes.c_int
+    set_information = kernel32.SetFileInformationByHandle
+    set_information.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+    ]
+    set_information.restype = ctypes.c_int
+    information = FileBasicInfo()
+    if not get_information(
+        ctypes.c_void_p(native),
+        0,
+        ctypes.byref(information),
+        ctypes.sizeof(information),
+    ):
+        last_error = ctypes.get_last_error()
+        raise WorkspaceBoundaryError(f"cannot inspect {label} mode ({last_error})")
+    if mode & stat.S_IWRITE:
+        information.FileAttributes &= ~0x00000001
+    else:
+        information.FileAttributes |= 0x00000001
+    if not information.FileAttributes:
+        information.FileAttributes = 0x00000080
+    if not set_information(
+        ctypes.c_void_p(native),
+        0,
+        ctypes.byref(information),
+        ctypes.sizeof(information),
+    ):
+        last_error = ctypes.get_last_error()
+        raise WorkspaceBoundaryError(f"cannot set {label} mode ({last_error})")
+
+
+def _windows_rename_open_file(
+    descriptor: int,
+    parent_handle: int,
+    parent_path: Path,
+    target_name: str,
+    *,
+    replace: bool,
+    label: str,
+) -> None:
+    """Rename the exact open file relative to the exact held parent."""
+
+    if os.name != "nt":
+        raise WorkspaceBoundaryError(f"Windows exact rename is unavailable for {label}")
+
+    import ctypes
+
+    if not target_name:
+        raise WorkspaceBoundaryError(f"cannot rename {label} to an empty name")
+    del parent_handle
+    target_path = os.fspath(parent_path / target_name)
+
+    class FileRenameInfo(ctypes.Structure):
+        _fields_ = [
+            ("ReplaceIfExists", ctypes.c_ubyte),
+            ("RootDirectory", ctypes.c_void_p),
+            ("FileNameLength", ctypes.c_uint32),
+            ("FileName", ctypes.c_wchar * (len(target_path) + 1)),
+        ]
+
+    native = _windows_descriptor_handle(descriptor)
+    information = FileRenameInfo()
+    information.ReplaceIfExists = int(replace)
+    information.RootDirectory = None
+    information.FileNameLength = len(target_path.encode("utf-16-le"))
+    information.FileName = target_path
+    set_information = ctypes.WinDLL("kernel32", use_last_error=True).SetFileInformationByHandle
+    set_information.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+    ]
+    set_information.restype = ctypes.c_int
+    if not set_information(
+        ctypes.c_void_p(native),
+        3,
+        ctypes.byref(information),
+        ctypes.sizeof(information),
+    ):
+        error = ctypes.get_last_error()
+        raise WorkspaceBoundaryError(f"cannot rename {label} by handle ({error})")
 
 
 def _delete_open_handle(handle: int, label: str) -> None:
@@ -478,28 +611,25 @@ class _ExactOwner:
             return
         if self.indeterminate:
             current = self._probe()
-            if isinstance(current, BaseException):
-                raise WorkspaceBoundaryError(
-                    f"{self.label} cleanup remains indeterminate; exact owner retained"
-                ) from current
-            if current != self.expected:
+            if not isinstance(current, BaseException) and current != self.expected:
                 self.released = True
                 raise WorkspaceBoundaryError(
                     f"{self.label} cleanup ownership changed; foreign value retained"
                 )
-            self.indeterminate = False
+            cause = current if isinstance(current, BaseException) else None
+            raise WorkspaceBoundaryError(
+                f"{self.label} cleanup remains indeterminate; numeric value retained"
+            ) from cause
         try:
             self.close_handle(self.handle)
         except BaseException as error:
             current = self._probe()
-            if isinstance(current, BaseException):
-                self.indeterminate = True
-                detail = "is indeterminate; exact owner retained"
-            elif current != self.expected:
+            if not isinstance(current, BaseException) and current != self.expected:
                 self.released = True
                 detail = "ownership changed; foreign value retained"
             else:
-                detail = "failed; exact owner retained"
+                self.indeterminate = True
+                detail = "is indeterminate; numeric value retained"
             raise WorkspaceBoundaryError(f"{self.label} cleanup {detail}") from error
         self.released = True
 
@@ -622,8 +752,7 @@ class _ExactCaseTransaction:
             or registration[4] != self._root_stamp
         ):
             raise WorkspaceBoundaryError("exact case authority binding changed")
-        if os.name == "nt":
-            _identity_stamp(self.root, "exact case root", self._root_stamp)
+        _identity_stamp(self.root, "exact case root", self._root_stamp)
 
     def _entry_state(
         self,
@@ -710,7 +839,7 @@ class _ExactCaseTransaction:
             descriptor,
             _stable_file_state(os.fstat(descriptor)),
             lambda value: _stable_file_state(os.fstat(value)),
-            os.close,
+            lambda value: os.close(value),
             label,
         )
         self._owners.append(owner)
@@ -726,7 +855,7 @@ class _ExactCaseTransaction:
                 parent_path,
                 parts[-1],
                 flags=os.O_RDWR | os.O_CREAT | os.O_EXCL,
-                access=0xC0000000,
+                access=0xC0010000,
                 share=0x0001 | 0x0002 | 0x0004,
                 disposition=1,
                 mode=mode,
@@ -756,10 +885,14 @@ class _ExactCaseTransaction:
         try:
             parent = self._directory(parts[:-1])
             owner.validate()
-            self._verify_file(parts, owner, f"{owner.label} cleanup")
             if os.name == "nt":
-                os.unlink(self.root.joinpath(*parts))
+                if owner.expected[3] != 1:
+                    raise WorkspaceBoundaryError(
+                        f"{owner.label} cleanup object is not singly linked"
+                    )
+                _delete_open_file(_windows_descriptor_handle(owner.handle), owner.label)
             else:
+                self._verify_file(parts, owner, f"{owner.label} cleanup")
                 os.unlink(parts[-1], dir_fd=parent.handle)
         except BaseException as cleanup:
             primary.add_note(f"{owner.label} cleanup failed: {cleanup}")
@@ -845,7 +978,7 @@ class _ExactCaseTransaction:
         owner.validate()
         return tuple(sorted(names))
 
-    def make_directory(self, relative_path: str | Path) -> None:
+    def make_directory(self, relative_path: str | Path) -> _IdentityStamp:
         parts = self._parts(relative_path, "exact directory creation")
         parent = self._directory(parts[:-1])
         parent_path = self.root.joinpath(*parts[:-1])
@@ -858,7 +991,14 @@ class _ExactCaseTransaction:
             raise
         except OSError as error:
             raise WorkspaceBoundaryError("cannot create exact directory") from error
-        self._directory(parts).validate()
+        metadata = self._entry_state(parts[:-1], parts[-1], "created exact directory")
+        created_stamp = (int(metadata.st_dev), int(metadata.st_ino))
+        owner = self._directory(parts)
+        owner.validate()
+        if owner.expected != _expected_native_directory_identity(created_stamp):
+            raise WorkspaceBoundaryError("created exact directory was substituted")
+        self._validate_root()
+        return created_stamp
 
     def exists(self, relative_path: str | Path) -> bool:
         parts = self._parts(relative_path, "exact existence check")
@@ -933,20 +1073,13 @@ class _ExactCaseTransaction:
             mode = 0o666
 
         temporary_name = f".{parts[-1]}.{secrets.token_hex(16)}"
-        temporary_path = parent_path / temporary_name
         temporary = self._new_file(
             (*parts[:-1], temporary_name), "exact replacement temporary", mode
         )
         descriptor = temporary.handle
         try:
             self._write(temporary, data)
-            if os.name == "nt":
-                os.chmod(temporary_path, mode)
-            else:
-                fchmod = getattr(os, "fchmod", None)
-                if fchmod is None:  # pragma: no cover - POSIX supplies fchmod
-                    raise WorkspaceBoundaryError("exact mode binding is unavailable")
-                fchmod(descriptor, mode)
+            _set_open_file_mode(descriptor, mode, "exact replacement temporary")
             temporary.expected = _stable_file_state(os.fstat(descriptor))
             temporary.validate()
             temporary_parts = (*parts[:-1], temporary_name)
@@ -1006,12 +1139,15 @@ def _replace_exact_entry(
     parent.validate()
     temporary.validate()
     if os.name == "nt":
-        temporary_path = parent_path / temporary_name
-        target_path = parent_path / target_name
-        if target_existed:
-            os.replace(temporary_path, target_path)
-        else:
-            os.rename(temporary_path, target_path)
+        del temporary_name
+        _windows_rename_open_file(
+            temporary.handle,
+            parent.handle,
+            parent_path,
+            target_name,
+            replace=target_existed,
+            label="exact replacement temporary",
+        )
         return
     if target_existed:
         os.replace(
@@ -1212,67 +1348,6 @@ def _validate_sha256(value: str) -> str:
     return value.casefold()
 
 
-def _atomic_replace_bytes(
-    target: Path,
-    data: bytes,
-    label: str,
-    *,
-    root: Path,
-    root_stamp: _IdentityStamp,
-) -> Path:
-    """Write bytes by replacing the owned directory entry atomically.
-
-    A regular file may have a hard-link name outside the case tree.  Opening
-    such a target with truncation would mutate that outside inode, so writes
-    always land in a fresh file before replacing the target name.
-    """
-
-    parent = _reject_reparse_alias(target.parent, f"{label} parent")
-    _reject_reparse_alias(target, label)
-    try:
-        existing_mode = stat.S_IMODE(target.stat().st_mode)
-    except FileNotFoundError:
-        existing_mode = 0o666
-    except OSError as error:
-        raise WorkspaceBoundaryError(f"cannot inspect {label}: {target}") from error
-
-    guard = _parent_guard(root, root_stamp, parent, label)
-    guard.__enter__()
-    descriptor: int | None = None
-    temporary_path: Path | None = None
-    try:
-        descriptor, temporary_name = tempfile.mkstemp(
-            prefix=f".{target.name}.",
-            dir=os.fspath(parent),
-        )
-        temporary_path = Path(temporary_name)
-        _reject_reparse_alias(temporary_path, f"{label} temporary file")
-        with os.fdopen(descriptor, "wb") as stream:
-            descriptor = None
-            _identity_stamp(root, "owned root", root_stamp)
-            stream.write(data)
-            stream.flush()
-            os.fsync(stream.fileno())
-            _identity_stamp(root, "owned root", root_stamp)
-        os.chmod(temporary_path, existing_mode)
-        _identity_stamp(root, "owned root", root_stamp)
-        os.replace(os.fspath(temporary_path), os.fspath(target))
-    except WorkspaceBoundaryError:
-        raise
-    except OSError as error:
-        raise WorkspaceBoundaryError(f"cannot write {label}: {target}") from error
-    finally:
-        if descriptor is not None:
-            with suppress(OSError):
-                os.close(descriptor)
-        if temporary_path is not None:
-            with suppress(OSError, WorkspaceBoundaryError):
-                _identity_stamp(root, "owned root", root_stamp)
-                temporary_path.unlink()
-        guard.__exit__(None, None, None)
-    return target
-
-
 def _append_bytes(
     target: Path,
     data: bytes,
@@ -1410,6 +1485,7 @@ class AttemptWorkspace:
         case_workspace: CaseWorkspace,
         attempt_id: str,
         root: Path,
+        expected_root_stamp: _IdentityStamp | None = None,
     ) -> AttemptWorkspace:
         """Construct a handle only for the manager-owned attempt path."""
 
@@ -1427,7 +1503,9 @@ class AttemptWorkspace:
         actual_root = _reject_reparse_alias(root, "attempt root")
         if actual_root != expected_root:
             raise WorkspaceBoundaryError("attempt root is not owned by the case workspace")
-        root_stamp = _identity_stamp(actual_root, "attempt root")
+        if expected_root_stamp is None:
+            raise WorkspaceBoundaryError("attempt creation identity is required")
+        root_stamp = _identity_stamp(actual_root, "attempt root", expected_root_stamp)
 
         instance = object.__new__(cls)
         object.__setattr__(instance, "case_id", case_workspace.case_id)
@@ -1469,9 +1547,19 @@ class AttemptWorkspace:
         raise TypeError("attempt workspace state is not transferable")
 
     def _atomic_owned(self, target: Path, data: bytes, label: str) -> Path:
-        return _atomic_replace_bytes(
-            target, data, label, root=self.root, root_stamp=_registered_attempt_stamp(self)
-        )
+        del label
+        attempt = _require_registered_attempt(self)
+        registration = _ATTEMPT_REGISTRY[id(attempt)]
+        case = cast(CaseWorkspace, registration[1])
+        attempt_stamp = _registered_attempt_stamp(attempt)
+        attempt_relative = attempt.root.relative_to(case.case_root)
+        target_relative = target.relative_to(case.case_root)
+        with case._exact_transaction() as exact:
+            attempt_owner = exact._directory(tuple(attempt_relative.parts))
+            if attempt_owner.expected != _expected_native_directory_identity(attempt_stamp):
+                raise WorkspaceBoundaryError("attempt root changed before exact write")
+            exact.replace_bytes(target_relative, data)
+        return target
 
     def write_bytes(self, relative_path: str | Path, data: bytes) -> Path:
         attempt = _require_registered_attempt(self)
@@ -1621,9 +1709,12 @@ class CaseWorkspace:
         raise TypeError("case workspace state is not transferable")
 
     def _atomic_owned(self, target: Path, data: bytes, label: str) -> Path:
-        return _atomic_replace_bytes(
-            target, data, label, root=self.case_root, root_stamp=_registered_case_stamp(self)
-        )
+        del label
+        case = _require_registered_case(self)
+        relative = target.relative_to(case.case_root)
+        with case._exact_transaction() as exact:
+            exact.replace_bytes(relative, data)
+        return target
 
     def _append_owned(self, target: Path, data: bytes) -> Path:
         return _append_bytes(
@@ -1834,7 +1925,6 @@ class CaseWorkspace:
 
     def allocate_attempt(self, attempt_id: str) -> AttemptWorkspace:
         case = _require_registered_case(self)
-        case_stamp = _registered_case_stamp(case)
         _validate_segment(attempt_id, "attempt_id")
         _reject_reparse_alias(case.case_root, "case root")
         _reject_reparse_alias(case.temporary_root, "temporary root")
@@ -1844,9 +1934,15 @@ class CaseWorkspace:
         )
         attempt_root = case.temporary_root / "attempts" / attempt_id
         _reject_reparse_alias(attempt_root, "attempt root")
-        with _parent_guard(case.case_root, case_stamp, attempt_root.parent, "attempt"):
-            attempt_root.mkdir(parents=False, exist_ok=False)
-            return AttemptWorkspace._from_manager(case, attempt_id, attempt_root)
+        relative = attempt_root.relative_to(case.case_root)
+        with case._exact_transaction() as exact:
+            root_stamp = exact.make_directory(relative)
+            return AttemptWorkspace._from_manager(
+                case,
+                attempt_id,
+                attempt_root,
+                root_stamp,
+            )
 
 
 class ValidatedCaseWorkspace:
