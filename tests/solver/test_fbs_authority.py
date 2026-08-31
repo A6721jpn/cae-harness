@@ -6,6 +6,7 @@ import ctypes
 import importlib
 import math
 import os
+import stat
 import sys
 from collections.abc import Sequence
 from ctypes import wintypes
@@ -349,7 +350,7 @@ def test_windows_same_object_same_value_reuse_never_closes_foreign_handle(
                 break
             fbs_module._close_owned_handle(candidate)
         assert foreign is not None, "Windows did not reuse the native handle value"
-        _set_windows_close_protection(owned_value, False)
+        assert fbs_module._windows_handle_flags(owned_value) & 0x00000002
 
         with pytest.raises(ValueError, match="refusing close"):
             fbs_module._close_owned_handle(owned)
@@ -363,16 +364,230 @@ def test_windows_same_object_same_value_reuse_never_closes_foreign_handle(
                 _set_windows_close_protection(foreign.value, False)
             with contextlib.suppress(OSError):
                 fbs_module._windows_close_raw(foreign.value)
-            foreign.closed = True
-            foreign.value = None
+            fbs_module._retire_owned_handle(foreign)
         if not owned.closed and owned.value is not None:
             with contextlib.suppress(OSError):
                 _set_windows_close_protection(owned.value, False)
             with contextlib.suppress(OSError):
                 fbs_module._windows_close_raw(owned.value)
-            owned.closed = True
-            owned.value = None
+            fbs_module._retire_owned_handle(owned)
         manager.close()
+
+
+def test_descriptor_generation_reuse_never_closes_current_foreign_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "synthetic.xplt"
+    stale = fbs_module._OwnedHandle(37, 11, 23, path, False)
+    foreign = fbs_module._OwnedHandle(37, 11, 23, path, False)
+    metadata = Mock(st_dev=11, st_ino=23)
+    close = Mock()
+    monkeypatch.setattr(os, "fstat", lambda _value: metadata)
+    monkeypatch.setattr(os, "close", close)
+
+    try:
+        with pytest.raises(ValueError, match="stale|ownership|refusing"):
+            fbs_module._close_owned_handle(stale)
+        assert stale.closed and stale.value is None
+        assert not foreign.closed and foreign.value == 37
+        close.assert_not_called()
+    finally:
+        fbs_module._retire_owned_handle(stale)
+        fbs_module._retire_owned_handle(foreign)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX descriptor reuse")
+def test_posix_descriptor_reuse_never_closes_current_foreign_owner(tmp_path: Path) -> None:
+    path = tmp_path / "same-object.xplt"
+    path.write_bytes(b"synthetic-xplt")
+    first_fd = os.open(os.fspath(path), os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+    metadata = os.fstat(first_fd)
+    stale = fbs_module._OwnedHandle(
+        first_fd,
+        int(metadata.st_dev),
+        int(metadata.st_ino),
+        path,
+        False,
+    )
+    os.close(first_fd)
+    foreign_fd: int | None = None
+    foreign: fbs_module._OwnedHandle | None = None
+    try:
+        for _ in range(256):
+            candidate_fd = os.open(os.fspath(path), os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+            if candidate_fd == first_fd:
+                foreign_fd = candidate_fd
+                break
+            os.close(candidate_fd)
+        assert foreign_fd is not None, "POSIX did not reuse the descriptor value"
+        foreign = fbs_module._OwnedHandle(
+            foreign_fd,
+            int(metadata.st_dev),
+            int(metadata.st_ino),
+            path,
+            False,
+        )
+
+        with pytest.raises(ValueError, match="stale|ownership|refusing"):
+            fbs_module._close_owned_handle(stale)
+        assert os.fstat(foreign_fd).st_ino == metadata.st_ino
+    finally:
+        fbs_module._retire_owned_handle(stale)
+        if foreign is not None:
+            fbs_module._close_owned_handle(foreign)
+        elif foreign_fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(foreign_fd)
+
+
+def test_root_binding_rejects_path_identity_change_even_with_held_fd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "attempt"
+    path.mkdir()
+    owner = fbs_module._OwnedHandle(41, 11, 23, path, False)
+    binding = fbs_module._RootBinding(path, owner, 11, 23)
+    held_metadata = Mock(st_mode=stat.S_IFDIR, st_dev=11, st_ino=23)
+    replaced_path_metadata = Mock(st_mode=stat.S_IFDIR, st_dev=31, st_ino=47)
+    monkeypatch.setattr(os, "fstat", lambda _value: held_metadata)
+    monkeypatch.setattr(
+        os,
+        "stat",
+        lambda _candidate, follow_symlinks=False: replaced_path_metadata,
+    )
+
+    try:
+        with pytest.raises(TypeError, match="changed"):
+            fbs_module._verify_root(binding)
+    finally:
+        fbs_module._retire_owned_handle(owner)
+
+
+@pytest.mark.parametrize("rename_target", ["root", "ancestor"])
+@pytest.mark.skipif(os.name != "posix", reason="POSIX pathname binding")
+def test_posix_validation_rejects_root_or_ancestor_namespace_replacement(
+    tmp_path: Path,
+    rename_target: str,
+) -> None:
+    container = tmp_path / "container"
+    ancestor = container / "ancestor"
+    root = ancestor / "attempt"
+    root.mkdir(parents=True)
+    path = root / "attempt.xplt"
+    path.write_bytes(b"synthetic-xplt")
+    moved = container / f"{rename_target}-moved"
+    attempts: list[str] = []
+
+    class RenamingAdapter:
+        def read_fields(self, _path: Path, fields: Sequence[str]) -> dict[str, object]:
+            target = root if rename_target == "root" else ancestor
+            target.rename(moved)
+            attempts.append("renamed")
+            if rename_target == "root":
+                root.mkdir()
+            else:
+                ancestor.mkdir()
+                root.mkdir()
+            (root / "attempt.xplt").write_bytes(b"synthetic-xplt")
+            return {field: 1.0 for field in fields}
+
+    manager = FbsAdapterManager(RenamingAdapter(), "synthetic-runtime", root)
+    authority = manager.issue_authority()
+    try:
+        result = validate_requested_fields(authority, path, ("stress",))
+        assert attempts == ["renamed"]
+        assert not result.valid
+        assert any("root" in issue.lower() or "changed" in issue.lower() for issue in result.issues)
+    finally:
+        manager.close()
+        if moved.exists():
+            if rename_target == "root":
+                if root.exists():
+                    (root / "attempt.xplt").unlink(missing_ok=True)
+                    root.rmdir()
+                moved.rename(root)
+            else:
+                if ancestor.exists():
+                    (root / "attempt.xplt").unlink(missing_ok=True)
+                    root.rmdir()
+                    ancestor.rmdir()
+                moved.rename(ancestor)
+
+
+def test_validation_rechecks_opened_namespace_after_digest_before_issuance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    path = tmp_path / "attempt.xplt"
+    path.write_bytes(b"synthetic-xplt")
+    manager = FbsAdapterManager(MappingAdapter(), "synthetic-runtime", tmp_path)
+    authority = manager.issue_authority()
+    events: list[str] = []
+
+    def record_verify(_opened: object) -> None:
+        events.append("verify")
+
+    def record_digest(_opened: object) -> str:
+        events.append("digest")
+        return "0" * 64
+
+    monkeypatch.setattr(fbs_module, "_verify_opened_xplt", record_verify)
+    monkeypatch.setattr(fbs_module, "_digest_fd", record_digest)
+    try:
+        result = validate_requested_fields(authority, path, ("stress",))
+        expected_before = (
+            ("verify", "digest", "verify", "digest")
+            if os.name == "nt"
+            else ("digest", "verify", "digest")
+        )
+        assert result.valid
+        assert tuple(events) == expected_before + ("verify",)
+    finally:
+        manager.close()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX pathname binding")
+def test_posix_namespace_replacement_during_digest_invalidates_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    container = tmp_path / "container"
+    ancestor = container / "ancestor"
+    root = ancestor / "attempt"
+    root.mkdir(parents=True)
+    path = root / "attempt.xplt"
+    path.write_bytes(b"synthetic-xplt")
+    moved = container / "attempt-moved"
+    manager = FbsAdapterManager(MappingAdapter(), "synthetic-runtime", root)
+    authority = manager.issue_authority()
+    original_digest = fbs_module._digest_fd
+    digest_calls = 0
+
+    def digest_then_replace(owner: fbs_module._OwnedHandle) -> str:
+        nonlocal digest_calls
+        digest = original_digest(owner)
+        digest_calls += 1
+        if digest_calls == 2:
+            root.rename(moved)
+            root.mkdir()
+            (root / "attempt.xplt").write_bytes(b"synthetic-xplt")
+        return digest
+
+    monkeypatch.setattr(fbs_module, "_digest_fd", digest_then_replace)
+    try:
+        result = validate_requested_fields(authority, path, ("stress",))
+        assert digest_calls == 2
+        assert not result.valid
+    finally:
+        manager.close()
+        if moved.exists():
+            if root.exists():
+                (root / "attempt.xplt").unlink(missing_ok=True)
+                root.rmdir()
+            moved.rename(root)
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows native handle ownership")
@@ -502,6 +717,89 @@ def test_windows_close_retry_reprotects_exact_owner_after_reprotect_failure(
         if not owner.closed and owner.value is not None:
             original_protect(owner.value, False)
             original_close(owner.value)
+            fbs_module._retire_owned_handle(owner)
+        manager.close()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows native handle ownership")
+def test_windows_unprotected_retry_never_closes_reused_protected_foreign_handle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "attempt"
+    root.mkdir()
+    manager = FbsAdapterManager(MappingAdapter(), "synthetic-runtime", root)
+    binding = object.__getattribute__(manager, "_record").root_binding
+    assert binding is not None and binding.fd is not None
+    owner = fbs_module._windows_duplicate(binding.fd)
+    value = owner.value
+    assert value is not None
+    original_close = fbs_module._windows_close_raw
+    original_protect = fbs_module._windows_set_close_protection
+    close_failed = False
+    reprotect_failed = False
+
+    def fail_close_once(value_to_close: int) -> None:
+        nonlocal close_failed
+        if not close_failed:
+            close_failed = True
+            raise OSError(32, "synthetic sharing violation")
+        original_close(value_to_close)
+
+    def fail_reprotect_once(value_to_protect: int, protected: bool) -> None:
+        nonlocal reprotect_failed
+        if protected and not reprotect_failed:
+            reprotect_failed = True
+            raise OSError(32, "synthetic re-protect failure")
+        original_protect(value_to_protect, protected)
+
+    monkeypatch.setattr(fbs_module, "_windows_close_raw", fail_close_once)
+    monkeypatch.setattr(fbs_module, "_windows_set_close_protection", fail_reprotect_once)
+    foreign: fbs_module._OwnedHandle | None = None
+    try:
+        with pytest.raises(OSError, match="sharing violation"):
+            fbs_module._close_owned_handle(owner)
+        assert owner.value == value and owner.windows_unprotected_for_close
+        assert not owner.windows_protected and reprotect_failed
+
+        original_close(value)
+        for _ in range(256):
+            candidate = fbs_module._windows_open_absolute(
+                root,
+                fbs_module._WINDOWS_FILE_LIST_DIRECTORY
+                | fbs_module._WINDOWS_FILE_READ_ATTRIBUTES
+                | fbs_module._WINDOWS_READ_CONTROL
+                | fbs_module._WINDOWS_SYNCHRONIZE,
+                fbs_module._WINDOWS_FILE_SHARE_READ | fbs_module._WINDOWS_FILE_SHARE_WRITE,
+                fbs_module._WINDOWS_FILE_FLAG_BACKUP_SEMANTICS
+                | fbs_module._WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT,
+            )
+            if candidate.value == value:
+                foreign = candidate
+                break
+            fbs_module._close_owned_handle(candidate)
+        assert foreign is not None, "Windows did not reuse the native handle value"
+
+        with pytest.raises(ValueError, match="stale|refusing"):
+            fbs_module._close_owned_handle(owner)
+        assert not foreign.closed and foreign.value == value
+        assert (
+            fbs_module._windows_handle_flags(value)
+            & fbs_module._WINDOWS_HANDLE_FLAG_PROTECT_FROM_CLOSE
+        )
+        assert fbs_module._windows_file_info(value)[1:3] == (owner.device, owner.inode)
+    finally:
+        if foreign is not None and not foreign.closed and foreign.value is not None:
+            with contextlib.suppress(OSError):
+                original_protect(foreign.value, False)
+            with contextlib.suppress(OSError):
+                original_close(foreign.value)
+            fbs_module._retire_owned_handle(foreign)
+        if not owner.closed and owner.value is not None:
+            with contextlib.suppress(OSError):
+                original_protect(owner.value, False)
+            with contextlib.suppress(OSError):
+                original_close(owner.value)
             fbs_module._retire_owned_handle(owner)
         manager.close()
 

@@ -16,6 +16,7 @@ import hashlib
 import math
 import os
 import stat
+import threading
 import weakref
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from ctypes import wintypes
@@ -194,6 +195,7 @@ class _RootBinding:
     fd: _OwnedHandle | None
     device: int
     inode: int
+    path_identities: tuple[tuple[Path, int, int], ...] = ()
     closed: bool = False
 
 
@@ -213,33 +215,62 @@ class _OwnedHandle:
     windows_protected: bool = False
     windows_unprotected_for_close: bool = False
 
+    generation: object = field(default_factory=object, init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if self.closed or self.value is None:
+            return
+        with _HANDLE_LOCK:
+            _HANDLE_REGISTRY[(self.windows, self.value)] = (self, self.generation)
+
 
 _PENDING_CLEANUP: list[_OwnedHandle] = []
+_HANDLE_LOCK = threading.RLock()
+_HANDLE_REGISTRY: dict[tuple[bool, int], tuple[_OwnedHandle, object]] = {}
+
+
+def _is_current_owned_handle(owner: _OwnedHandle, value: int) -> bool:
+    current = _HANDLE_REGISTRY.get((owner.windows, value))
+    return current is not None and current[0] is owner and current[1] is owner.generation
 
 
 def _retain_cleanup_owner(owner: _OwnedHandle) -> None:
-    if owner.closed or owner.value is None:
-        return
-    if not any(existing is owner for existing in _PENDING_CLEANUP):
-        _PENDING_CLEANUP.append(owner)
+    with _HANDLE_LOCK:
+        if owner.closed or owner.value is None:
+            return
+        if not any(existing is owner for existing in _PENDING_CLEANUP):
+            _PENDING_CLEANUP.append(owner)
 
 
 def _forget_cleanup_owner(owner: _OwnedHandle) -> None:
-    _PENDING_CLEANUP[:] = [existing for existing in _PENDING_CLEANUP if existing is not owner]
+    with _HANDLE_LOCK:
+        _PENDING_CLEANUP[:] = [existing for existing in _PENDING_CLEANUP if existing is not owner]
 
 
 def _retire_owned_handle(owner: _OwnedHandle) -> None:
-    owner.closed = True
-    owner.value = None
-    owner.windows_protected = False
-    owner.windows_unprotected_for_close = False
-    _forget_cleanup_owner(owner)
+    with _HANDLE_LOCK:
+        value = owner.value
+        owner.closed = True
+        owner.value = None
+        owner.windows_protected = False
+        owner.windows_unprotected_for_close = False
+        if value is not None:
+            current = _HANDLE_REGISTRY.get((owner.windows, value))
+            if current is not None and current[0] is owner and current[1] is owner.generation:
+                del _HANDLE_REGISTRY[(owner.windows, value)]
+        _forget_cleanup_owner(owner)
 
 
 def _owned_value(owner: _OwnedHandle) -> int:
     if owner.closed or owner.value is None:
         raise ValueError("owned filesystem handle is closed")
-    return owner.value
+    with _HANDLE_LOCK:
+        value = owner.value
+        if value is None or owner.closed:
+            raise ValueError("owned filesystem handle is closed")
+        if not _is_current_owned_handle(owner, value):
+            raise ValueError("owned filesystem handle generation is stale")
+        return value
 
 
 def _windows_error(message: str, code: int | None = None) -> OSError:
@@ -369,6 +400,16 @@ def _windows_open_absolute(
     share_mode: int,
     flags: int,
 ) -> _OwnedHandle:
+    with _HANDLE_LOCK:
+        return _windows_open_absolute_locked(path, desired_access, share_mode, flags)
+
+
+def _windows_open_absolute_locked(
+    path: Path,
+    desired_access: int,
+    share_mode: int,
+    flags: int,
+) -> _OwnedHandle:
     kernel32 = _windows_kernel32()
     create_file = kernel32.CreateFileW
     create_file.argtypes = [
@@ -411,6 +452,20 @@ def _windows_open_absolute(
 
 
 def _windows_open_relative(
+    parent: _OwnedHandle,
+    name: str,
+    desired_access: int,
+    share_mode: int,
+    create_options: int,
+    path: Path,
+) -> _OwnedHandle:
+    with _HANDLE_LOCK:
+        return _windows_open_relative_locked(
+            parent, name, desired_access, share_mode, create_options, path
+        )
+
+
+def _windows_open_relative_locked(
     parent: _OwnedHandle,
     name: str,
     desired_access: int,
@@ -488,6 +543,11 @@ def _windows_open_relative(
 
 
 def _windows_duplicate(owner: _OwnedHandle) -> _OwnedHandle:
+    with _HANDLE_LOCK:
+        return _windows_duplicate_locked(owner)
+
+
+def _windows_duplicate_locked(owner: _OwnedHandle) -> _OwnedHandle:
     value = _owned_value(owner)
     kernel32 = _windows_kernel32()
     get_current_process = kernel32.GetCurrentProcess
@@ -565,6 +625,17 @@ def _windows_verify_owner(
 
 
 def _close_owned_handle(owner: _OwnedHandle) -> None:
+    with _HANDLE_LOCK:
+        value = owner.value
+        if owner.closed or value is None:
+            return
+        if not _is_current_owned_handle(owner, value):
+            _retire_owned_handle(owner)
+            raise ValueError("native filesystem handle generation is stale; refusing close")
+        _close_owned_handle_locked(owner)
+
+
+def _close_owned_handle_locked(owner: _OwnedHandle) -> None:
     value = owner.value
     if owner.closed or value is None:
         return
@@ -707,8 +778,9 @@ def _finalize_root_binding(binding: _RootBinding | None) -> None:
 
 
 def _drain_pending_cleanup() -> None:
-    pending = tuple(_PENDING_CLEANUP)
-    _PENDING_CLEANUP.clear()
+    with _HANDLE_LOCK:
+        pending = tuple(_PENDING_CLEANUP)
+        _PENDING_CLEANUP.clear()
     for owner in pending:
         try:
             _close_owned_handle(owner)
@@ -719,7 +791,28 @@ def _drain_pending_cleanup() -> None:
 atexit.register(_drain_pending_cleanup)
 
 
+def _capture_posix_path_binding(path: Path) -> tuple[tuple[Path, int, int], ...]:
+    identities: list[tuple[Path, int, int]] = []
+    current = path
+    while True:
+        metadata = os.stat(os.fspath(current), follow_symlinks=False)
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise ValueError("attempt root pathname contains a non-directory")
+        identities.append((current, int(metadata.st_dev), int(metadata.st_ino)))
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+    identities.reverse()
+    return tuple(identities)
+
+
 def _hold_root(root: Path) -> _RootBinding:
+    with _HANDLE_LOCK:
+        return _hold_root_locked(root)
+
+
+def _hold_root_locked(root: Path) -> _RootBinding:
     """Hold the issued attempt root used for descriptor-relative reads."""
 
     path = _normalise_root(root)
@@ -729,6 +822,7 @@ def _hold_root(root: Path) -> _RootBinding:
         flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
         flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
         posix_owner: _OwnedHandle | None = None
+        path_identities: tuple[tuple[Path, int, int], ...] = ()
         try:
             fd = os.open(os.fspath(path), flags)
             metadata = os.fstat(fd)
@@ -739,7 +833,8 @@ def _hold_root(root: Path) -> _RootBinding:
                 path,
                 False,
             )
-        except OSError as error:
+            path_identities = _capture_posix_path_binding(path)
+        except (OSError, ValueError) as error:
             if posix_owner is not None:
                 _best_effort_close(posix_owner)
             elif "fd" in locals():
@@ -752,7 +847,19 @@ def _hold_root(root: Path) -> _RootBinding:
             raise ValueError("attempt root is not a directory")
         if posix_owner is None:  # pragma: no cover - defensive state guard
             raise ValueError("attempt root is not a held directory")
-        return _RootBinding(path, posix_owner, posix_owner.device, posix_owner.inode)
+        if not path_identities or path_identities[-1][1:] != (
+            posix_owner.device,
+            posix_owner.inode,
+        ):
+            _best_effort_close(posix_owner)
+            raise ValueError("attempt root pathname binding changed")
+        return _RootBinding(
+            path,
+            posix_owner,
+            posix_owner.device,
+            posix_owner.inode,
+            path_identities=path_identities,
+        )
 
     windows_owner: _OwnedHandle | None = None
     try:
@@ -788,6 +895,29 @@ def _hold_root(root: Path) -> _RootBinding:
 
 
 def _verify_root(binding: _RootBinding | None) -> None:
+    with _HANDLE_LOCK:
+        _verify_root_locked(binding)
+
+
+def _verify_posix_path_binding(binding: _RootBinding) -> None:
+    identities = binding.path_identities
+    if not identities:
+        identities = ((binding.path, binding.device, binding.inode),)
+    for path, device, inode in identities:
+        try:
+            metadata = os.stat(os.fspath(path), follow_symlinks=False)
+        except OSError as error:
+            raise TypeError("issued attempt root pathname binding changed") from error
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISDIR(metadata.st_mode)
+            or int(metadata.st_dev) != device
+            or int(metadata.st_ino) != inode
+        ):
+            raise TypeError("issued attempt root pathname binding changed")
+
+
+def _verify_root_locked(binding: _RootBinding | None) -> None:
     if binding is None or binding.closed or binding.fd is None:
         raise TypeError("issued attempt root authority is unavailable")
     if os.name == "nt":
@@ -809,7 +939,7 @@ def _verify_root(binding: _RootBinding | None) -> None:
         return
     try:
         metadata = os.fstat(_owned_value(binding.fd))
-    except OSError as error:
+    except (OSError, ValueError) as error:
         raise TypeError("issued attempt root authority is unavailable") from error
     if (
         not stat.S_ISDIR(metadata.st_mode)
@@ -817,6 +947,7 @@ def _verify_root(binding: _RootBinding | None) -> None:
         or int(metadata.st_ino) != binding.inode
     ):
         raise TypeError("issued attempt root authority changed")
+    _verify_posix_path_binding(binding)
 
 
 def _manager_record(value: object) -> _ManagerRecord:
@@ -1165,6 +1296,11 @@ def _relative_to_root(path: Path, root: Path) -> tuple[str, ...]:
 
 
 def _open_bound_xplt(record: _AuthorityRecord, reported_path: Path) -> _OpenedXplt:
+    with _HANDLE_LOCK:
+        return _open_bound_xplt_locked(record, reported_path)
+
+
+def _open_bound_xplt_locked(record: _AuthorityRecord, reported_path: Path) -> _OpenedXplt:
     root = record.attempt_root
     binding = record.root_binding
     if root is None or binding is None or binding.fd is None:
@@ -1314,11 +1450,12 @@ def _verify_opened_xplt(opened: _OpenedXplt) -> None:
             raise ValueError("XPLT changed or became unavailable") from error
         return
     try:
+        _verify_root(opened.root_binding)
         path_metadata = os.stat(
             opened.name, dir_fd=_owned_value(opened.parent_fd), follow_symlinks=False
         )
         descriptor_metadata = os.fstat(_owned_value(opened.fd))
-    except OSError as error:
+    except (OSError, TypeError, ValueError) as error:
         raise ValueError("XPLT changed or became unavailable") from error
     if (
         not stat.S_ISREG(path_metadata.st_mode)
@@ -1704,6 +1841,7 @@ def validate_requested_fields(
             if opened is not None:
                 _verify_opened_xplt(opened)
                 digest_after = _digest_fd(opened.fd)
+                _verify_opened_xplt(opened)
             else:
                 _require_xplt(reported_path, record.attempt_root)
                 digest_after = _digest(path)
