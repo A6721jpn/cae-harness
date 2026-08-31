@@ -438,10 +438,17 @@ def test_windows_reconnect_rejects_self_consistent_rewritten_journal_and_fabrica
         assert json.loads(record_path.read_text(encoding="utf-8"))["state"] == "BOUND_SUSPENDED"
     finally:
         if helper is not None:
-            with contextlib.suppress(BaseException):
-                helper.kill()
-            with contextlib.suppress(BaseException):
-                helper.wait(timeout=5.0)
+            try:
+                with contextlib.suppress(BaseException):
+                    if helper.poll() is None:
+                        helper.kill()
+                with contextlib.suppress(BaseException):
+                    helper.communicate(timeout=5.0)
+            finally:
+                for stream in (helper.stdout, helper.stderr):
+                    if stream is not None:
+                        with contextlib.suppress(BaseException):
+                            stream.close()
         _cleanup_windows_resume_recovery(capability, supervisor, process, bound_record, record_path)
 
 
@@ -677,10 +684,17 @@ def test_windows_resume_event_dacl_blocks_external_mutation_and_setevent(
         assert f"0x{denied:08X}" in supervisor_module._WINDOWS_EVENT_DACL_SDDL
     finally:
         if helper is not None:
-            with contextlib.suppress(BaseException):
-                helper.kill()
-            with contextlib.suppress(BaseException):
-                helper.wait(timeout=5.0)
+            try:
+                with contextlib.suppress(BaseException):
+                    if helper.poll() is None:
+                        helper.kill()
+                with contextlib.suppress(BaseException):
+                    helper.communicate(timeout=5.0)
+            finally:
+                for stream in (helper.stdout, helper.stderr):
+                    if stream is not None:
+                        with contextlib.suppress(BaseException):
+                            stream.close()
         _cleanup_windows_resume_recovery(capability, supervisor, process, bound_record, record_path)
 
 
