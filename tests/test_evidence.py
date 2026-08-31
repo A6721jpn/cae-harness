@@ -1332,6 +1332,35 @@ def test_attempt_recovery_marker_precedes_attempt_file_durability(
     assert reopened.manifest["attempts"] == []
 
 
+def test_reopen_rejects_invalid_enhanced_attempt_marker_before_directory(
+    tmp_path: Path,
+) -> None:
+    _, case, intent = make_case(tmp_path)
+    EvidenceStore(case, intent)
+    marker = {
+        "schema_version": evidence_module.SCHEMA_VERSION,
+        "case_id": case.case_id,
+        "sequence": 1,
+        "previous_sha256": None,
+        "event_sha256": "0" * 64,
+        "attempt_id": "attempt-1",
+        "attempt_sha256": "1" * 64,
+    }
+    marker_path = case.temporary_root / "event-recovery.json"
+    marker_path.write_bytes(
+        (json.dumps(marker, separators=(",", ":"), sort_keys=True) + "\n").encode("utf-8")
+    )
+
+    with pytest.raises(
+        EvidenceIntegrityError,
+        match="pending attempt recovery event binding is invalid",
+    ):
+        EvidenceStore.open(case)
+
+    assert marker_path.is_file()
+    assert not (case.temporary_root / "attempts" / "attempt-1").exists()
+
+
 def test_reopen_repairs_one_canonical_partial_attempt_event_idempotently(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

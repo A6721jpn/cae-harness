@@ -10,7 +10,8 @@ import shutil
 import subprocess
 from collections.abc import Callable
 from pathlib import Path
-from typing import IO, Any
+from types import SimpleNamespace
+from typing import IO, Any, cast
 
 import pytest
 
@@ -509,6 +510,42 @@ def test_unclaimed_attempt_creation_identities_have_a_bounded_lifetime(tmp_path:
         case.temporary_root / "attempts" / f"bounded-{limit:03d}",
     )
     assert newest.attempt_id == f"bounded-{limit:03d}"
+
+
+def test_posix_pending_attempt_cleanup_releases_creation_claim_before_rmdir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transaction = object.__new__(workspace_module._ExactCaseTransaction)
+    root = tmp_path / "case-a"
+    root_stamp = (101, 202)
+    parts = ("90_Temporary", "attempts", "attempt-1")
+    current = cast(Any, SimpleNamespace(expected=(303, 404), validate=lambda: None))
+    parent = SimpleNamespace(handle=505)
+    transaction.root = root
+    transaction._root_stamp = root_stamp
+    transaction._directories = {parts: current}
+    claim_key = (root, root_stamp, parts[-1])
+    calls: list[str] = []
+    claim_owner = SimpleNamespace(close=lambda: calls.append("release"))
+    claim = (root.joinpath(*parts), current.expected, claim_owner)
+    monkeypatch.setitem(workspace_module._ATTEMPT_ROOT_STAMPS, claim_key, claim)
+
+    def directory(_self: Any, requested: tuple[str, ...]) -> Any:
+        return current if requested == parts else parent
+
+    def rmdir(name: str, *, dir_fd: int) -> None:
+        assert name == parts[-1]
+        assert dir_fd == parent.handle
+        assert claim_key not in workspace_module._ATTEMPT_ROOT_STAMPS
+        calls.append("rmdir")
+
+    monkeypatch.setattr(workspace_module._ExactCaseTransaction, "_directory", directory)
+    monkeypatch.setattr(workspace_module, "os", SimpleNamespace(name="posix", rmdir=rmdir))
+
+    transaction.remove_empty_directory(Path(*parts))
+
+    assert calls == ["release", "rmdir"]
 
 
 def test_attempt_write_creates_nested_parents_under_exact_authority(tmp_path: Path) -> None:

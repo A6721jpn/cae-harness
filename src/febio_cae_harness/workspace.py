@@ -1415,16 +1415,6 @@ class _ExactCaseTransaction:
 
         parts = self._parts(relative_path, "exact empty directory cleanup")
         parent = self._directory(parts[:-1])
-        if os.name != "nt":
-            owner = self._directory(parts)
-            owner.validate()
-            try:
-                os.rmdir(parts[-1], dir_fd=parent.handle)
-            except OSError as error:
-                raise WorkspaceBoundaryError("cannot remove exact empty directory") from error
-            self._directories.pop(parts, None)
-            return
-
         current = self._directory(parts)
         expected = current.expected
         if len(parts) == 3 and parts[:2] == (_TEMPORARY_ROOT, "attempts"):
@@ -1434,6 +1424,15 @@ class _ExactCaseTransaction:
                 if _expected_native_directory_identity(claim[1]) != expected:
                     raise WorkspaceBoundaryError("pending attempt cleanup authority changed")
                 _release_attempt_root_claim(claim_key, claim)
+        if os.name != "nt":
+            current.validate()
+            try:
+                os.rmdir(parts[-1], dir_fd=parent.handle)
+            except OSError as error:
+                raise WorkspaceBoundaryError("cannot remove exact empty directory") from error
+            self._directories.pop(parts, None)
+            return
+
         current.close()
         self._directories.pop(parts, None)
         parent_path = self.root.joinpath(*parts[:-1])

@@ -1575,7 +1575,6 @@ class EvidenceStore:
                 ):
                     raise EvidenceIntegrityError("event recovery record does not match evidence")
                 if pending_attempt_directory is not None:
-                    self._validate_pre_file_attempt_recovery(recovery)
                     try:
                         self._exact().remove_empty_directory(pending_attempt_directory)
                     except WorkspaceBoundaryError as error:
@@ -1673,6 +1672,7 @@ class EvidenceStore:
             recovery["attempt_sha256"] = _validate_digest(
                 marker["attempt_sha256"], "event recovery attempt"
             )
+            self._validate_pre_file_attempt_recovery(recovery)
         return recovery
 
     def _validate_pre_file_attempt_recovery(self, recovery: Mapping[str, Any]) -> None:
