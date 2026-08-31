@@ -236,6 +236,229 @@ def test_posix_input_lease_uses_held_exact_descriptor(
             supervisor._close_filesystem_authority()
 
 
+def test_posix_input_lease_uses_immutable_snapshot_against_preexisting_writer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if os.name != "posix":
+        pytest.skip("POSIX-only immutable-input snapshot")
+
+    original = b"stable solver input bytes\n"
+    capability = _capability(tmp_path, monkeypatch, code=original.decode("ascii"))
+    supervisor = SolverSupervisor(capability)
+    source_fd = os.open(os.fspath(capability.spec.input_path), os.O_RDWR)
+    sealed_fd: int | None = None
+    try:
+        # The writer existed before the lease was acquired and remains usable.
+        supervisor._acquire_filesystem_authority()
+        supervisor._acquire_input_lease()
+        lease = supervisor._input_lease
+        assert lease is not None
+        assert lease.child_path != capability.spec.input_path
+
+        os.lseek(source_fd, 0, os.SEEK_SET)
+        tampered = bytes(value ^ 0xFF for value in original)
+        assert os.write(source_fd, tampered) == len(tampered)
+        assert lease.child_path.read_bytes() == original
+
+        sealed_fd = os.open(os.fspath(lease.child_path), os.O_RDWR)
+        with pytest.raises(OSError):
+            os.write(sealed_fd, b"x")
+        with pytest.raises(OSError):
+            os.ftruncate(sealed_fd, len(original) + 1)
+        with pytest.raises(OSError):
+            os.ftruncate(sealed_fd, len(original) - 1)
+    finally:
+        if sealed_fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(sealed_fd)
+        with contextlib.suppress(OSError):
+            os.lseek(source_fd, 0, os.SEEK_SET)
+            os.ftruncate(source_fd, 0)
+            os.write(source_fd, original)
+        with contextlib.suppress(OSError):
+            os.close(source_fd)
+        with contextlib.suppress(BaseException):
+            supervisor._close_filesystem_authority()
+
+
+def test_posix_sealing_fails_closed_when_fcntl_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seal = getattr(supervisor_module, "_posix_seal_fd", None)
+    assert callable(seal)
+
+    def unavailable() -> object:
+        raise ImportError("synthetic fcntl unavailable")
+
+    monkeypatch.setattr(supervisor_module, "_posix_fcntl", unavailable)
+    with pytest.raises(SolverOwnershipError, match="seal"):
+        seal(17)
+
+
+def test_posix_sealing_fails_closed_when_add_seals_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seal = getattr(supervisor_module, "_posix_seal_fd", None)
+    assert callable(seal)
+
+    class Fcntl:
+        F_ADD_SEALS = 1
+        F_GET_SEALS = 2
+        F_SEAL_WRITE = 4
+        F_SEAL_GROW = 8
+        F_SEAL_SHRINK = 16
+        F_SEAL_SEAL = 32
+
+        @staticmethod
+        def fcntl(fd: int, command: int, argument: int = 0) -> int:
+            del fd, command, argument
+            raise OSError("synthetic F_ADD_SEALS failure")
+
+    monkeypatch.setattr(supervisor_module, "_posix_fcntl", lambda: Fcntl())
+    with pytest.raises(SolverOwnershipError, match="seal"):
+        seal(17)
+
+
+def test_posix_sealing_fails_closed_when_seals_do_not_verify(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seal = getattr(supervisor_module, "_posix_seal_fd", None)
+    assert callable(seal)
+
+    class Fcntl:
+        F_ADD_SEALS = 1
+        F_GET_SEALS = 2
+        F_SEAL_WRITE = 4
+        F_SEAL_GROW = 8
+        F_SEAL_SHRINK = 16
+        F_SEAL_SEAL = 32
+
+        @staticmethod
+        def fcntl(fd: int, command: int, argument: int = 0) -> int:
+            del fd, argument
+            if command == Fcntl.F_ADD_SEALS:
+                return 0
+            return 0
+
+    monkeypatch.setattr(supervisor_module, "_posix_fcntl", lambda: Fcntl())
+    with pytest.raises(SolverOwnershipError, match="seal"):
+        seal(17)
+
+
+def test_posix_start_persists_sealed_child_fd_attestation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if os.name != "posix":
+        pytest.skip("POSIX-only sealed-child process record")
+
+    capability = _capability(tmp_path, monkeypatch, code="import time; time.sleep(30)")
+    supervisor = SolverSupervisor(capability)
+    supervisor.start()
+    try:
+        lease = supervisor._input_lease
+        assert lease is not None and lease.handle is not None
+        record = json.loads(supervisor.process_record_path.read_text(encoding="utf-8"))
+        input_record = record["input_lease"]
+        assert isinstance(input_record, dict)
+        assert input_record["fd"] == lease.handle
+        assert (
+            input_record["sha256"]
+            == hashlib.sha256(capability.spec.input_path.read_bytes()).hexdigest()
+        )
+        assert "path" not in input_record
+        identity = input_record["identity"]
+        assert isinstance(identity, dict)
+        metadata = os.fstat(lease.handle)
+        assert identity == {
+            "device": int(metadata.st_dev),
+            "inode": int(metadata.st_ino),
+            "nlink": int(metadata.st_nlink),
+            "size": int(metadata.st_size),
+            "mtime_ns": int(metadata.st_mtime_ns),
+        }
+    finally:
+        supervisor.cancel()
+
+
+def test_posix_reconnect_uses_recorded_sealed_child_object_after_source_replace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if os.name != "posix":
+        pytest.skip("POSIX-only sealed-child reconnect")
+
+    original_bytes = b"import time; time.sleep(30)\n"
+    capability = _capability(tmp_path, monkeypatch, code=original_bytes.decode("ascii"))
+    supervisor = SolverSupervisor(capability)
+    reconnected: SolverSupervisor | None = None
+    supervisor.start()
+    process = cast(subprocess.Popen[bytes], supervisor._process)
+    old_record = json.loads(supervisor.process_record_path.read_text(encoding="utf-8"))
+    old_fd = old_record["input_lease"]["fd"]
+    supervisor._close_filesystem_authority()
+    replacement = capability.spec.input_path.with_name("replacement.feb")
+    replacement.write_bytes(b"replaceable-current-path\n")
+    os.replace(os.fspath(replacement), os.fspath(capability.spec.input_path))
+    try:
+        reconnected = SolverSupervisor.reconnect(capability)
+        lease = reconnected._input_lease
+        assert lease is not None
+        assert lease.child_path.read_bytes() == original_bytes
+        assert reconnected.pid == process.pid
+        reconnect_record = reconnected._process_record
+        assert reconnect_record is not None
+        reconnect_input = reconnect_record["input_lease"]
+        assert isinstance(reconnect_input, dict)
+        assert reconnect_input["fd"] == old_fd
+    finally:
+        if reconnected is not None:
+            with contextlib.suppress(BaseException):
+                reconnected.cancel()
+        elif process.poll() is None:
+            with contextlib.suppress(BaseException):
+                process.kill()
+            with contextlib.suppress(BaseException):
+                process.wait(timeout=5.0)
+        with contextlib.suppress(BaseException):
+            if supervisor._process_authority is not None:
+                supervisor._process_authority.close()
+        with contextlib.suppress(OSError):
+            supervisor.process_record_path.unlink()
+
+
+def test_posix_reconnect_rejects_unavailable_recorded_input_fd_without_touching_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if os.name != "posix":
+        pytest.skip("POSIX-only sealed-child reconnect validation")
+
+    capability = _capability(tmp_path, monkeypatch, code="import time; time.sleep(30)")
+    supervisor = SolverSupervisor(capability)
+    supervisor.start()
+    process = cast(subprocess.Popen[bytes], supervisor._process)
+    supervisor._close_filesystem_authority()
+    record_path = supervisor.process_record_path
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    record["input_lease"]["fd"] = max(4096, int(record["input_lease"]["fd"]) + 10000)
+    tampered_content = json.dumps(record, indent=2, sort_keys=True).encode("utf-8")
+    record_path.write_bytes(tampered_content)
+    try:
+        with pytest.raises(SolverOwnershipError, match="input|sealed|descriptor|fd"):
+            SolverSupervisor.reconnect(capability)
+        assert process.poll() is None
+        assert record_path.read_bytes() == tampered_content
+    finally:
+        if process.poll() is None:
+            with contextlib.suppress(BaseException):
+                process.kill()
+            with contextlib.suppress(BaseException):
+                process.wait(timeout=5.0)
+        with contextlib.suppress(BaseException):
+            if supervisor._process_authority is not None:
+                supervisor._process_authority.close()
+        with contextlib.suppress(OSError):
+            record_path.unlink()
+
+
 def test_windows_input_lease_blocks_leaf_write_and_replace(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

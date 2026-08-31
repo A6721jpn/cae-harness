@@ -567,6 +567,176 @@ def _posix_unlink(parent_fd: int, name: str) -> None:
         raise OSError(error, "unable to unlink process record entry")
 
 
+def _input_identity(metadata: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        int(metadata.st_dev),
+        int(metadata.st_ino),
+        int(metadata.st_nlink),
+        int(metadata.st_size),
+        int(metadata.st_mtime_ns),
+    )
+
+
+def _posix_fcntl() -> Any:
+    try:
+        import fcntl
+    except (ImportError, OSError) as error:
+        raise SolverOwnershipError("POSIX input sealing is unavailable") from error
+    return fcntl
+
+
+def _posix_seal_configuration() -> tuple[Any, int]:
+    try:
+        fcntl = _posix_fcntl()
+    except (ImportError, OSError) as error:
+        raise SolverOwnershipError("POSIX input sealing is unavailable") from error
+    try:
+        add_seals = fcntl.F_ADD_SEALS
+        get_seals = fcntl.F_GET_SEALS
+        required = fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL
+    except (AttributeError, TypeError, ValueError) as error:
+        raise SolverOwnershipError("POSIX input sealing is unavailable") from error
+    if (
+        isinstance(add_seals, bool)
+        or not isinstance(add_seals, int)
+        or isinstance(get_seals, bool)
+        or not isinstance(get_seals, int)
+        or isinstance(required, bool)
+        or not isinstance(required, int)
+        or required <= 0
+    ):
+        raise SolverOwnershipError("POSIX input sealing is unavailable")
+    return (fcntl, required)
+
+
+def _posix_verify_seals(fd: int) -> None:
+    fcntl, required = _posix_seal_configuration()
+    try:
+        observed = fcntl.fcntl(fd, fcntl.F_GET_SEALS)
+    except (AttributeError, OSError, TypeError, ValueError) as error:
+        raise SolverOwnershipError("unable to verify POSIX input seals") from error
+    if (
+        isinstance(observed, bool)
+        or not isinstance(observed, int)
+        or observed & required != required
+    ):
+        raise SolverOwnershipError("POSIX input seals could not be verified")
+
+
+def _posix_seal_fd(fd: int) -> None:
+    fcntl, required = _posix_seal_configuration()
+    try:
+        fcntl.fcntl(fd, fcntl.F_ADD_SEALS, required)
+    except (AttributeError, OSError, TypeError, ValueError) as error:
+        raise SolverOwnershipError("unable to apply POSIX input seals") from error
+    _posix_verify_seals(fd)
+
+
+def _posix_create_input_snapshot(
+    source_fd: int,
+    expected_sha256: str,
+    expected_identity: tuple[int, int, int, int, int],
+) -> tuple[int, tuple[int, int, int, int, int]]:
+    """Copy one source descriptor into an anonymous, sealed child object."""
+
+    if not Path("/proc/self/fd").is_dir():
+        raise SolverOwnershipError("POSIX /proc descriptor path is unavailable")
+    try:
+        source_initial = os.fstat(source_fd)
+    except OSError as error:
+        raise SolverOwnershipError("solver input source descriptor is unavailable") from error
+    source_initial_identity = _input_identity(source_initial)
+    if not stat.S_ISREG(source_initial.st_mode):
+        raise SolverOwnershipError("solver input source is not a regular file")
+    if source_initial_identity != expected_identity:
+        raise SolverOwnershipError("solver input source identity changed")
+
+    memfd_create = getattr(os, "memfd_create", None)
+    sealing_flag = getattr(os, "MFD_ALLOW_SEALING", None)
+    if (
+        not callable(memfd_create)
+        or isinstance(sealing_flag, bool)
+        or not isinstance(sealing_flag, int)
+    ):
+        raise SolverOwnershipError("POSIX anonymous input sealing is unavailable")
+    cloexec_flag = getattr(os, "MFD_CLOEXEC", 0)
+    if isinstance(cloexec_flag, bool) or not isinstance(cloexec_flag, int):
+        raise SolverOwnershipError("POSIX anonymous input descriptor is unavailable")
+    snapshot_flags = sealing_flag | cloexec_flag
+
+    snapshot_fd: int | None = None
+    completed = False
+    try:
+        try:
+            created = memfd_create("febio-cae-input", snapshot_flags)
+        except (OSError, TypeError, ValueError) as error:
+            raise SolverOwnershipError("unable to create POSIX anonymous input snapshot") from error
+        if isinstance(created, bool) or not isinstance(created, int) or created < 0:
+            raise SolverOwnershipError("POSIX anonymous input snapshot descriptor is invalid")
+        snapshot_fd = created
+        try:
+            os.set_inheritable(snapshot_fd, False)
+        except (AttributeError, OSError, TypeError, ValueError) as error:
+            raise SolverOwnershipError("POSIX anonymous input descriptor is unavailable") from error
+
+        try:
+            os.lseek(source_fd, 0, os.SEEK_SET)
+            digest_state = hashlib.sha256()
+            while chunk := os.read(source_fd, 1024 * 1024):
+                digest_state.update(chunk)
+                offset = 0
+                while offset < len(chunk):
+                    written = os.write(snapshot_fd, chunk[offset:])
+                    if written <= 0:
+                        raise OSError("unable to write POSIX input snapshot")
+                    offset += written
+            source_finished = os.fstat(source_fd)
+        except OSError as error:
+            raise SolverOwnershipError("unable to copy POSIX solver input") from error
+        if _input_identity(source_finished) != expected_identity:
+            raise SolverOwnershipError("solver input source changed while copying")
+        if digest_state.hexdigest() != expected_sha256:
+            raise SolverOwnershipError("solver input source bytes changed while copying")
+
+        try:
+            snapshot_metadata = os.fstat(snapshot_fd)
+        except OSError as error:
+            raise SolverOwnershipError("POSIX input snapshot is unavailable") from error
+        if not stat.S_ISREG(snapshot_metadata.st_mode):
+            raise SolverOwnershipError("POSIX input snapshot is not a regular file")
+        if int(snapshot_metadata.st_size) != expected_identity[3]:
+            raise SolverOwnershipError("POSIX input snapshot size changed")
+        _posix_seal_fd(snapshot_fd)
+        _posix_verify_seals(snapshot_fd)
+        try:
+            sealed_metadata = os.fstat(snapshot_fd)
+        except OSError as error:
+            raise SolverOwnershipError("sealed POSIX input snapshot is unavailable") from error
+        if not stat.S_ISREG(sealed_metadata.st_mode):
+            raise SolverOwnershipError("sealed POSIX input snapshot is not a regular file")
+        if int(sealed_metadata.st_size) != expected_identity[3]:
+            raise SolverOwnershipError("sealed POSIX input snapshot size changed")
+        sealed_identity = _input_identity(sealed_metadata)
+        completed = True
+        return snapshot_fd, sealed_identity
+    except SolverOwnershipError:
+        raise
+    except (OSError, TypeError, ValueError) as error:
+        raise SolverOwnershipError("unable to create sealed POSIX input snapshot") from error
+    finally:
+        if snapshot_fd is not None and not completed:
+            try:
+                os.close(snapshot_fd)
+            except BaseException:
+                orphan = _InputLease(
+                    path=Path("."),
+                    expected_sha256=expected_sha256,
+                    expected_identity=expected_identity,
+                    handle=snapshot_fd,
+                )
+                _DURABLE_CLAIM_CLEANUP.adopt(None, None, (), input_lease=orphan)
+
+
 @dataclass(frozen=True, slots=True)
 class _FilesystemIdentity:
     path: Path
@@ -583,13 +753,18 @@ class _InputLease:
     expected_identity: tuple[int, int, int, int, int]
     handle: int | None
     native_handle: int | None = None
+    source_handle: int | None = None
+    object_identity: tuple[int, int, int, int, int] | None = None
 
     @property
     def child_path(self) -> Path:
         if os.name == "posix":
             if self.handle is None:
                 raise SolverOwnershipError("solver input lease is unavailable")
-            return Path("/proc/self/fd") / str(self.handle)
+            proc_fd = Path("/proc/self/fd")
+            if not proc_fd.is_dir():
+                raise SolverOwnershipError("POSIX /proc descriptor path is unavailable")
+            return proc_fd / str(self.handle)
         return self.path
 
     @property
@@ -623,14 +798,16 @@ class _InputLease:
             raise SolverOwnershipError("solver input lease is unavailable") from error
         if not stat.S_ISREG(metadata.st_mode):
             raise SolverOwnershipError("solver input lease is not a regular file")
-        current_identity = (
-            int(metadata.st_dev),
-            int(metadata.st_ino),
-            int(metadata.st_nlink),
-            int(metadata.st_size),
-            int(metadata.st_mtime_ns),
-        )
-        if current_identity != self.expected_identity:
+        current_identity = _input_identity(metadata)
+        if os.name == "posix":
+            if self.object_identity is None:
+                raise SolverOwnershipError("sealed POSIX input identity is unavailable")
+            if current_identity != self.object_identity:
+                raise SolverOwnershipError("sealed POSIX input identity changed")
+            if current_identity[3] != self.expected_identity[3]:
+                raise SolverOwnershipError("sealed POSIX input size changed")
+            _posix_verify_seals(self.handle)
+        elif current_identity != self.expected_identity:
             raise SolverOwnershipError("solver input lease identity changed")
         if not digest:
             return
@@ -640,14 +817,11 @@ class _InputLease:
             while chunk := os.read(self.handle, 1024 * 1024):
                 digest_state.update(chunk)
             finished = os.fstat(self.handle)
-            finished_identity = (
-                int(finished.st_dev),
-                int(finished.st_ino),
-                int(finished.st_nlink),
-                int(finished.st_size),
-                int(finished.st_mtime_ns),
-            )
-            if finished_identity != self.expected_identity:
+            finished_identity = _input_identity(finished)
+            if os.name == "posix":
+                if self.object_identity is None or finished_identity != self.object_identity:
+                    raise SolverOwnershipError("sealed POSIX input changed while reading")
+            elif finished_identity != self.expected_identity:
                 raise SolverOwnershipError("solver input lease changed while reading")
             if digest_state.hexdigest() != self.expected_sha256:
                 raise SolverOwnershipError("solver input lease bytes changed")
@@ -658,16 +832,38 @@ class _InputLease:
             raise SolverOwnershipError("unable to verify solver input lease bytes") from error
 
     def close(self) -> None:
-        if self.handle is None and self.native_handle is None:
+        if self.handle is None and self.native_handle is None and self.source_handle is None:
             return
         if _NATIVE_WINDOWS:
             _windows_close_owned_fd(self, "handle", "native_handle")
             return
-        handle = self.handle
+        failures: list[BaseException] = []
+        for attribute in ("handle", "source_handle"):
+            handle = getattr(self, attribute)
+            if handle is None:
+                continue
+            try:
+                os.close(handle)
+            except BaseException as error:
+                failures.append(error)
+            else:
+                if getattr(self, attribute) == handle:
+                    setattr(self, attribute, None)
+        if failures:
+            raise SolverOwnershipError(
+                "solver input lease handles could not be closed"
+            ) from failures[0]
+
+    def close_source(self) -> None:
+        handle = self.source_handle
         if handle is None:
             return
-        os.close(handle)
-        self.handle = None
+        try:
+            os.close(handle)
+        except OSError as error:
+            raise SolverOwnershipError("solver input source handle could not be closed") from error
+        if self.source_handle == handle:
+            self.source_handle = None
 
 
 @dataclass(slots=True)
@@ -1190,7 +1386,11 @@ class _DurableClaimCleanup:
                 self._filesystem_authorities.append(filesystem_authority)
             if (
                 input_lease is not None
-                and (input_lease.handle is not None or input_lease.native_handle is not None)
+                and (
+                    input_lease.handle is not None
+                    or input_lease.native_handle is not None
+                    or input_lease.source_handle is not None
+                )
                 and not any(held is input_lease for held in self._input_leases)
             ):
                 self._input_leases.append(input_lease)
@@ -1306,7 +1506,7 @@ class _DurableClaimCleanup:
                 lease.close()
             except BaseException:
                 continue
-            if lease.handle is None and lease.native_handle is None:
+            if lease.handle is None and lease.native_handle is None and lease.source_handle is None:
                 self._discard_identity(self._input_leases, lease)
 
     def drain(self) -> None:
@@ -1790,6 +1990,8 @@ class SolverSupervisor:
         input_path = self.spec.input_path
         handle: int
         native_handle: int | None = None
+        object_identity: tuple[int, int, int, int, int] | None = None
+        source_fd: int | None = None
         if os.name == "posix":
             authority = self._filesystem_authority
             if authority is None:
@@ -1797,9 +1999,28 @@ class SolverSupervisor:
             flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
             try:
                 with authority.open_directory(input_path.parent) as parent_fd:
-                    handle = os.open(input_path.name, flags, dir_fd=parent_fd)
+                    source_fd = os.open(input_path.name, flags, dir_fd=parent_fd)
             except OSError as error:
                 raise SolverOwnershipError("unable to hold exact solver input") from error
+            try:
+                handle, object_identity = _posix_create_input_snapshot(
+                    source_fd,
+                    expected_sha256,
+                    expected_identity,
+                )
+            except BaseException:
+                try:
+                    os.close(source_fd)
+                except BaseException:
+                    orphan = _InputLease(
+                        path=input_path,
+                        expected_sha256=expected_sha256,
+                        expected_identity=expected_identity,
+                        handle=None,
+                        source_handle=source_fd,
+                    )
+                    _DURABLE_CLAIM_CLEANUP.adopt(None, None, (), input_lease=orphan)
+                raise
         elif os.name == "nt" and _NATIVE_WINDOWS:
             try:
                 opened = _windows_open_input(input_path)
@@ -1820,8 +2041,12 @@ class SolverSupervisor:
             expected_identity=expected_identity,
             handle=handle,
             native_handle=native_handle,
+            source_handle=source_fd,
+            object_identity=object_identity,
         )
+        source_fd = None
         try:
+            lease.close_source()
             lease.verify(digest=True)
         except BaseException:
             try:
@@ -2667,10 +2892,13 @@ class SolverSupervisor:
         authority: ProcessAuthority | None = None
         try:
             supervisor._acquire_filesystem_authority()
-            supervisor._acquire_input_lease()
+            if os.name != "posix":
+                supervisor._acquire_input_lease()
             record = supervisor._read_process_record()
             supervisor._revalidate_launch_binding()
             metadata, started_at, authority = supervisor._validate_process_record(record)
+            if os.name == "posix":
+                supervisor._acquire_reconnected_posix_input_lease(record, metadata, authority)
             supervisor._revalidate_launch_binding()
             supervisor._verify_filesystem_authority()
             supervisor._install_pending_process_record_claim()
@@ -2776,6 +3004,55 @@ class SolverSupervisor:
             self._fail_terminal_operation(error)
         return self._complete(SolverState.CANCELLED, process.poll())
 
+    def _make_input_lease_record(self) -> dict[str, object]:
+        lease = self._input_lease
+        if lease is None or lease.handle is None or lease.object_identity is None:
+            raise SolverOwnershipError("sealed POSIX input lease is unavailable")
+        lease.verify(digest=True)
+        device, inode, nlink, size, mtime_ns = lease.object_identity
+        return {
+            "fd": lease.handle,
+            "sha256": lease.expected_sha256,
+            "identity": {
+                "device": device,
+                "inode": inode,
+                "nlink": nlink,
+                "size": size,
+                "mtime_ns": mtime_ns,
+            },
+        }
+
+    def _parse_posix_input_lease_record(
+        self, record: dict[str, object]
+    ) -> tuple[int, str, tuple[int, int, int, int, int]]:
+        value = record.get("input_lease")
+        if not isinstance(value, dict):
+            raise SolverOwnershipError("process record sealed input lease is invalid")
+        fd = value.get("fd")
+        sha256 = value.get("sha256")
+        identity_value = value.get("identity")
+        if (
+            isinstance(fd, bool)
+            or not isinstance(fd, int)
+            or fd < 0
+            or not isinstance(sha256, str)
+            or not sha256
+            or not isinstance(identity_value, dict)
+        ):
+            raise SolverOwnershipError("process record sealed input lease is invalid")
+        expected_sha256, _expected_identity = self._recorded_input_binding()
+        if sha256 != expected_sha256:
+            raise SolverOwnershipError("process record sealed input digest does not match")
+        identity: list[int] = []
+        for name in ("device", "inode", "nlink", "size", "mtime_ns"):
+            item = identity_value.get(name)
+            if isinstance(item, bool) or not isinstance(item, int):
+                raise SolverOwnershipError("process record sealed input identity is invalid")
+            identity.append(item)
+        if identity[2] <= 0 or identity[3] < 0:
+            raise SolverOwnershipError("process record sealed input identity is invalid")
+        return fd, sha256, cast(tuple[int, int, int, int, int], tuple(identity))
+
     def _make_process_record(
         self,
         pid: int,
@@ -2795,7 +3072,7 @@ class SolverSupervisor:
             raise ProcessAuthorityError(
                 "process authority root creation identity binding is invalid"
             )
-        return {
+        record: dict[str, object] = {
             "case_id": self._case_id,
             "intent_id": self._intent_id,
             "attempt_id": self._attempt_id,
@@ -2814,6 +3091,9 @@ class SolverSupervisor:
             "launch_context_digest": self._launch_context_digest,
             "process_authority": claim,
         }
+        if os.name == "posix":
+            record["input_lease"] = self._make_input_lease_record()
+        return record
 
     def _own_process_record_candidate(
         self,
@@ -3205,6 +3485,79 @@ class SolverSupervisor:
         ):
             raise SolverOwnershipError(f"{label} escapes the attempt root")
 
+    def _acquire_reconnected_posix_input_lease(
+        self,
+        record: dict[str, object],
+        metadata: _ProcessMetadata,
+        authority: ProcessAuthority,
+    ) -> None:
+        recorded_fd, expected_sha256, object_identity = self._parse_posix_input_lease_record(record)
+        pid = record.get("pid")
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+            raise SolverOwnershipError("process record PID is invalid")
+        proc_root = Path("/proc") / str(pid)
+        proc_fd_directory = proc_root / "fd"
+        if not proc_fd_directory.is_dir():
+            raise SolverOwnershipError("POSIX child descriptor path is unavailable")
+        try:
+            authority.verify(pid)
+        except ProcessAuthorityError as error:
+            raise SolverOwnershipError("reconnect process authority is no longer valid") from error
+
+        child_fd_path = proc_fd_directory / str(recorded_fd)
+        try:
+            handle = os.open(
+                os.fspath(child_fd_path),
+                os.O_RDONLY | getattr(os, "O_CLOEXEC", 0),
+            )
+        except OSError as error:
+            raise SolverOwnershipError(
+                "recorded POSIX child input descriptor is unavailable"
+            ) from error
+        _expected_source_sha256, expected_source_identity = self._recorded_input_binding()
+        lease = _InputLease(
+            path=self.spec.input_path,
+            expected_sha256=expected_sha256,
+            expected_identity=expected_source_identity,
+            handle=handle,
+            object_identity=object_identity,
+        )
+        try:
+            try:
+                authority.verify(pid)
+                current = _process_metadata(pid)
+            except (OSError, ProcessAuthorityError) as error:
+                raise SolverOwnershipError("reconnected process is no longer valid") from error
+            if (
+                not current.alive
+                or current.creation_identity != metadata.creation_identity
+                or _normalise_executable(current.executable_path)
+                != _normalise_executable(metadata.executable_path)
+                or current.started_at != metadata.started_at
+            ):
+                raise SolverOwnershipError("reconnected process identity changed")
+            lease.verify(digest=True)
+            try:
+                authority.verify(pid)
+                current = _process_metadata(pid)
+            except (OSError, ProcessAuthorityError) as error:
+                raise SolverOwnershipError("reconnected process is no longer valid") from error
+            if (
+                not current.alive
+                or current.creation_identity != metadata.creation_identity
+                or _normalise_executable(current.executable_path)
+                != _normalise_executable(metadata.executable_path)
+                or current.started_at != metadata.started_at
+            ):
+                raise SolverOwnershipError("reconnected process identity changed")
+        except BaseException:
+            try:
+                lease.close()
+            except BaseException:
+                _DURABLE_CLAIM_CLEANUP.adopt(None, None, (), input_lease=lease)
+            raise
+        self._input_lease = lease
+
     def _validate_process_record(
         self, record: dict[str, object]
     ) -> tuple[_ProcessMetadata, datetime, ProcessAuthority]:
@@ -3241,6 +3594,8 @@ class SolverSupervisor:
             or context != self._launch_context
         ):
             raise SolverOwnershipError("process record launch context does not match")
+        if os.name == "posix":
+            self._parse_posix_input_lease_record(record)
 
         authority_claim = record.get("process_authority")
         if (
