@@ -8,12 +8,18 @@ issued validations remain synthetic and unverified provenance.
 
 from __future__ import annotations
 
+import atexit
 import contextlib
+import ctypes
+import errno
 import hashlib
 import math
 import os
 import stat
+import threading
+import weakref
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from ctypes import wintypes
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
@@ -30,6 +36,76 @@ __all__ = [
 _AdapterReader = Callable[[Path, Sequence[str]], object]
 _PROVENANCE = "synthetic-unverified"
 _AUTHORITY_TOKEN = object()
+
+
+_WINDOWS_FILE_ATTRIBUTE_DIRECTORY = 0x00000010
+_WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
+_WINDOWS_FILE_LIST_DIRECTORY = 0x00000001
+_WINDOWS_FILE_READ_ATTRIBUTES = 0x00000080
+_WINDOWS_READ_CONTROL = 0x00020000
+_WINDOWS_SYNCHRONIZE = 0x00100000
+_WINDOWS_GENERIC_READ = 0x80000000
+_WINDOWS_FILE_SHARE_READ = 0x00000001
+_WINDOWS_FILE_SHARE_WRITE = 0x00000002
+_WINDOWS_OPEN_EXISTING = 3
+_WINDOWS_FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+_WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+_WINDOWS_FILE_DIRECTORY_FILE = 0x00000001
+_WINDOWS_FILE_NON_DIRECTORY_FILE = 0x00000040
+_WINDOWS_FILE_SYNCHRONOUS_IO_NONALERT = 0x00000020
+_WINDOWS_FILE_BEGIN = 0
+_WINDOWS_DUPLICATE_SAME_ACCESS = 0x00000002
+_WINDOWS_OBJ_CASE_INSENSITIVE = 0x00000040
+_WINDOWS_ERROR_INVALID_HANDLE = 6
+_WINDOWS_HANDLE_FLAG_PROTECT_FROM_CLOSE = 0x00000002
+
+
+class _WindowsFileTime(ctypes.Structure):
+    _fields_ = [
+        ("low", wintypes.DWORD),
+        ("high", wintypes.DWORD),
+    ]
+
+
+class _WindowsFileInformation(ctypes.Structure):
+    _fields_ = [
+        ("attributes", wintypes.DWORD),
+        ("creation_time", _WindowsFileTime),
+        ("last_access_time", _WindowsFileTime),
+        ("last_write_time", _WindowsFileTime),
+        ("volume_serial_number", wintypes.DWORD),
+        ("file_size_high", wintypes.DWORD),
+        ("file_size_low", wintypes.DWORD),
+        ("number_of_links", wintypes.DWORD),
+        ("file_index_high", wintypes.DWORD),
+        ("file_index_low", wintypes.DWORD),
+    ]
+
+
+class _WindowsUnicodeString(ctypes.Structure):
+    _fields_ = [
+        ("length", wintypes.USHORT),
+        ("maximum_length", wintypes.USHORT),
+        ("buffer", wintypes.LPWSTR),
+    ]
+
+
+class _WindowsObjectAttributes(ctypes.Structure):
+    _fields_ = [
+        ("length", wintypes.ULONG),
+        ("root_directory", wintypes.HANDLE),
+        ("object_name", ctypes.POINTER(_WindowsUnicodeString)),
+        ("attributes", wintypes.ULONG),
+        ("security_descriptor", wintypes.LPVOID),
+        ("security_quality_of_service", wintypes.LPVOID),
+    ]
+
+
+class _WindowsIoStatusBlock(ctypes.Structure):
+    _fields_ = [
+        ("status", ctypes.c_long),
+        ("information", ctypes.c_size_t),
+    ]
 
 
 class FbsAdapterProtocol(Protocol):
@@ -77,6 +153,7 @@ class _ManagerRecord:
     attempt_root: Path | None
     root_binding: _RootBinding | None
     authority: FbsAdapterAuthority | None = None
+    closed: bool = False
 
 
 @dataclass(slots=True)
@@ -115,12 +192,627 @@ class _ValidationRecord:
 @dataclass(slots=True)
 class _RootBinding:
     path: Path
-    fd: int | None
+    fd: _OwnedHandle | None
     device: int
     inode: int
+    path_identities: tuple[tuple[Path, int, int], ...] = ()
+    closed: bool = False
+
+
+@dataclass(slots=True)
+class _OwnedHandle:
+    """A native descriptor/handle together with its immutable object identity."""
+
+    value: int | None
+    device: int
+    inode: int
+    path: Path
+    windows: bool
+    attributes: int = 0
+    final_path: str = ""
+    closed: bool = False
+    identity_known: bool = True
+    windows_protected: bool = False
+    windows_unprotected_for_close: bool = False
+
+    generation: object = field(default_factory=object, init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if self.closed or self.value is None:
+            return
+        with _HANDLE_LOCK:
+            _HANDLE_REGISTRY[(self.windows, self.value)] = (self, self.generation)
+
+
+_PENDING_CLEANUP: list[_OwnedHandle] = []
+_HANDLE_LOCK = threading.RLock()
+_HANDLE_REGISTRY: dict[tuple[bool, int], tuple[_OwnedHandle, object]] = {}
+
+
+def _is_current_owned_handle(owner: _OwnedHandle, value: int) -> bool:
+    current = _HANDLE_REGISTRY.get((owner.windows, value))
+    return current is not None and current[0] is owner and current[1] is owner.generation
+
+
+def _retain_cleanup_owner(owner: _OwnedHandle) -> None:
+    with _HANDLE_LOCK:
+        if owner.closed or owner.value is None:
+            return
+        if not any(existing is owner for existing in _PENDING_CLEANUP):
+            _PENDING_CLEANUP.append(owner)
+
+
+def _forget_cleanup_owner(owner: _OwnedHandle) -> None:
+    with _HANDLE_LOCK:
+        _PENDING_CLEANUP[:] = [existing for existing in _PENDING_CLEANUP if existing is not owner]
+
+
+def _retire_owned_handle(owner: _OwnedHandle) -> None:
+    with _HANDLE_LOCK:
+        value = owner.value
+        owner.closed = True
+        owner.value = None
+        owner.windows_protected = False
+        owner.windows_unprotected_for_close = False
+        if value is not None:
+            current = _HANDLE_REGISTRY.get((owner.windows, value))
+            if current is not None and current[0] is owner and current[1] is owner.generation:
+                del _HANDLE_REGISTRY[(owner.windows, value)]
+        _forget_cleanup_owner(owner)
+
+
+def _owned_value(owner: _OwnedHandle) -> int:
+    if owner.closed or owner.value is None:
+        raise ValueError("owned filesystem handle is closed")
+    with _HANDLE_LOCK:
+        value = owner.value
+        if value is None or owner.closed:
+            raise ValueError("owned filesystem handle is closed")
+        if not _is_current_owned_handle(owner, value):
+            raise ValueError("owned filesystem handle generation is stale")
+        return value
+
+
+def _windows_error(message: str, code: int | None = None) -> OSError:
+    error_code = ctypes.get_last_error() if code is None else code
+    return OSError(error_code, f"{message} (WinError {error_code})")
+
+
+def _windows_kernel32() -> Any:
+    if os.name != "nt":
+        raise OSError("Windows native filesystem APIs are unavailable")
+    return ctypes.WinDLL("kernel32", use_last_error=True)
+
+
+def _windows_ntdll() -> Any:
+    if os.name != "nt":
+        raise OSError("Windows native filesystem APIs are unavailable")
+    return ctypes.WinDLL("ntdll", use_last_error=True)
+
+
+def _windows_handle_int(value: object) -> int:
+    raw = getattr(value, "value", value)
+    if raw is None:
+        return 0
+    if isinstance(raw, int):
+        return raw
+    return int(cast(SupportsIndex, raw))
+
+
+def _windows_close_raw(value: int) -> None:
+    kernel32 = _windows_kernel32()
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
+    if not close_handle(wintypes.HANDLE(value)):
+        raise _windows_error("unable to close native filesystem handle")
+
+
+def _windows_set_close_protection(value: int, protected: bool) -> None:
+    kernel32 = _windows_kernel32()
+    set_handle_information = kernel32.SetHandleInformation
+    set_handle_information.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.DWORD,
+    ]
+    set_handle_information.restype = wintypes.BOOL
+    ctypes.set_last_error(0)
+    flags = _WINDOWS_HANDLE_FLAG_PROTECT_FROM_CLOSE if protected else 0
+    if not set_handle_information(
+        wintypes.HANDLE(value),
+        wintypes.DWORD(_WINDOWS_HANDLE_FLAG_PROTECT_FROM_CLOSE),
+        wintypes.DWORD(flags),
+    ):
+        raise _windows_error("unable to change native filesystem handle close protection")
+
+
+def _windows_handle_flags(value: int) -> int:
+    kernel32 = _windows_kernel32()
+    get_handle_information = kernel32.GetHandleInformation
+    get_handle_information.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    get_handle_information.restype = wintypes.BOOL
+    flags = wintypes.DWORD()
+    ctypes.set_last_error(0)
+    if not get_handle_information(wintypes.HANDLE(value), ctypes.byref(flags)):
+        raise _windows_error("unable to inspect native filesystem handle flags")
+    return int(flags.value)
+
+
+def _windows_file_info(value: int) -> tuple[int, int, int, int]:
+    kernel32 = _windows_kernel32()
+    get_info = kernel32.GetFileInformationByHandle
+    get_info.argtypes = [wintypes.HANDLE, ctypes.POINTER(_WindowsFileInformation)]
+    get_info.restype = wintypes.BOOL
+    information = _WindowsFileInformation()
+    if not get_info(wintypes.HANDLE(value), ctypes.byref(information)):
+        raise _windows_error("unable to inspect native filesystem handle")
+    file_index = (int(information.file_index_high) << 32) | int(information.file_index_low)
+    return (
+        int(information.attributes),
+        int(information.volume_serial_number),
+        file_index,
+        int(information.number_of_links),
+    )
+
+
+def _windows_final_path(value: int) -> str:
+    kernel32 = _windows_kernel32()
+    get_final_path = kernel32.GetFinalPathNameByHandleW
+    get_final_path.argtypes = [wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD]
+    get_final_path.restype = wintypes.DWORD
+    size = 1024
+    while size <= 32768:
+        buffer = ctypes.create_unicode_buffer(size)
+        length = int(
+            get_final_path(wintypes.HANDLE(value), buffer, wintypes.DWORD(size), wintypes.DWORD(0))
+        )
+        if length == 0:
+            raise _windows_error("unable to inspect native filesystem path")
+        if length < size:
+            return buffer.value
+        size = min(32768, max(size * 2, length + 1))
+    raise OSError("native filesystem path is too long")
+
+
+def _windows_normalise_final(value: str) -> str:
+    normalised = os.path.normpath(value)
+    if normalised.startswith("\\\\?\\UNC\\"):
+        normalised = "\\\\" + normalised[8:]
+    elif normalised.startswith("\\\\?\\"):
+        normalised = normalised[4:]
+    return os.path.normcase(normalised)
+
+
+def _windows_expected_path(path: Path) -> str:
+    return _windows_normalise_final(os.path.realpath(os.fspath(path)))
+
+
+def _windows_path_inside(child: str, parent: str) -> bool:
+    child_value = _windows_normalise_final(child)
+    parent_value = _windows_normalise_final(parent).rstrip("\\/")
+    return child_value == parent_value or child_value.startswith(parent_value + "\\")
+
+
+def _windows_open_absolute(
+    path: Path,
+    desired_access: int,
+    share_mode: int,
+    flags: int,
+) -> _OwnedHandle:
+    with _HANDLE_LOCK:
+        return _windows_open_absolute_locked(path, desired_access, share_mode, flags)
+
+
+def _windows_open_absolute_locked(
+    path: Path,
+    desired_access: int,
+    share_mode: int,
+    flags: int,
+) -> _OwnedHandle:
+    kernel32 = _windows_kernel32()
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    create_file.restype = wintypes.HANDLE
+    raw = create_file(
+        os.fspath(path),
+        wintypes.DWORD(desired_access),
+        wintypes.DWORD(share_mode),
+        None,
+        wintypes.DWORD(_WINDOWS_OPEN_EXISTING),
+        wintypes.DWORD(flags),
+        wintypes.HANDLE(0),
+    )
+    value = _windows_handle_int(raw)
+    invalid_values = {0, -1, (1 << (ctypes.sizeof(ctypes.c_void_p) * 8)) - 1}
+    if value in invalid_values:
+        raise _windows_error("unable to open native filesystem object")
+    owner = _OwnedHandle(value, 0, 0, path, True, identity_known=False)
+    try:
+        _windows_set_close_protection(value, True)
+        owner.windows_protected = True
+        attributes, device, inode, _ = _windows_file_info(value)
+        owner.attributes = attributes
+        owner.device = device
+        owner.inode = inode
+        owner.final_path = _windows_final_path(value)
+        owner.identity_known = True
+        return owner
+    except BaseException:
+        _best_effort_close(owner)
+        raise
+
+
+def _windows_open_relative(
+    parent: _OwnedHandle,
+    name: str,
+    desired_access: int,
+    share_mode: int,
+    create_options: int,
+    path: Path,
+) -> _OwnedHandle:
+    with _HANDLE_LOCK:
+        return _windows_open_relative_locked(
+            parent, name, desired_access, share_mode, create_options, path
+        )
+
+
+def _windows_open_relative_locked(
+    parent: _OwnedHandle,
+    name: str,
+    desired_access: int,
+    share_mode: int,
+    create_options: int,
+    path: Path,
+) -> _OwnedHandle:
+    parent_value = _owned_value(parent)
+    name_buffer = ctypes.create_unicode_buffer(name)
+    unicode_name = _WindowsUnicodeString(
+        length=len(name) * ctypes.sizeof(ctypes.c_wchar),
+        maximum_length=(len(name) + 1) * ctypes.sizeof(ctypes.c_wchar),
+        buffer=ctypes.cast(name_buffer, wintypes.LPWSTR),
+    )
+    attributes = _WindowsObjectAttributes(
+        length=ctypes.sizeof(_WindowsObjectAttributes),
+        root_directory=wintypes.HANDLE(parent_value),
+        object_name=ctypes.pointer(unicode_name),
+        attributes=_WINDOWS_OBJ_CASE_INSENSITIVE,
+        security_descriptor=None,
+        security_quality_of_service=None,
+    )
+    io_status = _WindowsIoStatusBlock()
+    raw = wintypes.HANDLE()
+    ntdll = _windows_ntdll()
+    create_file = ntdll.NtCreateFile
+    create_file.argtypes = [
+        ctypes.POINTER(wintypes.HANDLE),
+        wintypes.ULONG,
+        ctypes.POINTER(_WindowsObjectAttributes),
+        ctypes.POINTER(_WindowsIoStatusBlock),
+        ctypes.c_void_p,
+        wintypes.ULONG,
+        wintypes.ULONG,
+        wintypes.ULONG,
+        wintypes.ULONG,
+        ctypes.c_void_p,
+        wintypes.ULONG,
+    ]
+    create_file.restype = ctypes.c_long
+    status = int(
+        create_file(
+            ctypes.byref(raw),
+            wintypes.ULONG(desired_access),
+            ctypes.byref(attributes),
+            ctypes.byref(io_status),
+            None,
+            wintypes.ULONG(0),
+            wintypes.ULONG(share_mode),
+            wintypes.ULONG(1),
+            wintypes.ULONG(create_options),
+            None,
+            wintypes.ULONG(0),
+        )
+    )
+    if status < 0:
+        raise OSError(f"NtCreateFile failed with NTSTATUS 0x{status & 0xFFFFFFFF:08x}")
+    value = _windows_handle_int(raw)
+    if value == 0:
+        raise OSError("NtCreateFile returned an invalid handle")
+    owner = _OwnedHandle(value, 0, 0, path, True, identity_known=False)
+    try:
+        _windows_set_close_protection(value, True)
+        owner.windows_protected = True
+        file_attributes, device, inode, _ = _windows_file_info(value)
+        owner.attributes = file_attributes
+        owner.device = device
+        owner.inode = inode
+        owner.final_path = _windows_final_path(value)
+        owner.identity_known = True
+        return owner
+    except BaseException:
+        _best_effort_close(owner)
+        raise
+
+
+def _windows_duplicate(owner: _OwnedHandle) -> _OwnedHandle:
+    with _HANDLE_LOCK:
+        return _windows_duplicate_locked(owner)
+
+
+def _windows_duplicate_locked(owner: _OwnedHandle) -> _OwnedHandle:
+    value = _owned_value(owner)
+    kernel32 = _windows_kernel32()
+    get_current_process = kernel32.GetCurrentProcess
+    get_current_process.argtypes = []
+    get_current_process.restype = wintypes.HANDLE
+    duplicate_handle = kernel32.DuplicateHandle
+    duplicate_handle.argtypes = [
+        wintypes.HANDLE,
+        wintypes.HANDLE,
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.HANDLE),
+        wintypes.DWORD,
+        wintypes.BOOL,
+        wintypes.DWORD,
+    ]
+    duplicate_handle.restype = wintypes.BOOL
+    process = get_current_process()
+    duplicate = wintypes.HANDLE()
+    if not duplicate_handle(
+        process,
+        wintypes.HANDLE(value),
+        process,
+        ctypes.byref(duplicate),
+        wintypes.DWORD(0),
+        wintypes.BOOL(False),
+        wintypes.DWORD(_WINDOWS_DUPLICATE_SAME_ACCESS),
+    ):
+        raise _windows_error("unable to duplicate native filesystem handle")
+    duplicate_value = _windows_handle_int(duplicate)
+    result = _OwnedHandle(
+        duplicate_value,
+        owner.device,
+        owner.inode,
+        owner.path,
+        True,
+        attributes=owner.attributes,
+        final_path=owner.final_path,
+        identity_known=False,
+    )
+    try:
+        _windows_set_close_protection(duplicate_value, True)
+        result.windows_protected = True
+        result.identity_known = True
+    except BaseException:
+        _best_effort_close(result)
+        raise
+    return result
+
+
+def _windows_verify_owner(
+    owner: _OwnedHandle,
+    *,
+    directory: bool,
+    expected_path: Path | None = None,
+) -> None:
+    value = _owned_value(owner)
+    attributes, device, inode, links = _windows_file_info(value)
+    if (
+        device != owner.device
+        or inode != owner.inode
+        or bool(attributes & _WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT)
+        or bool(attributes & _WINDOWS_FILE_ATTRIBUTE_DIRECTORY) != directory
+        or (not directory and links != 1)
+    ):
+        raise ValueError("native filesystem object identity or type changed")
+    final_path = _windows_final_path(value)
+    if owner.final_path and _windows_normalise_final(final_path) != _windows_normalise_final(
+        owner.final_path
+    ):
+        raise ValueError("native filesystem object path binding changed")
+    if expected_path is not None and _windows_normalise_final(final_path) != _windows_expected_path(
+        expected_path
+    ):
+        raise ValueError("native filesystem path binding changed")
+
+
+def _close_owned_handle(owner: _OwnedHandle) -> None:
+    with _HANDLE_LOCK:
+        value = owner.value
+        if owner.closed or value is None:
+            return
+        if not _is_current_owned_handle(owner, value):
+            _retire_owned_handle(owner)
+            raise ValueError("native filesystem handle generation is stale; refusing close")
+        _close_owned_handle_locked(owner)
+
+
+def _close_owned_handle_locked(owner: _OwnedHandle) -> None:
+    value = owner.value
+    if owner.closed or value is None:
+        return
+    if owner.windows:
+        if not owner.windows_protected:
+            if owner.windows_unprotected_for_close:
+                try:
+                    _windows_set_close_protection(value, True)
+                    flags = _windows_handle_flags(value)
+                except OSError as error:
+                    if getattr(error, "winerror", error.errno) == _WINDOWS_ERROR_INVALID_HANDLE:
+                        _retire_owned_handle(owner)
+                        return
+                    raise
+                if not flags & _WINDOWS_HANDLE_FLAG_PROTECT_FROM_CLOSE:
+                    raise ValueError(
+                        "native filesystem handle close protection is unavailable; retaining owner"
+                    )
+                owner.windows_protected = True
+                owner.windows_unprotected_for_close = False
+            else:
+                if owner.identity_known:
+                    _retire_owned_handle(owner)
+                    raise ValueError("native filesystem handle is not protected; refusing close")
+                try:
+                    _windows_close_raw(value)
+                except OSError as error:
+                    if getattr(error, "winerror", error.errno) == _WINDOWS_ERROR_INVALID_HANDLE:
+                        _retire_owned_handle(owner)
+                        return
+                    raise
+                _retire_owned_handle(owner)
+                return
+        try:
+            flags = _windows_handle_flags(value)
+        except OSError as error:
+            if getattr(error, "winerror", error.errno) == _WINDOWS_ERROR_INVALID_HANDLE:
+                _retire_owned_handle(owner)
+                return
+            raise
+        if not flags & _WINDOWS_HANDLE_FLAG_PROTECT_FROM_CLOSE:
+            _retire_owned_handle(owner)
+            raise ValueError("native filesystem handle is not protected; refusing close")
+        if owner.identity_known:
+            try:
+                _, device, inode, _ = _windows_file_info(value)
+            except OSError as error:
+                if getattr(error, "winerror", error.errno) == _WINDOWS_ERROR_INVALID_HANDLE:
+                    _retire_owned_handle(owner)
+                    return
+                raise
+            if device != owner.device or inode != owner.inode:
+                _retire_owned_handle(owner)
+                raise ValueError("native filesystem handle identity changed; refusing close")
+        try:
+            _windows_set_close_protection(value, False)
+            owner.windows_protected = False
+            owner.windows_unprotected_for_close = True
+            _windows_close_raw(value)
+        except OSError as error:
+            if getattr(error, "winerror", error.errno) == _WINDOWS_ERROR_INVALID_HANDLE:
+                _retire_owned_handle(owner)
+                return
+            try:
+                _windows_set_close_protection(value, True)
+            except BaseException:
+                owner.windows_protected = False
+            else:
+                owner.windows_protected = True
+                owner.windows_unprotected_for_close = False
+            raise
+        _retire_owned_handle(owner)
+        return
+    if not owner.identity_known:
+        try:
+            os.close(value)
+        except OSError as error:
+            if error.errno == errno.EBADF:
+                _retire_owned_handle(owner)
+                return
+            raise
+        _retire_owned_handle(owner)
+        return
+    try:
+        metadata = os.fstat(value)
+    except OSError as error:
+        if error.errno == errno.EBADF:
+            _retire_owned_handle(owner)
+            return
+        raise
+    if int(metadata.st_dev) != owner.device or int(metadata.st_ino) != owner.inode:
+        _retire_owned_handle(owner)
+        raise ValueError("descriptor identity changed; refusing close")
+    try:
+        os.close(value)
+    except OSError as error:
+        if error.errno == errno.EBADF:
+            _retire_owned_handle(owner)
+            return
+        raise
+    _retire_owned_handle(owner)
+
+
+def _best_effort_close(owner: _OwnedHandle) -> None:
+    try:
+        _close_owned_handle(owner)
+    except BaseException:
+        _retain_cleanup_owner(owner)
+
+
+def _release_root_binding(binding: _RootBinding | None) -> None:
+    if binding is None:
+        return
+    owner = binding.fd
+    if owner is None:
+        binding.closed = True
+        return
+    try:
+        _close_owned_handle(owner)
+    except BaseException:
+        _retain_cleanup_owner(owner)
+        if owner.closed:
+            binding.fd = None
+            binding.closed = True
+        raise
+    binding.fd = None
+    binding.closed = True
+
+
+def _finalize_root_binding(binding: _RootBinding | None) -> None:
+    if binding is None or binding.fd is None:
+        return
+    try:
+        _close_owned_handle(binding.fd)
+    except BaseException:
+        _retain_cleanup_owner(binding.fd)
+        return
+    binding.fd = None
+    binding.closed = True
+
+
+def _drain_pending_cleanup() -> None:
+    with _HANDLE_LOCK:
+        pending = tuple(_PENDING_CLEANUP)
+        _PENDING_CLEANUP.clear()
+    for owner in pending:
+        try:
+            _close_owned_handle(owner)
+        except BaseException:
+            _retain_cleanup_owner(owner)
+
+
+atexit.register(_drain_pending_cleanup)
+
+
+def _capture_posix_path_binding(path: Path) -> tuple[tuple[Path, int, int], ...]:
+    identities: list[tuple[Path, int, int]] = []
+    current = path
+    while True:
+        metadata = os.stat(os.fspath(current), follow_symlinks=False)
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise ValueError("attempt root pathname contains a non-directory")
+        identities.append((current, int(metadata.st_dev), int(metadata.st_ino)))
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+    identities.reverse()
+    return tuple(identities)
 
 
 def _hold_root(root: Path) -> _RootBinding:
+    with _HANDLE_LOCK:
+        return _hold_root_locked(root)
+
+
+def _hold_root_locked(root: Path) -> _RootBinding:
     """Hold the issued attempt root used for descriptor-relative reads."""
 
     path = _normalise_root(root)
@@ -129,41 +821,133 @@ def _hold_root(root: Path) -> _RootBinding:
     if os.name == "posix":
         flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
         flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        posix_owner: _OwnedHandle | None = None
+        path_identities: tuple[tuple[Path, int, int], ...] = ()
         try:
             fd = os.open(os.fspath(path), flags)
             metadata = os.fstat(fd)
-        except OSError as error:
-            if "fd" in locals():
+            posix_owner = _OwnedHandle(
+                fd,
+                int(metadata.st_dev),
+                int(metadata.st_ino),
+                path,
+                False,
+            )
+            path_identities = _capture_posix_path_binding(path)
+        except (OSError, ValueError) as error:
+            if posix_owner is not None:
+                _best_effort_close(posix_owner)
+            elif "fd" in locals():
                 with contextlib.suppress(OSError):
                     os.close(fd)
             raise ValueError("attempt root is not a held directory") from error
         if not stat.S_ISDIR(metadata.st_mode):
-            os.close(fd)
+            if posix_owner is not None:
+                _best_effort_close(posix_owner)
             raise ValueError("attempt root is not a directory")
-        return _RootBinding(path, fd, int(metadata.st_dev), int(metadata.st_ino))
+        if posix_owner is None:  # pragma: no cover - defensive state guard
+            raise ValueError("attempt root is not a held directory")
+        if not path_identities or path_identities[-1][1:] != (
+            posix_owner.device,
+            posix_owner.inode,
+        ):
+            _best_effort_close(posix_owner)
+            raise ValueError("attempt root pathname binding changed")
+        return _RootBinding(
+            path,
+            posix_owner,
+            posix_owner.device,
+            posix_owner.inode,
+            path_identities=path_identities,
+        )
+
+    windows_owner: _OwnedHandle | None = None
     try:
-        metadata = os.lstat(os.fspath(path))
+        windows_owner = _windows_open_absolute(
+            path,
+            _WINDOWS_FILE_LIST_DIRECTORY
+            | _WINDOWS_FILE_READ_ATTRIBUTES
+            | _WINDOWS_READ_CONTROL
+            | _WINDOWS_SYNCHRONIZE,
+            _WINDOWS_FILE_SHARE_READ | _WINDOWS_FILE_SHARE_WRITE,
+            _WINDOWS_FILE_FLAG_BACKUP_SEMANTICS | _WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT,
+        )
+        _windows_verify_owner(windows_owner, directory=True, expected_path=path)
     except OSError as error:
+        if windows_owner is not None:
+            _best_effort_close(windows_owner)
+        raise ValueError("attempt root is unavailable") from error
+    except ValueError as error:
+        if windows_owner is not None:
+            _best_effort_close(windows_owner)
+        raise ValueError("attempt root is not a directory") from error
+    if windows_owner is None:  # pragma: no cover - defensive state guard
+        raise ValueError("attempt root is unavailable")
+    try:
+        metadata = os.stat(os.fspath(path), follow_symlinks=False)
+    except OSError as error:
+        _best_effort_close(windows_owner)
         raise ValueError("attempt root is unavailable") from error
     if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        _best_effort_close(windows_owner)
         raise ValueError("attempt root is not a directory")
-    return _RootBinding(path, None, int(metadata.st_dev), int(metadata.st_ino))
+    return _RootBinding(path, windows_owner, int(metadata.st_dev), int(metadata.st_ino))
 
 
 def _verify_root(binding: _RootBinding | None) -> None:
-    if binding is None:
+    with _HANDLE_LOCK:
+        _verify_root_locked(binding)
+
+
+def _verify_posix_path_binding(binding: _RootBinding) -> None:
+    identities = binding.path_identities
+    if not identities:
+        identities = ((binding.path, binding.device, binding.inode),)
+    for path, device, inode in identities:
+        try:
+            metadata = os.stat(os.fspath(path), follow_symlinks=False)
+        except OSError as error:
+            raise TypeError("issued attempt root pathname binding changed") from error
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISDIR(metadata.st_mode)
+            or int(metadata.st_dev) != device
+            or int(metadata.st_ino) != inode
+        ):
+            raise TypeError("issued attempt root pathname binding changed")
+
+
+def _verify_root_locked(binding: _RootBinding | None) -> None:
+    if binding is None or binding.closed or binding.fd is None:
         raise TypeError("issued attempt root authority is unavailable")
+    if os.name == "nt":
+        try:
+            _windows_verify_owner(binding.fd, directory=True, expected_path=binding.path)
+        except (OSError, ValueError) as error:
+            raise TypeError("issued attempt root authority changed") from error
+        try:
+            metadata = os.stat(os.fspath(binding.path), follow_symlinks=False)
+        except OSError as error:
+            raise TypeError("issued attempt root authority changed") from error
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISDIR(metadata.st_mode)
+            or int(metadata.st_dev) != binding.device
+            or int(metadata.st_ino) != binding.inode
+        ):
+            raise TypeError("issued attempt root authority changed")
+        return
     try:
-        metadata = os.fstat(binding.fd) if binding.fd is not None else os.lstat(binding.path)
-    except OSError as error:
+        metadata = os.fstat(_owned_value(binding.fd))
+    except (OSError, ValueError) as error:
         raise TypeError("issued attempt root authority is unavailable") from error
     if (
-        stat.S_ISLNK(metadata.st_mode)
-        or not stat.S_ISDIR(metadata.st_mode)
+        not stat.S_ISDIR(metadata.st_mode)
         or int(metadata.st_dev) != binding.device
         or int(metadata.st_ino) != binding.inode
     ):
         raise TypeError("issued attempt root authority changed")
+    _verify_posix_path_binding(binding)
 
 
 def _manager_record(value: object) -> _ManagerRecord:
@@ -188,6 +972,8 @@ def _authority_record(value: object) -> _AuthorityRecord:
     if not isinstance(record, _AuthorityRecord) or record.authority is not value:
         raise TypeError("FbsAdapterAuthority binding is invalid")
     manager_record = _manager_record(record.manager)
+    if manager_record.closed:
+        raise TypeError("FbsAdapterManager authority is closed")
     if manager_record.authority is not value:
         raise TypeError("FbsAdapterAuthority manager binding is invalid")
     if manager_record.root_binding is not record.root_binding:
@@ -213,7 +999,7 @@ def _normalise_root(root: str | Path) -> Path:
 class FbsAdapterManager:
     """Bind one adapter and issue one opaque validation authority."""
 
-    __slots__ = ("_record", "__weakref__")
+    __slots__ = ("_record", "_finalizer", "__weakref__")
 
     def __init__(
         self,
@@ -230,8 +1016,10 @@ class FbsAdapterManager:
         if not isinstance(runtime_identity, str) or not runtime_identity.strip():
             raise ValueError("runtime_identity must be a non-empty string")
         reader = _adapter_reader(adapter)
+        _drain_pending_cleanup()
         root = _normalise_root(attempt_root) if attempt_root is not None else None
         root_binding = _hold_root(root) if root is not None else None
+        object.__setattr__(self, "_finalizer", None)
         object.__setattr__(
             self,
             "_record",
@@ -244,6 +1032,22 @@ class FbsAdapterManager:
                 root_binding=root_binding,
             ),
         )
+        if root_binding is not None:
+            object.__setattr__(
+                self,
+                "_finalizer",
+                weakref.finalize(self, _finalize_root_binding, root_binding),
+            )
+
+    def __del__(self) -> None:
+        """Release only this manager's filesystem owner during finalization."""
+
+        try:
+            record = object.__getattribute__(self, "_record")
+            binding = getattr(record, "root_binding", None)
+            _finalize_root_binding(binding)
+        except BaseException:
+            return
 
     def __init_subclass__(cls, **kwargs: object) -> None:
         del kwargs
@@ -263,10 +1067,39 @@ class FbsAdapterManager:
         del protocol
         raise TypeError("FbsAdapterManager cannot be serialized")
 
+    def __enter__(self) -> FbsAdapterManager:
+        _manager_record(self)
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: Any,
+    ) -> None:
+        del exc_type, exc_value, traceback
+        self.close()
+
+    def close(self) -> None:
+        """Revoke authority and close only this manager's exact root owner."""
+
+        record = _manager_record(self)
+        record.closed = True
+        try:
+            _release_root_binding(record.root_binding)
+        except BaseException:
+            raise
+        finalizer = object.__getattribute__(self, "_finalizer")
+        if isinstance(finalizer, weakref.finalize):
+            finalizer.detach()
+            object.__setattr__(self, "_finalizer", None)
+
     def issue_authority(self) -> FbsAdapterAuthority:
         """Issue the manager's exact-instance authority."""
 
         record = _manager_record(self)
+        if record.closed:
+            raise TypeError("FbsAdapterManager is closed")
         if record.authority is None:
             authority = FbsAdapterAuthority(_AUTHORITY_TOKEN)
             authority_record = _AuthorityRecord(
@@ -312,11 +1145,14 @@ def _path(path: str | Path) -> Path:
 
 @dataclass(slots=True)
 class _OpenedXplt:
-    fd: int
-    parent_fd: int
+    fd: _OwnedHandle
+    parent_fd: _OwnedHandle
     name: str
     device: int
     inode: int
+    path: Path
+    parent_path: Path
+    root_binding: _RootBinding
 
 
 def _fd_alias_parts(path: Path) -> tuple[int, tuple[str, ...]] | None:
@@ -372,16 +1208,73 @@ def _digest(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _digest_fd(fd: int) -> str:
+def _windows_seek(value: int) -> None:
+    kernel32 = _windows_kernel32()
+    set_pointer = kernel32.SetFilePointerEx
+    set_pointer.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_longlong,
+        ctypes.POINTER(ctypes.c_longlong),
+        wintypes.DWORD,
+    ]
+    set_pointer.restype = wintypes.BOOL
+    new_position = ctypes.c_longlong()
+    if not set_pointer(
+        wintypes.HANDLE(value),
+        ctypes.c_longlong(0),
+        ctypes.byref(new_position),
+        wintypes.DWORD(_WINDOWS_FILE_BEGIN),
+    ):
+        raise _windows_error("unable to seek held XPLT handle")
+
+
+def _digest_windows(owner: _OwnedHandle) -> str:
+    value = _owned_value(owner)
+    kernel32 = _windows_kernel32()
+    read_file = kernel32.ReadFile
+    read_file.argtypes = [
+        wintypes.HANDLE,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+        wintypes.LPVOID,
+    ]
+    read_file.restype = wintypes.BOOL
+    _windows_seek(value)
+    digest = hashlib.sha256()
+    buffer = ctypes.create_string_buffer(1024 * 1024)
+    try:
+        while True:
+            count = wintypes.DWORD()
+            if not read_file(
+                wintypes.HANDLE(value),
+                buffer,
+                wintypes.DWORD(len(buffer)),
+                ctypes.byref(count),
+                None,
+            ):
+                raise _windows_error("unable to hash held XPLT handle")
+            if count.value == 0:
+                break
+            digest.update(buffer.raw[: count.value])
+    finally:
+        _windows_seek(value)
+    return digest.hexdigest()
+
+
+def _digest_fd(fd: _OwnedHandle) -> str:
+    if os.name == "nt":
+        return _digest_windows(fd)
+    value = _owned_value(fd)
     digest = hashlib.sha256()
     try:
-        os.lseek(fd, 0, os.SEEK_SET)
+        os.lseek(value, 0, os.SEEK_SET)
         while True:
-            chunk = os.read(fd, 1024 * 1024)
+            chunk = os.read(value, 1024 * 1024)
             if not chunk:
                 break
             digest.update(chunk)
-        os.lseek(fd, 0, os.SEEK_SET)
+        os.lseek(value, 0, os.SEEK_SET)
     except OSError as error:
         raise ValueError("unable to hash the held XPLT descriptor") from error
     return digest.hexdigest()
@@ -403,49 +1296,166 @@ def _relative_to_root(path: Path, root: Path) -> tuple[str, ...]:
 
 
 def _open_bound_xplt(record: _AuthorityRecord, reported_path: Path) -> _OpenedXplt:
+    with _HANDLE_LOCK:
+        return _open_bound_xplt_locked(record, reported_path)
+
+
+def _open_bound_xplt_locked(record: _AuthorityRecord, reported_path: Path) -> _OpenedXplt:
     root = record.attempt_root
     binding = record.root_binding
     if root is None or binding is None or binding.fd is None:
         raise ValueError("FBS validation requires a held issued attempt root")
     _verify_root(binding)
     parts = _relative_to_root(reported_path, root)
+    if os.name == "nt":
+        current = _windows_duplicate(binding.fd)
+        try:
+            if len(parts) == 1:
+                parent_path = root
+            else:
+                parent_path = root.joinpath(*parts[:-1])
+                for index, component in enumerate(parts[:-1]):
+                    next_path = root.joinpath(*parts[: index + 1])
+                    next_owner = _windows_open_relative(
+                        current,
+                        component,
+                        _WINDOWS_FILE_LIST_DIRECTORY
+                        | _WINDOWS_FILE_READ_ATTRIBUTES
+                        | _WINDOWS_READ_CONTROL
+                        | _WINDOWS_SYNCHRONIZE,
+                        _WINDOWS_FILE_SHARE_READ | _WINDOWS_FILE_SHARE_WRITE,
+                        _WINDOWS_FILE_DIRECTORY_FILE
+                        | _WINDOWS_FILE_SYNCHRONOUS_IO_NONALERT
+                        | _WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT,
+                        next_path,
+                    )
+                    try:
+                        _windows_verify_owner(next_owner, directory=True, expected_path=next_path)
+                    except BaseException:
+                        _best_effort_close(next_owner)
+                        raise
+                    try:
+                        _close_owned_handle(current)
+                    except BaseException:
+                        _retain_cleanup_owner(next_owner)
+                        raise
+                    current = next_owner
+            file_owner = _windows_open_relative(
+                current,
+                parts[-1],
+                _WINDOWS_GENERIC_READ | _WINDOWS_FILE_READ_ATTRIBUTES | _WINDOWS_SYNCHRONIZE,
+                _WINDOWS_FILE_SHARE_READ,
+                _WINDOWS_FILE_NON_DIRECTORY_FILE
+                | _WINDOWS_FILE_SYNCHRONOUS_IO_NONALERT
+                | _WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT,
+                reported_path,
+            )
+            try:
+                _windows_verify_owner(file_owner, directory=False, expected_path=reported_path)
+                _windows_verify_owner(current, directory=True, expected_path=parent_path)
+                if not _windows_path_inside(file_owner.final_path, binding.fd.final_path):
+                    raise ValueError("XPLT path is outside the held attempt root")
+                return _OpenedXplt(
+                    fd=file_owner,
+                    parent_fd=current,
+                    name=parts[-1],
+                    device=file_owner.device,
+                    inode=file_owner.inode,
+                    path=reported_path,
+                    parent_path=parent_path,
+                    root_binding=binding,
+                )
+            except BaseException:
+                _best_effort_close(file_owner)
+                raise
+        except BaseException:
+            _best_effort_close(current)
+            raise
+
     directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
     directory_flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     file_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-    current_fd = os.dup(binding.fd)
+    root_value = _owned_value(binding.fd)
+    current_fd = os.dup(root_value)
+    current = _OwnedHandle(current_fd, binding.device, binding.inode, root, False)
     try:
-        for component in parts[:-1]:
-            next_fd = os.open(component, directory_flags, dir_fd=current_fd)
-            os.close(current_fd)
-            current_fd = next_fd
-        file_fd = os.open(parts[-1], file_flags, dir_fd=current_fd)
+        for index, component in enumerate(parts[:-1]):
+            next_fd = os.open(component, directory_flags, dir_fd=_owned_value(current))
+            next_metadata = os.fstat(next_fd)
+            next_owner = _OwnedHandle(
+                next_fd,
+                int(next_metadata.st_dev),
+                int(next_metadata.st_ino),
+                root.joinpath(*parts[: index + 1]),
+                False,
+            )
+            if not stat.S_ISDIR(next_metadata.st_mode):
+                _best_effort_close(next_owner)
+                raise ValueError("XPLT parent is not a directory")
+            try:
+                _close_owned_handle(current)
+            except BaseException:
+                _retain_cleanup_owner(next_owner)
+                raise
+            current = next_owner
+        file_fd = os.open(parts[-1], file_flags, dir_fd=_owned_value(current))
+        file_owner = _OwnedHandle(
+            file_fd,
+            0,
+            0,
+            reported_path,
+            False,
+            identity_known=False,
+        )
         try:
             metadata = os.fstat(file_fd)
+            file_owner.device = int(metadata.st_dev)
+            file_owner.inode = int(metadata.st_ino)
             if not stat.S_ISREG(metadata.st_mode):
                 raise ValueError("XPLT path must be a regular file")
             if int(metadata.st_nlink) != 1:
                 raise ValueError("XPLT path must not be a hard link")
             return _OpenedXplt(
-                fd=file_fd,
-                parent_fd=current_fd,
+                fd=file_owner,
+                parent_fd=current,
                 name=parts[-1],
                 device=int(metadata.st_dev),
                 inode=int(metadata.st_ino),
+                path=reported_path,
+                parent_path=reported_path.parent,
+                root_binding=binding,
             )
         except BaseException:
-            os.close(file_fd)
+            _best_effort_close(file_owner)
             raise
     except BaseException:
-        with contextlib.suppress(OSError):
-            os.close(current_fd)
+        _best_effort_close(current)
         raise
 
 
 def _verify_opened_xplt(opened: _OpenedXplt) -> None:
+    if os.name == "nt":
+        try:
+            _verify_root(opened.root_binding)
+            _windows_verify_owner(
+                opened.parent_fd, directory=True, expected_path=opened.parent_path
+            )
+            _windows_verify_owner(opened.fd, directory=False, expected_path=opened.path)
+            root_owner = opened.root_binding.fd
+            if root_owner is None or not _windows_path_inside(
+                opened.fd.final_path, root_owner.final_path
+            ):
+                raise ValueError("XPLT path is outside the held attempt root")
+        except (OSError, ValueError, TypeError) as error:
+            raise ValueError("XPLT changed or became unavailable") from error
+        return
     try:
-        path_metadata = os.stat(opened.name, dir_fd=opened.parent_fd, follow_symlinks=False)
-        descriptor_metadata = os.fstat(opened.fd)
-    except OSError as error:
+        _verify_root(opened.root_binding)
+        path_metadata = os.stat(
+            opened.name, dir_fd=_owned_value(opened.parent_fd), follow_symlinks=False
+        )
+        descriptor_metadata = os.fstat(_owned_value(opened.fd))
+    except (OSError, TypeError, ValueError) as error:
         raise ValueError("XPLT changed or became unavailable") from error
     if (
         not stat.S_ISREG(path_metadata.st_mode)
@@ -458,14 +1468,15 @@ def _verify_opened_xplt(opened: _OpenedXplt) -> None:
 
 
 def _close_opened_xplt(opened: _OpenedXplt) -> None:
-    failures: list[OSError] = []
-    for fd in (opened.fd, opened.parent_fd):
+    failures: list[BaseException] = []
+    for owner in (opened.fd, opened.parent_fd):
         try:
-            os.close(fd)
-        except OSError as error:
+            _close_owned_handle(owner)
+        except BaseException as error:
+            _retain_cleanup_owner(owner)
             failures.append(error)
     if failures:
-        raise ValueError("unable to close held XPLT descriptors") from failures[0]
+        raise ValueError("unable to close held XPLT handles") from failures[0]
 
 
 def _finite_value(value: object) -> bool:
@@ -551,11 +1562,17 @@ def _field_snapshot(fields: object) -> tuple[str, ...]:
 
 
 def _register_validation(
-    validation: FbsValidation, authority: FbsAdapterAuthority
+    validation: FbsValidation,
+    authority: FbsAdapterAuthority,
+    *,
+    authority_record: _AuthorityRecord | None = None,
 ) -> FbsValidation:
     if type(validation) is not FbsValidation:
         raise TypeError("validation is not an exact FbsValidation instance")
-    authority_record = _authority_record(authority)
+    if authority_record is None:
+        authority_record = _authority_record(authority)
+    elif authority_record.authority is not authority:
+        raise TypeError("validation authority binding is invalid")
     if validation.authority is not authority:
         raise TypeError("validation authority binding is invalid")
     try:
@@ -697,11 +1714,14 @@ def _invalid_validation(
     *,
     digest_before: str = "",
     digest_after: str = "",
+    authority_record: _AuthorityRecord | None = None,
 ) -> FbsValidation:
-    record = _authority_record(authority)
+    record = authority_record or _authority_record(authority)
+    if record.authority is not authority:
+        raise TypeError("validation authority binding is invalid")
     fields = _field_snapshot(requested_fields)
     validation = FbsValidation(
-        authority=authority,
+        authority=None,
         runtime_identity=record.runtime_identity,
         xplt_path=_path(xplt_path),
         requested_fields=fields,
@@ -715,7 +1735,8 @@ def _invalid_validation(
         digest_after=digest_after,
         issues=(issue,),
     )
-    return _register_validation(validation, authority)
+    object.__setattr__(validation, "authority", authority)
+    return _register_validation(validation, authority, authority_record=record)
 
 
 def _build_validation(
@@ -778,25 +1799,27 @@ def validate_requested_fields(
         raise ValueError("FBS validation requires an issued attempt-root authority")
     reported_path = _path(xplt_path)
     _require_xplt(reported_path, record.attempt_root, require_exists=False)
+    _require_xplt(reported_path, record.attempt_root)
 
     opened: _OpenedXplt | None = None
     path = reported_path
     digest_before = ""
+    digest_after = ""
     raw_result: object = None
     try:
         if os.name == "posix":
             opened = _open_bound_xplt(record, reported_path)
-            path = Path("/proc/self/fd") / str(opened.fd)
+            path = Path("/proc/self/fd") / str(_owned_value(opened.fd))
             digest_before = _digest_fd(opened.fd)
         else:
-            _require_xplt(reported_path, record.attempt_root)
-            digest_before = _digest(path)
+            opened = _open_bound_xplt(record, reported_path)
+            _verify_opened_xplt(opened)
+            digest_before = _digest_fd(opened.fd)
         try:
             raw_result = record.reader(path, fields)
         except Exception as error:
             try:
                 if opened is not None:
-                    _verify_root(record.root_binding)
                     _verify_opened_xplt(opened)
                     digest_after = _digest_fd(opened.fd)
                 else:
@@ -811,13 +1834,14 @@ def validate_requested_fields(
                 f"adapter execution failed: {error}",
                 digest_before=digest_before,
                 digest_after=digest_after,
+                authority_record=record,
             )
 
         try:
             if opened is not None:
-                _verify_root(record.root_binding)
                 _verify_opened_xplt(opened)
                 digest_after = _digest_fd(opened.fd)
+                _verify_opened_xplt(opened)
             else:
                 _require_xplt(reported_path, record.attempt_root)
                 digest_after = _digest(path)
@@ -828,6 +1852,7 @@ def validate_requested_fields(
                 fields,
                 f"XPLT changed or became unavailable during adapter execution: {error}",
                 digest_before=digest_before,
+                authority_record=record,
             )
     finally:
         if opened is not None:
@@ -841,6 +1866,7 @@ def validate_requested_fields(
             "adapter mutated the XPLT artifact",
             digest_before=digest_before,
             digest_after=digest_after,
+            authority_record=record,
         )
     if not isinstance(raw_result, Mapping):
         return _invalid_validation(
@@ -850,6 +1876,7 @@ def validate_requested_fields(
             "adapter must return a field mapping",
             digest_before=digest_before,
             digest_after=digest_after,
+            authority_record=record,
         )
     try:
         values: dict[str, object] = dict(raw_result)
@@ -861,6 +1888,7 @@ def validate_requested_fields(
             f"adapter returned an unreadable field mapping: {error}",
             digest_before=digest_before,
             digest_after=digest_after,
+            authority_record=record,
         )
     if any(not isinstance(field, str) for field in values):
         return _invalid_validation(
@@ -870,6 +1898,7 @@ def validate_requested_fields(
             "adapter field mapping keys must be strings",
             digest_before=digest_before,
             digest_after=digest_after,
+            authority_record=record,
         )
     return _build_validation(
         authority,
