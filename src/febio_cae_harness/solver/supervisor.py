@@ -6,6 +6,7 @@ import atexit
 import contextlib
 import ctypes
 import errno
+import hashlib
 import io
 import json
 import math
@@ -41,6 +42,7 @@ from .runtime import (
     _RuntimeLaunchClaim,
     _windows_close_native_handle,
     _windows_close_owned_fd,
+    _windows_compare_object_handles,
     _windows_convert_raw_handle,
     _windows_duplicate_fd_handle,  # noqa: F401
     _windows_duplicate_native_handle,
@@ -573,10 +575,108 @@ class _FilesystemIdentity:
 
 
 @dataclass(slots=True)
+class _InputLease:
+    """Hold the exact launch input object until its child has consumed it."""
+
+    path: Path
+    expected_sha256: str
+    expected_identity: tuple[int, int, int, int, int]
+    handle: int | None
+    native_handle: int | None = None
+
+    @property
+    def child_path(self) -> Path:
+        if os.name == "posix":
+            if self.handle is None:
+                raise SolverOwnershipError("solver input lease is unavailable")
+            return Path("/proc/self/fd") / str(self.handle)
+        return self.path
+
+    @property
+    def child_pass_fds(self) -> tuple[int, ...]:
+        if os.name != "posix" or self.handle is None:
+            return ()
+        return (self.handle,)
+
+    @property
+    def child_handle(self) -> int | None:
+        return self.native_handle if _NATIVE_WINDOWS else None
+
+    def prepare_child_handle(self) -> int | None:
+        child_handle = self.child_handle
+        if child_handle is None:
+            return None
+        _windows_set_handle_inheritable(child_handle, True)
+        return child_handle
+
+    def clear_child_handle(self) -> None:
+        child_handle = self.child_handle
+        if child_handle is not None:
+            _windows_set_handle_inheritable(child_handle, False)
+
+    def verify(self, *, digest: bool = False) -> None:
+        if self.handle is None:
+            raise SolverOwnershipError("solver input lease is unavailable")
+        try:
+            metadata = os.fstat(self.handle)
+        except OSError as error:
+            raise SolverOwnershipError("solver input lease is unavailable") from error
+        if not stat.S_ISREG(metadata.st_mode):
+            raise SolverOwnershipError("solver input lease is not a regular file")
+        current_identity = (
+            int(metadata.st_dev),
+            int(metadata.st_ino),
+            int(metadata.st_nlink),
+            int(metadata.st_size),
+            int(metadata.st_mtime_ns),
+        )
+        if current_identity != self.expected_identity:
+            raise SolverOwnershipError("solver input lease identity changed")
+        if not digest:
+            return
+        try:
+            os.lseek(self.handle, 0, os.SEEK_SET)
+            digest_state = hashlib.sha256()
+            while chunk := os.read(self.handle, 1024 * 1024):
+                digest_state.update(chunk)
+            finished = os.fstat(self.handle)
+            finished_identity = (
+                int(finished.st_dev),
+                int(finished.st_ino),
+                int(finished.st_nlink),
+                int(finished.st_size),
+                int(finished.st_mtime_ns),
+            )
+            if finished_identity != self.expected_identity:
+                raise SolverOwnershipError("solver input lease changed while reading")
+            if digest_state.hexdigest() != self.expected_sha256:
+                raise SolverOwnershipError("solver input lease bytes changed")
+            os.lseek(self.handle, 0, os.SEEK_SET)
+        except SolverOwnershipError:
+            raise
+        except OSError as error:
+            raise SolverOwnershipError("unable to verify solver input lease bytes") from error
+
+    def close(self) -> None:
+        if self.handle is None and self.native_handle is None:
+            return
+        if _NATIVE_WINDOWS:
+            _windows_close_owned_fd(self, "handle", "native_handle")
+            return
+        handle = self.handle
+        if handle is None:
+            return
+        os.close(handle)
+        self.handle = None
+
+
+@dataclass(slots=True)
 class _WindowsDirectoryHandle:
     value: int
     volume_serial: int
     file_index: int
+    native_handle: int | None = None
+    closed: bool = False
 
 
 class _WindowsFileInformation(ctypes.Structure):
@@ -655,29 +755,68 @@ def _windows_open_directory(path: Path) -> _WindowsDirectoryHandle:
     if not raw_value_int or raw_value_int in {-1, _WINDOWS_INVALID_HANDLE_VALUE}:
         error = ctypes.get_last_error()
         raise OSError(error, f"unable to hold directory authority: {path}")
-    value = raw_value_int
-    try:
-        information = _windows_directory_information(value)
-    except BaseException:
-        with contextlib.suppress(BaseException):
-            kernel32.CloseHandle(value)
-        raise
-    file_index = (int(information.nFileIndexHigh) << 32) | int(information.nFileIndexLow)
-    return _WindowsDirectoryHandle(
-        value=value,
-        volume_serial=int(information.dwVolumeSerialNumber),
-        file_index=file_index,
+    held = _WindowsDirectoryHandle(
+        value=raw_value_int,
+        volume_serial=0,
+        file_index=0,
     )
+    _DURABLE_CLAIM_CLEANUP.adopt_directory_handle(held)
+    try:
+        held.native_handle = _windows_duplicate_native_handle(raw_value_int)
+        information = _windows_directory_information(raw_value_int)
+        held.volume_serial = int(information.dwVolumeSerialNumber)
+        held.file_index = (int(information.nFileIndexHigh) << 32) | int(information.nFileIndexLow)
+    except BaseException:
+        try:
+            _windows_close_directory(held)
+        except BaseException:
+            pass
+        else:
+            _DURABLE_CLAIM_CLEANUP.discard_directory_handle(held)
+        raise
+    _DURABLE_CLAIM_CLEANUP.discard_directory_handle(held)
+    return held
 
 
 def _windows_close_directory(handle: _WindowsDirectoryHandle) -> None:
+    value = handle.value
+    native_handle = handle.native_handle
+    if handle.closed:
+        if native_handle is None:
+            return
+        _windows_close_native_handle(native_handle)
+        handle.native_handle = None
+        return
+    if native_handle is None:
+        raise OSError("filesystem authority handle has no exact native guard")
+    identity_matches = _windows_compare_object_handles(value, native_handle)
+    if identity_matches is None:
+        raise OSError("unable to verify filesystem authority handle identity")
+    if not identity_matches:
+        handle.closed = True
+        _windows_close_native_handle(native_handle)
+        handle.native_handle = None
+        return
+
     kernel32 = _windows_kernel32()
-    if not kernel32.CloseHandle(handle.value):
+    ctypes.set_last_error(0)
+    if not kernel32.CloseHandle(ctypes.c_void_p(value)):
         error = ctypes.get_last_error()
+        after_close = _windows_compare_object_handles(value, native_handle)
+        if after_close is False:
+            handle.closed = True
+            _windows_close_native_handle(native_handle)
+            handle.native_handle = None
+            return
         raise OSError(error, "unable to close filesystem authority handle")
+    handle.closed = True
+    _windows_close_native_handle(native_handle)
+    handle.native_handle = None
 
 
 def _windows_verify_directory(handle: _WindowsDirectoryHandle) -> None:
+    if handle.closed:
+        raise SolverOwnershipError("filesystem authority handle is unavailable")
     try:
         information = _windows_directory_information(handle.value)
     except SolverOwnershipError:
@@ -690,6 +829,53 @@ def _windows_verify_directory(handle: _WindowsDirectoryHandle) -> None:
         or file_index != handle.file_index
     ):
         raise SolverOwnershipError("filesystem authority handle identity changed")
+
+
+def _windows_set_handle_inheritable(native_handle: int, inheritable: bool) -> None:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.SetHandleInformation.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32]
+    kernel32.SetHandleInformation.restype = ctypes.c_int
+    ctypes.set_last_error(0)
+    if not kernel32.SetHandleInformation(
+        ctypes.c_void_p(native_handle),
+        ctypes.c_uint32(0x00000001),
+        ctypes.c_uint32(0x00000001 if inheritable else 0),
+    ):
+        error = ctypes.get_last_error()
+        raise OSError(error, "unable to configure solver input handle inheritance")
+
+
+def _windows_open_input(path: Path) -> int:
+    """Open the exact solver input with read-only, replacement-blocking sharing."""
+
+    kernel32 = _windows_kernel32()
+    ctypes.set_last_error(0)
+    raw_handle = kernel32.CreateFileW(
+        os.fspath(path),
+        _WINDOWS_GENERIC_READ,
+        _WINDOWS_FILE_SHARE_READ,
+        None,
+        _WINDOWS_OPEN_EXISTING,
+        _WINDOWS_FILE_ATTRIBUTE_NORMAL | _WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT,
+        None,
+    )
+    raw_value = raw_handle.value if isinstance(raw_handle, ctypes.c_void_p) else raw_handle
+    try:
+        value = 0 if raw_value is None else int(cast(int, raw_value))
+    except (TypeError, ValueError, OverflowError):
+        value = 0
+    if not value or value in {-1, _WINDOWS_INVALID_HANDLE_VALUE}:
+        error = ctypes.get_last_error()
+        raise OSError(error, f"unable to hold solver input authority: {path}")
+    return cast(
+        int,
+        _windows_convert_raw_handle(
+            value,
+            os.O_RDONLY,
+            duplicate_native_handle=_windows_duplicate_native_handle,
+            close_native_handle=_windows_close_native_handle,
+        ),
+    )
 
 
 class _FilesystemAuthority:
@@ -758,8 +944,10 @@ class _FilesystemAuthority:
                         )
                     except BaseException:
                         if isinstance(held, _WindowsDirectoryHandle):
-                            with contextlib.suppress(BaseException):
+                            try:
                                 _windows_close_directory(held)
+                            except BaseException:
+                                _DURABLE_CLAIM_CLEANUP.adopt_directory_handle(held)
                         raise
                 else:
                     metadata = os.lstat(os.fspath(path))
@@ -780,8 +968,15 @@ class _FilesystemAuthority:
             self.verify()
         except BaseException:
             self._entries = tuple(entries)
-            with contextlib.suppress(BaseException):
+            try:
                 self.close()
+            except BaseException:
+                _DURABLE_CLAIM_CLEANUP.adopt(
+                    None,
+                    None,
+                    (),
+                    filesystem_authority=self,
+                )
             raise
 
     @property
@@ -943,20 +1138,37 @@ class _DurableClaimCleanup:
 
     __slots__ = (
         "_lock",
+        "_directory_handles",
         "_filesystem_authorities",
+        "_input_leases",
         "_runtime_claims",
         "_process_record_claims",
     )
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
+        self._directory_handles: list[_WindowsDirectoryHandle] = []
         self._filesystem_authorities: list[_FilesystemAuthority] = []
+        self._input_leases: list[_InputLease] = []
         self._runtime_claims: list[_RuntimeLaunchClaim] = []
         self._process_record_claims: list[_ProcessRecordClaim] = []
 
     @staticmethod
     def _discard_identity(entries: list[Any], target: Any) -> None:
         entries[:] = [entry for entry in entries if entry is not target]
+
+    def adopt_directory_handle(self, handle: _WindowsDirectoryHandle) -> None:
+        """Retain one exact raw directory handle until it can be closed."""
+
+        with self._lock:
+            if (not handle.closed or handle.native_handle is not None) and not any(
+                held is handle for held in self._directory_handles
+            ):
+                self._directory_handles.append(handle)
+
+    def discard_directory_handle(self, handle: _WindowsDirectoryHandle) -> None:
+        with self._lock:
+            self._discard_identity(self._directory_handles, handle)
 
     def adopt(
         self,
@@ -965,6 +1177,7 @@ class _DurableClaimCleanup:
         candidates: Iterable[_ProcessRecordClaim],
         *,
         filesystem_authority: _FilesystemAuthority | None = None,
+        input_lease: _InputLease | None = None,
     ) -> None:
         """Adopt still-live claims without retaining their supervisor owner."""
 
@@ -975,6 +1188,12 @@ class _DurableClaimCleanup:
                 and not any(held is filesystem_authority for held in self._filesystem_authorities)
             ):
                 self._filesystem_authorities.append(filesystem_authority)
+            if (
+                input_lease is not None
+                and (input_lease.handle is not None or input_lease.native_handle is not None)
+                and not any(held is input_lease for held in self._input_leases)
+            ):
+                self._input_leases.append(input_lease)
             if (
                 runtime_claim is not None
                 and (runtime_claim.handle is not None or runtime_claim.native_handle is not None)
@@ -1072,11 +1291,31 @@ class _DurableClaimCleanup:
                 continue
             self._discard_identity(self._filesystem_authorities, authority)
 
+    def _drain_directory_handles(self) -> None:
+        for handle in tuple(self._directory_handles):
+            try:
+                _windows_close_directory(handle)
+            except BaseException:
+                continue
+            if handle.closed and handle.native_handle is None:
+                self._discard_identity(self._directory_handles, handle)
+
+    def _drain_input_leases(self) -> None:
+        for lease in tuple(self._input_leases):
+            try:
+                lease.close()
+            except BaseException:
+                continue
+            if lease.handle is None and lease.native_handle is None:
+                self._discard_identity(self._input_leases, lease)
+
     def drain(self) -> None:
         """Retry exact descriptor closes; persistent failures remain owned."""
 
         with self._lock:
+            self._drain_directory_handles()
             self._drain_filesystem_authorities()
+            self._drain_input_leases()
             _drain_runtime_claims()
             self._drain_runtime_claims()
             self._drain_process_record_claims()
@@ -1391,6 +1630,7 @@ class SolverSupervisor:
         self._process_record_candidates: list[_ProcessRecordClaim] = []
         self._pending_process_record_claim: _ProcessRecordClaim | None = None
         self._runtime_launch_claim: _RuntimeLaunchClaim | None = None
+        self._input_lease: _InputLease | None = None
         self._record_owner_token = self._owner_token
         _drain_durable_cleanup()
         filesystem_authority = _FilesystemAuthority(self.spec.attempt_root)
@@ -1441,11 +1681,13 @@ class SolverSupervisor:
             claim = getattr(self, "_process_record_claim", None)
             candidates = getattr(self, "_process_record_candidates", ())
             runtime_claim = getattr(self, "_runtime_launch_claim", None)
+            input_lease = getattr(self, "_input_lease", None)
             if (
                 authority is not None
                 or claim is not None
                 or candidates
                 or runtime_claim is not None
+                or input_lease is not None
             ):
                 with contextlib.suppress(BaseException):
                     self._close_filesystem_authority()
@@ -1458,6 +1700,7 @@ class SolverSupervisor:
                 getattr(self, "_process_record_claim", None),
                 candidate_values,
                 filesystem_authority=getattr(self, "_filesystem_authority", None),
+                input_lease=getattr(self, "_input_lease", None),
             )
         except BaseException:
             # Finalization must not surface an unraisable exception. Claims
@@ -1514,6 +1757,95 @@ class SolverSupervisor:
         if authority is None:
             raise SolverOwnershipError("filesystem authority is unavailable")
         authority.verify()
+        self._verify_input_lease()
+
+    def _recorded_input_binding(self) -> tuple[str, tuple[int, int, int, int, int]]:
+        expected_path = self._launch_context.get("input_path")
+        expected_sha256 = self._launch_context.get("input_sha256")
+        identity_value = self._launch_context.get("input_identity")
+        if not isinstance(expected_path, str) or not expected_path:
+            raise SolverOwnershipError("solver input path binding is invalid")
+        canonical_path = os.path.normcase(
+            os.path.realpath(os.path.abspath(os.fspath(self.spec.input_path)))
+        )
+        if expected_path != canonical_path:
+            raise SolverOwnershipError("solver input path binding is invalid")
+        if not isinstance(expected_sha256, str) or not expected_sha256:
+            raise SolverOwnershipError("solver input SHA256 binding is invalid")
+        if not isinstance(identity_value, dict):
+            raise SolverOwnershipError("solver input identity binding is invalid")
+        identity: list[int] = []
+        for name in ("device", "inode", "nlink", "size", "mtime_ns"):
+            value = identity_value.get(name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise SolverOwnershipError("solver input identity binding is invalid")
+            identity.append(value)
+        return expected_sha256, cast(tuple[int, int, int, int, int], tuple(identity))
+
+    def _acquire_input_lease(self) -> None:
+        if self._input_lease is not None:
+            self._input_lease.verify()
+            return
+        expected_sha256, expected_identity = self._recorded_input_binding()
+        input_path = self.spec.input_path
+        handle: int
+        native_handle: int | None = None
+        if os.name == "posix":
+            authority = self._filesystem_authority
+            if authority is None:
+                raise SolverOwnershipError("filesystem authority is unavailable")
+            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+            try:
+                with authority.open_directory(input_path.parent) as parent_fd:
+                    handle = os.open(input_path.name, flags, dir_fd=parent_fd)
+            except OSError as error:
+                raise SolverOwnershipError("unable to hold exact solver input") from error
+        elif os.name == "nt" and _NATIVE_WINDOWS:
+            try:
+                opened = _windows_open_input(input_path)
+            except OSError as error:
+                raise SolverOwnershipError("unable to hold exact solver input") from error
+            handle = int(opened)
+            native_handle = getattr(opened, "native_handle", None)
+            if not isinstance(native_handle, int) or isinstance(native_handle, bool):
+                with contextlib.suppress(BaseException):
+                    os.close(handle)
+                raise SolverOwnershipError("exact solver input has no native handle")
+        else:
+            raise SolverOwnershipError("exact solver input leases are unsupported")
+
+        lease = _InputLease(
+            path=input_path,
+            expected_sha256=expected_sha256,
+            expected_identity=expected_identity,
+            handle=handle,
+            native_handle=native_handle,
+        )
+        try:
+            lease.verify(digest=True)
+        except BaseException:
+            try:
+                lease.close()
+            except BaseException:
+                _DURABLE_CLAIM_CLEANUP.adopt(None, None, (), input_lease=lease)
+            raise
+        self._input_lease = lease
+
+    def _verify_input_lease(self, *, digest: bool = False) -> None:
+        lease = self._input_lease
+        if lease is not None:
+            lease.verify(digest=digest)
+
+    def _release_input_lease(self) -> tuple[BaseException, ...]:
+        lease = self._input_lease
+        if lease is None:
+            return ()
+        try:
+            lease.close()
+        except BaseException as error:
+            return (error,)
+        self._input_lease = None
+        return ()
 
     def _filesystem_identities(self) -> tuple[_FilesystemIdentity, ...]:
         authority = self._filesystem_authority
@@ -1675,6 +2007,7 @@ class SolverSupervisor:
             self._process_record_claim = None
         for candidate in tuple(self._process_record_candidates):
             failures.extend(self._release_process_record_claim(candidate))
+        failures.extend(self._release_input_lease())
         failures.extend(self._release_runtime_launch_claim())
         _drain_runtime_claims()
         if failures:
@@ -1733,12 +2066,16 @@ class SolverSupervisor:
 
     def _child_command(self) -> tuple[str, ...]:
         root = self.spec.attempt_root
+        input_lease = self._input_lease
         command: list[str] = []
         for value in self.spec.command:
             try:
                 candidate = Path(value)
             except (TypeError, ValueError):
                 command.append(value)
+                continue
+            if input_lease is not None and candidate == self.spec.input_path:
+                command.append(os.fspath(input_lease.child_path))
                 continue
             if candidate.is_absolute() and candidate.is_relative_to(root):
                 command.append(os.fspath(self._path_for_io(candidate)))
@@ -2114,6 +2451,8 @@ class SolverSupervisor:
                 self._revalidate_launch_binding()
                 if not self._input_is_regular():
                     raise FileNotFoundError(f"solver input does not exist: {self.spec.input_path}")
+                self._acquire_input_lease()
+                self._verify_input_lease(digest=True)
                 authority = ProcessAuthority.create(
                     self.spec.attempt_root, self._launch_context_digest
                 )
@@ -2138,29 +2477,45 @@ class SolverSupervisor:
                     child_handle = authority.child_handle()
                     if child_handle is None:
                         raise ProcessAuthorityError("process attestation handle is unavailable")
+                    input_lease = self._input_lease
+                    if input_lease is None:
+                        raise SolverOwnershipError("solver input lease is unavailable")
+                    input_child_handle = input_lease.prepare_child_handle()
+                    if input_child_handle is None:
+                        raise SolverOwnershipError("solver input child handle is unavailable")
                     startup_info = subprocess.STARTUPINFO()
-                    startup_info.lpAttributeList = {"handle_list": [child_handle]}
-                    self._revalidate_launch_binding()
-                    self._verify_filesystem_authority()
-                    process = subprocess.Popen(
-                        command,
-                        cwd=cwd,
-                        env=environment,
-                        shell=False,
-                        stdin=subprocess.DEVNULL,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        creationflags=creation_flags,
-                        close_fds=True,
-                        startupinfo=startup_info,
-                    )
+                    startup_info.lpAttributeList = {
+                        "handle_list": [child_handle, input_child_handle]
+                    }
+                    try:
+                        self._revalidate_launch_binding()
+                        self._verify_filesystem_authority()
+                        process = subprocess.Popen(
+                            command,
+                            cwd=cwd,
+                            env=environment,
+                            shell=False,
+                            stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            creationflags=creation_flags,
+                            close_fds=True,
+                            startupinfo=startup_info,
+                        )
+                    finally:
+                        input_lease.clear_child_handle()
                 else:
                     filesystem_authority = self._filesystem_authority
                     if filesystem_authority is None:  # pragma: no cover - state guard
                         raise SolverOwnershipError("filesystem authority is unavailable")
+                    input_lease = self._input_lease
+                    if input_lease is None:
+                        raise SolverOwnershipError("solver input lease is unavailable")
                     pass_fds = tuple(
                         dict.fromkeys(
-                            authority.child_pass_fds() + filesystem_authority.child_pass_fds
+                            authority.child_pass_fds()
+                            + filesystem_authority.child_pass_fds
+                            + input_lease.child_pass_fds
                         )
                     )
                     self._revalidate_launch_binding()
@@ -2312,6 +2667,7 @@ class SolverSupervisor:
         authority: ProcessAuthority | None = None
         try:
             supervisor._acquire_filesystem_authority()
+            supervisor._acquire_input_lease()
             record = supervisor._read_process_record()
             supervisor._revalidate_launch_binding()
             metadata, started_at, authority = supervisor._validate_process_record(record)
@@ -3260,6 +3616,7 @@ class SolverSupervisor:
                 if state is not SolverState.CANCELLED:
                     self._revalidate_launch_binding()
                 self._verify_filesystem_authority()
+                self._verify_input_lease(digest=True)
                 started_at = self._started_at
                 pid = self._process.pid if self._process is not None else None
                 outputs = self.spec.expected_outputs

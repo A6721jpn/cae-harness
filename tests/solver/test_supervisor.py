@@ -208,6 +208,180 @@ def test_start_persists_attempt_owned_process_record(
     assert supervisor.state is SolverState.CANCELLED
 
 
+def test_posix_input_lease_uses_held_exact_descriptor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if os.name != "posix":
+        pytest.skip("POSIX-only exact-input descriptor lease")
+
+    capability = _capability(tmp_path, monkeypatch, code="exact input bytes")
+    supervisor = SolverSupervisor(capability)
+    try:
+        supervisor._acquire_filesystem_authority()
+        supervisor._acquire_input_lease()
+        lease = supervisor._input_lease
+        assert lease is not None
+        held_path = lease.child_path
+        assert held_path != capability.spec.input_path
+        assert held_path.read_bytes() == b"exact input bytes"
+        assert os.fspath(held_path) in supervisor._child_command()
+
+        replacement = capability.spec.input_path.with_name("replacement.feb")
+        replacement.write_bytes(b"replacement bytes")
+        os.replace(os.fspath(replacement), os.fspath(capability.spec.input_path))
+
+        assert held_path.read_bytes() == b"exact input bytes"
+    finally:
+        with contextlib.suppress(BaseException):
+            supervisor._close_filesystem_authority()
+
+
+def test_windows_input_lease_blocks_leaf_write_and_replace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if os.name != "nt":
+        pytest.fail("required Windows exact-input lease test executed on a non-Windows host")
+
+    capability = _capability(tmp_path, monkeypatch, code="exact input bytes")
+    supervisor = SolverSupervisor(capability)
+    replacement = capability.spec.input_path.with_name("replacement.feb")
+    try:
+        supervisor._acquire_filesystem_authority()
+        supervisor._acquire_input_lease()
+        lease = supervisor._input_lease
+        assert lease is not None
+        assert lease.child_path == capability.spec.input_path
+        assert lease.native_handle is not None
+
+        with pytest.raises(OSError):
+            os.open(os.fspath(capability.spec.input_path), os.O_WRONLY)
+
+        replacement.write_bytes(b"replacement bytes")
+        with pytest.raises(OSError):
+            os.replace(os.fspath(replacement), os.fspath(capability.spec.input_path))
+    finally:
+        with contextlib.suppress(BaseException):
+            supervisor._close_filesystem_authority()
+        with contextlib.suppress(OSError):
+            replacement.unlink()
+
+
+def test_windows_directory_open_identity_failure_retains_exact_raw_handle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if os.name != "nt":
+        pytest.fail("required Windows directory-open cleanup test executed on a non-Windows host")
+
+    import ctypes
+
+    captured: list[supervisor_module._WindowsDirectoryHandle] = []
+
+    def capture_directory(self: object, handle: supervisor_module._WindowsDirectoryHandle) -> None:
+        del self
+        captured.append(handle)
+
+    class FakeKernel32:
+        def CreateFileW(self, *args: object) -> ctypes.c_void_p:
+            del args
+            return ctypes.c_void_p(0x1234)
+
+        def CloseHandle(self, handle: object) -> int:
+            del handle
+            return 0
+
+    monkeypatch.setattr(
+        supervisor_module._DurableClaimCleanup,
+        "adopt_directory_handle",
+        capture_directory,
+        raising=False,
+    )
+    monkeypatch.setattr(supervisor_module, "_windows_kernel32", lambda: FakeKernel32())
+    monkeypatch.setattr(
+        supervisor_module,
+        "_windows_directory_information",
+        lambda handle: (_ for _ in ()).throw(OSError("synthetic identity failure")),
+    )
+    monkeypatch.setattr(
+        supervisor_module, "_windows_duplicate_native_handle", lambda handle: 0x5678
+    )
+    monkeypatch.setattr(supervisor_module, "_windows_close_native_handle", lambda handle: None)
+    monkeypatch.setattr(
+        supervisor_module,
+        "_windows_compare_object_handles",
+        lambda first, second: True,
+        raising=False,
+    )
+
+    with pytest.raises(OSError, match="synthetic identity failure"):
+        supervisor_module._windows_open_directory(tmp_path)
+
+    assert len(captured) == 1
+    assert captured[0].value == 0x1234
+
+
+def test_windows_partial_filesystem_authority_is_durably_adopted_after_close_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if os.name != "nt":
+        pytest.fail(
+            "required Windows partial-authority cleanup test executed on a non-Windows host"
+        )
+
+    root = tmp_path / "attempt"
+    root.mkdir()
+    captured: list[supervisor_module._FilesystemAuthority] = []
+    handles: list[supervisor_module._WindowsDirectoryHandle] = []
+
+    def fake_open(path: Path) -> supervisor_module._WindowsDirectoryHandle:
+        del path
+        handle = supervisor_module._WindowsDirectoryHandle(
+            value=len(handles) + 1,
+            volume_serial=1,
+            file_index=len(handles) + 1,
+        )
+        handles.append(handle)
+        return handle
+
+    def failing_close(handle: supervisor_module._WindowsDirectoryHandle) -> None:
+        del handle
+        raise OSError("synthetic directory close failure")
+
+    def capture_authority(
+        self: object,
+        runtime_claim: object,
+        process_record_claim: object,
+        candidates: object,
+        *,
+        filesystem_authority: supervisor_module._FilesystemAuthority | None = None,
+        input_lease: object = None,
+    ) -> None:
+        del self, runtime_claim, process_record_claim, candidates, input_lease
+        if filesystem_authority is not None:
+            captured.append(filesystem_authority)
+
+    original_lstat = os.lstat
+    lstat_calls = 0
+
+    def flaky_lstat(path: str | os.PathLike[str]) -> os.stat_result:
+        nonlocal lstat_calls
+        lstat_calls += 1
+        if lstat_calls == 2:
+            raise OSError("synthetic directory identity failure")
+        return original_lstat(path)
+
+    monkeypatch.setattr(supervisor_module, "_windows_open_directory", fake_open)
+    monkeypatch.setattr(supervisor_module, "_windows_close_directory", failing_close)
+    monkeypatch.setattr(supervisor_module._DurableClaimCleanup, "adopt", capture_authority)
+    monkeypatch.setattr(os, "lstat", flaky_lstat)
+
+    with pytest.raises(OSError, match="synthetic directory identity failure"):
+        supervisor_module._FilesystemAuthority(root)
+
+    assert len(handles) >= 2
+    assert len(captured) == 1
+    assert captured[0]._entries
+
+
 def test_raw_launch_spec_is_rejected_before_popen_or_attempt_creation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
