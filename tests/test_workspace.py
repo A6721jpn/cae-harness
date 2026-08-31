@@ -512,7 +512,7 @@ def test_unclaimed_attempt_creation_identities_have_a_bounded_lifetime(tmp_path:
     assert newest.attempt_id == f"bounded-{limit:03d}"
 
 
-def test_posix_pending_attempt_cleanup_releases_creation_claim_before_rmdir(
+def test_posix_pending_attempt_cleanup_fails_closed_without_namespace_mutation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -526,8 +526,8 @@ def test_posix_pending_attempt_cleanup_releases_creation_claim_before_rmdir(
     transaction._root_stamp = root_stamp
     transaction._directories = {parts: current}
     claim_key = (root, root_stamp, parts[-1])
-    calls: list[str] = []
-    claim_owner = SimpleNamespace(close=lambda: calls.append("release"))
+    mutation_calls: list[str] = []
+    claim_owner = SimpleNamespace(close=lambda: mutation_calls.append("release"))
     claim = (root.joinpath(*parts), current.expected, claim_owner)
     monkeypatch.setitem(workspace_module._ATTEMPT_ROOT_STAMPS, claim_key, claim)
 
@@ -537,15 +537,19 @@ def test_posix_pending_attempt_cleanup_releases_creation_claim_before_rmdir(
     def rmdir(name: str, *, dir_fd: int) -> None:
         assert name == parts[-1]
         assert dir_fd == parent.handle
-        assert claim_key not in workspace_module._ATTEMPT_ROOT_STAMPS
-        calls.append("rmdir")
+        mutation_calls.append("rmdir")
 
     monkeypatch.setattr(workspace_module._ExactCaseTransaction, "_directory", directory)
     monkeypatch.setattr(workspace_module, "os", SimpleNamespace(name="posix", rmdir=rmdir))
 
-    transaction.remove_empty_directory(Path(*parts))
+    with pytest.raises(
+        WorkspaceBoundaryError,
+        match="exact empty directory deletion is unavailable",
+    ):
+        transaction.remove_empty_directory(Path(*parts))
 
-    assert calls == ["release", "rmdir"]
+    assert mutation_calls == []
+    assert workspace_module._ATTEMPT_ROOT_STAMPS[claim_key] is claim
 
 
 def test_attempt_write_creates_nested_parents_under_exact_authority(tmp_path: Path) -> None:

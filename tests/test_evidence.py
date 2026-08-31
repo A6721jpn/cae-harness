@@ -1286,11 +1286,9 @@ def test_reopen_recovers_attempt_interrupted_before_recovery_backed_event(
     ]
 
 
-@pytest.mark.parametrize("interruption", ["marker-publication", "after-directory"])
-def test_attempt_recovery_marker_precedes_attempt_file_durability(
+def test_attempt_recovery_marker_publication_failure_is_evidence_error(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    interruption: str,
 ) -> None:
     _, case, intent = make_case(tmp_path)
     store = EvidenceStore(case, intent)
@@ -1304,14 +1302,9 @@ def test_attempt_recovery_marker_precedes_attempt_file_durability(
     ) -> None:
         nonlocal interruption_attempted
         relative = Path(relative_path).as_posix()
-        if interruption == "marker-publication" and relative == (
-            "90_Temporary/event-recovery.json"
-        ):
+        if relative == "90_Temporary/event-recovery.json":
             interruption_attempted = True
             raise OSError("injected recovery marker publication failure")
-        if interruption == "after-directory" and relative.endswith("/ATTEMPT.json"):
-            interruption_attempted = True
-            raise OSError("injected interruption before attempt file durability")
         original_replace(self, relative_path, data)
 
     with monkeypatch.context() as patch:
@@ -1320,7 +1313,10 @@ def test_attempt_recovery_marker_precedes_attempt_file_durability(
             "replace_bytes",
             fail_marker_publication,
         )
-        with pytest.raises((OSError, EvidenceIntegrityError)):
+        with pytest.raises(
+            EvidenceIntegrityError,
+            match="event log is missing or unreadable",
+        ):
             store.record_attempt("attempt-1", {"status": "prepared"})
 
     reopened = EvidenceStore.open(case)
@@ -1330,6 +1326,95 @@ def test_attempt_recovery_marker_precedes_attempt_file_durability(
     assert reopened.events_path.read_bytes() == b""
     assert reopened.manifest["events"]["count"] == 0
     assert reopened.manifest["attempts"] == []
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows exact directory cleanup")
+def test_attempt_recovery_after_directory_uses_live_same_process_claim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, case, intent = make_case(tmp_path)
+    store = EvidenceStore(case, intent)
+    original_replace = workspace_module._ExactCaseTransaction.replace_bytes
+    interruption_attempted = False
+
+    def fail_attempt_file_publication(
+        self: Any,
+        relative_path: str | Path,
+        data: bytes,
+    ) -> None:
+        nonlocal interruption_attempted
+        if Path(relative_path).as_posix().endswith("/ATTEMPT.json"):
+            interruption_attempted = True
+            raise OSError("injected interruption before attempt file durability")
+        original_replace(self, relative_path, data)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            workspace_module._ExactCaseTransaction,
+            "replace_bytes",
+            fail_attempt_file_publication,
+        )
+        with pytest.raises(
+            OSError,
+            match="injected interruption before attempt file durability",
+        ):
+            store.record_attempt("attempt-1", {"status": "prepared"})
+
+    reopened = EvidenceStore.open(case)
+
+    assert interruption_attempted
+    assert not (case.temporary_root / "attempts" / "attempt-1").exists()
+    assert reopened.events_path.read_bytes() == b""
+    assert reopened.manifest["events"]["count"] == 0
+    assert reopened.manifest["attempts"] == []
+
+
+def test_fresh_process_reopen_retains_empty_attempt_and_marker_without_claim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, case, intent = make_case(tmp_path)
+    store = EvidenceStore(case, intent)
+    original_replace = workspace_module._ExactCaseTransaction.replace_bytes
+
+    def fail_attempt_file_publication(
+        self: Any,
+        relative_path: str | Path,
+        data: bytes,
+    ) -> None:
+        if Path(relative_path).as_posix().endswith("/ATTEMPT.json"):
+            raise OSError("injected interruption before attempt file durability")
+        original_replace(self, relative_path, data)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            workspace_module._ExactCaseTransaction,
+            "replace_bytes",
+            fail_attempt_file_publication,
+        )
+        with pytest.raises(
+            OSError,
+            match="injected interruption before attempt file durability",
+        ):
+            store.record_attempt("attempt-1", {"status": "prepared"})
+
+    attempt_root = case.temporary_root / "attempts" / "attempt-1"
+    marker_path = case.temporary_root / "event-recovery.json"
+    case_stamp = workspace_module._registered_case_stamp(case)
+    claim_key = (case.case_root, case_stamp, "attempt-1")
+    claim = workspace_module._ATTEMPT_ROOT_STAMPS[claim_key]
+    workspace_module._release_attempt_root_claim(claim_key, claim)
+
+    with pytest.raises(
+        EvidenceIntegrityError,
+        match="empty pending attempt directory could not be recovered",
+    ):
+        EvidenceStore.open(case)
+
+    assert claim_key not in workspace_module._ATTEMPT_ROOT_STAMPS
+    assert attempt_root.is_dir()
+    assert marker_path.is_file()
 
 
 def test_reopen_rejects_invalid_enhanced_attempt_marker_before_directory(
