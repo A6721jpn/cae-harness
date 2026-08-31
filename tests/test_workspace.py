@@ -1230,3 +1230,104 @@ def test_failed_case_creation_deletes_authoritative_case_not_foreign_replacement
     assert blocked
     assert not displaced.exists(), "foreign replacement must not be installed"
     assert not case_path.exists(), "authoritative case directory must be deleted"
+
+
+def test_exact_case_transaction_owns_reads_and_replacements_for_full_body(
+    tmp_path: Path,
+) -> None:
+    workspace = make_workspace(tmp_path)
+    case = workspace.create_case("case-a")
+    target = case.write_text("90_Temporary/value.txt", "before")
+
+    assert callable(getattr(case, "_exact_transaction", None))
+    transaction = case._exact_transaction()
+    with transaction as exact:
+        assert exact.read_bytes("90_Temporary/value.txt") == b"before"
+        exact.replace_bytes("90_Temporary/value.txt", b"after")
+        assert exact.read_bytes("90_Temporary/value.txt") == b"after"
+
+    assert target.read_bytes() == b"after"
+    assert transaction.closed
+
+
+def test_exact_case_transaction_keeps_case_substitution_outside_owned_side_effects(
+    tmp_path: Path,
+) -> None:
+    workspace = make_workspace(tmp_path)
+    case = workspace.create_case("case-a")
+    target = case.write_text("90_Temporary/value.txt", "owned-before")
+    displaced = tmp_path / "displaced-case"
+
+    with case._exact_transaction() as exact:
+        if os.name == "nt":
+            with pytest.raises(OSError):
+                case.case_root.rename(displaced)
+        else:  # pragma: no cover - exercised by the POSIX gate
+            case.case_root.rename(displaced)
+            case.case_root.mkdir()
+            foreign_target = case.case_root / "90_Temporary" / "value.txt"
+            foreign_target.parent.mkdir()
+            foreign_target.write_text("foreign", encoding="utf-8")
+        exact.replace_bytes("90_Temporary/value.txt", b"owned-after")
+
+    if os.name == "nt":
+        assert target.read_bytes() == b"owned-after"
+    else:  # pragma: no cover - exercised by the POSIX gate
+        assert (displaced / "90_Temporary" / "value.txt").read_bytes() == b"owned-after"
+        assert foreign_target.read_text(encoding="utf-8") == "foreign"
+
+
+def test_exact_owner_retains_failed_cleanup_and_never_closes_foreign_reuse() -> None:
+    identity = ["owned"]
+    close_calls: list[int] = []
+
+    def identity_of(handle: int) -> str:
+        assert handle == 17
+        return identity[0]
+
+    def close_then_reuse(handle: int) -> None:
+        close_calls.append(handle)
+        identity[0] = "foreign"
+        raise OSError("close status lost after descriptor reuse")
+
+    owner = workspace_module._ExactOwner(
+        17,
+        "owned",
+        identity_of,
+        close_then_reuse,
+        "synthetic owner",
+    )
+    with pytest.raises(WorkspaceBoundaryError, match="cleanup ownership changed"):
+        owner.close()
+    owner.close()
+
+    assert close_calls == [17]
+    assert owner.released
+
+
+def test_exact_transaction_preserves_body_exception_and_retains_failed_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = make_workspace(tmp_path)
+    case = workspace.create_case("case-a")
+    transaction = case._exact_transaction()
+    real_close = workspace_module._close_handle
+    close_calls: list[int] = []
+
+    def fail_close(handle: int) -> None:
+        close_calls.append(handle)
+        raise OSError("synthetic close failure")
+
+    monkeypatch.setattr(workspace_module, "_close_handle", fail_close)
+    with pytest.raises(RuntimeError, match="primary body failure") as caught, transaction:
+        raise RuntimeError("primary body failure")
+
+    assert any("cleanup" in note for note in getattr(caught.value, "__notes__", ()))
+    assert not transaction.closed
+    assert len(close_calls) == 1
+
+    monkeypatch.setattr(workspace_module, "_close_handle", real_close)
+    transaction.close()
+    transaction.close()
+    assert transaction.closed
