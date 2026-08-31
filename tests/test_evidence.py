@@ -1236,6 +1236,56 @@ def test_reopen_rolls_forward_acknowledged_event_after_manifest_interruption(
     assert not tuple(case.case_root.glob(".CASE_MANIFEST.json.*"))
 
 
+def test_reopen_recovers_attempt_interrupted_before_recovery_backed_event(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, case, intent = make_case(tmp_path)
+    store = EvidenceStore(case, intent)
+    original_append = workspace_module._ExactCaseTransaction.append_bytes
+    interrupted = False
+
+    def interrupt_attempt_event_once(
+        self: Any,
+        relative_path: str | Path,
+        data: bytes,
+    ) -> None:
+        nonlocal interrupted
+        if not interrupted and Path(relative_path).as_posix() == EVENTS_FILE:
+            interrupted = True
+            raise OSError("simulated attempt event interruption")
+        original_append(self, relative_path, data)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            workspace_module._ExactCaseTransaction,
+            "append_bytes",
+            interrupt_attempt_event_once,
+        )
+        with pytest.raises(EvidenceIntegrityError):
+            store.record_attempt("attempt-1", {"status": "prepared"})
+
+    assert interrupted
+    assert store.events_path.read_text(encoding="utf-8") == ""
+    assert (case.temporary_root / "attempts" / "attempt-1" / "ATTEMPT.json").is_file()
+
+    reopened = EvidenceStore.open(case)
+    events = [
+        json.loads(line) for line in reopened.events_path.read_text(encoding="utf-8").splitlines()
+    ]
+
+    assert len(events) == 1
+    assert events[0]["event_type"] == "attempt_recorded"
+    assert events[0]["payload"]["attempt_id"] == "attempt-1"
+    assert reopened.manifest["attempts"] == [
+        {
+            "attempt_id": "attempt-1",
+            "path": "90_Temporary/attempts/attempt-1/ATTEMPT.json",
+            "sha256": events[0]["payload"]["sha256"],
+        }
+    ]
+
+
 @pytest.mark.parametrize(
     "operation",
     [

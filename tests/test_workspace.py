@@ -458,6 +458,59 @@ def test_attempt_factory_reuses_only_recorded_exact_creation_identity(tmp_path: 
     assert attempt_root.joinpath("foreign.txt").read_text(encoding="utf-8") == "foreign"
 
 
+def test_attempt_creation_identity_is_single_use_and_cross_case_scoped(tmp_path: Path) -> None:
+    workspace = make_workspace(tmp_path)
+    case_a = workspace.create_case("case-a")
+    case_b = workspace.create_case("case-b")
+    intent = IntentContract(engineering_question="Attempt identity lifetime")
+    EvidenceStore(case_a, intent).record_attempt("attempt-1")
+    EvidenceStore(case_b, intent).record_attempt("attempt-1")
+    root_a = case_a.temporary_root / "attempts" / "attempt-1"
+    root_b = case_b.temporary_root / "attempts" / "attempt-1"
+
+    issued_a = AttemptWorkspace._from_manager(workspace.open_case("case-a"), "attempt-1", root_a)
+    issued_b = AttemptWorkspace._from_manager(workspace.open_case("case-b"), "attempt-1", root_b)
+
+    assert issued_a.root == root_a
+    assert issued_b.root == root_b
+    with pytest.raises(WorkspaceBoundaryError, match="creation identity is required"):
+        AttemptWorkspace._from_manager(case_a, "attempt-1", root_a)
+    with pytest.raises(WorkspaceBoundaryError, match="creation identity is required"):
+        AttemptWorkspace._from_manager(case_b, "attempt-1", root_b)
+
+
+def test_unclaimed_attempt_creation_identities_have_a_bounded_lifetime(tmp_path: Path) -> None:
+    workspace = make_workspace(tmp_path)
+    case = workspace.create_case("case-a")
+    limit = 128
+
+    for index in range(limit + 1):
+        relative = Path("90_Temporary") / "attempts" / f"bounded-{index:03d}"
+        with case._exact_transaction() as exact:
+            exact.make_directory(relative)
+
+    case_stamp = workspace_module._registered_case_stamp(case)
+    registrations = {
+        key
+        for key in workspace_module._ATTEMPT_ROOT_STAMPS
+        if key[0] == case.case_root and key[1] == case_stamp
+    }
+
+    assert len(registrations) <= limit
+    with pytest.raises(WorkspaceBoundaryError, match="creation identity is required"):
+        AttemptWorkspace._from_manager(
+            case,
+            "bounded-000",
+            case.temporary_root / "attempts" / "bounded-000",
+        )
+    newest = AttemptWorkspace._from_manager(
+        case,
+        f"bounded-{limit:03d}",
+        case.temporary_root / "attempts" / f"bounded-{limit:03d}",
+    )
+    assert newest.attempt_id == f"bounded-{limit:03d}"
+
+
 def test_attempt_write_creates_nested_parents_under_exact_authority(tmp_path: Path) -> None:
     workspace = make_workspace(tmp_path)
     case = workspace.create_case("case-a")
@@ -810,6 +863,43 @@ def test_write_does_not_reopen_case_path_at_atomic_replace(
     assert not swapped
     assert written.read_text(encoding="utf-8") == "owned"
     assert not (case_b.case_root / "90_Temporary" / "replace-race.txt").exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows rename substitution")
+def test_replace_rejects_target_substitution_at_exact_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = make_workspace(tmp_path)
+    case = workspace.create_case("case-a")
+    relative = Path("90_Temporary") / "commit-race.txt"
+    target = case.case_root / relative
+    displaced = target.with_name("commit-race-owned.txt")
+    foreign = target.with_name("commit-race-foreign.txt")
+    case.write_text(relative, "authoritative-old")
+    foreign.write_text("foreign", encoding="utf-8")
+    original_replace = workspace_module._replace_exact_entry
+    substituted = False
+
+    def substitute_after_validation(*args: Any, **kwargs: Any) -> None:
+        nonlocal substituted
+        target.rename(displaced)
+        foreign.rename(target)
+        substituted = True
+        original_replace(*args, **kwargs)
+
+    monkeypatch.setattr(workspace_module, "_replace_exact_entry", substitute_after_validation)
+
+    with pytest.raises(WorkspaceBoundaryError):
+        case.write_text(relative, "authoritative-new")
+
+    assert substituted
+    assert target.read_text(encoding="utf-8") == "foreign"
+    retained = {
+        child.read_text(encoding="utf-8") for child in target.parent.iterdir() if child.is_file()
+    }
+    assert "authoritative-old" in retained
+    assert "authoritative-new" not in retained
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires Windows directory sharing semantics")
