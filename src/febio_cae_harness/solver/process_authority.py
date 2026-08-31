@@ -380,13 +380,40 @@ class _PosixProcessAuthority(ProcessAuthority):
 
 
 class _WindowsProcessAuthority(ProcessAuthority):
-    _JOB_ACCESS = 0x000C
+    _JOB_OBJECT_ASSIGN_PROCESS = 0x0001
+    _JOB_OBJECT_SET_ATTRIBUTES = 0x0002
+    _JOB_OBJECT_QUERY = 0x0004
+    _JOB_OBJECT_TERMINATE = 0x0008
+    _JOB_OBJECT_SET_SECURITY_ATTRIBUTES = 0x0010
+    _JOB_OBJECT_IMPERSONATE = 0x0020
+    _DELETE = 0x00010000
+    _WRITE_DAC = 0x00040000
+    _WRITE_OWNER = 0x00080000
+    _SYNCHRONIZE = 0x00100000
+    _JOB_RECONNECT_ACCESS = _JOB_OBJECT_QUERY | _SYNCHRONIZE
+    _JOB_DENIED_ACCESS = (
+        _DELETE
+        | _WRITE_DAC
+        | _WRITE_OWNER
+        | _JOB_OBJECT_ASSIGN_PROCESS
+        | _JOB_OBJECT_SET_ATTRIBUTES
+        | _JOB_OBJECT_TERMINATE
+        | _JOB_OBJECT_SET_SECURITY_ATTRIBUTES
+        | _JOB_OBJECT_IMPERSONATE
+    )
+    _JOB_DACL_SDDL = (
+        f"D:P(D;;0x{_JOB_DENIED_ACCESS:08X};;;OW)(A;;0x{_JOB_RECONNECT_ACCESS:08X};;;OW)"
+    )
     _PROCESS_ACCESS = 0x1101
+    _PROCESS_TERMINATE_ACCESS = 0x1001
     _PROCESS_QUERY = 0x1000
     _THREAD_SUSPEND_RESUME = 0x0002
     _THREAD_QUERY_LIMITED_INFORMATION = 0x0800
-    _TH32CS_SNAPPROCESS = 0x00000002
     _TH32CS_SNAPTHREAD = 0x00000004
+    _JOB_OBJECT_BASIC_PROCESS_ID_LIST = 3
+    _ERROR_MORE_DATA = 234
+    _ERROR_ACCESS_DENIED = 5
+    _STILL_ACTIVE = 259
     _STILL_SUSPENDED = 0xFFFFFFFF
 
     class _SecurityAttributes(ctypes.Structure):
@@ -407,18 +434,11 @@ class _WindowsProcessAuthority(ProcessAuthority):
             ("dwFlags", ctypes.c_uint32),
         ]
 
-    class _ProcessEntry32(ctypes.Structure):
+    class _JobProcessIdList(ctypes.Structure):
         _fields_ = [
-            ("dwSize", ctypes.c_uint32),
-            ("cntUsage", ctypes.c_uint32),
-            ("th32ProcessID", ctypes.c_uint32),
-            ("th32DefaultHeapID", ctypes.c_size_t),
-            ("th32ModuleID", ctypes.c_uint32),
-            ("cntThreads", ctypes.c_uint32),
-            ("th32ParentProcessID", ctypes.c_uint32),
-            ("pcPriClassBase", ctypes.c_int32),
-            ("dwFlags", ctypes.c_uint32),
-            ("szExeFile", ctypes.c_wchar * 260),
+            ("NumberOfAssignedProcesses", ctypes.c_uint32),
+            ("NumberOfProcessIdsInList", ctypes.c_uint32),
+            ("ProcessIdList", ctypes.c_size_t * 1),
         ]
 
     def __init__(
@@ -428,14 +448,18 @@ class _WindowsProcessAuthority(ProcessAuthority):
         name: str,
         handle: Any,
         context_digest: str,
+        child_handle: int | None = None,
         bound_pid: int | None = None,
         bound_creation_identity: str | None = None,
+        can_terminate_job: bool = True,
     ) -> None:
         self._binding = _attempt_binding(attempt_root)
         self._context_digest = _validate_context_digest(context_digest)
         self._handle = handle
+        self._child_handle = child_handle
         self._bound_pid = bound_pid
         self._bound_creation_identity = bound_creation_identity
+        self._can_terminate_job = can_terminate_job
         self._claim_verified = False
         self._root_checked = False
         self._claim = {
@@ -458,20 +482,35 @@ class _WindowsProcessAuthority(ProcessAuthority):
         k.AssignProcessToJobObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
         k.IsProcessInJob.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
         k.TerminateJobObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        k.TerminateJobObject.restype = ctypes.c_int
+        k.QueryInformationJobObject.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+        ]
+        k.QueryInformationJobObject.restype = ctypes.c_int
+        k.TerminateProcess.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        k.TerminateProcess.restype = ctypes.c_int
+        k.GetExitCodeProcess.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
+        k.GetExitCodeProcess.restype = ctypes.c_int
+        k.GetCurrentProcess.argtypes = []
+        k.GetCurrentProcess.restype = ctypes.c_void_p
+        k.DuplicateHandle.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_uint32,
+            ctypes.c_int,
+            ctypes.c_uint32,
+        ]
+        k.DuplicateHandle.restype = ctypes.c_int
         k.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
         k.OpenProcess.restype = ctypes.c_void_p
         k.CreateToolhelp32Snapshot.argtypes = [ctypes.c_uint32, ctypes.c_uint32]
         k.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
-        k.Process32FirstW.argtypes = [
-            ctypes.c_void_p,
-            ctypes.POINTER(_WindowsProcessAuthority._ProcessEntry32),
-        ]
-        k.Process32FirstW.restype = ctypes.c_int
-        k.Process32NextW.argtypes = [
-            ctypes.c_void_p,
-            ctypes.POINTER(_WindowsProcessAuthority._ProcessEntry32),
-        ]
-        k.Process32NextW.restype = ctypes.c_int
         k.Thread32First.argtypes = [
             ctypes.c_void_p,
             ctypes.POINTER(_WindowsProcessAuthority._ThreadEntry32),
@@ -489,7 +528,37 @@ class _WindowsProcessAuthority(ProcessAuthority):
         k.ResumeThread.argtypes = [ctypes.c_void_p]
         k.ResumeThread.restype = ctypes.c_uint32
         k.CloseHandle.argtypes = [ctypes.c_void_p]
+        k.CloseHandle.restype = ctypes.c_int
+        k.LocalFree.argtypes = [ctypes.c_void_p]
+        k.LocalFree.restype = ctypes.c_void_p
         return k
+
+    @staticmethod
+    def _advapi32() -> Any:
+        a = ctypes.WinDLL("advapi32", use_last_error=True)
+        a.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
+            ctypes.c_wchar_p,
+            ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(ctypes.c_uint32),
+        ]
+        a.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = ctypes.c_int
+        return a
+
+    @classmethod
+    def _job_security_descriptor(cls) -> int:
+        descriptor = ctypes.c_void_p()
+        if (
+            not cls._advapi32().ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                cls._JOB_DACL_SDDL,
+                1,
+                ctypes.byref(descriptor),
+                None,
+            )
+            or not descriptor.value
+        ):
+            raise ProcessAuthorityError("unable to create restricted job security descriptor")
+        return int(descriptor.value)
 
     @classmethod
     def create(
@@ -501,19 +570,40 @@ class _WindowsProcessAuthority(ProcessAuthority):
         binding = _attempt_binding(attempt_root)
         name = _windows_job_name(binding, context_digest)
         k = cls._kernel32()
-        security = cls._SecurityAttributes(ctypes.sizeof(cls._SecurityAttributes), None, 1)
-        ctypes.set_last_error(0)
-        handle = k.CreateJobObjectW(ctypes.byref(security), name)
+        descriptor = cls._job_security_descriptor()
+        security = cls._SecurityAttributes(
+            ctypes.sizeof(cls._SecurityAttributes),
+            descriptor,
+            0,
+        )
+        handle: Any = None
+        try:
+            ctypes.set_last_error(0)
+            handle = k.CreateJobObjectW(ctypes.byref(security), name)
+        finally:
+            if k.LocalFree(descriptor):
+                if handle:
+                    with contextlib.suppress(BaseException):
+                        k.CloseHandle(handle)
+                raise ProcessAuthorityError("unable to release restricted job security descriptor")
         if not handle:
             raise ProcessAuthorityError("unable to create process job attestation")
         if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
             k.CloseHandle(handle)
             raise ProcessAuthorityError("process authority job claim already exists")
+        try:
+            child_handle = cls._duplicate_child_handle(handle)
+        except BaseException:
+            with contextlib.suppress(BaseException):
+                k.CloseHandle(handle)
+            raise
         return cls(
             attempt_root,
             name=name,
             handle=handle,
             context_digest=context_digest,
+            child_handle=child_handle,
+            can_terminate_job=True,
         )
 
     @classmethod
@@ -532,7 +622,7 @@ class _WindowsProcessAuthority(ProcessAuthority):
         expected_name = _windows_job_name(binding, context_digest)
         if not isinstance(name, str) or name != expected_name:
             raise ProcessAuthorityError("process authority job name is invalid")
-        handle = cls._kernel32().OpenJobObjectW(cls._JOB_ACCESS, False, name)
+        handle = cls._kernel32().OpenJobObjectW(cls._JOB_RECONNECT_ACCESS, False, name)
         if not handle:
             raise ProcessAuthorityError("live process job attestation is unavailable")
         return cls(
@@ -542,6 +632,7 @@ class _WindowsProcessAuthority(ProcessAuthority):
             context_digest=context_digest,
             bound_pid=bound_pid,
             bound_creation_identity=bound_creation_identity,
+            can_terminate_job=False,
         )
 
     @property
@@ -558,7 +649,27 @@ class _WindowsProcessAuthority(ProcessAuthority):
         return {}
 
     def child_handle(self) -> int | None:
-        return None if self._handle is None else int(self._handle)
+        return self._child_handle
+
+    @classmethod
+    def _duplicate_child_handle(cls, handle: Any) -> int:
+        k = cls._kernel32()
+        current_process = k.GetCurrentProcess()
+        duplicate = ctypes.c_void_p()
+        if (
+            not k.DuplicateHandle(
+                current_process,
+                handle,
+                current_process,
+                ctypes.byref(duplicate),
+                cls._SYNCHRONIZE,
+                True,
+                0,
+            )
+            or not duplicate.value
+        ):
+            raise ProcessAuthorityError("unable to create inheritable child job lifetime handle")
+        return int(duplicate.value)
 
     @staticmethod
     def _creation_identity_from_handle(handle: Any) -> str:
@@ -584,46 +695,65 @@ class _WindowsProcessAuthority(ProcessAuthority):
             if opened:
                 k.CloseHandle(process)
 
+    def _job_pids(self) -> tuple[int, ...]:
+        """Read exact job membership through the held query capability."""
+
+        if not self._handle:
+            raise ProcessAuthorityError("process authority handle is unavailable")
+        k = self._kernel32()
+        offset = self._JobProcessIdList.ProcessIdList.offset
+        capacity = 16
+        for _ in range(8):
+            size = offset + ctypes.sizeof(ctypes.c_size_t) * capacity
+            buffer = ctypes.create_string_buffer(size)
+            ctypes.set_last_error(0)
+            queried = k.QueryInformationJobObject(
+                self._handle,
+                self._JOB_OBJECT_BASIC_PROCESS_ID_LIST,
+                buffer,
+                size,
+                None,
+            )
+            header = ctypes.cast(
+                buffer,
+                ctypes.POINTER(self._JobProcessIdList),
+            ).contents
+            assigned = int(header.NumberOfAssignedProcesses)
+            listed = int(header.NumberOfProcessIdsInList)
+            if queried:
+                if assigned != listed or listed > capacity:
+                    raise ProcessAuthorityError("attested job process list is incomplete")
+                values = (ctypes.c_size_t * listed).from_address(ctypes.addressof(buffer) + offset)
+                pids = tuple(int(value) for value in values)
+                if any(pid <= 0 for pid in pids) or len(set(pids)) != len(pids):
+                    raise ProcessAuthorityError("attested job process list is invalid")
+                return pids
+            if ctypes.get_last_error() != self._ERROR_MORE_DATA or assigned <= capacity:
+                raise ProcessAuthorityError("unable to enumerate attested job processes")
+            capacity = assigned
+        raise ProcessAuthorityError("attested job process list is unstable")
+
     def _job_members(self) -> tuple[tuple[int, str], ...]:
         k = self._kernel32()
-        snapshot = k.CreateToolhelp32Snapshot(self._TH32CS_SNAPPROCESS, 0)
-        invalid_handle = ctypes.c_void_p(-1).value
-        if not snapshot or snapshot == invalid_handle:
-            raise ProcessAuthorityError("unable to enumerate attested job processes")
         members: list[tuple[int, str]] = []
-        try:
-            entry = self._ProcessEntry32()
-            entry.dwSize = ctypes.sizeof(entry)
-            first = k.Process32FirstW(snapshot, ctypes.byref(entry))
-            while first:
-                pid = int(entry.th32ProcessID)
-                if pid > 0:
-                    process = k.OpenProcess(self._PROCESS_QUERY, False, pid)
-                    if process:
-                        try:
-                            in_job = ctypes.c_int()
-                            if (
-                                k.IsProcessInJob(
-                                    process,
-                                    self._handle,
-                                    ctypes.byref(in_job),
-                                )
-                                and in_job.value
-                            ):
-                                try:
-                                    identity = self._live_creation_identity(pid, process)
-                                except ProcessAuthorityError:
-                                    pass
-                                else:
-                                    members.append((pid, identity))
-                        finally:
-                            k.CloseHandle(process)
-                entry.dwSize = ctypes.sizeof(entry)
-                if not k.Process32NextW(snapshot, ctypes.byref(entry)):
-                    break
-                first = 1
-        finally:
-            k.CloseHandle(snapshot)
+        for pid in self._job_pids():
+            process = k.OpenProcess(self._PROCESS_QUERY, False, pid)
+            if not process:
+                if pid not in self._job_pids():
+                    continue
+                raise ProcessAuthorityError("unable to open attested job process")
+            try:
+                identity = self._live_creation_identity(pid, process)
+                in_job = ctypes.c_int()
+                if not k.IsProcessInJob(process, self._handle, ctypes.byref(in_job)):
+                    raise ProcessAuthorityError("unable to verify attested job process")
+                if not in_job.value:
+                    if pid not in self._job_pids():
+                        continue
+                    raise ProcessAuthorityError("attested job process membership changed")
+                members.append((pid, identity))
+            finally:
+                k.CloseHandle(process)
         return tuple(members)
 
     def _verify_root_process(self, pid: int, identity: str) -> None:
@@ -739,8 +869,68 @@ class _WindowsProcessAuthority(ProcessAuthority):
         raise ProcessAuthorityError(message)
 
     def _terminate_job(self) -> None:
-        if not self._handle or not self._kernel32().TerminateJobObject(self._handle, 1):
+        if not self._handle:
             raise ProcessAuthorityError("unable to terminate attested process tree")
+        if not self._can_terminate_job:
+            self._terminate_members()
+            return
+        if not self._kernel32().TerminateJobObject(self._handle, 1):
+            raise ProcessAuthorityError("unable to terminate attested process tree")
+
+    def _terminate_member(self, pid: int, expected_identity: str) -> None:
+        """Terminate one currently held job member after revalidating its identity."""
+
+        k = self._kernel32()
+        ctypes.set_last_error(0)
+        process = k.OpenProcess(self._PROCESS_TERMINATE_ACCESS, False, pid)
+        if not process:
+            error_code = ctypes.get_last_error()
+            if pid not in self._job_pids():
+                return
+            if error_code == self._ERROR_ACCESS_DENIED:
+                return
+            raise ProcessAuthorityError(
+                f"unable to open attested job member for termination ({error_code})"
+            )
+        try:
+            if self._live_creation_identity(pid, process) != expected_identity:
+                raise ProcessAuthorityError("attested job member identity changed")
+            in_job = ctypes.c_int()
+            if not k.IsProcessInJob(process, self._handle, ctypes.byref(in_job)):
+                raise ProcessAuthorityError("unable to verify attested job member")
+            if not in_job.value:
+                raise ProcessAuthorityError("process is no longer an attested job member")
+            ctypes.set_last_error(0)
+            if not k.TerminateProcess(process, 1):
+                error_code = ctypes.get_last_error()
+                exit_code = ctypes.c_uint32()
+                if (
+                    k.GetExitCodeProcess(process, ctypes.byref(exit_code))
+                    and exit_code.value != self._STILL_ACTIVE
+                ):
+                    return
+                if pid not in self._job_pids():
+                    return
+                if error_code == self._ERROR_ACCESS_DENIED:
+                    return
+                raise ProcessAuthorityError(
+                    f"unable to terminate attested job member ({error_code})"
+                )
+        finally:
+            k.CloseHandle(process)
+
+    def _terminate_members(self) -> None:
+        """Drain a reconnect authority without acquiring job-wide mutation rights."""
+
+        for _ in range(40):
+            members = self._job_members()
+            if not members:
+                return
+            for pid, identity in members:
+                self._terminate_member(pid, identity)
+            time.sleep(0.05)
+        if self._job_members():
+            raise ProcessAuthorityError("attested process descendants remain live")
 
     def verify(self, pid: int) -> None:
         pid = _validate_pid(pid)
@@ -778,10 +968,21 @@ class _WindowsProcessAuthority(ProcessAuthority):
             self._terminate_job()
 
     def close(self) -> None:
-        if self._handle:
-            handle, self._handle = self._handle, None
-            self._claim_verified = False
-            self._kernel32().CloseHandle(handle)
+        child_handle, self._child_handle = self._child_handle, None
+        handle, self._handle = self._handle, None
+        self._claim_verified = False
+        first_error: BaseException | None = None
+        kernel = self._kernel32()
+        for owned_handle in (child_handle, handle):
+            if owned_handle is None:
+                continue
+            try:
+                kernel.CloseHandle(owned_handle)
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+        if first_error is not None:
+            raise first_error
 
 
 __all__ = ["ProcessAuthority", "ProcessAuthorityError"]

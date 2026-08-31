@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import ctypes
 import os
 import subprocess
 import sys
@@ -228,9 +230,14 @@ def test_windows_immediate_descendant_runs_only_after_primary_binding(
     try:
         assert binding_observations == [False, False]
         deadline = time.monotonic() + 5.0
-        while not sentinel.exists() and time.monotonic() < deadline:
+        content = ""
+        while time.monotonic() < deadline:
+            with contextlib.suppress(FileNotFoundError):
+                content = sentinel.read_text(encoding="utf-8")
+            if content == "ran":
+                break
             time.sleep(0.02)
-        assert sentinel.read_text(encoding="utf-8") == "ran"
+        assert content == "ran"
     finally:
         assert supervisor.cancel().cancelled
 
@@ -268,12 +275,14 @@ def test_windows_native_failure_preserves_only_durable_authority_record(
 class _ClaimKernel:
     def __init__(self) -> None:
         self.opened_names: list[str] = []
+        self.opened_accesses: list[int] = []
         self.opened_pids: list[int] = []
         self.terminated: list[int] = []
 
     def OpenJobObjectW(self, access: int, inherit: bool, name: str) -> int:
-        del access, inherit
+        del inherit
         self.opened_names.append(name)
+        self.opened_accesses.append(access)
         return 700
 
     def OpenProcess(self, access: int, inherit: bool, pid: int) -> int:
@@ -293,6 +302,342 @@ class _ClaimKernel:
 
     def CloseHandle(self, handle: int) -> None:
         del handle
+
+
+class _ChildHandleKernel:
+    def __init__(
+        self,
+        *,
+        duplicate_succeeds: bool,
+        descriptor_succeeds: bool = True,
+        free_succeeds: bool = True,
+        create_succeeds: bool = True,
+    ) -> None:
+        self.duplicate_succeeds = duplicate_succeeds
+        self.descriptor_succeeds = descriptor_succeeds
+        self.free_succeeds = free_succeeds
+        self.create_succeeds = create_succeeds
+        self.closed: list[int] = []
+        self.freed: list[int] = []
+        self.security_sddl: list[str] = []
+        self.create_security: list[tuple[int | None, int]] = []
+        self.duplicate_calls: list[tuple[int, int, int, int, bool, int]] = []
+
+    def ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        self,
+        sddl: str,
+        revision: int,
+        descriptor: Any,
+        size: object,
+    ) -> int:
+        del revision, size
+        self.security_sddl.append(sddl)
+        if self.descriptor_succeeds:
+            descriptor._obj.value = 600
+        return int(self.descriptor_succeeds)
+
+    def CreateJobObjectW(self, security: Any, name: str) -> int:
+        del name
+        self.create_security.append(
+            (security._obj.lpSecurityDescriptor, security._obj.bInheritHandle)
+        )
+        return 700 if self.create_succeeds else 0
+
+    def GetCurrentProcess(self) -> int:
+        return -1
+
+    def DuplicateHandle(
+        self,
+        source_process: int,
+        source_handle: int,
+        target_process: int,
+        target_handle: Any,
+        access: int,
+        inherit: bool,
+        options: int,
+    ) -> int:
+        self.duplicate_calls.append(
+            (source_process, source_handle, target_process, access, inherit, options)
+        )
+        if self.duplicate_succeeds:
+            target_handle._obj.value = 701
+        return int(self.duplicate_succeeds)
+
+    def CloseHandle(self, handle: int) -> None:
+        self.closed.append(handle)
+
+    def LocalFree(self, descriptor: int) -> int | None:
+        self.freed.append(descriptor)
+        return None if self.free_succeeds else descriptor
+
+
+def _native_handle_api() -> Any:
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.GetCurrentProcess.argtypes = []
+    kernel.GetCurrentProcess.restype = ctypes.c_void_p
+    kernel.GetHandleInformation.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_uint32),
+    ]
+    kernel.GetHandleInformation.restype = ctypes.c_int
+    kernel.DuplicateHandle.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_uint32,
+        ctypes.c_int,
+        ctypes.c_uint32,
+    ]
+    kernel.DuplicateHandle.restype = ctypes.c_int
+    kernel.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel.CloseHandle.restype = ctypes.c_int
+    kernel.AssignProcessToJobObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    kernel.AssignProcessToJobObject.restype = ctypes.c_int
+    kernel.QueryInformationJobObject.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+    ]
+    kernel.QueryInformationJobObject.restype = ctypes.c_int
+    kernel.TerminateJobObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    kernel.TerminateJobObject.restype = ctypes.c_int
+    kernel.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+    kernel.OpenProcess.restype = ctypes.c_void_p
+    kernel.OpenJobObjectW.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_wchar_p]
+    kernel.OpenJobObjectW.restype = ctypes.c_void_p
+    return kernel
+
+
+def test_windows_child_job_handle_is_restricted_and_retains_job_lifetime(
+    tmp_path: Path,
+) -> None:
+    digest = "e" * 64
+    authority = authority_module._WindowsProcessAuthority.create(tmp_path, digest)
+    kernel = _native_handle_api()
+    full_handle = int(authority._handle)
+    child_handle = authority.child_handle()
+    assert child_handle is not None
+    assert child_handle != full_handle
+
+    inherit_flag = 0x00000001
+    full_information = ctypes.c_uint32()
+    child_information = ctypes.c_uint32()
+    assert kernel.GetHandleInformation(ctypes.c_void_p(full_handle), ctypes.byref(full_information))
+    assert kernel.GetHandleInformation(
+        ctypes.c_void_p(child_handle), ctypes.byref(child_information)
+    )
+    assert not full_information.value & inherit_flag
+    assert child_information.value & inherit_flag
+
+    child_code = "\n".join(
+        (
+            "import ctypes, sys, time",
+            "k = ctypes.WinDLL('kernel32', use_last_error=True)",
+            "k.GetCurrentProcess.argtypes = []",
+            "k.GetCurrentProcess.restype = ctypes.c_void_p",
+            "k.DuplicateHandle.argtypes = [ctypes.c_void_p, ctypes.c_void_p, "
+            "ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p), ctypes.c_uint32, "
+            "ctypes.c_int, ctypes.c_uint32]",
+            "k.DuplicateHandle.restype = ctypes.c_int",
+            "k.AssignProcessToJobObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]",
+            "k.AssignProcessToJobObject.restype = ctypes.c_int",
+            "k.QueryInformationJobObject.argtypes = [ctypes.c_void_p, ctypes.c_int, "
+            "ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p]",
+            "k.QueryInformationJobObject.restype = ctypes.c_int",
+            "k.TerminateJobObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]",
+            "k.TerminateJobObject.restype = ctypes.c_int",
+            "k.OpenJobObjectW.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_wchar_p]",
+            "k.OpenJobObjectW.restype = ctypes.c_void_p",
+            "k.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]",
+            "k.OpenProcess.restype = ctypes.c_void_p",
+            "k.CloseHandle.argtypes = [ctypes.c_void_p]",
+            "k.CloseHandle.restype = ctypes.c_int",
+            "current = k.GetCurrentProcess()",
+            "handle = ctypes.c_void_p(int(sys.argv[1]))",
+            "target = k.OpenProcess(0x101, 0, int(sys.argv[2]))",
+            "assigned = k.AssignProcessToJobObject(handle, target)",
+            "query_buffer = ctypes.create_string_buffer(64)",
+            "queried = k.QueryInformationJobObject(handle, 1, query_buffer, 64, None)",
+            "terminated = k.TerminateJobObject(handle, 1)",
+            "duplicate_results = []",
+            "for access in (0x1, 0x2, 0x4, 0x8, 0x10, 0x20, 0x10000, 0x40000, 0x80000, 0x100000):",
+            "    duplicate = ctypes.c_void_p()",
+            "    ok = k.DuplicateHandle(current, handle, current, "
+            "ctypes.byref(duplicate), access, 0, 0)",
+            "    duplicate_results.append(int(bool(ok)))",
+            "    if duplicate: k.CloseHandle(duplicate)",
+            "open_results = []",
+            "for access in (0x1, 0x2, 0x4, 0x8, 0x10, 0x20, 0x10000, 0x40000, 0x80000, 0x100000):",
+            "    opened = k.OpenJobObjectW(access, 0, sys.argv[3])",
+            "    open_results.append(int(bool(opened)))",
+            "    if opened: k.CloseHandle(opened)",
+            "print('direct', int(bool(assigned)), int(bool(queried)), "
+            "int(bool(terminated)), flush=True)",
+            "print('duplicate', *duplicate_results, flush=True)",
+            "print('open', *open_results, flush=True)",
+            "if target: k.CloseHandle(target)",
+            "time.sleep(30)",
+        )
+    )
+    target = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    startup_info = subprocess.STARTUPINFO()
+    startup_info.lpAttributeList = {"handle_list": [child_handle]}
+    name = authority_module._windows_job_name(authority_module._attempt_binding(tmp_path), digest)
+    helper = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            child_code,
+            str(child_handle),
+            str(target.pid),
+            name,
+        ],
+        close_fds=True,
+        startupinfo=startup_info,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    reopened: int | None = None
+    try:
+        assert helper.stdout is not None
+        assert helper.stdout.readline().strip() == "direct 0 0 0"
+        assert helper.stdout.readline().strip() == "duplicate 0 0 1 0 0 0 0 0 0 1"
+        assert helper.stdout.readline().strip() == "open 0 0 1 0 0 0 0 0 0 1"
+        assert target.poll() is None
+        authority.close()
+        authority.close()
+        reopened = kernel.OpenJobObjectW(
+            authority_module._WindowsProcessAuthority._JOB_OBJECT_QUERY
+            | authority_module._WindowsProcessAuthority._SYNCHRONIZE,
+            False,
+            name,
+        )
+        assert reopened
+    finally:
+        if reopened:
+            kernel.CloseHandle(reopened)
+        helper.kill()
+        helper.wait(timeout=5)
+        if target.poll() is None:
+            target.kill()
+        target.wait(timeout=5)
+        authority.close()
+
+
+def test_windows_child_job_handle_duplicate_failure_closes_full_handle_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    kernel = _ChildHandleKernel(duplicate_succeeds=False)
+    monkeypatch.setattr(
+        authority_module._WindowsProcessAuthority,
+        "_kernel32",
+        staticmethod(lambda: kernel),
+    )
+    monkeypatch.setattr(
+        authority_module._WindowsProcessAuthority,
+        "_advapi32",
+        staticmethod(lambda: kernel),
+    )
+
+    with pytest.raises(ProcessAuthorityError, match="child|retention|duplicate"):
+        authority_module._WindowsProcessAuthority.create(tmp_path, "f" * 64)
+
+    assert kernel.closed == [700]
+    assert kernel.freed == [600]
+    assert kernel.security_sddl == [authority_module._WindowsProcessAuthority._JOB_DACL_SDDL]
+    assert kernel.create_security == [(600, 0)]
+    assert len(kernel.duplicate_calls) == 1
+    assert kernel.duplicate_calls[0][4] is True
+
+
+def test_windows_child_job_handle_close_is_idempotent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    kernel = _ChildHandleKernel(duplicate_succeeds=True)
+    monkeypatch.setattr(
+        authority_module._WindowsProcessAuthority,
+        "_kernel32",
+        staticmethod(lambda: kernel),
+    )
+    monkeypatch.setattr(
+        authority_module._WindowsProcessAuthority,
+        "_advapi32",
+        staticmethod(lambda: kernel),
+    )
+
+    authority = authority_module._WindowsProcessAuthority.create(tmp_path, "a" * 64)
+    authority.close()
+    authority.close()
+
+    assert kernel.closed == [701, 700]
+    assert kernel.freed == [600]
+    assert kernel.create_security == [(600, 0)]
+    assert len(kernel.duplicate_calls) == 1
+    assert kernel.duplicate_calls[0][3] == authority_module._WindowsProcessAuthority._SYNCHRONIZE
+    assert kernel.duplicate_calls[0][4] is True
+
+
+@pytest.mark.parametrize(
+    ("kernel", "message", "closed", "freed"),
+    (
+        (
+            _ChildHandleKernel(
+                duplicate_succeeds=True,
+                descriptor_succeeds=False,
+            ),
+            "security descriptor",
+            [],
+            [],
+        ),
+        (
+            _ChildHandleKernel(
+                duplicate_succeeds=True,
+                create_succeeds=False,
+            ),
+            "create process job",
+            [],
+            [600],
+        ),
+        (
+            _ChildHandleKernel(
+                duplicate_succeeds=True,
+                free_succeeds=False,
+            ),
+            "release restricted job security descriptor",
+            [700],
+            [600],
+        ),
+    ),
+)
+def test_windows_child_job_handle_security_setup_failure_closes_every_owned_handle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kernel: _ChildHandleKernel,
+    message: str,
+    closed: list[int],
+    freed: list[int],
+) -> None:
+    monkeypatch.setattr(
+        authority_module._WindowsProcessAuthority,
+        "_kernel32",
+        staticmethod(lambda: kernel),
+    )
+    monkeypatch.setattr(
+        authority_module._WindowsProcessAuthority,
+        "_advapi32",
+        staticmethod(lambda: kernel),
+    )
+
+    with pytest.raises(ProcessAuthorityError, match=message):
+        authority_module._WindowsProcessAuthority.create(tmp_path, "6" * 64)
+
+    assert kernel.closed == closed
+    assert kernel.freed == freed
+    assert kernel.duplicate_calls == []
 
 
 def _windows_claim(root: Path, digest: str, name: str) -> dict[str, object]:
@@ -350,6 +695,115 @@ def test_windows_reconnect_rejects_same_job_descendant_without_terminating_job(
 
     assert kernel.opened_pids == []
     assert kernel.terminated == []
+
+
+def test_windows_reconnect_limited_authority_opens_query_and_synchronize_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    digest = "9" * 64
+    kernel = _ClaimKernel()
+    monkeypatch.setattr(
+        authority_module._WindowsProcessAuthority,
+        "_kernel32",
+        staticmethod(lambda: kernel),
+    )
+    binding = authority_module._attempt_binding(tmp_path)
+    name = f"Local\\febio-cae-{binding}-{digest}"
+
+    authority = ProcessAuthority.from_claim(
+        tmp_path,
+        _windows_claim(tmp_path, digest, name),
+        digest,
+    )
+    authority.close()
+
+    assert kernel.opened_accesses == [
+        authority_module._WindowsProcessAuthority._JOB_OBJECT_QUERY
+        | authority_module._WindowsProcessAuthority._SYNCHRONIZE
+    ]
+
+
+def test_windows_reconnect_limited_authority_never_uses_job_wide_terminate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    digest = "8" * 64
+    kernel = _ClaimKernel()
+    authority = authority_module._WindowsProcessAuthority(
+        tmp_path,
+        name="Local\\febio-cae-limited-termination",
+        handle=700,
+        context_digest=digest,
+        bound_pid=101,
+        bound_creation_identity="windows:1001",
+        can_terminate_job=False,
+    )
+    batches = iter(
+        (
+            ((101, "windows:1001"), (202, "windows:2002")),
+            (),
+        )
+    )
+    terminated: list[tuple[int, str]] = []
+    monkeypatch.setattr(
+        authority_module._WindowsProcessAuthority,
+        "_kernel32",
+        staticmethod(lambda: kernel),
+    )
+    monkeypatch.setattr(
+        authority, "verify", lambda pid: setattr(authority, "_claim_verified", True)
+    )
+    monkeypatch.setattr(authority, "_job_members", lambda: next(batches))
+    monkeypatch.setattr(
+        authority,
+        "_terminate_member",
+        lambda pid, identity: terminated.append((pid, identity)),
+    )
+
+    authority.terminate(101)
+
+    assert terminated == [(101, "windows:1001"), (202, "windows:2002")]
+    assert kernel.terminated == []
+
+
+def test_windows_reconnect_limited_authority_terminates_only_its_native_job_member(
+    tmp_path: Path,
+) -> None:
+    digest = "7" * 64
+    creator = authority_module._WindowsProcessAuthority.create(tmp_path, digest)
+    child_handle = creator.child_handle()
+    assert child_handle is not None
+    startup_info = subprocess.STARTUPINFO()
+    startup_info.lpAttributeList = {"handle_list": [child_handle]}
+    root = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        close_fds=True,
+        startupinfo=startup_info,
+    )
+    unrelated = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    limited: ProcessAuthority | None = None
+    try:
+        identity = supervisor_module._process_metadata(root.pid).creation_identity
+        creator.bind(root.pid, identity)
+        claim = creator.claim
+        creator.close()
+        limited = ProcessAuthority.from_claim(tmp_path, claim, digest)
+        limited.verify(root.pid)
+
+        limited.terminate(root.pid)
+
+        root.wait(timeout=5)
+        assert root.poll() is not None
+        assert unrelated.poll() is None
+    finally:
+        if limited is not None:
+            limited.close()
+        creator.close()
+        if root.poll() is None:
+            root.kill()
+        root.wait(timeout=5)
+        if unrelated.poll() is None:
+            unrelated.kill()
+        unrelated.wait(timeout=5)
 
 
 def test_windows_binding_rejects_creation_identity_changed_before_assignment(
