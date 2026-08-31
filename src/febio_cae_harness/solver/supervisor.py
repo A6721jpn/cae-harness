@@ -316,6 +316,8 @@ def _windows_duplicate_record_claim(path: Path) -> int | None:
             if entry_matches is not True:
                 raise SolverOwnershipError("process record registry claim identity is uncertain")
             probe_fd: _WindowsProbeFd | None = None
+            duplicate_owner: _ProcessRecordClaim | None = None
+            duplicate_owner_adopted = False
             try:
                 probe_fd = _windows_probe_process_record(path)
                 probe_metadata = os.fstat(probe_fd)
@@ -328,18 +330,44 @@ def _windows_duplicate_record_claim(path: Path) -> int | None:
                     duplicate_native_handle=_windows_duplicate_native_handle,
                     close_native_handle=_windows_close_native_handle,
                 )
+                duplicate_native = getattr(duplicate, "native_handle", None)
+                if duplicate_native is None:
+                    raise SolverOwnershipError(
+                        "duplicated process record has no exact native guard"
+                    )
+                duplicate_owner = _ProcessRecordClaim(
+                    path=path,
+                    content=b"",
+                    device=device,
+                    inode=inode,
+                    state=None,
+                    handle=int(duplicate),
+                    name=path.name,
+                    native_handle=duplicate_native,
+                )
                 retained.append(entry)
                 retained.extend(entries[index + 1 :])
                 _WINDOWS_RECORD_CLAIMS[key] = retained
                 return duplicate
             except FileNotFoundError as error:
+                if duplicate_owner is not None:
+                    _DURABLE_CLAIM_CLEANUP.adopt(None, None, (duplicate_owner,))
+                    duplicate_owner_adopted = True
                 raise SolverOwnershipError("process record registry path is unavailable") from error
             except BaseException:
+                if duplicate_owner is not None:
+                    _DURABLE_CLAIM_CLEANUP.adopt(None, None, (duplicate_owner,))
+                    duplicate_owner_adopted = True
                 _WINDOWS_RECORD_CLAIMS[key] = retained + entries[index:]
                 raise
             finally:
                 if probe_fd is not None:
-                    _close_windows_probe(probe_fd)
+                    try:
+                        _close_windows_probe(probe_fd)
+                    except BaseException:
+                        if duplicate_owner is not None and not duplicate_owner_adopted:
+                            _DURABLE_CLAIM_CLEANUP.adopt(None, None, (duplicate_owner,))
+                        raise
         _WINDOWS_RECORD_CLAIMS[key] = retained
         return None
 

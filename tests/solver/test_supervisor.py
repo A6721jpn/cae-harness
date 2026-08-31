@@ -11,6 +11,7 @@ import os
 import subprocess
 import sys
 import weakref
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -28,6 +29,7 @@ from febio_cae_harness.solver.process_authority import ProcessAuthority, Process
 from febio_cae_harness.solver.runtime import (
     FebioRuntimeDiagnostic,
     _acquire_runtime_launch_claim,
+    _windows_convert_raw_handle,
     probe_febio,
 )
 from febio_cae_harness.solver.supervisor import SolverSupervisor
@@ -2721,6 +2723,177 @@ def test_windows_duplicate_record_claim_returns_exact_guarded_descriptor(
             if native_handle is not None:
                 with contextlib.suppress(OSError):
                     runtime_module._windows_close_native_handle(native_handle)
+        with contextlib.suppress(BaseException):
+            supervisor.cancel()
+
+
+def test_windows_duplicate_record_claim_late_probe_close_failure_retains_exact_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A late probe-close failure durably owns the unreturned duplicate exactly."""
+
+    if os.name != "nt":
+        pytest.fail("required Windows duplicate cleanup test executed on a non-Windows host")
+
+    capability = _capability(tmp_path, monkeypatch, code="import time; time.sleep(30)")
+    supervisor = SolverSupervisor(capability)
+    supervisor.start()
+    original_claim = supervisor._process_record_claim
+    assert original_claim is not None and original_claim.handle is not None
+    record_path = Path(os.fspath(supervisor.process_record_path))
+    record_key = supervisor_module._windows_record_claim_key(record_path)
+    original_probe = supervisor_module._windows_probe_process_record
+    original_convert = _windows_convert_raw_handle
+    original_close = os.close
+    original_open = os.open
+    original_close_native = runtime_module._windows_close_native_handle
+    captured_probes: list[supervisor_module._WindowsProbeFd] = []
+    captured_duplicates: list[int] = []
+    probe_foreign_fd: int | None = None
+    duplicate_foreign_fd: int | None = None
+    duplicate_owner_observed = False
+    native_close_attempts: list[int] = []
+    fail_probe_native_close = True
+    duplicate: int | None = None
+
+    def capture_probe(path: Path) -> supervisor_module._WindowsProbeFd:
+        probe = original_probe(path)
+        captured_probes.append(probe)
+        return probe
+
+    def capture_convert(
+        raw_handle: int,
+        descriptor_flags: int,
+        *,
+        duplicate_native_handle: Callable[[int], int] | None = None,
+        close_native_handle: Callable[[int], None] | None = None,
+    ) -> int:
+        result = original_convert(
+            raw_handle,
+            descriptor_flags,
+            duplicate_native_handle=duplicate_native_handle,
+            close_native_handle=close_native_handle,
+        )
+        if descriptor_flags == os.O_RDWR:
+            captured_duplicates.append(result)
+        return result
+
+    def failing_close_native(native_handle: int) -> None:
+        native_close_attempts.append(native_handle)
+        if (
+            fail_probe_native_close
+            and captured_probes
+            and native_handle == captured_probes[0].native_handle
+        ):
+            raise OSError("synthetic probe native close failure")
+        original_close_native(native_handle)
+
+    def partially_close_probe(fd: int) -> None:
+        nonlocal probe_foreign_fd
+        assert captured_probes
+        probe = captured_probes[0]
+        if fd == int(probe) and probe_foreign_fd is None:
+            original_close(fd)
+            probe_foreign_fd = original_open(
+                os.fspath(tmp_path / "late-probe-foreign.bin"),
+                os.O_RDWR | os.O_CREAT,
+                0o600,
+            )
+            if probe_foreign_fd != fd:
+                duplicated = os.dup2(probe_foreign_fd, fd)
+                original_close(probe_foreign_fd)
+                probe_foreign_fd = duplicated
+            assert probe_foreign_fd == fd
+            raise OSError("synthetic probe CRT close failure after retirement")
+        original_close(fd)
+
+    try:
+        monkeypatch.setattr(runtime_module, "_windows_close_native_handle", failing_close_native)
+        with monkeypatch.context() as fault_patch:
+            fault_patch.setattr(supervisor_module, "_windows_probe_process_record", capture_probe)
+            fault_patch.setattr(supervisor_module, "_windows_convert_raw_handle", capture_convert)
+            fault_patch.setattr(os, "close", partially_close_probe)
+            with pytest.raises(OSError, match="synthetic probe native close failure"):
+                duplicate = supervisor_module._windows_duplicate_record_claim(record_path)
+
+        assert duplicate is None
+        assert captured_probes
+        assert captured_duplicates
+        probe = captured_probes[0]
+        duplicate = captured_duplicates[0]
+        duplicate_native = getattr(duplicate, "native_handle", None)
+        probe_native = probe.native_handle
+        assert duplicate_native is not None
+        assert probe.handle is None
+        assert probe_native is not None
+        assert any(held is probe for held in supervisor_module._WINDOWS_PROBE_CLAIMS)
+
+        duplicate_owners = [
+            owner
+            for owner in supervisor_module._DURABLE_CLAIM_CLEANUP._process_record_claims
+            if owner.handle == int(duplicate) and owner.native_handle == duplicate_native
+        ]
+        duplicate_owner_observed = bool(duplicate_owners)
+        assert len(duplicate_owners) == 1
+        duplicate_owner = duplicate_owners[0]
+        assert duplicate_owner.handle == int(duplicate)
+        assert duplicate_owner.native_handle == duplicate_native
+        assert supervisor._process_record_claim is original_claim
+        entries = supervisor_module._WINDOWS_RECORD_CLAIMS.get(record_key)
+        assert entries is not None
+        assert any(entry.owner is original_claim for entry in entries)
+        assert probe_foreign_fd is not None
+        os.write(probe_foreign_fd, b"probe-foreign")
+
+        fail_probe_native_close = False
+        os.fstat(int(duplicate))
+        original_close(int(duplicate))
+        duplicate.handle = None  # type: ignore[attr-defined]
+        duplicate_foreign_fd = original_open(
+            os.fspath(tmp_path / "late-duplicate-foreign.bin"),
+            os.O_RDWR | os.O_CREAT,
+            0o600,
+        )
+        if duplicate_foreign_fd != int(duplicate):
+            duplicated = os.dup2(duplicate_foreign_fd, int(duplicate))
+            original_close(duplicate_foreign_fd)
+            duplicate_foreign_fd = duplicated
+        assert duplicate_foreign_fd == int(duplicate)
+        supervisor_module._drain_durable_cleanup()
+        assert duplicate_owner.handle is None
+        assert duplicate_owner.native_handle is None
+        assert not any(
+            owner is duplicate_owner
+            for owner in supervisor_module._DURABLE_CLAIM_CLEANUP._process_record_claims
+        )
+        assert native_close_attempts.count(duplicate_native) == 1
+        os.write(duplicate_foreign_fd, b"duplicate-foreign")
+        assert probe.native_handle is None
+        assert not any(held is probe for held in supervisor_module._WINDOWS_PROBE_CLAIMS)
+        assert native_close_attempts.count(probe_native) == 2
+        assert original_claim.handle is not None
+        assert supervisor_module._read_record_fd(original_claim.handle)
+    finally:
+        fail_probe_native_close = False
+        with contextlib.suppress(BaseException):
+            supervisor_module._drain_durable_cleanup()
+        if not duplicate_owner_observed and duplicate is not None:
+            duplicate_handle = getattr(duplicate, "handle", None)
+            if duplicate_handle is not None:
+                with contextlib.suppress(OSError):
+                    original_close(int(duplicate_handle))
+                duplicate.handle = None  # type: ignore[attr-defined]
+            duplicate_native = getattr(duplicate, "native_handle", None)
+            if duplicate_native is not None:
+                with contextlib.suppress(OSError):
+                    original_close_native(duplicate_native)
+                duplicate.native_handle = None  # type: ignore[attr-defined]
+        if probe_foreign_fd is not None:
+            with contextlib.suppress(OSError):
+                original_close(probe_foreign_fd)
+        if duplicate_foreign_fd is not None:
+            with contextlib.suppress(OSError):
+                original_close(duplicate_foreign_fd)
         with contextlib.suppress(BaseException):
             supervisor.cancel()
 
