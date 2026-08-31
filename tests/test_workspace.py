@@ -161,6 +161,40 @@ def test_create_case_copies_one_stable_source_object(
     assert source.read_bytes() == b"authoritative input"
 
 
+def test_create_case_revalidates_all_sources_before_return(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    earlier_source = tmp_path / "earlier.feb"
+    later_source = tmp_path / "later.feb"
+    earlier_initial = b"earlier authoritative input"
+    earlier_changed = b"earlier changed by test"
+    later_initial = b"later authoritative input"
+    earlier_source.write_bytes(earlier_initial)
+    later_source.write_bytes(later_initial)
+    workspace = make_workspace(tmp_path)
+    original_copyfileobj = shutil.copyfileobj
+    changed = False
+
+    def change_earlier_while_copying_later(source_stream: IO[Any], target: IO[Any]) -> None:
+        nonlocal changed
+        if Path(source_stream.name) == later_source and not changed:
+            target.write(source_stream.read(1))
+            earlier_source.write_bytes(earlier_changed)
+            changed = True
+        original_copyfileobj(source_stream, target)
+
+    monkeypatch.setattr(shutil, "copyfileobj", change_earlier_while_copying_later)
+
+    with pytest.raises(WorkspaceBoundaryError, match="changed during case creation"):
+        workspace.create_case("case-a", [earlier_source, later_source])
+
+    assert changed
+    assert not (workspace.cae_root / "case-a").exists()
+    assert earlier_source.read_bytes() == earlier_changed
+    assert later_source.read_bytes() == later_initial
+
+
 def test_original_input_is_immutable_through_case_handle(tmp_path: Path) -> None:
     source = tmp_path / "input.feb"
     source.write_bytes(b"original")

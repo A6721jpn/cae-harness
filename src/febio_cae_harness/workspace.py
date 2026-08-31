@@ -1394,6 +1394,25 @@ class ValidatedCaseWorkspace:
                             )
                         copied_inputs.append(_lexical_path(destination))
 
+                    for source, source_stream, stream_state, initial_digest in opened_sources:
+                        if (
+                            _source_stream_state(source_stream) != stream_state
+                            or _source_path_state(source.path) != source.state
+                        ):
+                            raise WorkspaceBoundaryError(
+                                "original input changed during case creation"
+                            )
+                        source_stream.seek(0)
+                        final_digest = _stream_sha256(source_stream)
+                        if (
+                            final_digest != initial_digest
+                            or _source_stream_state(source_stream) != stream_state
+                            or _source_path_state(source.path) != source.state
+                        ):
+                            raise WorkspaceBoundaryError(
+                                "original input changed during case creation"
+                            )
+
                     return CaseWorkspace._from_manager(
                         manager,
                         case_id,
