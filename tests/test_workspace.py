@@ -1599,9 +1599,9 @@ def test_posix_discard_retains_exact_owner_without_namespace_unlink(
     transaction._discard(("90_Temporary", "owned.tmp"), discarded, primary)
 
     assert mutations == []
-    assert getattr(primary, "__notes__", ()) == (
+    assert getattr(primary, "__notes__", ()) == [
         "synthetic temporary cleanup failed: exact-object cleanup is unavailable on this platform",
-    )
+    ]
     assert not parent.released
     assert not discarded.released
 
