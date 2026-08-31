@@ -570,7 +570,7 @@ def _windows_create_resume_event(name: str) -> int:
             descriptor,
             0,
         )
-        created = kernel32.CreateEventW(ctypes.byref(security), False, False, name)
+        created = kernel32.CreateEventW(ctypes.byref(security), True, False, name)
         raw_value = created.value if isinstance(created, ctypes.c_void_p) else created
         if raw_value:
             raw_handle = int(raw_value)

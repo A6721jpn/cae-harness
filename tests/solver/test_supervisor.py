@@ -501,6 +501,95 @@ def test_windows_resume_event_dacl_blocks_external_mutation_and_setevent(
         _cleanup_windows_resume_recovery(capability, supervisor, process, bound_record, record_path)
 
 
+def test_windows_external_wait_preserves_resume_event_for_reconnect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A permitted external wait must not consume crash-recovery authority."""
+
+    if os.name != "nt":
+        pytest.fail("required Windows resume-event durability test executed on a non-Windows host")
+
+    (
+        capability,
+        supervisor,
+        process,
+        _authority,
+        bound_record,
+        _running_record,
+        record_path,
+    ) = _prepare_windows_resume_recovery(tmp_path, monkeypatch, resume_before_crash=False)
+    transaction_path = record_path.with_name(".process.json.resume")
+    resume_claim = cast(Any, supervisor._test_resume_transaction_claim)  # type: ignore[attr-defined]
+    event_name = resume_claim.event_name
+    record_before = record_path.read_bytes()
+    transaction_before = transaction_path.read_bytes()
+    helper_code = "\n".join(
+        (
+            "import ctypes, sys",
+            "k = ctypes.WinDLL('kernel32', use_last_error=True)",
+            "k.OpenEventW.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_wchar_p]",
+            "k.OpenEventW.restype = ctypes.c_void_p",
+            "k.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]",
+            "k.WaitForSingleObject.restype = ctypes.c_uint32",
+            "k.CloseHandle.argtypes = [ctypes.c_void_p]",
+            "k.CloseHandle.restype = ctypes.c_int",
+            f"access = {supervisor_module._WINDOWS_EVENT_RECONNECT_ACCESS}",
+            "print('access', hex(access), flush=True)",
+            "handle = k.OpenEventW(access, 0, sys.argv[1])",
+            "print('opened', int(bool(handle)), flush=True)",
+            "if not handle: raise SystemExit(2)",
+            "wait_result = k.WaitForSingleObject(handle, 0)",
+            "print('wait', hex(int(wait_result)), flush=True)",
+            "if wait_result != 0: raise SystemExit(3)",
+            "if not k.CloseHandle(handle): raise SystemExit(4)",
+        )
+    )
+    reconnected: SolverSupervisor | None = None
+    try:
+        helper = subprocess.run(
+            [sys.executable, "-c", helper_code, event_name],
+            capture_output=True,
+            text=True,
+            timeout=10.0,
+            check=False,
+        )
+        assert helper.returncode == 0, helper.stderr
+        assert helper.stdout.splitlines() == [
+            f"access {supervisor_module._WINDOWS_EVENT_RECONNECT_ACCESS:#x}",
+            "opened 1",
+            "wait 0x0",
+        ]
+        assert record_path.read_bytes() == record_before
+        assert transaction_path.read_bytes() == transaction_before
+        assert process.poll() is None
+        assert process.returncode is None
+
+        reconnected = SolverSupervisor.reconnect(capability)
+        assert reconnected.state is SolverState.RUNNING
+        assert reconnected.pid == process.pid
+        assert reconnected.poll() is None
+        assert process.returncode is None
+        reconnected_claim = reconnected._process_record_claim
+        assert reconnected_claim is not None and reconnected_claim.handle is not None
+        assert (
+            json.loads(supervisor_module._read_record_fd(reconnected_claim.handle).decode("utf-8"))[
+                "state"
+            ]
+            == SolverState.RUNNING.value
+        )
+    finally:
+        if reconnected is not None:
+            with contextlib.suppress(BaseException):
+                reconnected.cancel()
+        _cleanup_windows_resume_recovery(
+            capability,
+            supervisor,
+            process,
+            bound_record,
+            record_path,
+        )
+
+
 def test_windows_active_finalizer_closes_only_own_process_authority_and_reconnects(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
