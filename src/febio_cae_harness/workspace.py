@@ -1189,17 +1189,14 @@ class _ExactCaseTransaction:
         primary: BaseException,
     ) -> None:
         try:
-            parent = self._directory(parts[:-1])
+            if os.name != "nt":
+                owner.validate()
+                raise WorkspaceBoundaryError("exact-object cleanup is unavailable on this platform")
+            self._directory(parts[:-1])
             owner.validate()
-            if os.name == "nt":
-                if owner.expected[3] != 1:
-                    raise WorkspaceBoundaryError(
-                        f"{owner.label} cleanup object is not singly linked"
-                    )
-                _delete_open_file(_windows_descriptor_handle(owner.handle), owner.label)
-            else:
-                self._verify_file(parts, owner, f"{owner.label} cleanup")
-                os.unlink(parts[-1], dir_fd=parent.handle)
+            if owner.expected[3] != 1:
+                raise WorkspaceBoundaryError(f"{owner.label} cleanup object is not singly linked")
+            _delete_open_file(_windows_descriptor_handle(owner.handle), owner.label)
         except BaseException as cleanup:
             primary.add_note(f"{owner.label} cleanup failed: {cleanup}")
 
@@ -1531,6 +1528,10 @@ class _ExactCaseTransaction:
 
     def replace_bytes(self, relative_path: str | Path, data: bytes) -> None:
         parts = self._parts(relative_path, "exact replacement")
+        if os.name != "nt":
+            raise WorkspaceBoundaryError(
+                "exact namespace replacement is unavailable on this platform"
+            )
         parent = self._directory(parts[:-1])
         parent_path = self.root.joinpath(*parts[:-1])
         key = Path(*parts).as_posix()
@@ -1654,69 +1655,51 @@ def _replace_exact_entry(
 
     parent.validate()
     temporary.validate()
-    if os.name == "nt":
-        del temporary_name
-        if existing is None:
-            _windows_rename_open_file(
-                temporary.handle,
-                parent.handle,
-                parent_path,
-                target_name,
-                replace=False,
-                label="exact replacement temporary",
-            )
-            state.new_committed = True
-            return
-        previous_name = f".{target_name}.previous.{secrets.token_hex(16)}"
-        existing.validate()
+    if os.name != "nt":
+        raise WorkspaceBoundaryError("exact namespace replacement is unavailable on this platform")
+    del temporary_name
+    if existing is None:
         _windows_rename_open_file(
-            existing.handle,
+            temporary.handle,
             parent.handle,
             parent_path,
-            previous_name,
-            replace=False,
-            label="exact replacement prior target",
-        )
-        state.previous_name = previous_name
-        try:
-            _windows_rename_open_file(
-                temporary.handle,
-                parent.handle,
-                parent_path,
-                target_name,
-                replace=False,
-                label="exact replacement temporary",
-            )
-            state.new_committed = True
-        except BaseException as primary:
-            _restore_windows_previous(
-                parent=parent,
-                parent_path=parent_path,
-                target_name=target_name,
-                existing=existing,
-                state=state,
-                primary=primary,
-            )
-            raise
-        return
-    if target_existed:
-        os.replace(
-            temporary_name,
             target_name,
-            src_dir_fd=parent.handle,
-            dst_dir_fd=parent.handle,
+            replace=False,
+            label="exact replacement temporary",
         )
         state.new_committed = True
         return
-    os.link(
-        temporary_name,
-        target_name,
-        src_dir_fd=parent.handle,
-        dst_dir_fd=parent.handle,
-        follow_symlinks=False,
+    previous_name = f".{target_name}.previous.{secrets.token_hex(16)}"
+    existing.validate()
+    _windows_rename_open_file(
+        existing.handle,
+        parent.handle,
+        parent_path,
+        previous_name,
+        replace=False,
+        label="exact replacement prior target",
     )
-    state.new_committed = True
-    os.unlink(temporary_name, dir_fd=parent.handle)
+    state.previous_name = previous_name
+    try:
+        _windows_rename_open_file(
+            temporary.handle,
+            parent.handle,
+            parent_path,
+            target_name,
+            replace=False,
+            label="exact replacement temporary",
+        )
+        state.new_committed = True
+    except BaseException as primary:
+        _restore_windows_previous(
+            parent=parent,
+            parent_path=parent_path,
+            target_name=target_name,
+            existing=existing,
+            state=state,
+            primary=primary,
+        )
+        raise
 
 
 def _restore_windows_previous(
