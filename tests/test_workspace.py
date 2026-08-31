@@ -1463,6 +1463,46 @@ def test_atomic_replace_never_mutates_a_substituted_foreign_hard_link(
     assert outside.stat().st_nlink == 1
 
 
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows handle-relative rename")
+def test_windows_exact_rename_is_rooted_in_held_parent_not_foreign_path(tmp_path: Path) -> None:
+    owned_parent = tmp_path / "owned"
+    foreign_parent = tmp_path / "foreign"
+    owned_parent.mkdir()
+    foreign_parent.mkdir()
+    foreign_target = foreign_parent / "target.txt"
+    foreign_target.write_bytes(b"foreign")
+    parent_handle = workspace_module._open_directory(owned_parent, "owned parent")
+    descriptor = workspace_module._open_exact_file_descriptor(
+        parent_handle,
+        owned_parent,
+        "temporary.txt",
+        flags=os.O_RDWR | os.O_CREAT | os.O_EXCL,
+        access=0xC0010000,
+        share=0x0001 | 0x0002 | 0x0004,
+        disposition=1,
+    )
+    try:
+        os.write(descriptor, b"owned")
+        os.fsync(descriptor)
+
+        workspace_module._windows_rename_open_file(
+            descriptor,
+            parent_handle,
+            foreign_parent,
+            "target.txt",
+            replace=True,
+            label="exact test file",
+        )
+
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        assert os.read(descriptor, 5) == b"owned"
+        assert foreign_target.read_bytes() == b"foreign"
+    finally:
+        os.close(descriptor)
+        workspace_module._close_handle(parent_handle)
+    assert (owned_parent / "target.txt").read_bytes() == b"owned"
+
+
 @pytest.mark.skipif(os.name != "nt", reason="requires Windows rename substitution")
 def test_make_directory_rejects_substituted_created_entry(
     tmp_path: Path,

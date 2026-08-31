@@ -288,8 +288,7 @@ def _windows_rename_open_file(
 
     if not target_name:
         raise WorkspaceBoundaryError(f"cannot rename {label} to an empty name")
-    del parent_handle
-    target_path = os.fspath(parent_path / target_name)
+    target_path = target_name
 
     class FileRenameInfo(ctypes.Structure):
         _fields_ = [
@@ -299,28 +298,41 @@ def _windows_rename_open_file(
             ("FileName", ctypes.c_wchar * (len(target_path) + 1)),
         ]
 
+    class IoStatusBlock(ctypes.Structure):
+        _fields_ = [("Status", ctypes.c_void_p), ("Information", ctypes.c_size_t)]
+
     native = _windows_descriptor_handle(descriptor)
     information = FileRenameInfo()
     information.ReplaceIfExists = int(replace)
-    information.RootDirectory = None
+    information.RootDirectory = ctypes.c_void_p(parent_handle)
     information.FileNameLength = len(target_path.encode("utf-16-le"))
     information.FileName = target_path
-    set_information = ctypes.WinDLL("kernel32", use_last_error=True).SetFileInformationByHandle
+    status_block = IoStatusBlock()
+    ntdll = ctypes.WinDLL("ntdll")
+    set_information = ntdll.NtSetInformationFile
     set_information.argtypes = [
         ctypes.c_void_p,
-        ctypes.c_int,
+        ctypes.POINTER(IoStatusBlock),
         ctypes.c_void_p,
-        ctypes.c_uint32,
+        ctypes.c_ulong,
+        ctypes.c_int,
     ]
-    set_information.restype = ctypes.c_int
-    if not set_information(
+    set_information.restype = ctypes.c_long
+    status = set_information(
         ctypes.c_void_p(native),
-        3,
+        ctypes.byref(status_block),
         ctypes.byref(information),
         ctypes.sizeof(information),
-    ):
-        error = ctypes.get_last_error()
-        raise WorkspaceBoundaryError(f"cannot rename {label} by handle ({error})")
+        10,
+    )
+    if status < 0:
+        rtl_error = ntdll.RtlNtStatusToDosError
+        rtl_error.argtypes = [ctypes.c_long]
+        rtl_error.restype = ctypes.c_ulong
+        error = int(rtl_error(status))
+        raise WorkspaceBoundaryError(
+            f"cannot rename {label} in exact parent {parent_path} by handle ({error})"
+        )
 
 
 def _delete_open_handle(handle: int, label: str) -> None:
