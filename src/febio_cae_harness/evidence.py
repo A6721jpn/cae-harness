@@ -1037,14 +1037,16 @@ class EvidenceStore:
             record["sha256"] = _digest(body)
 
             attempt_root = f"90_Temporary/attempts/{attempt_id}"
+            event = self._prepare_event(
+                "attempt_recorded", {"attempt_id": attempt_id, "sha256": record["sha256"]}
+            )
+            self._publish_event_recovery(event)
             self._exact().make_directory(attempt_root)
             self._exact().replace_bytes(
                 f"{attempt_root}/{ATTEMPT_FILE}",
                 _json_text(record).encode("utf-8"),
             )
-            self._append_event(
-                "attempt_recorded", {"attempt_id": attempt_id, "sha256": record["sha256"]}
-            )
+            self._append_prepared_event(event)
             return record
 
     def record_artifact(
@@ -1524,8 +1526,10 @@ class EvidenceStore:
     def _load_and_validate(self, supplied_intent: IntentContract | None) -> None:
         manifest = self._read_json(self.manifest_path)
         persisted_intent, persisted_payload, _ = self._read_intent()
-        events, last_event_sha256 = self._read_events()
         recovery = self._read_event_recovery()
+        events, last_event_sha256, pending_event_prefix = self._read_events_with_pending_prefix(
+            recovery
+        )
         revision = self._latest_intent_revision(events)
         if revision is None:
             intent = persisted_intent
@@ -1539,7 +1543,7 @@ class EvidenceStore:
         intent_sha256 = _digest(intent_payload)
         if supplied_intent is not None and supplied_intent.to_dict() != intent_payload:
             raise EvidenceIntegrityError("supplied intent differs from current event-backed intent")
-        attempts = self._read_attempts()
+        attempts, pending_attempt_directory = self._read_attempts_with_pending(recovery)
         artifacts = self._read_artifacts(manifest)
         self._intent = intent
         self._artifacts = artifacts
@@ -1553,6 +1557,7 @@ class EvidenceStore:
                 events,
                 last_event_sha256,
                 attempts,
+                pending_event_prefix,
             )
         expected = self._project_manifest(
             intent_payload,
@@ -1569,6 +1574,14 @@ class EvidenceStore:
                     last_event_sha256,
                 ):
                     raise EvidenceIntegrityError("event recovery record does not match evidence")
+                if pending_attempt_directory is not None:
+                    self._validate_pre_file_attempt_recovery(recovery)
+                    try:
+                        self._exact().remove_empty_directory(pending_attempt_directory)
+                    except WorkspaceBoundaryError as error:
+                        raise EvidenceIntegrityError(
+                            "empty pending attempt directory could not be recovered"
+                        ) from error
                 self._clear_event_recovery()
             self._case_sha256 = str(expected["case_sha256"])
             return
@@ -1622,14 +1635,15 @@ class EvidenceStore:
         if not exact.read_bytes(_EVENT_RECOVERY_FILE):
             return None
         marker = self._read_json(self._safe_case_path(_EVENT_RECOVERY_FILE))
-        expected_keys = {
+        base_keys = {
             "schema_version",
             "case_id",
             "sequence",
             "previous_sha256",
             "event_sha256",
         }
-        if set(marker) != expected_keys:
+        attempt_keys = {"attempt_id", "attempt_sha256"}
+        if set(marker) not in (base_keys, base_keys | attempt_keys):
             raise EvidenceIntegrityError("event recovery record has unexpected fields")
         previous_sha256 = marker["previous_sha256"]
         if previous_sha256 is not None:
@@ -1642,13 +1656,49 @@ class EvidenceStore:
             or marker["sequence"] < 1
         ):
             raise EvidenceIntegrityError("event recovery record identity is invalid")
-        return {
+        recovery = {
             "schema_version": SCHEMA_VERSION,
             "case_id": self.case_workspace.case_id,
             "sequence": marker["sequence"],
             "previous_sha256": previous_sha256,
             "event_sha256": event_sha256,
         }
+        if attempt_keys <= marker.keys():
+            attempt_id = marker["attempt_id"]
+            try:
+                _validate_segment(attempt_id, "event recovery attempt")
+            except (TypeError, ValueError) as error:
+                raise EvidenceIntegrityError("event recovery attempt is invalid") from error
+            recovery["attempt_id"] = attempt_id
+            recovery["attempt_sha256"] = _validate_digest(
+                marker["attempt_sha256"], "event recovery attempt"
+            )
+        return recovery
+
+    def _validate_pre_file_attempt_recovery(self, recovery: Mapping[str, Any]) -> None:
+        if set(recovery) != {
+            "schema_version",
+            "case_id",
+            "sequence",
+            "previous_sha256",
+            "event_sha256",
+            "attempt_id",
+            "attempt_sha256",
+        }:
+            raise EvidenceIntegrityError("pending attempt recovery binding is incomplete")
+        body = {
+            "schema_version": SCHEMA_VERSION,
+            "case_id": self.case_workspace.case_id,
+            "sequence": recovery["sequence"],
+            "event_type": "attempt_recorded",
+            "payload": {
+                "attempt_id": recovery["attempt_id"],
+                "sha256": recovery["attempt_sha256"],
+            },
+            "previous_sha256": recovery["previous_sha256"],
+        }
+        if _digest(body) != recovery["event_sha256"]:
+            raise EvidenceIntegrityError("pending attempt recovery event binding is invalid")
 
     @staticmethod
     def _recovery_matches_event(
@@ -1685,14 +1735,19 @@ class EvidenceStore:
         events: list[dict[str, Any]],
         last_event_sha256: str | None,
         attempts: list[dict[str, object]],
+        pending_event_prefix: bytes,
     ) -> tuple[list[dict[str, Any]], str | None]:
         if events and self._recovery_matches_event(recovery, events[-1]):
+            if pending_event_prefix:
+                raise EvidenceIntegrityError("event log has data after its recovered event")
             return events, last_event_sha256
         if not (
             recovery["sequence"] == len(events) + 1
             and recovery["previous_sha256"] == last_event_sha256
             and all(event["sha256"] != recovery["event_sha256"] for event in events)
         ):
+            if pending_event_prefix:
+                raise EvidenceIntegrityError("partial event does not match pending recovery")
             return events, last_event_sha256
 
         matches: list[tuple[int, dict[str, Any]]] = []
@@ -1714,6 +1769,8 @@ class EvidenceStore:
             if self._recovery_matches_event(recovery, event):
                 matches.append((index, event))
         if len(matches) != 1:
+            if pending_event_prefix:
+                raise EvidenceIntegrityError("partial event has no unique attempt recovery")
             return events, last_event_sha256
 
         attempt_index, event = matches[0]
@@ -1728,9 +1785,18 @@ class EvidenceStore:
             previous_attempts,
         )
         if persisted_payload != intent_payload or manifest != previous_manifest:
+            if pending_event_prefix:
+                raise EvidenceIntegrityError("partial event predecessor projection is invalid")
             return events, last_event_sha256
+        event_bytes = _json_text(event).encode("utf-8")
+        if pending_event_prefix and (
+            len(pending_event_prefix) >= len(event_bytes)
+            or not event_bytes.startswith(pending_event_prefix)
+        ):
+            raise EvidenceIntegrityError("partial event is not a canonical event prefix")
+        remaining = event_bytes[len(pending_event_prefix) :]
         try:
-            self._exact().append_bytes(EVENTS_FILE, _json_text(event).encode("utf-8"))
+            self._exact().append_bytes(EVENTS_FILE, remaining)
         except (OSError, WorkspaceBoundaryError) as error:
             raise EvidenceIntegrityError("pending attempt event could not be recovered") from error
         return [*events, event], cast(str, event["sha256"])
@@ -1774,12 +1840,31 @@ class EvidenceStore:
         return intent, payload, _digest(payload)
 
     def _read_events(self) -> tuple[list[dict[str, Any]], str | None]:
-        try:
-            text = self._exact().read_bytes(EVENTS_FILE).decode("utf-8")
-        except (OSError, UnicodeDecodeError, WorkspaceBoundaryError) as error:
-            raise EvidenceIntegrityError("event log is missing or unreadable") from error
-        if text and not text.endswith("\n"):
+        events, previous_sha256, pending_prefix = self._read_events_with_pending_prefix(None)
+        if pending_prefix:  # pragma: no cover - strict reader rejects this before returning
             raise EvidenceIntegrityError("event log is truncated")
+        return events, previous_sha256
+
+    def _read_events_with_pending_prefix(
+        self,
+        recovery: Mapping[str, Any] | None,
+    ) -> tuple[list[dict[str, Any]], str | None, bytes]:
+        try:
+            event_bytes = self._exact().read_bytes(EVENTS_FILE)
+        except (OSError, WorkspaceBoundaryError) as error:
+            raise EvidenceIntegrityError("event log is missing or unreadable") from error
+        pending_prefix = b""
+        complete_bytes = event_bytes
+        if event_bytes and not event_bytes.endswith(b"\n"):
+            if recovery is None:
+                raise EvidenceIntegrityError("event log is truncated")
+            final_newline = event_bytes.rfind(b"\n")
+            complete_bytes = event_bytes[: final_newline + 1]
+            pending_prefix = event_bytes[final_newline + 1 :]
+        try:
+            text = complete_bytes.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise EvidenceIntegrityError("event log is missing or unreadable") from error
 
         events: list[dict[str, Any]] = []
         previous_sha256: str | None = None
@@ -1847,7 +1932,7 @@ class EvidenceStore:
                 revised_intent = cast(dict[str, object], payload["new_intent"])
             events.append(event)
             previous_sha256 = stored_sha256
-        return events, previous_sha256
+        return events, previous_sha256, pending_prefix
 
     def _latest_intent_revision(
         self,
@@ -1963,8 +2048,19 @@ class EvidenceStore:
         }
 
     def _read_attempts(self) -> list[dict[str, object]]:
+        records, pending_directory = self._read_attempts_with_pending(None)
+        if pending_directory is not None:  # pragma: no cover - strict reader cannot skip one
+            raise EvidenceIntegrityError("attempt record path is invalid")
+        return records
+
+    def _read_attempts_with_pending(
+        self,
+        recovery: Mapping[str, Any] | None,
+    ) -> tuple[list[dict[str, object]], str | None]:
         exact = self._exact()
         records: list[dict[str, object]] = []
+        pending_directory: str | None = None
+        pending_attempt_id = recovery.get("attempt_id") if recovery is not None else None
         try:
             children = exact.list_directory("90_Temporary/attempts")
         except WorkspaceBoundaryError as error:
@@ -1973,7 +2069,13 @@ class EvidenceStore:
             try:
                 _validate_segment(child_name, "attempt_id")
                 relative_record = f"90_Temporary/attempts/{child_name}/{ATTEMPT_FILE}"
-                exact.list_directory(f"90_Temporary/attempts/{child_name}")
+                relative_directory = f"90_Temporary/attempts/{child_name}"
+                entries = exact.list_directory(relative_directory)
+                if not entries and child_name == pending_attempt_id:
+                    if pending_directory is not None:
+                        raise EvidenceIntegrityError("multiple empty pending attempts")
+                    pending_directory = relative_directory
+                    continue
                 record_path = self._safe_case_file(relative_record)
             except (OSError, ValueError, WorkspaceBoundaryError, EvidenceIntegrityError) as error:
                 raise EvidenceIntegrityError("attempt record path is invalid") from error
@@ -1999,7 +2101,7 @@ class EvidenceStore:
                     "sha256": stored_sha256,
                 }
             )
-        return records
+        return records, pending_directory
 
     def _read_artifacts(self, manifest: Mapping[str, Any]) -> dict[str, dict[str, object]]:
         raw_artifacts = manifest.get("artifacts")
@@ -2132,6 +2234,15 @@ class EvidenceStore:
         *,
         refresh_manifest: bool = True,
     ) -> dict[str, object]:
+        event = self._prepare_event(event_type, payload)
+        self._publish_event_recovery(event)
+        return self._append_prepared_event(event, refresh_manifest=refresh_manifest)
+
+    def _prepare_event(
+        self,
+        event_type: str,
+        payload: Mapping[str, Any] | None,
+    ) -> dict[str, object]:
         events, previous_sha256 = self._read_events()
         body: dict[str, object] = {
             "schema_version": SCHEMA_VERSION,
@@ -2143,18 +2254,42 @@ class EvidenceStore:
         }
         event = dict(body)
         event["sha256"] = _digest(body)
+        return event
+
+    def _publish_event_recovery(self, event: Mapping[str, object]) -> None:
         recovery = {
             "schema_version": SCHEMA_VERSION,
             "case_id": self.case_workspace.case_id,
             "sequence": event["sequence"],
-            "previous_sha256": previous_sha256,
+            "previous_sha256": event["previous_sha256"],
             "event_sha256": event["sha256"],
         }
+        if event.get("event_type") == "attempt_recorded":
+            payload = _as_mapping(event.get("payload"), "attempt recovery payload")
+            recovery["attempt_id"] = payload["attempt_id"]
+            recovery["attempt_sha256"] = payload["sha256"]
         try:
             self._exact().replace_bytes(
                 _EVENT_RECOVERY_FILE,
                 _json_text(recovery).encode("utf-8"),
             )
+        except (OSError, WorkspaceBoundaryError) as error:
+            raise EvidenceIntegrityError("event log is missing or unreadable") from error
+
+    def _append_prepared_event(
+        self,
+        event: dict[str, object],
+        *,
+        refresh_manifest: bool = True,
+    ) -> dict[str, object]:
+        events, previous_sha256 = self._read_events()
+        if (
+            event.get("sequence") != len(events) + 1
+            or event.get("previous_sha256") != previous_sha256
+            or any(existing["sha256"] == event.get("sha256") for existing in events)
+        ):
+            raise EvidenceIntegrityError("prepared event no longer matches the event head")
+        try:
             self._exact().append_bytes(EVENTS_FILE, _json_text(event).encode("utf-8"))
         except (OSError, WorkspaceBoundaryError) as error:
             raise EvidenceIntegrityError("event log is missing or unreadable") from error
