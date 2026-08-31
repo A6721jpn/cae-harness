@@ -1144,14 +1144,19 @@ def test_record_attempt_rejects_cross_case_directory_substitution(
     displaced = case_a.temporary_root / "attempts" / "attempt-1-owned"
     original_directory = workspace_module._ExactCaseTransaction._directory
     substituted = False
+    blocked = False
 
     def substitute_before_open(self: Any, parts: tuple[str, ...]) -> Any:
-        nonlocal substituted
+        nonlocal blocked, substituted
         target = self.root.joinpath(*parts)
         if not substituted and target == case_a.case_root / relative and target.exists():
-            substituted = True
-            target.rename(displaced)
-            foreign.rename(target)
+            try:
+                target.rename(displaced)
+            except OSError:
+                blocked = True
+            else:
+                foreign.rename(target)
+                substituted = True
         return original_directory(self, parts)
 
     monkeypatch.setattr(
@@ -1160,16 +1165,30 @@ def test_record_attempt_rejects_cross_case_directory_substitution(
         substitute_before_open,
     )
 
-    with pytest.raises((WorkspaceBoundaryError, EvidenceIntegrityError)):
-        store_a.record_attempt("attempt-1", {"owner": "case-a"})
+    try:
+        owned_record = store_a.record_attempt("attempt-1", {"owner": "case-a"})
+    except (WorkspaceBoundaryError, EvidenceIntegrityError):
+        owned_record = None
 
-    persisted = json.loads(
-        (case_a.case_root / relative / "ATTEMPT.json").read_text(encoding="utf-8")
-    )
-    assert substituted
-    assert persisted["sha256"] == foreign_record["sha256"]
-    assert persisted["payload"] == {"owner": "case-b"}
-    assert tuple(displaced.iterdir()) == ()
+    assert blocked or (substituted and owned_record is None)
+    if blocked:
+        assert owned_record is not None
+        persisted = json.loads(
+            (case_a.case_root / relative / "ATTEMPT.json").read_text(encoding="utf-8")
+        )
+        foreign_persisted = json.loads(foreign.joinpath("ATTEMPT.json").read_text(encoding="utf-8"))
+        assert persisted["sha256"] == owned_record["sha256"]
+        assert persisted["payload"] == {"owner": "case-a"}
+        assert foreign_persisted["sha256"] == foreign_record["sha256"]
+        assert foreign_persisted["payload"] == {"owner": "case-b"}
+        assert not displaced.exists()
+    else:
+        persisted = json.loads(
+            (case_a.case_root / relative / "ATTEMPT.json").read_text(encoding="utf-8")
+        )
+        assert persisted["sha256"] == foreign_record["sha256"]
+        assert persisted["payload"] == {"owner": "case-b"}
+        assert tuple(displaced.iterdir()) == ()
 
 
 @pytest.mark.parametrize("operation", ["event", "attempt"])
