@@ -880,10 +880,15 @@ def test_replace_rejects_target_substitution_at_exact_commit(
     foreign.write_text("foreign", encoding="utf-8")
     original_replace = workspace_module._replace_exact_entry
     substituted = False
+    blocked = False
 
     def substitute_after_validation(*args: Any, **kwargs: Any) -> None:
-        nonlocal substituted
-        target.rename(displaced)
+        nonlocal blocked, substituted
+        try:
+            target.rename(displaced)
+        except OSError:
+            blocked = True
+            raise
         foreign.rename(target)
         substituted = True
         original_replace(*args, **kwargs)
@@ -893,8 +898,12 @@ def test_replace_rejects_target_substitution_at_exact_commit(
     with pytest.raises(WorkspaceBoundaryError):
         case.write_text(relative, "authoritative-new")
 
-    assert substituted
-    assert target.read_text(encoding="utf-8") == "foreign"
+    assert blocked or substituted
+    if blocked:
+        assert target.read_text(encoding="utf-8") == "authoritative-old"
+        assert foreign.read_text(encoding="utf-8") == "foreign"
+    else:
+        assert target.read_text(encoding="utf-8") == "foreign"
     retained = {
         child.read_text(encoding="utf-8") for child in target.parent.iterdir() if child.is_file()
     }

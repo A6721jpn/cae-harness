@@ -11,6 +11,7 @@ import os
 import secrets
 import shutil
 import stat
+from collections import OrderedDict
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import FrozenInstanceError, dataclass
@@ -46,7 +47,10 @@ class _OriginalInputSource:
 _MANAGER_REGISTRY: dict[int, tuple[Any, ...]] = {}
 _CASE_REGISTRY: dict[int, tuple[Any, ...]] = {}
 _ATTEMPT_REGISTRY: dict[int, tuple[Any, ...]] = {}
-_ATTEMPT_ROOT_STAMPS: dict[tuple[Path, _IdentityStamp, str], tuple[Path, _IdentityStamp]] = {}
+_ATTEMPT_ROOT_STAMP_LIMIT = 128
+_ATTEMPT_ROOT_STAMPS: OrderedDict[
+    tuple[Path, _IdentityStamp, str], tuple[Path, _IdentityStamp, Any]
+] = OrderedDict()
 
 
 class WorkspaceBoundaryError(PermissionError):
@@ -740,6 +744,55 @@ class _ExactOwner:
         self.released = True
 
 
+type _AttemptRootKey = tuple[Path, _IdentityStamp, str]
+type _AttemptRootClaim = tuple[Path, _IdentityStamp, _ExactOwner]
+
+
+def _release_attempt_root_claim(
+    key: _AttemptRootKey,
+    claim: _AttemptRootClaim,
+) -> None:
+    owner = claim[2]
+    owner.close()
+    if _ATTEMPT_ROOT_STAMPS.get(key) is claim:
+        del _ATTEMPT_ROOT_STAMPS[key]
+
+
+def _register_attempt_root_claim(
+    key: _AttemptRootKey,
+    path: Path,
+    created_stamp: _IdentityStamp,
+    created_owner: _ExactOwner,
+) -> None:
+    existing = cast(_AttemptRootClaim | None, _ATTEMPT_ROOT_STAMPS.get(key))
+    if existing is not None:
+        _release_attempt_root_claim(key, existing)
+    while len(_ATTEMPT_ROOT_STAMPS) >= _ATTEMPT_ROOT_STAMP_LIMIT:
+        oldest_key = next(iter(_ATTEMPT_ROOT_STAMPS))
+        oldest = cast(_AttemptRootClaim, _ATTEMPT_ROOT_STAMPS[oldest_key])
+        _release_attempt_root_claim(oldest_key, oldest)
+
+    created_owner.validate()
+    handle = _open_directory(path, "attempt creation identity")
+    claim = _ExactOwner(
+        handle,
+        created_owner.expected,
+        _native_directory_identity,
+        lambda value: _close_handle(value),
+        "attempt creation identity",
+    )
+    try:
+        claim.validate()
+    except BaseException as primary:
+        try:
+            claim.close()
+        except BaseException as cleanup:
+            _ATTEMPT_ROOT_STAMPS[key] = (path, created_stamp, claim)
+            primary.add_note(f"attempt creation claim cleanup failed: {cleanup}")
+        raise
+    _ATTEMPT_ROOT_STAMPS[key] = (path, created_stamp, claim)
+
+
 class _ExactCaseTransaction:
     """Hold and operate below one exact registered case for a full transaction."""
 
@@ -1038,6 +1091,42 @@ class _ExactCaseTransaction:
         self._files[key] = owner
         return owner
 
+    def _windows_replacement_target(
+        self,
+        parts: tuple[str, ...],
+        existing: _ExactOwner,
+    ) -> _ExactOwner:
+        """Conditionally reacquire the validated target with rename authority."""
+
+        expected = existing.expected
+        existing.close()
+        parent = self._directory(parts[:-1])
+        parent_path = self.root.joinpath(*parts[:-1])
+        try:
+            descriptor = _open_exact_file_descriptor(
+                parent.handle,
+                parent_path,
+                parts[-1],
+                flags=os.O_RDONLY,
+                access=0x80000000 | 0x00010000,
+                share=0x0001 | 0x0002,
+                disposition=3,
+            )
+        except OSError as error:
+            raise WorkspaceBoundaryError("cannot reacquire exact replacement target") from error
+        owner = _ExactOwner(
+            descriptor,
+            expected,
+            lambda value: _stable_file_state(os.fstat(value)),
+            lambda value: os.close(value),
+            "exact replacement target",
+        )
+        self._owners.append(owner)
+        owner.validate()
+        self._verify_file(parts, owner, "exact replacement target")
+        self._files[Path(*parts).as_posix()] = owner
+        return owner
+
     def read_bytes(self, relative_path: str | Path) -> bytes:
         parts = self._parts(relative_path, "exact read")
         owner = self._open_file(parts)
@@ -1129,9 +1218,12 @@ class _ExactCaseTransaction:
             raise WorkspaceBoundaryError("created exact directory was substituted")
         self._validate_root()
         if len(parts) == 3 and parts[:2] == (_TEMPORARY_ROOT, "attempts"):
-            _ATTEMPT_ROOT_STAMPS[(self.root, self._root_stamp, parts[2])] = (
-                self.root.joinpath(*parts),
+            created_path = self.root.joinpath(*parts)
+            _register_attempt_root_claim(
+                (self.root, self._root_stamp, parts[2]),
+                created_path,
                 created_stamp,
+                owner,
             )
         return created_stamp
 
@@ -1217,12 +1309,15 @@ class _ExactCaseTransaction:
                 raise
             existing = None
             mode = 0o666
+        if os.name == "nt" and existing is not None:
+            existing = self._windows_replacement_target(parts, existing)
 
         temporary_name = f".{parts[-1]}.{secrets.token_hex(16)}"
         temporary = self._new_file(
             (*parts[:-1], temporary_name), "exact replacement temporary", mode
         )
         descriptor = temporary.handle
+        replacement = _ExactReplacementState()
         try:
             self._write(temporary, data)
             _set_open_file_mode(descriptor, mode, "exact replacement temporary")
@@ -1233,9 +1328,6 @@ class _ExactCaseTransaction:
             if existing is not None:
                 existing.validate()
                 self._verify_file(parts, existing, "exact replacement target")
-                if os.name == "nt":
-                    existing.close()
-                    self._verify_file(parts, existing, "exact replacement target")
             self._validate_root()
             _replace_exact_entry(
                 parent=parent,
@@ -1243,10 +1335,22 @@ class _ExactCaseTransaction:
                 temporary_name=temporary_name,
                 target_name=parts[-1],
                 temporary=temporary,
+                existing=existing,
                 target_existed=existing is not None,
+                state=replacement,
             )
             temporary.expected = _stable_file_state(os.fstat(descriptor))
             self._verify_file(parts, temporary, "exact replacement result")
+            if replacement.previous_name is not None and existing is not None:
+                existing.validate()
+                _delete_open_file(
+                    _windows_descriptor_handle(existing.handle),
+                    "exact replacement prior target",
+                )
+                existing.expected = _stable_file_state(os.fstat(existing.handle))
+                existing.validate()
+                existing.close()
+                replacement.previous_name = None
             self._files[key] = temporary
         except BaseException as error:
             primary = (
@@ -1254,6 +1358,16 @@ class _ExactCaseTransaction:
                 if isinstance(error, OSError)
                 else error
             )
+            if replacement.previous_name is not None and existing is not None:
+                _rollback_windows_replacement(
+                    parent=parent,
+                    parent_path=parent_path,
+                    temporary_name=temporary_name,
+                    target_name=parts[-1],
+                    temporary=temporary,
+                    existing=existing,
+                    primary=primary,
+                )
             self._discard((*parts[:-1], temporary_name), temporary, primary)
             if primary is error:
                 raise
@@ -1271,6 +1385,11 @@ class _ExactCaseTransaction:
             self._verify_file(parts, owner, "exact file")
 
 
+@dataclass(slots=True)
+class _ExactReplacementState:
+    previous_name: str | None = None
+
+
 def _replace_exact_entry(
     *,
     parent: _ExactOwner,
@@ -1278,7 +1397,9 @@ def _replace_exact_entry(
     temporary_name: str,
     target_name: str,
     temporary: _ExactOwner,
+    existing: _ExactOwner | None,
     target_existed: bool,
+    state: _ExactReplacementState,
 ) -> None:
     """Replace through the held parent while retaining the temporary owner."""
 
@@ -1286,14 +1407,49 @@ def _replace_exact_entry(
     temporary.validate()
     if os.name == "nt":
         del temporary_name
+        if existing is None:
+            _windows_rename_open_file(
+                temporary.handle,
+                parent.handle,
+                parent_path,
+                target_name,
+                replace=False,
+                label="exact replacement temporary",
+            )
+            return
+        previous_name = f".{target_name}.previous.{secrets.token_hex(16)}"
+        existing.validate()
         _windows_rename_open_file(
-            temporary.handle,
+            existing.handle,
             parent.handle,
             parent_path,
-            target_name,
-            replace=target_existed,
-            label="exact replacement temporary",
+            previous_name,
+            replace=False,
+            label="exact replacement prior target",
         )
+        try:
+            _windows_rename_open_file(
+                temporary.handle,
+                parent.handle,
+                parent_path,
+                target_name,
+                replace=False,
+                label="exact replacement temporary",
+            )
+        except BaseException as primary:
+            try:
+                _windows_rename_open_file(
+                    existing.handle,
+                    parent.handle,
+                    parent_path,
+                    target_name,
+                    replace=False,
+                    label="exact replacement prior target recovery",
+                )
+            except BaseException as cleanup:
+                primary.add_note(f"exact replacement prior target recovery failed: {cleanup}")
+            raise
+        state.previous_name = previous_name
         return
     if target_existed:
         os.replace(
@@ -1311,6 +1467,44 @@ def _replace_exact_entry(
         follow_symlinks=False,
     )
     os.unlink(temporary_name, dir_fd=parent.handle)
+
+
+def _rollback_windows_replacement(
+    *,
+    parent: _ExactOwner,
+    parent_path: Path,
+    temporary_name: str,
+    target_name: str,
+    temporary: _ExactOwner,
+    existing: _ExactOwner,
+    primary: BaseException,
+) -> None:
+    try:
+        parent.validate()
+        temporary.validate()
+        _windows_rename_open_file(
+            temporary.handle,
+            parent.handle,
+            parent_path,
+            temporary_name,
+            replace=False,
+            label="exact replacement new target recovery",
+        )
+    except BaseException as cleanup:
+        primary.add_note(f"exact replacement new target recovery failed: {cleanup}")
+    try:
+        parent.validate()
+        existing.validate()
+        _windows_rename_open_file(
+            existing.handle,
+            parent.handle,
+            parent_path,
+            target_name,
+            replace=False,
+            label="exact replacement prior target recovery",
+        )
+    except BaseException as cleanup:
+        primary.add_note(f"exact replacement prior target recovery failed: {cleanup}")
 
 
 @contextmanager
@@ -1649,12 +1843,19 @@ class AttemptWorkspace:
         actual_root = _reject_reparse_alias(root, "attempt root")
         if actual_root != expected_root:
             raise WorkspaceBoundaryError("attempt root is not owned by the case workspace")
+        case_stamp = _registered_case_stamp(case_workspace)
+        creation_key = (case_workspace.case_root, case_stamp, attempt_id)
+        creation = cast(_AttemptRootClaim | None, _ATTEMPT_ROOT_STAMPS.get(creation_key))
         if expected_root_stamp is None:
-            case_stamp = _registered_case_stamp(case_workspace)
-            creation = _ATTEMPT_ROOT_STAMPS.get((case_workspace.case_root, case_stamp, attempt_id))
             if creation is None or creation[0] != actual_root:
                 raise WorkspaceBoundaryError("attempt creation identity is required")
             expected_root_stamp = creation[1]
+        if creation is not None:
+            if creation[0] != actual_root or creation[1] != expected_root_stamp:
+                raise WorkspaceBoundaryError("attempt creation identity changed")
+            creation[2].validate()
+            if creation[2].expected != _expected_native_directory_identity(expected_root_stamp):
+                raise WorkspaceBoundaryError("attempt creation identity changed")
         root_stamp = _identity_stamp(actual_root, "attempt root", expected_root_stamp)
 
         instance = object.__new__(cls)
@@ -1669,6 +1870,12 @@ class AttemptWorkspace:
             actual_root,
             root_stamp,
         )
+        if creation is not None:
+            try:
+                _release_attempt_root_claim(creation_key, creation)
+            except BaseException:
+                del _ATTEMPT_REGISTRY[id(instance)]
+                raise
         return instance
 
     def __fspath__(self) -> str:

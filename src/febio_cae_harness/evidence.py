@@ -1543,6 +1543,17 @@ class EvidenceStore:
         artifacts = self._read_artifacts(manifest)
         self._intent = intent
         self._artifacts = artifacts
+        if recovery is not None:
+            events, last_event_sha256 = self._recover_pending_attempt_event(
+                recovery,
+                manifest,
+                persisted_payload,
+                intent_payload,
+                intent_sha256,
+                events,
+                last_event_sha256,
+                attempts,
+            )
         expected = self._project_manifest(
             intent_payload,
             intent_sha256,
@@ -1663,6 +1674,66 @@ class EvidenceStore:
             and recovery["previous_sha256"] == last_event_sha256
             and all(event["sha256"] != recovery["event_sha256"] for event in events)
         )
+
+    def _recover_pending_attempt_event(
+        self,
+        recovery: Mapping[str, Any],
+        manifest: Mapping[str, Any],
+        persisted_payload: Mapping[str, Any],
+        intent_payload: Mapping[str, Any],
+        intent_sha256: str,
+        events: list[dict[str, Any]],
+        last_event_sha256: str | None,
+        attempts: list[dict[str, object]],
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        if events and self._recovery_matches_event(recovery, events[-1]):
+            return events, last_event_sha256
+        if not (
+            recovery["sequence"] == len(events) + 1
+            and recovery["previous_sha256"] == last_event_sha256
+            and all(event["sha256"] != recovery["event_sha256"] for event in events)
+        ):
+            return events, last_event_sha256
+
+        matches: list[tuple[int, dict[str, Any]]] = []
+        for index, attempt in enumerate(attempts):
+            payload = {
+                "attempt_id": attempt["attempt_id"],
+                "sha256": attempt["sha256"],
+            }
+            body: dict[str, object] = {
+                "schema_version": SCHEMA_VERSION,
+                "case_id": self.case_workspace.case_id,
+                "sequence": len(events) + 1,
+                "event_type": "attempt_recorded",
+                "payload": payload,
+                "previous_sha256": last_event_sha256,
+            }
+            event = dict(body)
+            event["sha256"] = _digest(body)
+            if self._recovery_matches_event(recovery, event):
+                matches.append((index, event))
+        if len(matches) != 1:
+            return events, last_event_sha256
+
+        attempt_index, event = matches[0]
+        previous_attempts = [
+            attempt for index, attempt in enumerate(attempts) if index != attempt_index
+        ]
+        previous_manifest = self._project_manifest(
+            intent_payload,
+            intent_sha256,
+            events,
+            last_event_sha256,
+            previous_attempts,
+        )
+        if persisted_payload != intent_payload or manifest != previous_manifest:
+            return events, last_event_sha256
+        try:
+            self._exact().append_bytes(EVENTS_FILE, _json_text(event).encode("utf-8"))
+        except (OSError, WorkspaceBoundaryError) as error:
+            raise EvidenceIntegrityError("pending attempt event could not be recovered") from error
+        return [*events, event], cast(str, event["sha256"])
 
     def _attempts_before_terminal(
         self,
