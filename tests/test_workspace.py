@@ -1773,8 +1773,22 @@ def test_new_replacement_blocks_substitution_after_final_validation(
     foreign = target.with_name("final-seam-foreign.txt")
     foreign.write_bytes(b"foreign")
     original_validate = workspace_module._ExactCaseTransaction.validate
+    original_windows_create = workspace_module._windows_create
     blocked = False
     substituted = False
+    absolute_target_reopens: list[Path] = []
+
+    def reject_absolute_target_reopen(
+        path: Path,
+        access: int,
+        share: int,
+        disposition: int,
+        flags: int,
+        label: str,
+    ) -> int:
+        if path == target:
+            absolute_target_reopens.append(path)
+        return original_windows_create(path, access, share, disposition, flags, label)
 
     def substitute_after_final_validation(self: Any) -> None:
         nonlocal blocked, substituted
@@ -1792,6 +1806,7 @@ def test_new_replacement_blocks_substitution_after_final_validation(
         "validate",
         substitute_after_final_validation,
     )
+    monkeypatch.setattr(workspace_module, "_windows_create", reject_absolute_target_reopen)
 
     with case._exact_transaction() as exact:
         exact.replace_bytes(relative, b"authoritative-new")
@@ -1801,6 +1816,7 @@ def test_new_replacement_blocks_substitution_after_final_validation(
     assert target.read_bytes() == b"authoritative-new"
     assert foreign.read_bytes() == b"foreign"
     assert not displaced.exists()
+    assert absolute_target_reopens == []
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires Windows exact-handle replacement")
