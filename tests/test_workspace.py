@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import ctypes
 import dataclasses
 import json
 import os
@@ -1283,6 +1284,216 @@ def test_exact_transaction_preserves_body_exception_and_retains_failed_owner(
     assert any(not owner.released for owner in transaction._owners)
 
     monkeypatch.undo()
-    transaction.close()
-    transaction.close()
-    assert all(owner.released for owner in transaction._owners)
+    with pytest.raises(WorkspaceBoundaryError, match="indeterminate"):
+        transaction.close()
+    assert any(owner.indeterminate for owner in transaction._owners)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows exact-handle replacement")
+def test_exact_replacement_never_installs_substituted_source_or_leaks_owned_temporary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = make_workspace(tmp_path)
+    case = workspace.create_case("case-a")
+    outside = tmp_path / "foreign.txt"
+    outside.write_bytes(b"foreign")
+    target = case.temporary_root / "value.txt"
+    attacked = False
+    owned_recovery = case.temporary_root / ".owned-recovery"
+    original_replace = os.replace
+
+    with case._exact_transaction() as exact:
+        exact.replace_bytes("90_Temporary/value.txt", b"before")
+
+    def substitute_source_before_path_replace(
+        source: str | bytes | Path,
+        destination: str | bytes | Path,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        nonlocal attacked
+        source_path = Path(source)
+        destination_path = Path(destination)
+        if destination_path == target and source_path.name.startswith(".value.txt."):
+            attacked = True
+            source_path.rename(owned_recovery)
+            os.link(outside, source_path)
+        original_replace(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(os, "replace", substitute_source_before_path_replace)
+
+    with case._exact_transaction() as exact:
+        exact.replace_bytes("90_Temporary/value.txt", b"after")
+
+    assert not attacked, "the final install must not reopen the temporary by path"
+    assert target.read_bytes() == b"after"
+    assert outside.read_bytes() == b"foreign"
+    assert outside.stat().st_nlink == 1
+    assert not owned_recovery.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows hard-link semantics")
+def test_atomic_replace_never_mutates_a_substituted_foreign_hard_link(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = make_workspace(tmp_path)
+    case = workspace.create_case("case-a")
+    outside = tmp_path / "foreign.txt"
+    outside.write_bytes(b"foreign")
+    target = case.temporary_root / "value.txt"
+    original_chmod = os.chmod
+    attacked = False
+
+    def substitute_before_path_chmod(
+        path: str | bytes | Path,
+        mode: int,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        nonlocal attacked
+        candidate = Path(path)
+        if candidate.name.startswith(".value.txt."):
+            attacked = True
+            candidate.unlink()
+            os.link(outside, candidate)
+        original_chmod(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(os, "chmod", substitute_before_path_chmod)
+
+    written = case.write_bytes("90_Temporary/value.txt", b"owned")
+
+    assert not attacked, "mode and install effects must remain tied to the open file"
+    assert written == target
+    assert target.read_bytes() == b"owned"
+    assert outside.read_bytes() == b"foreign"
+    assert outside.stat().st_nlink == 1
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows rename substitution")
+def test_make_directory_rejects_substituted_created_entry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = make_workspace(tmp_path)
+    case_a = workspace.create_case("case-a")
+    case_b = workspace.create_case("case-b")
+    relative = Path("90_Temporary") / "attempts" / "attempt-1"
+    foreign = case_b.case_root / relative
+    foreign.mkdir()
+    foreign.joinpath("foreign.txt").write_text("foreign", encoding="utf-8")
+    displaced = case_a.temporary_root / "attempts" / "attempt-1-owned"
+    original_directory = workspace_module._ExactCaseTransaction._directory
+    substituted = False
+
+    def substitute_before_open(
+        self: Any,
+        parts: tuple[str, ...],
+    ) -> Any:
+        nonlocal substituted
+        target = self.root.joinpath(*parts)
+        if not substituted and target == case_a.case_root / relative and target.exists():
+            substituted = True
+            target.rename(displaced)
+            foreign.rename(target)
+        return original_directory(self, parts)
+
+    monkeypatch.setattr(
+        workspace_module._ExactCaseTransaction,
+        "_directory",
+        substitute_before_open,
+    )
+
+    with case_a._exact_transaction() as exact, pytest.raises(WorkspaceBoundaryError):
+        exact.make_directory(relative)
+
+    assert substituted
+    assert (case_a.case_root / relative / "foreign.txt").read_text(encoding="utf-8") == "foreign"
+    assert tuple(displaced.iterdir()) == ()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows rename substitution")
+def test_allocate_attempt_rejects_substituted_root_before_issuance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = make_workspace(tmp_path)
+    case_a = workspace.create_case("case-a")
+    case_b = workspace.create_case("case-b")
+    foreign = case_b.temporary_root / "attempts" / "attempt-1"
+    foreign.mkdir()
+    foreign.joinpath("foreign.txt").write_text("foreign", encoding="utf-8")
+    displaced = case_a.temporary_root / "attempts" / "attempt-1-owned"
+    original_factory = AttemptWorkspace._from_manager
+    substituted = False
+
+    def substitute_before_issue(
+        cls: type[AttemptWorkspace],
+        case_workspace: CaseWorkspace,
+        attempt_id: str,
+        root: Path,
+        *args: object,
+        **kwargs: object,
+    ) -> AttemptWorkspace:
+        del cls
+        nonlocal substituted
+        if not substituted:
+            substituted = True
+            root.rename(displaced)
+            foreign.rename(root)
+        return original_factory(case_workspace, attempt_id, root, *args, **kwargs)
+
+    monkeypatch.setattr(AttemptWorkspace, "_from_manager", classmethod(substitute_before_issue))
+
+    with pytest.raises(WorkspaceBoundaryError):
+        case_a.allocate_attempt("attempt-1")
+
+    assert substituted
+    assert (case_a.temporary_root / "attempts" / "attempt-1" / "foreign.txt").read_text(
+        encoding="utf-8"
+    ) == "foreign"
+    assert tuple(displaced.iterdir()) == ()
+
+
+def test_exact_owner_never_retries_ambiguous_close_with_same_identity() -> None:
+    close_calls: list[int] = []
+
+    def same_identity(_handle: int) -> tuple[int, ...]:
+        return (1,)
+
+    def lost_close_status(handle: int) -> None:
+        close_calls.append(handle)
+        raise OSError("close status lost after value reuse")
+
+    owner = workspace_module._ExactOwner(
+        17,
+        (1,),
+        same_identity,
+        lost_close_status,
+        "synthetic owner",
+    )
+
+    with pytest.raises(WorkspaceBoundaryError, match="indeterminate"):
+        owner.close()
+    with pytest.raises(WorkspaceBoundaryError, match="indeterminate"):
+        owner.close()
+
+    assert owner.indeterminate
+    assert close_calls == [17]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows CloseHandle")
+def test_windows_close_handle_reports_lost_close_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Kernel32:
+        @staticmethod
+        def CloseHandle(_handle: object) -> int:
+            return 0
+
+    monkeypatch.setattr(ctypes, "WinDLL", lambda *args, **kwargs: Kernel32())
+    monkeypatch.setattr(ctypes, "get_last_error", lambda: 6)
+
+    with pytest.raises(OSError, match="CloseHandle"):
+        workspace_module._close_handle(17)
