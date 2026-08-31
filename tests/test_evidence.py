@@ -16,6 +16,7 @@ from typing import Any, cast
 import pytest
 
 import febio_cae_harness.evidence as evidence_module
+import febio_cae_harness.workspace as workspace_module
 from febio_cae_harness.contracts import IntentContract, IntentState
 from febio_cae_harness.evidence import (
     EVENT_LOCK_FILE,
@@ -574,24 +575,26 @@ def test_revise_intent_recovers_from_interrupted_projection_write(
         engineering_question=f"Revision interrupted before {interrupted_file}",
         state=IntentState.BOUND,
     )
-    original_write = CaseWorkspace._write_control_text
+    original_write = workspace_module._ExactCaseTransaction.replace_bytes
     interrupted = False
 
     def interrupt_projection_once(
-        self: CaseWorkspace,
+        self: Any,
         relative_path: str | Path,
-        text: str,
-        *,
-        encoding: str = "utf-8",
-    ) -> Path:
+        data: bytes,
+    ) -> None:
         nonlocal interrupted
         if not interrupted and Path(relative_path).as_posix() == interrupted_file:
             interrupted = True
             raise OSError("simulated projection interruption")
-        return original_write(self, relative_path, text, encoding=encoding)
+        original_write(self, relative_path, data)
 
     with monkeypatch.context() as patch:
-        patch.setattr(CaseWorkspace, "_write_control_text", interrupt_projection_once)
+        patch.setattr(
+            workspace_module._ExactCaseTransaction,
+            "replace_bytes",
+            interrupt_projection_once,
+        )
         with pytest.raises(EvidenceIntegrityError, match="intent revision projection"):
             store.revise_intent(revised)
 
@@ -1048,3 +1051,107 @@ def test_receipt_token_construction_and_reopen_store_are_not_authority(
         object.__new__(VerificationReceipt)
     with pytest.raises(TypeError):
         type("ForgedReceipt", (VerificationReceipt,), {})
+
+
+def test_reopen_holds_exact_case_across_midload_substitution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, case, intent = make_case(tmp_path)
+    store = EvidenceStore(case, intent)
+    displaced = tmp_path / "displaced-case"
+    original_read_json = EvidenceStore._read_json
+    attempted = False
+    foreign_marker: Path | None = None
+
+    assert callable(getattr(store, "_transaction", None))
+
+    def substitute_after_first_read(
+        self: EvidenceStore,
+        path: Path,
+    ) -> dict[str, Any]:
+        nonlocal attempted, foreign_marker
+        result = original_read_json(self, path)
+        if attempted:
+            return result
+        attempted = True
+        if os.name == "nt":
+            with pytest.raises(OSError):
+                case.case_root.rename(displaced)
+        else:  # pragma: no cover - exercised by the POSIX gate
+            case.case_root.rename(displaced)
+            case.case_root.mkdir()
+            foreign_marker = case.case_root / "foreign.txt"
+            foreign_marker.write_text("foreign", encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(EvidenceStore, "_read_json", substitute_after_first_read)
+
+    assert store.reopen() is store
+    assert attempted
+    if foreign_marker is not None:  # pragma: no cover - exercised by the POSIX gate
+        assert foreign_marker.read_text(encoding="utf-8") == "foreign"
+
+
+def test_recovery_replace_keeps_exact_temporary_owner_until_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, case, intent = make_case(tmp_path)
+    store = EvidenceStore(case, intent)
+    revised = IntentContract(
+        engineering_question="Recover an interrupted exact projection",
+        state=IntentState.BOUND,
+    )
+    original_write = workspace_module._ExactCaseTransaction.replace_bytes
+    interrupted = False
+
+    def interrupt_manifest_once(
+        self: Any,
+        relative_path: str | Path,
+        data: bytes,
+    ) -> None:
+        nonlocal interrupted
+        if not interrupted and Path(relative_path).as_posix() == "CASE_MANIFEST.json":
+            interrupted = True
+            raise OSError("synthetic interrupted projection")
+        original_write(self, relative_path, data)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            workspace_module._ExactCaseTransaction,
+            "replace_bytes",
+            interrupt_manifest_once,
+        )
+        with pytest.raises(EvidenceIntegrityError, match="projection was interrupted"):
+            store.revise_intent(revised)
+
+    original_replace = workspace_module._replace_exact_entry
+    observed: list[tuple[bool, bool]] = []
+
+    def observe_replace(*args: Any, **kwargs: Any) -> None:
+        temporary = kwargs["temporary"]
+        temporary.validate()
+        observed.append((temporary.released, temporary.handle >= 0))
+        original_replace(*args, **kwargs)
+
+    monkeypatch.setattr(workspace_module, "_replace_exact_entry", observe_replace)
+
+    reopened = EvidenceStore.open(case)
+
+    assert reopened.intent == revised
+    assert observed
+    assert all(not released and valid_handle for released, valid_handle in observed)
+
+
+def test_posix_lock_descriptor_open_is_relative_to_exact_root() -> None:
+    calls: list[tuple[str, int, int | None]] = []
+
+    def fake_open(path: str, flags: int, *, dir_fd: int | None = None) -> int:
+        calls.append((path, flags, dir_fd))
+        return 103
+
+    descriptor = evidence_module._open_posix_lock_descriptor(71, opener=fake_open)
+
+    assert descriptor == 103
+    assert calls == [(".", calls[0][1], 71)]

@@ -13,6 +13,7 @@ import stat
 import threading
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager, suppress
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NoReturn, SupportsIndex, cast
@@ -21,6 +22,7 @@ from .contracts import IntentContract
 from .workspace import (
     CaseWorkspace,
     WorkspaceBoundaryError,
+    _ExactCaseTransaction,
     _lexical_path,
     _reject_reparse_alias,
 )
@@ -72,6 +74,9 @@ _INTENT_REVISION_FIELDS = frozenset(
 
 _LOCAL_EVENT_LOCKS: dict[str, threading.RLock] = {}
 _LOCAL_EVENT_LOCKS_GUARD = threading.Lock()
+_ACTIVE_EXACT_TRANSACTION: ContextVar[tuple[object, _ExactCaseTransaction] | None] = ContextVar(
+    "active_evidence_exact_transaction", default=None
+)
 
 
 class _AuthorityRegistry:
@@ -597,27 +602,29 @@ def _local_event_lock(key: str) -> threading.RLock:
 def _event_lock_identity(case_root: Path, case_id: str) -> str:
     """Return the stable OS-lock key for one validated case identity."""
 
-    try:
-        validated_root = _reject_reparse_alias(case_root, "evidence case")
-        metadata = validated_root.stat()
-    except (OSError, WorkspaceBoundaryError) as error:
-        raise EvidenceIntegrityError("evidence case identity is invalid") from error
-    if not stat.S_ISDIR(metadata.st_mode):
-        raise EvidenceIntegrityError("evidence case identity is not a directory")
-    root_text = str(_lexical_path(validated_root))
+    root_text = str(_lexical_path(case_root))
     if os.name == "nt":
         root_text = root_text.casefold()
     return _digest({"case_id": case_id, "case_root": root_text})
 
 
-def _acquire_posix_event_lock(case_root: Path) -> int:
+def _open_posix_lock_descriptor(
+    root_descriptor: int,
+    *,
+    opener: Callable[..., int] = os.open,
+) -> int:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    return opener(".", flags, dir_fd=root_descriptor)
+
+
+def _acquire_posix_event_lock(root_descriptor: int) -> int:
     """Lock the validated case directory, whose inode is not events.lock."""
 
     descriptor = -1
     try:
         import fcntl
 
-        descriptor = os.open(case_root, os.O_RDONLY)
+        descriptor = _open_posix_lock_descriptor(root_descriptor)
         metadata = os.fstat(descriptor)
         if not stat.S_ISDIR(metadata.st_mode):
             raise EvidenceIntegrityError("evidence case lock target is not a directory")
@@ -688,28 +695,10 @@ def _release_windows_event_lock(lock: tuple[Any, Any]) -> None:
         kernel32.CloseHandle(handle)
 
 
-def _open_event_lock_marker(lock_path: Path) -> Any:
-    try:
-        stream = lock_path.open("a+b")
-        metadata = os.fstat(stream.fileno())
-        if metadata.st_nlink != 1:
-            stream.close()
-            raise EvidenceIntegrityError("event log lock cannot be a hard link")
-        if not stat.S_ISREG(metadata.st_mode):
-            stream.close()
-            raise EvidenceIntegrityError("event log lock is not a regular file")
-        return stream
-    except EvidenceIntegrityError:
-        raise
-    except OSError as error:
-        raise EvidenceIntegrityError("cannot validate event log lock") from error
-
-
 @contextmanager
 def _exclusive_event_lock(
-    lock_path: Path,
+    exact: _ExactCaseTransaction,
     *,
-    case_root: Path,
     case_identity: str,
 ) -> Iterator[None]:
     """Serialize event-chain transactions with a case-scoped OS authority."""
@@ -717,30 +706,40 @@ def _exclusive_event_lock(
     key = case_identity
     local_lock = _local_event_lock(key)
     local_lock.acquire()
-    marker_stream = None
     os_lock: Any = None
+    body_error: BaseException | None = None
     try:
         try:
             if os.name == "nt":
                 os_lock = _acquire_windows_event_lock(case_identity)
             else:
-                os_lock = _acquire_posix_event_lock(case_root)
-            marker_stream = _open_event_lock_marker(lock_path)
+                os_lock = _acquire_posix_event_lock(exact.root_handle)
+            exact.ensure_file(EVENT_LOCK_FILE)
         except EvidenceIntegrityError:
             raise
-        except OSError as error:
+        except (OSError, WorkspaceBoundaryError) as error:
             raise EvidenceIntegrityError("cannot acquire event log lock") from error
-        yield
+        try:
+            yield
+        except BaseException as error:
+            body_error = error
+            raise
     finally:
-        if marker_stream is not None:
-            with suppress(OSError):
-                marker_stream.close()
+        cleanup_error: BaseException | None = None
         if os_lock is not None:
-            if os.name == "nt":
-                _release_windows_event_lock(os_lock)
-            else:
-                _release_posix_event_lock(os_lock)
+            try:
+                if os.name == "nt":
+                    _release_windows_event_lock(os_lock)
+                else:
+                    _release_posix_event_lock(os_lock)
+            except BaseException as error:
+                cleanup_error = error
         local_lock.release()
+        if cleanup_error is not None:
+            if body_error is not None:
+                body_error.add_note(f"event lock cleanup failed: {cleanup_error}")
+            else:
+                raise EvidenceIntegrityError("event lock cleanup failed") from cleanup_error
 
 
 class EvidenceStore:
@@ -790,7 +789,7 @@ class EvidenceStore:
         self._artifacts: dict[str, dict[str, object]] = {}
         self._case_sha256 = ""
 
-        with self._event_lock():
+        with self._transaction():
             if self._has_persisted_state():
                 self._load_and_validate(intent)
             elif intent is None:
@@ -850,13 +849,14 @@ class EvidenceStore:
 
     @property
     def manifest(self) -> dict[str, Any]:
-        self.reopen()
-        return self._read_json(self.manifest_path)
+        with self._transaction():
+            self._load_and_validate(None)
+            return self._read_json(self.manifest_path)
 
     def reopen(self) -> EvidenceStore:
         """Revalidate every link, recover exact revision projections, and return this store."""
 
-        with self._event_lock():
+        with self._transaction():
             self._load_and_validate(None)
         return self
 
@@ -946,7 +946,7 @@ class EvidenceStore:
             raise EvidenceIntegrityError(
                 "verification events must be recorded through their dedicated API"
             )
-        with self._event_lock():
+        with self._transaction():
             self._load_and_validate(None)
             return self._append_event(event_type, payload)
 
@@ -955,7 +955,7 @@ class EvidenceStore:
 
         if not isinstance(new_intent, IntentContract):
             raise TypeError("new_intent must be a complete IntentContract")
-        with self._event_lock():
+        with self._transaction():
             self._load_and_validate(None)
             previous_payload = self._intent.to_dict()
             new_payload = new_intent.to_dict()
@@ -970,7 +970,10 @@ class EvidenceStore:
                 refresh_manifest=False,
             )
             try:
-                self.case_workspace._write_control_text(INTENT_FILE, _json_text(new_payload))
+                self._exact().replace_bytes(
+                    INTENT_FILE,
+                    _json_text(new_payload).encode("utf-8"),
+                )
                 self._intent = new_intent
                 self._refresh_manifest()
             except (OSError, WorkspaceBoundaryError, EvidenceIntegrityError) as error:
@@ -987,7 +990,7 @@ class EvidenceStore:
         """Create a new attempt record and link it into the event chain."""
 
         _validate_segment(attempt_id, "attempt_id")
-        with self._event_lock():
+        with self._transaction():
             self._load_and_validate(None)
             normalised_payload = self._normalise_payload(payload)
             body: dict[str, object] = {
@@ -1016,7 +1019,7 @@ class EvidenceStore:
 
         if attempt_id is not None:
             _validate_segment(attempt_id, "attempt_id")
-        with self._event_lock():
+        with self._transaction():
             self._load_and_validate(None)
             artifact_path = self._safe_case_file(path)
             relative = artifact_path.relative_to(self.case_workspace.case_root).as_posix()
@@ -1062,7 +1065,7 @@ class EvidenceStore:
         """
 
         _validate_segment(attempt_id, "attempt_id")
-        with self._event_lock():
+        with self._transaction():
             self._load_and_validate(None)
             if not any(record.get("attempt_id") == attempt_id for record in self._read_attempts()):
                 raise EvidenceIntegrityError("verification attempt is not recorded")
@@ -1105,7 +1108,7 @@ class EvidenceStore:
     def promote_verified(self, receipt: VerificationReceipt) -> Path:
         """Promote only the exact artifact authorised by a persisted receipt."""
 
-        with self._event_lock():
+        with self._transaction():
             self._load_and_validate(None)
             receipt_state = self._receipt_state(receipt)
             if receipt_state.store_state_sha256 != self._case_sha256:
@@ -1185,14 +1188,43 @@ class EvidenceStore:
             raise EvidenceIntegrityError("evidence store authority registry changed")
         return manager
 
-    def _event_lock(self) -> Any:
-        case_root = _reject_reparse_alias(self.case_workspace.case_root, "evidence case")
-        case_identity = _event_lock_identity(case_root, self.case_workspace.case_id)
-        return _exclusive_event_lock(
-            self._safe_case_path(EVENT_LOCK_FILE),
-            case_root=case_root,
-            case_identity=case_identity,
-        )
+    @contextmanager
+    def _transaction(self) -> Iterator[_ExactCaseTransaction]:
+        """Hold the exact case, lock, files, and directories through return."""
+
+        with self.case_workspace._exact_transaction() as exact:
+            token = _ACTIVE_EXACT_TRANSACTION.set((self, exact))
+            try:
+                with self._event_lock(exact):
+                    yield exact
+            finally:
+                _ACTIVE_EXACT_TRANSACTION.reset(token)
+
+    def _exact(self) -> _ExactCaseTransaction:
+        active = _ACTIVE_EXACT_TRANSACTION.get()
+        if active is None or active[0] is not self:
+            raise EvidenceIntegrityError("evidence operation lacks an exact transaction")
+        exact = active[1]
+        exact.validate()
+        return exact
+
+    @contextmanager
+    def _event_lock(
+        self,
+        exact: _ExactCaseTransaction | None = None,
+    ) -> Iterator[None]:
+        if exact is None:
+            with self.case_workspace._exact_transaction() as owned:
+                token = _ACTIVE_EXACT_TRANSACTION.set((self, owned))
+                try:
+                    with self._event_lock(owned):
+                        yield
+                finally:
+                    _ACTIVE_EXACT_TRANSACTION.reset(token)
+            return
+        case_identity = _event_lock_identity(exact.root, self.case_workspace.case_id)
+        with _exclusive_event_lock(exact, case_identity=case_identity):
+            yield
 
     @staticmethod
     def _validate_validator(validator: str) -> str:
@@ -1378,39 +1410,56 @@ class EvidenceStore:
         return None
 
     def _has_persisted_state(self) -> bool:
-        if any(path.exists() for path in (self.manifest_path, self.intent_path, self.events_path)):
+        exact = self._exact()
+        if any(exact.exists(path) for path in (MANIFEST_FILE, INTENT_FILE, EVENTS_FILE)):
             return True
-        attempts_root = self._safe_case_path("90_Temporary/attempts")
-        return attempts_root.is_dir() and any(attempts_root.iterdir())
+        return bool(exact.list_directory("90_Temporary/attempts"))
 
-    def _safe_case_path(self, relative_path: str | Path) -> Path:
-        root = _reject_reparse_alias(self.case_workspace.case_root, "case root")
-        candidate_path = Path(relative_path)
+    def _relative_case_path(self, path: str | Path) -> tuple[Path, str]:
+        root = _lexical_path(self.case_workspace.case_root)
+        candidate_path = Path(path)
         if ".." in candidate_path.parts:
             raise WorkspaceBoundaryError("evidence path cannot contain parent traversal")
         if candidate_path.is_absolute() or candidate_path.anchor:
             candidate = _lexical_path(candidate_path)
         else:
             candidate = _lexical_path(root / candidate_path)
-        candidate = _reject_reparse_alias(candidate, "evidence path")
         if candidate == root or not candidate.is_relative_to(root):
             raise WorkspaceBoundaryError("evidence path is outside the case workspace")
-        input_root = _reject_reparse_alias(root / "01_Input", "input root")
+        return candidate, candidate.relative_to(root).as_posix()
+
+    def _safe_case_path(self, relative_path: str | Path) -> Path:
+        candidate, relative = self._relative_case_path(relative_path)
+        root = _lexical_path(self.case_workspace.case_root)
+        if _ACTIVE_EXACT_TRANSACTION.get() is None:
+            root = _reject_reparse_alias(root, "case root")
+            candidate = _reject_reparse_alias(candidate, "evidence path")
+        input_root = root / "01_Input"
         if candidate == input_root or candidate.is_relative_to(input_root):
             raise WorkspaceBoundaryError("evidence path is inside immutable 01_Input")
+        if relative != candidate.relative_to(root).as_posix():  # pragma: no cover - defensive
+            raise WorkspaceBoundaryError("evidence path is not canonical")
         return candidate
 
     def _safe_case_file(self, path: str | Path) -> Path:
         candidate = self._safe_case_path(path)
-        if not candidate.is_file():
+        active = _ACTIVE_EXACT_TRANSACTION.get()
+        if active is not None and active[0] is self:
+            _, relative = self._relative_case_path(candidate)
+            try:
+                self._exact().read_bytes(relative)
+            except WorkspaceBoundaryError as error:
+                raise EvidenceIntegrityError(f"artifact is not a file: {candidate}") from error
+        elif not candidate.is_file():
             raise EvidenceIntegrityError(f"artifact is not a file: {candidate}")
         return candidate
 
     def _read_json(self, path: Path) -> dict[str, Any]:
         try:
-            text = path.read_text(encoding="utf-8")
+            _, relative = self._relative_case_path(path)
+            text = self._exact().read_bytes(relative).decode("utf-8")
             value = json.loads(text)
-        except (OSError, json.JSONDecodeError) as error:
+        except (OSError, UnicodeDecodeError, WorkspaceBoundaryError, json.JSONDecodeError) as error:
             raise EvidenceIntegrityError(f"cannot read JSON evidence: {path}") from error
         try:
             if text != _json_text(value):
@@ -1432,8 +1481,11 @@ class EvidenceStore:
         self._intent = intent
         self._artifacts = {}
         intent_payload = intent.to_dict()
-        self.case_workspace._write_control_text(INTENT_FILE, _json_text(intent_payload))
-        self.case_workspace.append_text(EVENTS_FILE, "")
+        exact = self._exact()
+        exact.replace_bytes(INTENT_FILE, _json_text(intent_payload).encode("utf-8"))
+        exact.ensure_file(EVENTS_FILE)
+        if exact.read_bytes(EVENTS_FILE):
+            raise EvidenceIntegrityError("new event log is not empty")
         self._refresh_manifest()
 
     def _load_and_validate(self, supplied_intent: IntentContract | None) -> None:
@@ -1491,8 +1543,14 @@ class EvidenceStore:
 
         try:
             if persisted_payload != intent_payload:
-                self.case_workspace._write_control_text(INTENT_FILE, _json_text(intent_payload))
-            self.case_workspace._write_control_text(MANIFEST_FILE, _json_text(expected))
+                self._exact().replace_bytes(
+                    INTENT_FILE,
+                    _json_text(intent_payload).encode("utf-8"),
+                )
+            self._exact().replace_bytes(
+                MANIFEST_FILE,
+                _json_text(expected).encode("utf-8"),
+            )
         except (OSError, WorkspaceBoundaryError) as error:
             raise EvidenceIntegrityError(
                 "intent revision projections could not be recovered"
@@ -1511,8 +1569,8 @@ class EvidenceStore:
 
     def _read_events(self) -> tuple[list[dict[str, Any]], str | None]:
         try:
-            text = self.events_path.read_text(encoding="utf-8")
-        except OSError as error:
+            text = self._exact().read_bytes(EVENTS_FILE).decode("utf-8")
+        except (OSError, UnicodeDecodeError, WorkspaceBoundaryError) as error:
             raise EvidenceIntegrityError("event log is missing or unreadable") from error
         if text and not text.endswith("\n"):
             raise EvidenceIntegrityError("event log is truncated")
@@ -1683,7 +1741,8 @@ class EvidenceStore:
             raise EvidenceIntegrityError("artifact verification path is invalid") from error
         if source_relative != source or destination_relative != destination:
             raise EvidenceIntegrityError("artifact verification path is not canonical")
-        if _file_digest(source_path) != source_sha256:
+        _, exact_source = self._relative_case_path(source_path)
+        if self._exact().digest(exact_source) != source_sha256:
             raise EvidenceIntegrityError("artifact verification source digest changed")
         return {
             "case_id": case_id,
@@ -1698,28 +1757,17 @@ class EvidenceStore:
         }
 
     def _read_attempts(self) -> list[dict[str, object]]:
-        attempts_root = self._safe_case_path("90_Temporary/attempts")
-        if not attempts_root.is_dir():
-            raise EvidenceIntegrityError("attempts directory is missing")
+        exact = self._exact()
         records: list[dict[str, object]] = []
         try:
-            children = sorted(attempts_root.iterdir(), key=lambda path: path.name)
-        except OSError as error:
+            children = exact.list_directory("90_Temporary/attempts")
+        except WorkspaceBoundaryError as error:
             raise EvidenceIntegrityError("attempts directory is unreadable") from error
-        for child in children:
+        for child_name in children:
             try:
-                child = _reject_reparse_alias(child, "attempt root")
-            except WorkspaceBoundaryError as error:
-                raise EvidenceIntegrityError(
-                    "attempts directory contains an invalid entry"
-                ) from error
-            if not child.is_dir():
-                raise EvidenceIntegrityError("attempts directory contains an invalid entry")
-            try:
-                _validate_segment(child.name, "attempt_id")
-                relative_record = child.joinpath(ATTEMPT_FILE).relative_to(
-                    self.case_workspace.case_root
-                )
+                _validate_segment(child_name, "attempt_id")
+                relative_record = f"90_Temporary/attempts/{child_name}/{ATTEMPT_FILE}"
+                exact.list_directory(f"90_Temporary/attempts/{child_name}")
                 record_path = self._safe_case_file(relative_record)
             except (OSError, ValueError, WorkspaceBoundaryError, EvidenceIntegrityError) as error:
                 raise EvidenceIntegrityError("attempt record path is invalid") from error
@@ -1730,7 +1778,7 @@ class EvidenceStore:
             if (
                 record["schema_version"] != SCHEMA_VERSION
                 or record["case_id"] != self.case_workspace.case_id
-                or record["attempt_id"] != child.name
+                or record["attempt_id"] != child_name
             ):
                 raise EvidenceIntegrityError("attempt record identity mismatch")
             stored_sha256 = record["sha256"]
@@ -1740,8 +1788,8 @@ class EvidenceStore:
                 raise EvidenceIntegrityError("attempt digest mismatch")
             records.append(
                 {
-                    "attempt_id": child.name,
-                    "path": record_path.relative_to(self.case_workspace.case_root).as_posix(),
+                    "attempt_id": child_name,
+                    "path": relative_record,
                     "sha256": stored_sha256,
                 }
             )
@@ -1785,7 +1833,7 @@ class EvidenceStore:
                 attempt_prefix = f"90_Temporary/attempts/{attempt_id}/"
                 if not relative.startswith(attempt_prefix):
                     raise EvidenceIntegrityError("artifact is outside its attempt")
-            if _file_digest(artifact_path) != stored_sha256:
+            if self._exact().digest(relative) != stored_sha256:
                 raise EvidenceIntegrityError(f"artifact digest mismatch: {relative}")
             if relative in artifacts:
                 raise EvidenceIntegrityError(f"duplicate artifact record: {relative}")
@@ -1797,49 +1845,27 @@ class EvidenceStore:
         return artifacts
 
     def _input_records(self) -> list[dict[str, object]]:
+        exact = self._exact()
         records: list[dict[str, object]] = []
         try:
-            input_root = _reject_reparse_alias(
-                self.case_workspace.case_root / "01_Input",
-                "input root",
-            )
+            input_names = exact.list_directory("01_Input")
         except WorkspaceBoundaryError as error:
-            raise EvidenceIntegrityError("original input directory is invalid") from error
-        try:
-            input_entries = tuple(input_root.iterdir())
-        except OSError as error:
             raise EvidenceIntegrityError(
                 "original input directory is missing or unreadable"
             ) from error
-        normalised_entries: list[Path] = []
-        for entry in input_entries:
-            try:
-                normalised_entry = _reject_reparse_alias(entry, "original input")
-            except WorkspaceBoundaryError as error:
-                raise EvidenceIntegrityError(
-                    "original input directory contains an invalid entry"
-                ) from error
-            if not normalised_entry.is_file():
-                raise EvidenceIntegrityError("original input directory contains an invalid entry")
-            normalised_entries.append(normalised_entry)
-        expected_paths = {
-            _reject_reparse_alias(input_path, "original input")
-            for input_path in self.case_workspace.original_inputs
-        }
-        actual_paths = set(normalised_entries)
-        if expected_paths != actual_paths:
+        expected_names = {input_path.name for input_path in self.case_workspace.original_inputs}
+        if expected_names != set(input_names):
             raise EvidenceIntegrityError("original input set changed")
         for input_path in self.case_workspace.original_inputs:
+            relative = f"01_Input/{input_path.name}"
             try:
-                path = _reject_reparse_alias(input_path, "original input")
+                digest = exact.digest(relative)
             except WorkspaceBoundaryError as error:
                 raise EvidenceIntegrityError("original input is invalid") from error
-            if not path.is_file() or not path.is_relative_to(input_root):
-                raise EvidenceIntegrityError("original input is missing or escaped 01_Input")
             records.append(
                 {
-                    "path": path.relative_to(self.case_workspace.case_root).as_posix(),
-                    "sha256": _file_digest(path),
+                    "path": relative,
+                    "sha256": digest,
                 }
             )
         return sorted(records, key=lambda record: str(record["path"]))
@@ -1851,7 +1877,8 @@ class EvidenceStore:
                 path = self._safe_case_file(relative)
             except (WorkspaceBoundaryError, EvidenceIntegrityError) as error:
                 raise EvidenceIntegrityError("stored artifact path is invalid") from error
-            digest = _file_digest(path)
+            _, relative_path = self._relative_case_path(path)
+            digest = self._exact().digest(relative_path)
             if digest != record.get("sha256"):
                 raise EvidenceIntegrityError(f"artifact digest mismatch: {relative}")
             records.append(dict(record))
@@ -1911,8 +1938,8 @@ class EvidenceStore:
         event = dict(body)
         event["sha256"] = _digest(body)
         try:
-            self.case_workspace.append_text(EVENTS_FILE, _json_text(event))
-        except OSError as error:
+            self._exact().append_bytes(EVENTS_FILE, _json_text(event).encode("utf-8"))
+        except (OSError, WorkspaceBoundaryError) as error:
             raise EvidenceIntegrityError("event log is missing or unreadable") from error
         if refresh_manifest:
             self._refresh_manifest()
@@ -1931,4 +1958,7 @@ class EvidenceStore:
             attempts,
         )
         self._case_sha256 = str(manifest["case_sha256"])
-        self.case_workspace._write_control_text(MANIFEST_FILE, _json_text(manifest))
+        self._exact().replace_bytes(
+            MANIFEST_FILE,
+            _json_text(manifest).encode("utf-8"),
+        )
