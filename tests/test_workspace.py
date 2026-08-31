@@ -1501,6 +1501,148 @@ def test_exact_owner_never_closes_foreign_or_indeterminate_reuse(
     assert close_calls == [17]
 
 
+@pytest.mark.parametrize("target_existed", [True, False], ids=["existing", "new"])
+def test_posix_exact_replace_helper_fails_before_namespace_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    target_existed: bool,
+) -> None:
+    mutations: list[str] = []
+
+    def owner(handle: int, label: str) -> Any:
+        return workspace_module._ExactOwner(
+            handle,
+            (handle,),
+            lambda value: (value,),
+            lambda _value: None,
+            label,
+        )
+
+    def reject_mutation(operation: str) -> Callable[..., None]:
+        def reject(*args: object, **kwargs: object) -> None:
+            del args, kwargs
+            mutations.append(operation)
+            raise AssertionError(f"unexpected POSIX namespace {operation}")
+
+        return reject
+
+    parent = owner(17, "synthetic parent")
+    temporary = owner(18, "synthetic temporary")
+    existing = owner(19, "synthetic existing") if target_existed else None
+    state = workspace_module._ExactReplacementState()
+    monkeypatch.setattr(os, "name", "posix")
+    monkeypatch.setattr(os, "replace", reject_mutation("replace"))
+    monkeypatch.setattr(os, "link", reject_mutation("link"))
+    monkeypatch.setattr(os, "unlink", reject_mutation("unlink"))
+
+    with pytest.raises(
+        WorkspaceBoundaryError,
+        match="exact namespace replacement is unavailable on this platform",
+    ):
+        workspace_module._replace_exact_entry(
+            parent=parent,
+            parent_path=tmp_path,
+            temporary_name=".target.txt.owned",
+            target_name="target.txt",
+            temporary=temporary,
+            existing=existing,
+            target_existed=target_existed,
+            state=state,
+        )
+
+    assert mutations == []
+    assert not parent.released
+    assert not temporary.released
+    assert existing is None or not existing.released
+    assert state == workspace_module._ExactReplacementState()
+
+
+def test_posix_discard_retains_exact_owner_without_namespace_unlink(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mutations: list[str] = []
+    parent = workspace_module._ExactOwner(
+        17,
+        (17,),
+        lambda value: (value,),
+        lambda _value: None,
+        "synthetic parent",
+    )
+    discarded = workspace_module._ExactOwner(
+        18,
+        (18,),
+        lambda value: (value,),
+        lambda _value: None,
+        "synthetic temporary",
+    )
+    transaction = object.__new__(workspace_module._ExactCaseTransaction)
+    monkeypatch.setattr(
+        workspace_module._ExactCaseTransaction,
+        "_directory",
+        lambda _self, _parts: parent,
+    )
+    monkeypatch.setattr(
+        workspace_module._ExactCaseTransaction,
+        "_verify_file",
+        lambda _self, _parts, _owner, _label: discarded.expected,
+    )
+
+    def reject_unlink(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        mutations.append("unlink")
+        raise AssertionError("unexpected POSIX namespace unlink")
+
+    monkeypatch.setattr(os, "name", "posix")
+    monkeypatch.setattr(os, "unlink", reject_unlink)
+    primary = RuntimeError("primary failure")
+
+    transaction._discard(("90_Temporary", "owned.tmp"), discarded, primary)
+
+    assert mutations == []
+    assert getattr(primary, "__notes__", ()) == (
+        "synthetic temporary cleanup failed: exact-object cleanup is unavailable on this platform",
+    )
+    assert not parent.released
+    assert not discarded.released
+
+
+def test_posix_replace_bytes_fails_before_temporary_namespace_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = make_workspace(tmp_path)
+    case = workspace.create_case("case-a")
+    transaction = case._exact_transaction()
+    created: list[tuple[tuple[str, ...], str, int]] = []
+
+    def reject_new_file(
+        _self: Any,
+        parts: tuple[str, ...],
+        label: str,
+        mode: int = 0o666,
+    ) -> Any:
+        created.append((parts, label, mode))
+        raise AssertionError("unexpected POSIX temporary namespace creation")
+
+    transaction.__enter__()
+    try:
+        monkeypatch.setattr(os, "name", "posix")
+        monkeypatch.setattr(
+            workspace_module._ExactCaseTransaction,
+            "_new_file",
+            reject_new_file,
+        )
+        with pytest.raises(
+            WorkspaceBoundaryError,
+            match="exact namespace replacement is unavailable on this platform",
+        ):
+            transaction.replace_bytes("90_Temporary/value.txt", b"new")
+        assert created == []
+    finally:
+        monkeypatch.undo()
+        transaction.close()
+
+
 def test_exact_transaction_preserves_body_exception_and_retains_failed_owner(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
