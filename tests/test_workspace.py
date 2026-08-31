@@ -1851,13 +1851,16 @@ def test_replacement_failure_retains_an_authoritative_version(
             fail_commit_and_first_restore,
         )
 
-        with pytest.raises(WorkspaceBoundaryError, match="injected new commit failure") as caught:
+        with pytest.raises(WorkspaceBoundaryError, match="cannot replace exact file") as caught:
             case.write_bytes(relative, b"authoritative-new")
 
         assert restoration_attempts == 2
         assert target.read_bytes() == b"authoritative-old"
+        assert isinstance(caught.value.__cause__, WorkspaceBoundaryError)
+        assert "injected new commit failure" in str(caught.value.__cause__)
         assert any(
-            "first restoration failure" in note for note in getattr(caught.value, "__notes__", ())
+            "first restoration failure" in note
+            for note in getattr(caught.value.__cause__, "__notes__", ())
         )
     else:
         original_delete = workspace_module._delete_open_file
