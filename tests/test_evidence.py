@@ -16,7 +16,7 @@ from typing import Any, cast
 import pytest
 
 import febio_cae_harness.evidence as evidence_module
-from febio_cae_harness.contracts import IntentContract
+from febio_cae_harness.contracts import IntentContract, IntentState
 from febio_cae_harness.evidence import (
     EVENT_LOCK_FILE,
     EVENTS_FILE,
@@ -69,6 +69,33 @@ def _append_event_from_replacement_process(
         results.put(("ok", event["sequence"]))
     finally:
         completed.set()
+
+
+def _reopen_intent_from_fresh_process(
+    tool_root: str,
+    cae_root: str,
+    case_id: str,
+    results: Any,
+) -> None:
+    """Reopen one case in a spawned interpreter and return its projections."""
+
+    try:
+        workspace = ValidatedCaseWorkspace(Path(tool_root), Path(cae_root))
+        store = EvidenceStore.open(workspace.open_case(case_id))
+        results.put(("ok", store.intent.to_dict(), store.manifest))
+    except BaseException as error:  # pragma: no cover - assertion reports details
+        results.put(("error", type(error).__name__, str(error)))
+
+
+def _canonical_digest(value: object) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def test_verification_authority_is_manager_bound() -> None:
@@ -402,6 +429,181 @@ def test_reopen_validates_and_restores_persisted_state(tmp_path: Path) -> None:
     assert reopened.reopen() is reopened
     assert reopened.intent == intent
     assert reopened.manifest == store.manifest
+
+
+def test_revise_intent_appends_complete_revision_and_reprojects_manifest(
+    tmp_path: Path,
+) -> None:
+    _, case, intent = make_case(tmp_path)
+    store = EvidenceStore(case, intent)
+    snapshot = store.issue_intent_snapshot()
+    revised = IntentContract(
+        engineering_question="What is the revised synthetic displacement?",
+        units={"length": "mm", "force": "N"},
+        material={"source": "authoritative-synthetic-input"},
+        condition_sources=["synthetic-user-revision"],
+        state=IntentState.BOUND,
+    )
+
+    event = store.revise_intent(revised)
+
+    assert event["event_type"] == "intent_revised"
+    payload = cast(dict[str, object], event["payload"])
+    assert payload == {
+        "previous_intent": intent.to_dict(),
+        "previous_intent_sha256": _canonical_digest(intent.to_dict()),
+        "new_intent": revised.to_dict(),
+        "new_intent_sha256": _canonical_digest(revised.to_dict()),
+    }
+    persisted_event = json.loads(store.events_path.read_text(encoding="utf-8").splitlines()[-1])
+    assert persisted_event == event
+    assert json.loads(store.intent_path.read_text(encoding="utf-8")) == revised.to_dict()
+    assert store.intent == revised
+    assert store.manifest["state"] == "BOUND"
+    assert store.manifest["intent"]["sha256"] == _canonical_digest(revised.to_dict())
+    assert store.manifest["events"]["last_sha256"] == event["sha256"]
+    with pytest.raises(EvidenceIntegrityError, match="stale"):
+        _ = snapshot.intent
+
+
+def test_revise_intent_survives_spawned_fresh_process_reopen(tmp_path: Path) -> None:
+    workspace, case, intent = make_case(tmp_path)
+    store = EvidenceStore(case, intent)
+    revised = IntentContract(
+        engineering_question="Fresh-process revised intent",
+        units={"length": "mm"},
+        unresolved=["synthetic-condition"],
+        state=IntentState.ASK_AND_BLOCK,
+    )
+    event = store.revise_intent(revised)
+    context = multiprocessing.get_context("spawn")
+    results = context.Queue()
+
+    child = context.Process(
+        target=_reopen_intent_from_fresh_process,
+        args=(
+            str(workspace.tool_root),
+            str(workspace.cae_root),
+            case.case_id,
+            results,
+        ),
+    )
+    child.start()
+    child.join(timeout=10)
+
+    assert not child.is_alive()
+    assert child.exitcode == 0
+    result = results.get(timeout=5)
+    results.close()
+    results.join_thread()
+    assert result[0] == "ok", result
+    assert result[1] == revised.to_dict()
+    assert result[2]["intent"]["sha256"] == _canonical_digest(revised.to_dict())
+    assert result[2]["events"]["last_sha256"] == event["sha256"]
+
+
+def test_revise_intent_rejects_stale_or_fabricated_revision_history(
+    tmp_path: Path,
+) -> None:
+    _, case, intent = make_case(tmp_path)
+    store = EvidenceStore(case, intent)
+    revised = IntentContract(
+        engineering_question="Current revision",
+        state=IntentState.BOUND,
+    )
+    first = store.revise_intent(revised)
+
+    with pytest.raises(EvidenceIntegrityError, match="supplied intent"):
+        EvidenceStore(case, intent)
+
+    fabricated = IntentContract(
+        engineering_question="Fabricated revision",
+        state=IntentState.BOUND,
+    )
+    payload = {
+        "previous_intent": intent.to_dict(),
+        "previous_intent_sha256": _canonical_digest(intent.to_dict()),
+        "new_intent": fabricated.to_dict(),
+        "new_intent_sha256": _canonical_digest(fabricated.to_dict()),
+    }
+    body = {
+        "schema_version": evidence_module.SCHEMA_VERSION,
+        "case_id": case.case_id,
+        "sequence": 2,
+        "event_type": "intent_revised",
+        "payload": payload,
+        "previous_sha256": first["sha256"],
+    }
+    fabricated_event = {**body, "sha256": _canonical_digest(body)}
+    case.append_text(
+        EVENTS_FILE,
+        json.dumps(
+            fabricated_event,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n",
+    )
+
+    with pytest.raises(EvidenceIntegrityError, match="intent revision chain"):
+        EvidenceStore.open(case)
+
+
+def test_internal_intent_revision_event_cannot_be_fabricated_through_generic_event_api(
+    tmp_path: Path,
+) -> None:
+    _, case, intent = make_case(tmp_path)
+    store = EvidenceStore(case, intent)
+
+    with pytest.raises(EvidenceIntegrityError, match="dedicated API"):
+        store.append_event("intent_revised", {})
+    assert store.events_path.read_text(encoding="utf-8") == ""
+
+
+@pytest.mark.parametrize("interrupted_file", ["intent.json", "CASE_MANIFEST.json"])
+def test_revise_intent_recovers_from_interrupted_projection_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    interrupted_file: str,
+) -> None:
+    _, case, intent = make_case(tmp_path)
+    store = EvidenceStore(case, intent)
+    revised = IntentContract(
+        engineering_question=f"Revision interrupted before {interrupted_file}",
+        state=IntentState.BOUND,
+    )
+    original_write = CaseWorkspace._write_control_text
+    interrupted = False
+
+    def interrupt_projection_once(
+        self: CaseWorkspace,
+        relative_path: str | Path,
+        text: str,
+        *,
+        encoding: str = "utf-8",
+    ) -> Path:
+        nonlocal interrupted
+        if not interrupted and Path(relative_path).as_posix() == interrupted_file:
+            interrupted = True
+            raise OSError("simulated projection interruption")
+        return original_write(self, relative_path, text, encoding=encoding)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(CaseWorkspace, "_write_control_text", interrupt_projection_once)
+        with pytest.raises(EvidenceIntegrityError, match="intent revision projection"):
+            store.revise_intent(revised)
+
+    terminal_event = json.loads(store.events_path.read_text(encoding="utf-8").splitlines()[-1])
+    assert terminal_event["event_type"] == "intent_revised"
+
+    reopened = EvidenceStore.open(case)
+
+    assert reopened.intent == revised
+    assert json.loads(reopened.intent_path.read_text(encoding="utf-8")) == revised.to_dict()
+    assert reopened.manifest["intent"]["sha256"] == _canonical_digest(revised.to_dict())
+    assert reopened.manifest["events"]["last_sha256"] == terminal_event["sha256"]
 
 
 @pytest.mark.parametrize("tamper", ["intent", "event", "attempt", "manifest"])

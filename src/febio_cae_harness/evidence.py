@@ -60,6 +60,15 @@ _RECEIPT_FACTORY = object()
 _INTENT_SNAPSHOT_FACTORY = object()
 _DIAGNOSTIC_EVENT = "artifact_validation_diagnostic"
 _PROMOTION_CONSUMED_EVENT = "artifact_promotion_consumed"
+_INTENT_REVISED_EVENT = "intent_revised"
+_INTENT_REVISION_FIELDS = frozenset(
+    {
+        "previous_intent",
+        "previous_intent_sha256",
+        "new_intent",
+        "new_intent_sha256",
+    }
+)
 
 _LOCAL_EVENT_LOCKS: dict[str, threading.RLock] = {}
 _LOCAL_EVENT_LOCKS_GUARD = threading.Lock()
@@ -795,7 +804,7 @@ class EvidenceStore:
         case_workspace: CaseWorkspace,
         authority_manager: ValidatorAuthorityManager | None = None,
     ) -> EvidenceStore:
-        """Open and validate an existing store without changing it."""
+        """Open, validate, and recover exact interrupted revision projections."""
 
         return cls(case_workspace, authority_manager=authority_manager)
 
@@ -845,7 +854,7 @@ class EvidenceStore:
         return self._read_json(self.manifest_path)
 
     def reopen(self) -> EvidenceStore:
-        """Revalidate every persisted link and return this store."""
+        """Revalidate every link, recover exact revision projections, and return this store."""
 
         with self._event_lock():
             self._load_and_validate(None)
@@ -929,6 +938,10 @@ class EvidenceStore:
 
         if not isinstance(event_type, str) or not event_type.strip():
             raise ValueError("event_type must be a non-empty string")
+        if event_type == _INTENT_REVISED_EVENT:
+            raise EvidenceIntegrityError(
+                "intent revision events must be recorded through their dedicated API"
+            )
         if event_type in {"artifact_verified", _DIAGNOSTIC_EVENT, _PROMOTION_CONSUMED_EVENT}:
             raise EvidenceIntegrityError(
                 "verification events must be recorded through their dedicated API"
@@ -936,6 +949,35 @@ class EvidenceStore:
         with self._event_lock():
             self._load_and_validate(None)
             return self._append_event(event_type, payload)
+
+    def revise_intent(self, new_intent: IntentContract) -> dict[str, object]:
+        """Append a complete intent revision and project its newest contract."""
+
+        if not isinstance(new_intent, IntentContract):
+            raise TypeError("new_intent must be a complete IntentContract")
+        with self._event_lock():
+            self._load_and_validate(None)
+            previous_payload = self._intent.to_dict()
+            new_payload = new_intent.to_dict()
+            event = self._append_event(
+                _INTENT_REVISED_EVENT,
+                {
+                    "previous_intent": previous_payload,
+                    "previous_intent_sha256": _digest(previous_payload),
+                    "new_intent": new_payload,
+                    "new_intent_sha256": _digest(new_payload),
+                },
+                refresh_manifest=False,
+            )
+            try:
+                self.case_workspace._write_control_text(INTENT_FILE, _json_text(new_payload))
+                self._intent = new_intent
+                self._refresh_manifest()
+            except (OSError, WorkspaceBoundaryError, EvidenceIntegrityError) as error:
+                raise EvidenceIntegrityError(
+                    "intent revision projection was interrupted"
+                ) from error
+            return event
 
     def record_attempt(
         self,
@@ -1396,13 +1438,24 @@ class EvidenceStore:
 
     def _load_and_validate(self, supplied_intent: IntentContract | None) -> None:
         manifest = self._read_json(self.manifest_path)
-        persisted_intent, intent_payload, intent_sha256 = self._read_intent()
-        if supplied_intent is not None and supplied_intent.to_dict() != intent_payload:
-            raise EvidenceIntegrityError("supplied intent differs from persisted intent")
+        persisted_intent, persisted_payload, _ = self._read_intent()
         events, last_event_sha256 = self._read_events()
+        revision = self._latest_intent_revision(events)
+        if revision is None:
+            intent = persisted_intent
+            intent_payload = persisted_payload
+        else:
+            intent_payload = cast(dict[str, Any], revision["new_intent"])
+            try:
+                intent = IntentContract.from_mapping(intent_payload)
+            except (TypeError, ValueError) as error:  # pragma: no cover - validated earlier
+                raise EvidenceIntegrityError("event-backed intent is invalid") from error
+        intent_sha256 = _digest(intent_payload)
+        if supplied_intent is not None and supplied_intent.to_dict() != intent_payload:
+            raise EvidenceIntegrityError("supplied intent differs from current event-backed intent")
         attempts = self._read_attempts()
         artifacts = self._read_artifacts(manifest)
-        self._intent = persisted_intent
+        self._intent = intent
         self._artifacts = artifacts
         expected = self._project_manifest(
             intent_payload,
@@ -1411,8 +1464,39 @@ class EvidenceStore:
             last_event_sha256,
             attempts,
         )
-        if manifest != expected:
-            raise EvidenceIntegrityError("manifest projection does not match persisted evidence")
+        if persisted_payload == intent_payload and manifest == expected:
+            self._case_sha256 = str(expected["case_sha256"])
+            return
+
+        if revision is None or not events or events[-1]["event_type"] != _INTENT_REVISED_EVENT:
+            raise EvidenceIntegrityError("intent or manifest projection does not match evidence")
+
+        previous_payload = cast(dict[str, Any], revision["previous_intent"])
+        previous_events = events[:-1]
+        previous_event_sha256 = (
+            cast(str, previous_events[-1]["sha256"]) if previous_events else None
+        )
+        previous_manifest = self._project_manifest(
+            previous_payload,
+            _digest(previous_payload),
+            previous_events,
+            previous_event_sha256,
+            attempts,
+        )
+        if (
+            persisted_payload not in (previous_payload, intent_payload)
+            or manifest != previous_manifest
+        ):
+            raise EvidenceIntegrityError("intent revision projections are split-brain")
+
+        try:
+            if persisted_payload != intent_payload:
+                self.case_workspace._write_control_text(INTENT_FILE, _json_text(intent_payload))
+            self.case_workspace._write_control_text(MANIFEST_FILE, _json_text(expected))
+        except (OSError, WorkspaceBoundaryError) as error:
+            raise EvidenceIntegrityError(
+                "intent revision projections could not be recovered"
+            ) from error
         self._case_sha256 = str(expected["case_sha256"])
 
     def _read_intent(self) -> tuple[IntentContract, dict[str, Any], str]:
@@ -1438,6 +1522,7 @@ class EvidenceStore:
         verification_digests: set[str] = set()
         verification_records: dict[str, dict[str, object]] = {}
         consumed_digests: set[str] = set()
+        revised_intent: dict[str, object] | None = None
         for expected_sequence, line in enumerate(text.splitlines(), start=1):
             try:
                 event = _as_mapping(json.loads(line), "event")
@@ -1490,9 +1575,48 @@ class EvidenceStore:
                 if verification_records.get(evidence_digest) != payload:
                     raise EvidenceIntegrityError("consumed verification binding mismatch")
                 consumed_digests.add(evidence_digest)
+            elif event["event_type"] == _INTENT_REVISED_EVENT:
+                payload = self._validate_intent_revision_payload(event["payload"])
+                previous_intent = cast(dict[str, object], payload["previous_intent"])
+                if revised_intent is not None and previous_intent != revised_intent:
+                    raise EvidenceIntegrityError("intent revision chain is discontinuous")
+                revised_intent = cast(dict[str, object], payload["new_intent"])
             events.append(event)
             previous_sha256 = stored_sha256
         return events, previous_sha256
+
+    def _latest_intent_revision(
+        self,
+        events: list[dict[str, Any]],
+    ) -> dict[str, object] | None:
+        for event in reversed(events):
+            if event["event_type"] == _INTENT_REVISED_EVENT:
+                return self._validate_intent_revision_payload(event["payload"])
+        return None
+
+    def _validate_intent_revision_payload(self, value: object) -> dict[str, object]:
+        payload = _as_mapping(value, "intent revision")
+        if set(payload) != _INTENT_REVISION_FIELDS:
+            raise EvidenceIntegrityError("intent revision has unexpected fields")
+        previous_payload = _as_mapping(payload["previous_intent"], "previous intent")
+        new_payload = _as_mapping(payload["new_intent"], "new intent")
+        try:
+            previous_intent = IntentContract.from_mapping(previous_payload)
+            new_intent = IntentContract.from_mapping(new_payload)
+        except (TypeError, ValueError) as error:
+            raise EvidenceIntegrityError("intent revision snapshot is invalid") from error
+        if previous_intent.to_dict() != previous_payload or new_intent.to_dict() != new_payload:
+            raise EvidenceIntegrityError("intent revision snapshot is incomplete or non-canonical")
+        previous_sha256 = _validate_digest(payload["previous_intent_sha256"], "previous intent")
+        new_sha256 = _validate_digest(payload["new_intent_sha256"], "new intent")
+        if previous_sha256 != _digest(previous_payload) or new_sha256 != _digest(new_payload):
+            raise EvidenceIntegrityError("intent revision snapshot digest mismatch")
+        return {
+            "previous_intent": previous_payload,
+            "previous_intent_sha256": previous_sha256,
+            "new_intent": new_payload,
+            "new_intent_sha256": new_sha256,
+        }
 
     def _validate_promotion_consumed_payload(self, value: object) -> dict[str, object]:
         payload = self._validate_verification_payload(value)
@@ -1772,6 +1896,8 @@ class EvidenceStore:
         self,
         event_type: str,
         payload: Mapping[str, Any] | None,
+        *,
+        refresh_manifest: bool = True,
     ) -> dict[str, object]:
         events, previous_sha256 = self._read_events()
         body: dict[str, object] = {
@@ -1788,7 +1914,8 @@ class EvidenceStore:
             self.case_workspace.append_text(EVENTS_FILE, _json_text(event))
         except OSError as error:
             raise EvidenceIntegrityError("event log is missing or unreadable") from error
-        self._refresh_manifest()
+        if refresh_manifest:
+            self._refresh_manifest()
         return event
 
     def _refresh_manifest(self) -> None:
