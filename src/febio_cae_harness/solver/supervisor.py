@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import atexit
 import contextlib
 import ctypes
 import errno
@@ -87,6 +88,7 @@ _WINDOWS_FILE_DISPOSITION_INFO = 4
 _POSIX_AT_EMPTY_PATH = 0x1000
 _POSIX_RENAME_EXCHANGE = 0x2
 _WINDOWS_RECORD_CLAIMS: dict[str, list[tuple[int, int, int]]] = {}
+_WINDOWS_RECORD_CLAIMS_LOCK = threading.RLock()
 
 
 def _same_file_identity(left: os.stat_result, right: os.stat_result) -> bool:
@@ -182,63 +184,82 @@ def _windows_record_claim_key(path: Path) -> str:
 
 def _windows_register_record_claim(path: Path, fd: int, device: int, inode: int) -> None:
     key = _windows_record_claim_key(path)
-    entries = _WINDOWS_RECORD_CLAIMS.setdefault(key, [])
-    entry = (fd, device, inode)
-    if entry not in entries:
-        entries.append(entry)
+    with _WINDOWS_RECORD_CLAIMS_LOCK:
+        entries = _WINDOWS_RECORD_CLAIMS.setdefault(key, [])
+        entry = (fd, device, inode)
+        if entry not in entries:
+            entries.append(entry)
 
 
-def _windows_unregister_record_claim(path: Path, fd: int) -> None:
+def _windows_unregister_record_claim(
+    path: Path,
+    fd: int,
+    *,
+    device: int | None = None,
+    inode: int | None = None,
+) -> None:
     key = _windows_record_claim_key(path)
-    entries = _WINDOWS_RECORD_CLAIMS.get(key)
-    if not entries:
-        return
-    retained = [entry for entry in entries if entry[0] != fd]
-    if retained:
-        _WINDOWS_RECORD_CLAIMS[key] = retained
-    else:
-        _WINDOWS_RECORD_CLAIMS.pop(key, None)
+    with _WINDOWS_RECORD_CLAIMS_LOCK:
+        entries = _WINDOWS_RECORD_CLAIMS.get(key)
+        if not entries:
+            return
+        if device is None or inode is None:
+            retained = [entry for entry in entries if entry[0] != fd]
+        else:
+            target = (fd, device, inode)
+            removed = False
+            retained = []
+            for entry in entries:
+                if not removed and entry == target:
+                    removed = True
+                else:
+                    retained.append(entry)
+        if retained:
+            _WINDOWS_RECORD_CLAIMS[key] = retained
+        else:
+            _WINDOWS_RECORD_CLAIMS.pop(key, None)
 
 
 def _windows_duplicate_record_claim(path: Path) -> int | None:
     """Duplicate an in-process claim for reconnect before opening a new object."""
 
     key = _windows_record_claim_key(path)
-    entries = _WINDOWS_RECORD_CLAIMS.get(key)
-    if not entries:
-        return None
-    retained: list[tuple[int, int, int]] = []
-    for index, (fd, device, inode) in enumerate(entries):
-        try:
-            metadata = os.fstat(fd)
-        except OSError:
-            continue
-        if int(metadata.st_dev) != device or int(metadata.st_ino) != inode:
-            continue
-        probe_fd: int | None = None
-        try:
-            probe_fd = _windows_probe_process_record(path)
-            probe_metadata = os.fstat(probe_fd)
-            if int(probe_metadata.st_dev) != device or int(probe_metadata.st_ino) != inode:
-                retained.append((fd, device, inode))
-                continue
+    with _WINDOWS_RECORD_CLAIMS_LOCK:
+        entries = _WINDOWS_RECORD_CLAIMS.get(key)
+        if not entries:
+            return None
+        retained: list[tuple[int, int, int]] = []
+        for index, (fd, device, inode) in enumerate(entries):
             try:
-                duplicate = os.dup(fd)
+                metadata = os.fstat(fd)
+            except OSError:
+                continue
+            if int(metadata.st_dev) != device or int(metadata.st_ino) != inode:
+                continue
+            probe_fd: int | None = None
+            try:
+                probe_fd = _windows_probe_process_record(path)
+                probe_metadata = os.fstat(probe_fd)
+                if int(probe_metadata.st_dev) != device or int(probe_metadata.st_ino) != inode:
+                    retained.append((fd, device, inode))
+                    continue
+                try:
+                    duplicate = os.dup(fd)
+                except OSError:
+                    retained.append((fd, device, inode))
+                    continue
+                retained.append((fd, device, inode))
+                retained.extend(entries[index + 1 :])
+                _WINDOWS_RECORD_CLAIMS[key] = retained
+                return duplicate
             except OSError:
                 retained.append((fd, device, inode))
-                continue
-            retained.append((fd, device, inode))
-            retained.extend(entries[index + 1 :])
-            _WINDOWS_RECORD_CLAIMS[key] = retained
-            return duplicate
-        except OSError:
-            retained.append((fd, device, inode))
-        finally:
-            if probe_fd is not None:
-                with contextlib.suppress(OSError):
-                    os.close(probe_fd)
-    _WINDOWS_RECORD_CLAIMS[key] = retained
-    return None
+            finally:
+                if probe_fd is not None:
+                    with contextlib.suppress(OSError):
+                        os.close(probe_fd)
+        _WINDOWS_RECORD_CLAIMS[key] = retained
+        return None
 
 
 def _windows_probe_process_record(path: Path) -> int:
@@ -750,6 +771,116 @@ class _ProcessRecordClaim:
     name: str = _PROCESS_RECORD_NAME
 
 
+class _DurableClaimCleanup:
+    """Retain only exact claim objects whose descriptors could not be closed."""
+
+    __slots__ = ("_lock", "_runtime_claims", "_process_record_claims")
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._runtime_claims: list[_RuntimeLaunchClaim] = []
+        self._process_record_claims: list[_ProcessRecordClaim] = []
+
+    @staticmethod
+    def _discard_identity(entries: list[Any], target: Any) -> None:
+        entries[:] = [entry for entry in entries if entry is not target]
+
+    def adopt(
+        self,
+        runtime_claim: _RuntimeLaunchClaim | None,
+        process_record_claim: _ProcessRecordClaim | None,
+        candidates: Iterable[_ProcessRecordClaim],
+    ) -> None:
+        """Adopt still-live claims without retaining their supervisor owner."""
+
+        with self._lock:
+            if (
+                runtime_claim is not None
+                and runtime_claim.handle is not None
+                and not any(held is runtime_claim for held in self._runtime_claims)
+            ):
+                self._runtime_claims.append(runtime_claim)
+            for candidate in (
+                process_record_claim,
+                *tuple(candidates),
+            ):
+                if candidate is None:
+                    continue
+                if candidate.handle is None and candidate.parent_fd is None:
+                    continue
+                if not any(held is candidate for held in self._process_record_claims):
+                    self._process_record_claims.append(candidate)
+
+    def _drain_runtime_claims(self) -> None:
+        for claim in tuple(self._runtime_claims):
+            if claim.handle is None:
+                self._discard_identity(self._runtime_claims, claim)
+                continue
+            try:
+                claim.close()
+            except BaseException:
+                continue
+            if claim.handle is None:
+                self._discard_identity(self._runtime_claims, claim)
+
+    @staticmethod
+    def _close_record_claim_descriptors(claim: _ProcessRecordClaim) -> None:
+        for attribute in ("handle", "parent_fd"):
+            fd = getattr(claim, attribute)
+            if fd is None:
+                continue
+            try:
+                if attribute == "handle" and _NATIVE_WINDOWS:
+                    # Keep the registry entry in place until this exact handle
+                    # is confirmed closed, while preventing fd reuse from
+                    # interleaving with the close/unregister pair.
+                    with _WINDOWS_RECORD_CLAIMS_LOCK:
+                        os.close(fd)
+                        setattr(claim, attribute, None)
+                        _windows_unregister_record_claim(
+                            claim.path,
+                            fd,
+                            device=claim.device,
+                            inode=claim.inode,
+                        )
+                else:
+                    os.close(fd)
+                    setattr(claim, attribute, None)
+            except BaseException:
+                continue
+
+    def _drain_process_record_claims(self) -> None:
+        for claim in tuple(self._process_record_claims):
+            if claim.handle is None and claim.parent_fd is None:
+                self._discard_identity(self._process_record_claims, claim)
+                continue
+            self._close_record_claim_descriptors(claim)
+            if claim.handle is None and claim.parent_fd is None:
+                self._discard_identity(self._process_record_claims, claim)
+
+    def drain(self) -> None:
+        """Retry exact descriptor closes; persistent failures remain owned."""
+
+        with self._lock:
+            self._drain_runtime_claims()
+            self._drain_process_record_claims()
+
+
+_DURABLE_CLAIM_CLEANUP = _DurableClaimCleanup()
+
+
+def _drain_durable_cleanup(
+    owner: _DurableClaimCleanup = _DURABLE_CLAIM_CLEANUP,
+) -> None:
+    """Opportunistically retry durable claim cleanup without raising."""
+
+    with contextlib.suppress(BaseException):
+        owner.drain()
+
+
+atexit.register(_drain_durable_cleanup)
+
+
 class _ProcessRecordPath(type(Path())):  # type: ignore[misc]
     """Path view that routes owner-local record observations through safe probes."""
 
@@ -1031,6 +1162,7 @@ class SolverSupervisor:
         self._pending_process_record_claim: _ProcessRecordClaim | None = None
         self._runtime_launch_claim: _RuntimeLaunchClaim | None = None
         self._record_owner_token = self._owner_token
+        _drain_durable_cleanup()
         filesystem_authority = _FilesystemAuthority(self.spec.attempt_root)
         try:
             self._filesystem_authority: _FilesystemAuthority | None = filesystem_authority
@@ -1065,13 +1197,32 @@ class SolverSupervisor:
             raise
 
     def __del__(self) -> None:
-        authority = getattr(self, "_filesystem_authority", None)
-        claim = getattr(self, "_process_record_claim", None)
-        candidates = getattr(self, "_process_record_candidates", ())
-        runtime_claim = getattr(self, "_runtime_launch_claim", None)
-        if authority is not None or claim is not None or candidates or runtime_claim is not None:
-            with contextlib.suppress(BaseException):
-                self._close_filesystem_authority()
+        try:
+            authority = getattr(self, "_filesystem_authority", None)
+            claim = getattr(self, "_process_record_claim", None)
+            candidates = getattr(self, "_process_record_candidates", ())
+            runtime_claim = getattr(self, "_runtime_launch_claim", None)
+            if (
+                authority is not None
+                or claim is not None
+                or candidates
+                or runtime_claim is not None
+            ):
+                with contextlib.suppress(BaseException):
+                    self._close_filesystem_authority()
+            pending = getattr(self, "_pending_process_record_claim", None)
+            candidate_values = tuple(getattr(self, "_process_record_candidates", ()))
+            if pending is not None:
+                candidate_values += (pending,)
+            _DURABLE_CLAIM_CLEANUP.adopt(
+                getattr(self, "_runtime_launch_claim", None),
+                getattr(self, "_process_record_claim", None),
+                candidate_values,
+            )
+        except BaseException:
+            # Finalization must not surface an unraisable exception. Claims
+            # already adopted above remain owned by the process-lifetime owner.
+            pass
 
     @property
     def state(self) -> SolverState:
@@ -1110,6 +1261,7 @@ class SolverSupervisor:
             return latch
 
     def _acquire_filesystem_authority(self) -> None:
+        _drain_durable_cleanup()
         if self._filesystem_authority is None:
             self._filesystem_authority = _FilesystemAuthority(self.spec.attempt_root)
         self._filesystem_authority.verify()
@@ -1192,13 +1344,23 @@ class SolverSupervisor:
                 fd = getattr(claim, attribute)
                 if fd is not None:
                     try:
-                        os.close(fd)
+                        if attribute == "handle" and _NATIVE_WINDOWS:
+                            with _WINDOWS_RECORD_CLAIMS_LOCK:
+                                os.close(fd)
+                                setattr(claim, attribute, None)
+                                _windows_unregister_record_claim(
+                                    claim.path,
+                                    fd,
+                                    device=claim.device,
+                                    inode=claim.inode,
+                                )
+                        else:
+                            os.close(fd)
                     except BaseException as error:
                         failures.append(error)
                     else:
-                        setattr(claim, attribute, None)
-                        if attribute == "handle" and _NATIVE_WINDOWS:
-                            _windows_unregister_record_claim(claim.path, fd)
+                        if getattr(claim, attribute) == fd:
+                            setattr(claim, attribute, None)
             if claim.handle is None and claim.parent_fd is None:
                 self._process_record_candidates[:] = [
                     candidate
@@ -2015,6 +2177,7 @@ class SolverSupervisor:
     ) -> _ProcessRecordClaim:
         """Retain a newly opened record descriptor before fallible use."""
 
+        path = Path(os.fspath(path))
         candidate = _ProcessRecordClaim(
             path=path,
             content=b"",
