@@ -158,7 +158,15 @@ def test_probe_uses_exact_path_and_no_shell(
     diagnostic = probe_febio(executable)
 
     assert diagnostic.version == "4.2.0"
-    assert observed["command"] == [str(executable.absolute())]
+    if os.name == "posix":
+        command = observed["command"]
+        assert isinstance(command, list)
+        assert len(command) == 1
+        assert isinstance(command[0], str)
+        assert command[0].startswith("/proc/self/fd/")
+        assert observed["pass_fds"]
+    else:
+        assert observed["command"] == [str(executable.absolute())]
     assert observed["shell"] is False
     assert observed["stdin"] is not None
     assert observed["stdout"] is not None
@@ -217,11 +225,26 @@ def test_probe_hashes_again_after_process_exit(
 ) -> None:
     executable = _fake_file(tmp_path)
 
+    if os.name == "nt":
+        original_snapshot_from_fd = runtime_module._snapshot_from_fd
+        snapshot_calls = 0
+
+        def changed_snapshot(handle: int) -> object:
+            nonlocal snapshot_calls
+            snapshot_calls += 1
+            snapshot = original_snapshot_from_fd(handle)
+            if snapshot_calls >= 2:
+                return replace(snapshot, sha256="0" * 64)
+            return snapshot
+
+        monkeypatch.setattr(runtime_module, "_snapshot_from_fd", changed_snapshot)
+
     class CompletedProcess:
         returncode = 0
 
         def communicate(self, input: bytes, timeout: float) -> tuple[bytes, bytes]:
-            executable.write_bytes(b"modified synthetic FEBio executable")
+            if os.name != "nt":
+                executable.write_bytes(b"modified synthetic FEBio executable")
             return b"version 4.2.0\n", b""
 
     monkeypatch.setattr(
@@ -332,7 +355,247 @@ def test_probe_requires_exact_executable_arguments(
     diagnostic = probe_febio(executable)
 
     assert diagnostic.version == "4.2.0"
-    assert observed["command"] == [str(executable.absolute())]
+    if os.name == "posix":
+        command = observed["command"]
+        assert isinstance(command, list)
+        assert len(command) == 1
+        assert isinstance(command[0], str)
+        assert command[0].startswith("/proc/self/fd/")
+    else:
+        assert observed["command"] == [str(executable.absolute())]
+
+
+def test_probe_holds_exact_image_claim_across_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Probe execution must use the held image while the path is replaced and restored."""
+
+    executable = _fake_file(tmp_path)
+    claimed_path = tmp_path / "claimed-executable"
+    events: list[str] = []
+
+    class Claim:
+        child_path = claimed_path
+        child_pass_fds = (71,)
+        handle = 71
+
+        def close(self) -> None:
+            events.append("close")
+
+    claim = Claim()
+
+    def open_claim(path: Path, snapshot: object) -> Claim:
+        assert path == executable.absolute()
+        del snapshot
+        events.append("claim")
+        return claim
+
+    monkeypatch.setattr(runtime_module, "_open_runtime_claim", open_claim, raising=False)
+    monkeypatch.setattr(
+        runtime_module,
+        "_snapshot_from_fd",
+        lambda handle: runtime_module._snapshot(executable),
+    )
+
+    class CompletedProcess:
+        returncode = 0
+
+        def communicate(self, input: bytes, timeout: float) -> tuple[bytes, bytes]:
+            assert input == b"quit\n"
+            assert timeout > 0
+            events.append("consume")
+            replacement = tmp_path / "replacement"
+            original = tmp_path / "original"
+            replacement.write_bytes(b"replacement image")
+            os.replace(os.fspath(executable), os.fspath(original))
+            os.replace(os.fspath(replacement), os.fspath(executable))
+            os.replace(os.fspath(executable), os.fspath(replacement))
+            os.replace(os.fspath(original), os.fspath(executable))
+            replacement.unlink()
+            return b"version 4.2.0\n", b""
+
+    def fake_popen(command: object, **kwargs: object) -> CompletedProcess:
+        events.append("popen")
+        assert command == [os.fspath(claimed_path)]
+        assert kwargs["pass_fds"] == (71,)
+        return CompletedProcess()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
+    diagnostic = probe_febio(executable)
+
+    assert diagnostic.version == "4.2.0"
+    assert events == ["claim", "popen", "consume", "close"]
+
+
+def test_posix_runtime_snapshot_is_immutable_against_preexisting_writer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A writer held before acquisition cannot mutate the executable claim."""
+
+    source = _fake_file(tmp_path)
+    original = source.read_bytes()
+    writer_fd = os.open(os.fspath(source), os.O_RDWR)
+    expected = runtime_module._snapshot(source)
+    snapshot_fds: set[int] = set()
+    observed_seals: dict[int, int] = {}
+    memfd_flags: list[int] = []
+    original_fstat = os.fstat
+    original_is_dir = Path.is_dir
+
+    class FakeFcntl:
+        F_ADD_SEALS = 1
+        F_GET_SEALS = 2
+        F_SEAL_WRITE = 4
+        F_SEAL_GROW = 8
+        F_SEAL_SHRINK = 16
+        F_SEAL_SEAL = 32
+
+        @staticmethod
+        def fcntl(fd: int, command: int, argument: int = 0) -> int:
+            if command == FakeFcntl.F_ADD_SEALS:
+                observed_seals[fd] = argument
+                return 0
+            if command == FakeFcntl.F_GET_SEALS:
+                return observed_seals.get(fd, 0)
+            raise OSError("synthetic unsupported fcntl command")
+
+    def fake_memfd_create(name: str, flags: int) -> int:
+        assert name == "febio-cae-runtime"
+        memfd_flags.append(flags)
+        snapshot = tmp_path / "synthetic-anonymous-image"
+        fd = os.open(os.fspath(snapshot), os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o700)
+        snapshot_fds.add(fd)
+        return fd
+
+    def fake_fstat(fd: int) -> object:
+        metadata = original_fstat(fd)
+        if fd not in snapshot_fds:
+            return metadata
+        return SimpleNamespace(
+            st_mode=metadata.st_mode,
+            st_dev=metadata.st_dev,
+            st_ino=metadata.st_ino,
+            st_nlink=0,
+            st_size=metadata.st_size,
+        )
+
+    def fake_is_dir(path: Path) -> bool:
+        if path.as_posix() == "/proc/self/fd":
+            return True
+        return original_is_dir(path)
+
+    monkeypatch.setattr(os, "memfd_create", fake_memfd_create, raising=False)
+    monkeypatch.setattr(os, "MFD_ALLOW_SEALING", 0x0002, raising=False)
+    monkeypatch.setattr(os, "MFD_CLOEXEC", 0x0001, raising=False)
+    monkeypatch.setattr(os, "fstat", fake_fstat)
+    monkeypatch.setattr(Path, "is_dir", fake_is_dir)
+    monkeypatch.setattr(
+        runtime_module,
+        "_posix_seal_configuration",
+        lambda: (FakeFcntl, 60),
+        raising=False,
+    )
+
+    snapshot_fd: int | None = None
+    try:
+        snapshot_fd, image = runtime_module._posix_create_runtime_snapshot(writer_fd, expected)
+        assert image.nlink == 0
+        assert image.sha256 == expected.sha256
+        assert image.size == expected.size
+        assert memfd_flags == [0x0003]
+        assert observed_seals[snapshot_fd] == 60
+
+        tampered = bytes(value ^ 0xFF for value in original)
+        os.lseek(writer_fd, 0, os.SEEK_SET)
+        assert os.write(writer_fd, tampered) == len(tampered)
+        os.lseek(snapshot_fd, 0, os.SEEK_SET)
+        assert os.read(snapshot_fd, len(original)) == original
+    finally:
+        if snapshot_fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(snapshot_fd)
+        with contextlib.suppress(OSError):
+            os.lseek(writer_fd, 0, os.SEEK_SET)
+            os.ftruncate(writer_fd, 0)
+            os.write(writer_fd, original)
+        with contextlib.suppress(OSError):
+            os.close(writer_fd)
+
+
+def test_posix_runtime_claim_fails_closed_without_proc_fd_primitive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if os.name != "posix":
+        pytest.skip("POSIX-only exact executable descriptor primitive")
+
+    executable = _fake_file(tmp_path)
+
+    class CompletedProcess:
+        returncode = 0
+
+        def communicate(self, input: bytes, timeout: float) -> tuple[bytes, bytes]:
+            del input, timeout
+            return b"version 4.2.0\n", b""
+
+    monkeypatch.setattr(
+        subprocess,
+        "Popen",
+        lambda command, **kwargs: CompletedProcess(),
+    )
+    diagnostic = probe_febio(executable)
+    original_is_dir = Path.is_dir
+
+    def unavailable(path: Path) -> bool:
+        if path == Path("/proc/self/fd"):
+            return False
+        return original_is_dir(path)
+
+    monkeypatch.setattr(Path, "is_dir", unavailable)
+    with pytest.raises(RuntimeProbeError, match="descriptor|image|/proc"):
+        runtime_module._acquire_runtime_launch_claim(diagnostic)
+
+
+def test_posix_runtime_claim_close_failure_retains_exact_descriptor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if os.name != "posix":
+        pytest.skip("POSIX-only executable descriptor ownership")
+
+    executable = _fake_file(tmp_path)
+
+    class CompletedProcess:
+        returncode = 0
+
+        def communicate(self, input: bytes, timeout: float) -> tuple[bytes, bytes]:
+            del input, timeout
+            return b"version 4.2.0\n", b""
+
+    monkeypatch.setattr(
+        subprocess,
+        "Popen",
+        lambda command, **kwargs: CompletedProcess(),
+    )
+    diagnostic = probe_febio(executable)
+    claim = runtime_module._acquire_runtime_launch_claim(diagnostic)
+    assert claim.handle is not None
+    target_fd = claim.handle
+    original_close = os.close
+
+    def fail_close(fd: int) -> None:
+        if fd == target_fd:
+            raise OSError("synthetic exact descriptor close failure")
+        original_close(fd)
+
+    monkeypatch.setattr(os, "close", fail_close)
+    with pytest.raises(RuntimeProbeError, match="close"):
+        claim.close()
+    assert claim.handle == target_fd
+
+    monkeypatch.setattr(os, "close", original_close)
+    claim.close()
+    with pytest.raises(OSError):
+        os.fstat(target_fd)
 
 
 def test_windows_launch_claim_rejects_digest_mismatch_before_resume(

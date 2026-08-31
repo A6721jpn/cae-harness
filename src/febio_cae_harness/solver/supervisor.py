@@ -39,7 +39,9 @@ from .runtime import (
     RuntimeProbeError,
     _acquire_runtime_launch_claim,
     _drain_runtime_claims,
+    _FileSnapshot,
     _RuntimeLaunchClaim,
+    _snapshot_from_fd,
     _windows_close_native_handle,
     _windows_close_owned_fd,
     _windows_compare_object_handles,
@@ -1396,7 +1398,11 @@ class _DurableClaimCleanup:
                 self._input_leases.append(input_lease)
             if (
                 runtime_claim is not None
-                and (runtime_claim.handle is not None or runtime_claim.native_handle is not None)
+                and (
+                    runtime_claim.handle is not None
+                    or runtime_claim.native_handle is not None
+                    or runtime_claim.source_handle is not None
+                )
                 and not any(held is runtime_claim for held in self._runtime_claims)
             ):
                 self._runtime_claims.append(runtime_claim)
@@ -1418,14 +1424,14 @@ class _DurableClaimCleanup:
 
     def _drain_runtime_claims(self) -> None:
         for claim in tuple(self._runtime_claims):
-            if claim.handle is None and claim.native_handle is None:
+            if claim.handle is None and claim.native_handle is None and claim.source_handle is None:
                 self._discard_identity(self._runtime_claims, claim)
                 continue
             try:
                 claim.close()
             except BaseException:
                 continue
-            if claim.handle is None and claim.native_handle is None:
+            if claim.handle is None and claim.native_handle is None and claim.source_handle is None:
                 self._discard_identity(self._runtime_claims, claim)
 
     @staticmethod
@@ -1620,6 +1626,7 @@ class _ProcessMetadata:
     alive: bool
     return_code: int | None
     started_at: datetime | None = None
+    executable_snapshot: _FileSnapshot | None = None
 
 
 def _normalise_executable(path: str | Path) -> str:
@@ -1663,12 +1670,16 @@ def _windows_process_metadata(pid: int) -> _ProcessMetadata:
 
 def _posix_process_metadata(pid: int) -> _ProcessMetadata:
     proc_root = Path("/proc") / str(pid)
+    if not Path("/proc").is_dir() or not proc_root.is_dir():
+        raise ProcessLookupError(pid)
     try:
         stat_line = (proc_root / "stat").read_text(encoding="utf-8")
         stat_fields = stat_line.rpartition(")")[2].split()
         executable_path = os.readlink(os.fspath(proc_root / "exe"))
-    except OSError as error:
+    except (OSError, TypeError, ValueError) as error:
         raise ProcessLookupError(pid) from error
+    if not isinstance(executable_path, str) or not executable_path:
+        raise ProcessLookupError(pid)
     if len(stat_fields) < 20:
         raise OSError("unable to read process start identity")
     state = stat_fields[0]
@@ -1690,12 +1701,35 @@ def _posix_process_metadata(pid: int) -> _ProcessMetadata:
         )
     except (OSError, StopIteration, ValueError, TypeError, OverflowError) as error:
         raise OSError("unable to read process start identity") from error
+    executable_fd: int | None = None
+    try:
+        close_on_exec = getattr(os, "O_CLOEXEC", None)
+        if (
+            isinstance(close_on_exec, bool)
+            or not isinstance(close_on_exec, int)
+            or close_on_exec <= 0
+        ):
+            raise OSError("process executable descriptor primitive is unavailable")
+        executable_fd = os.open(
+            os.fspath(proc_root / "exe"),
+            os.O_RDONLY | close_on_exec,
+        )
+        executable_snapshot = _snapshot_from_fd(executable_fd)
+    except (AttributeError, OSError, RuntimeProbeError, TypeError, ValueError) as error:
+        raise OSError("unable to read process executable image") from error
+    finally:
+        if executable_fd is not None:
+            try:
+                os.close(executable_fd)
+            except (AttributeError, OSError, TypeError, ValueError) as error:
+                raise OSError("unable to close process executable descriptor") from error
     return _ProcessMetadata(
         executable_path=executable_path,
         creation_identity=f"posix:{stat_fields[19]}",
         alive=state not in {"Z", "X"},
         return_code=None if state not in {"Z", "X"} else 0,
         started_at=started_at,
+        executable_snapshot=executable_snapshot,
     )
 
 
@@ -1733,11 +1767,13 @@ class _ReconnectedProcess:
         executable_path: str,
         creation_identity: str,
         authority: ProcessAuthority,
+        executable_snapshot: _FileSnapshot | None = None,
     ) -> None:
         self.pid = pid
         self._executable_path = executable_path
         self._creation_identity = creation_identity
         self._authority = authority
+        self._executable_snapshot = executable_snapshot
 
     def poll(self) -> int | None:
         try:
@@ -1746,12 +1782,19 @@ class _ReconnectedProcess:
             return 1
         if not metadata.alive:
             return metadata.return_code
-        if metadata.alive and (
-            _normalise_executable(metadata.executable_path)
-            != _normalise_executable(self._executable_path)
-            or metadata.creation_identity != self._creation_identity
-        ):
+        if metadata.alive and metadata.creation_identity != self._creation_identity:
             raise SolverOwnershipError("reconnected process identity no longer matches")
+        if metadata.alive:
+            if os.name == "posix":
+                if (
+                    self._executable_snapshot is None
+                    or metadata.executable_snapshot != self._executable_snapshot
+                ):
+                    raise SolverOwnershipError("reconnected process image no longer matches")
+            elif _normalise_executable(metadata.executable_path) != _normalise_executable(
+                self._executable_path
+            ):
+                raise SolverOwnershipError("reconnected process identity no longer matches")
         try:
             self._authority.verify(self.pid)
         except ProcessAuthorityError as error:
@@ -1830,6 +1873,7 @@ class SolverSupervisor:
         self._process_record_candidates: list[_ProcessRecordClaim] = []
         self._pending_process_record_claim: _ProcessRecordClaim | None = None
         self._runtime_launch_claim: _RuntimeLaunchClaim | None = None
+        self._runtime_image_snapshot: _FileSnapshot | None = None
         self._input_lease: _InputLease | None = None
         self._record_owner_token = self._owner_token
         _drain_durable_cleanup()
@@ -2299,6 +2343,10 @@ class SolverSupervisor:
             except (TypeError, ValueError):
                 command.append(value)
                 continue
+            runtime_claim = self._runtime_launch_claim
+            if runtime_claim is not None and candidate == self.spec.executable:
+                command.append(os.fspath(runtime_claim.child_path))
+                continue
             if input_lease is not None and candidate == self.spec.input_path:
                 command.append(os.fspath(input_lease.child_path))
                 continue
@@ -2682,14 +2730,13 @@ class SolverSupervisor:
                     self.spec.attempt_root, self._launch_context_digest
                 )
                 self._verify_filesystem_authority()
-                if os.name == "nt":
-                    try:
-                        runtime_claim = _acquire_runtime_launch_claim(self._runtime_diagnostic)
-                    except RuntimeProbeError as error:
-                        raise SolverLaunchError(
-                            "unable to hold the probed runtime executable identity"
-                        ) from error
-                    self._runtime_launch_claim = runtime_claim
+                try:
+                    runtime_claim = _acquire_runtime_launch_claim(self._runtime_diagnostic)
+                except RuntimeProbeError as error:
+                    raise SolverLaunchError(
+                        "unable to hold the probed runtime executable identity"
+                    ) from error
+                self._runtime_launch_claim = runtime_claim
                 environment = self._child_environment()
                 environment.update(authority.child_environment())
                 command = self._child_command()
@@ -2740,6 +2787,7 @@ class SolverSupervisor:
                         dict.fromkeys(
                             authority.child_pass_fds()
                             + filesystem_authority.child_pass_fds
+                            + (() if runtime_claim is None else runtime_claim.child_pass_fds)
                             + input_lease.child_pass_fds
                         )
                     )
@@ -2759,7 +2807,10 @@ class SolverSupervisor:
                 self._verify_filesystem_authority()
                 metadata = _process_metadata(process.pid)
                 if runtime_claim is not None:
-                    runtime_claim.authenticate(metadata.executable_path)
+                    runtime_claim.authenticate(
+                        metadata.executable_path,
+                        image_snapshot=metadata.executable_snapshot,
+                    )
                 authority.bind(process.pid, metadata.creation_identity)
                 bound = True
                 self._verify_filesystem_authority()
@@ -2772,8 +2823,24 @@ class SolverSupervisor:
                         "process creation identity changed during assignment"
                     )
                 if runtime_claim is not None:
-                    runtime_claim.authenticate(bound_metadata.executable_path)
+                    runtime_claim.authenticate(
+                        bound_metadata.executable_path,
+                        image_snapshot=bound_metadata.executable_snapshot,
+                    )
                 metadata = bound_metadata
+                if runtime_claim is not None:
+                    if os.name == "posix":
+                        if (
+                            metadata.executable_snapshot is None
+                            or metadata.executable_snapshot != runtime_claim.snapshot
+                            or metadata.executable_snapshot.nlink != 0
+                        ):
+                            raise ProcessAuthorityError(
+                                "executed POSIX runtime image attestation is unavailable"
+                            )
+                        self._runtime_image_snapshot = metadata.executable_snapshot
+                    else:
+                        self._runtime_image_snapshot = runtime_claim.snapshot
                 if metadata.started_at is None:
                     raise ProcessAuthorityError("process start identity is unavailable")
                 started_at = metadata.started_at
@@ -2817,6 +2884,13 @@ class SolverSupervisor:
                                 "runtime executable claim could not be closed"
                             ) from release_failures[0]
                         runtime_claim = None
+                elif runtime_claim is not None:
+                    release_failures = self._release_runtime_launch_claim()
+                    if release_failures:
+                        raise SolverOwnershipError(
+                            "runtime executable claim could not be closed"
+                        ) from release_failures[0]
+                    runtime_claim = None
                 running_record = self._make_process_record(
                     process.pid, metadata, started_at, authority, state=SolverState.RUNNING.value
                 )
@@ -2908,7 +2982,11 @@ class SolverSupervisor:
             supervisor._process_record = record
             pid = cast(int, record["pid"])
             supervisor._process = _ReconnectedProcess(
-                pid, metadata.executable_path, metadata.creation_identity, authority
+                pid,
+                metadata.executable_path,
+                metadata.creation_identity,
+                authority,
+                metadata.executable_snapshot,
             )
             supervisor._process_authority = authority
             supervisor._started_at = started_at
@@ -3036,7 +3114,8 @@ class SolverSupervisor:
             or not isinstance(fd, int)
             or fd < 0
             or not isinstance(sha256, str)
-            or not sha256
+            or len(sha256) != 64
+            or any(character not in "0123456789abcdef" for character in sha256)
             or not isinstance(identity_value, dict)
         ):
             raise SolverOwnershipError("process record sealed input lease is invalid")
@@ -3049,7 +3128,7 @@ class SolverSupervisor:
             if isinstance(item, bool) or not isinstance(item, int):
                 raise SolverOwnershipError("process record sealed input identity is invalid")
             identity.append(item)
-        if identity[2] <= 0 or identity[3] < 0:
+        if any(value < 0 for value in identity) or identity[2] != 0:
             raise SolverOwnershipError("process record sealed input identity is invalid")
         return fd, sha256, cast(tuple[int, int, int, int, int], tuple(identity))
 
@@ -3072,6 +3151,13 @@ class SolverSupervisor:
             raise ProcessAuthorityError(
                 "process authority root creation identity binding is invalid"
             )
+        executable_snapshot = self._runtime_image_snapshot
+        if executable_snapshot is None:
+            raise ProcessAuthorityError("runtime executable image binding is unavailable")
+        if executable_snapshot.sha256 != self._launch_context.get("runtime_sha256"):
+            raise ProcessAuthorityError("runtime executable image digest binding is invalid")
+        if os.name == "posix" and executable_snapshot.nlink != 0:
+            raise ProcessAuthorityError("runtime executable image is not anonymous")
         record: dict[str, object] = {
             "case_id": self._case_id,
             "intent_id": self._intent_id,
@@ -3079,6 +3165,15 @@ class SolverSupervisor:
             "state": state,
             "owner_token": self._record_owner_token,
             "executable_path": str(self.spec.executable),
+            "executable_image": {
+                "sha256": executable_snapshot.sha256,
+                "identity": {
+                    "device": executable_snapshot.device,
+                    "inode": executable_snapshot.inode,
+                    "nlink": executable_snapshot.nlink,
+                    "size": executable_snapshot.size,
+                },
+            },
             "pid": pid,
             "process_creation_identity": metadata.creation_identity,
             "start_time": started_at.isoformat(),
@@ -3485,6 +3580,37 @@ class SolverSupervisor:
         ):
             raise SolverOwnershipError(f"{label} escapes the attempt root")
 
+    def _parse_executable_image_record(self, record: dict[str, object]) -> _FileSnapshot:
+        value = record.get("executable_image")
+        if not isinstance(value, dict):
+            raise SolverOwnershipError("process record executable image is invalid")
+        sha256 = value.get("sha256")
+        identity_value = value.get("identity")
+        expected_sha256 = self._launch_context.get("runtime_sha256")
+        if (
+            not isinstance(sha256, str)
+            or len(sha256) != 64
+            or any(character not in "0123456789abcdef" for character in sha256)
+            or sha256 != expected_sha256
+            or not isinstance(identity_value, dict)
+        ):
+            raise SolverOwnershipError("process record executable image is invalid")
+        identity: list[int] = []
+        for name in ("device", "inode", "nlink", "size"):
+            item = identity_value.get(name)
+            if isinstance(item, bool) or not isinstance(item, int) or item < 0:
+                raise SolverOwnershipError("process record executable image identity is invalid")
+            identity.append(item)
+        if os.name == "posix" and identity[2] != 0:
+            raise SolverOwnershipError("process record executable image identity is not anonymous")
+        return _FileSnapshot(
+            device=identity[0],
+            inode=identity[1],
+            nlink=identity[2],
+            size=identity[3],
+            sha256=sha256,
+        )
+
     def _acquire_reconnected_posix_input_lease(
         self,
         record: dict[str, object],
@@ -3531,9 +3657,12 @@ class SolverSupervisor:
             if (
                 not current.alive
                 or current.creation_identity != metadata.creation_identity
-                or _normalise_executable(current.executable_path)
-                != _normalise_executable(metadata.executable_path)
                 or current.started_at != metadata.started_at
+                or (
+                    current.executable_snapshot is None
+                    or metadata.executable_snapshot is None
+                    or current.executable_snapshot != metadata.executable_snapshot
+                )
             ):
                 raise SolverOwnershipError("reconnected process identity changed")
             lease.verify(digest=True)
@@ -3545,9 +3674,12 @@ class SolverSupervisor:
             if (
                 not current.alive
                 or current.creation_identity != metadata.creation_identity
-                or _normalise_executable(current.executable_path)
-                != _normalise_executable(metadata.executable_path)
                 or current.started_at != metadata.started_at
+                or (
+                    current.executable_snapshot is None
+                    or metadata.executable_snapshot is None
+                    or current.executable_snapshot != metadata.executable_snapshot
+                )
             ):
                 raise SolverOwnershipError("reconnected process identity changed")
         except BaseException:
@@ -3612,6 +3744,7 @@ class SolverSupervisor:
             raise SolverOwnershipError("process record executable must be absolute")
         if _normalise_executable(executable_value) != _normalise_executable(self.spec.executable):
             raise SolverOwnershipError("process record executable does not match")
+        executable_snapshot = self._parse_executable_image_record(record)
 
         pid = record.get("pid")
         if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
@@ -3656,7 +3789,12 @@ class SolverSupervisor:
         if not metadata.alive:
             authority.close()
             raise SolverOwnershipError("recorded process is not live")
-        if _normalise_executable(metadata.executable_path) != _normalise_executable(
+        if os.name == "posix":
+            current_snapshot = metadata.executable_snapshot
+            if current_snapshot is None or current_snapshot != executable_snapshot:
+                authority.close()
+                raise SolverOwnershipError("current process executable image does not match")
+        elif _normalise_executable(metadata.executable_path) != _normalise_executable(
             executable_value
         ):
             authority.close()
@@ -3669,6 +3807,7 @@ class SolverSupervisor:
             raise SolverOwnershipError("current process start time does not match")
         if authority is None:  # pragma: no cover - defensive type/state guard
             raise SolverOwnershipError("recorded process authority is unavailable")
+        self._runtime_image_snapshot = executable_snapshot
         self._verify_filesystem_authority()
         return metadata, metadata.started_at, authority
 

@@ -8,6 +8,7 @@ import hashlib
 import inspect
 import json
 import os
+import stat
 import subprocess
 import sys
 import weakref
@@ -55,7 +56,9 @@ def _spec(tmp_path: Path) -> SolverLaunchSpec:
     )
 
 
-def _issued_runtime(monkeypatch: pytest.MonkeyPatch) -> FebioRuntimeDiagnostic:
+def _issued_runtime(
+    monkeypatch: pytest.MonkeyPatch, executable: Path | None = None
+) -> FebioRuntimeDiagnostic:
     class ProbeProcess:
         returncode = 0
 
@@ -69,7 +72,7 @@ def _issued_runtime(monkeypatch: pytest.MonkeyPatch) -> FebioRuntimeDiagnostic:
             "febio_cae_harness.solver.runtime.subprocess.Popen",
             lambda command, **kwargs: ProbeProcess(),
         )
-        return probe_febio(Path(sys.executable))
+        return probe_febio(Path(sys.executable) if executable is None else executable)
 
 
 def _capability(
@@ -77,6 +80,7 @@ def _capability(
     monkeypatch: pytest.MonkeyPatch,
     *,
     code: str,
+    executable: Path | None = None,
 ) -> SolverLaunchCapability:
     manager = ValidatedCaseWorkspace(tmp_path / "tool", tmp_path / "cae")
     case = manager.create_case("case-a")
@@ -89,7 +93,7 @@ def _capability(
     )
     intent = store.issue_intent_snapshot()
     input_path = attempt.write_text("input.feb", code)
-    runtime = _issued_runtime(monkeypatch)
+    runtime = _issued_runtime(monkeypatch, executable)
     return headless_module._issue_launch_capability(
         attempt,
         intent,
@@ -99,6 +103,14 @@ def _capability(
         expected_final_time=None,
         timeout_seconds=None,
     )
+
+
+def _runtime_copy(tmp_path: Path) -> Path:
+    path = tmp_path / "runtime-copy"
+    source = Path(sys.executable)
+    path.write_bytes(source.read_bytes())
+    path.chmod(path.stat().st_mode | stat.S_IXUSR)
+    return path
 
 
 def _windows_process_handle_count() -> int:
@@ -457,6 +469,202 @@ def test_posix_reconnect_rejects_unavailable_recorded_input_fd_without_touching_
                 supervisor._process_authority.close()
         with contextlib.suppress(OSError):
             record_path.unlink()
+
+
+def test_posix_launch_executes_held_runtime_image_after_path_replace_restore(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if os.name != "posix":
+        pytest.skip("POSIX-only exact executable image launch")
+
+    executable = _runtime_copy(tmp_path)
+    marker = tmp_path / "executed-marker.txt"
+    code = (
+        "from pathlib import Path; "
+        f"Path({str(marker)!r}).write_text('held-image', encoding='utf-8')"
+    )
+    capability = _capability(tmp_path, monkeypatch, code=code, executable=executable)
+    supervisor = SolverSupervisor(capability)
+    original_popen = cast(Callable[..., subprocess.Popen[bytes]], subprocess.Popen)
+    observed: dict[str, object] = {}
+
+    def racing_popen(command: object, **kwargs: object) -> subprocess.Popen[bytes]:
+        observed["command"] = command
+        assert isinstance(command, tuple)
+        assert str(command[0]).startswith("/proc/self/fd/")
+        replacement = executable.with_name("runtime-replacement")
+        displaced = executable.with_name("runtime-displaced")
+        replacement.write_bytes(b"replacement image")
+        os.replace(os.fspath(executable), os.fspath(displaced))
+        os.replace(os.fspath(replacement), os.fspath(executable))
+        try:
+            return original_popen(command, **kwargs)
+        finally:
+            os.replace(os.fspath(executable), os.fspath(replacement))
+            os.replace(os.fspath(displaced), os.fspath(executable))
+            replacement.unlink()
+
+    monkeypatch.setattr(subprocess, "Popen", racing_popen)
+    result = supervisor.run()
+
+    assert result.state is SolverState.NORMAL_EXIT
+    assert marker.read_text(encoding="utf-8") == "held-image"
+    assert observed["command"]
+
+
+def test_posix_process_record_binds_executed_image_and_reconnects_by_digest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if os.name != "posix":
+        pytest.skip("POSIX-only executed-image reconnect binding")
+
+    executable = _runtime_copy(tmp_path)
+    capability = _capability(
+        tmp_path,
+        monkeypatch,
+        code="import time; time.sleep(30)",
+        executable=executable,
+    )
+    supervisor = SolverSupervisor(capability)
+    reconnected: SolverSupervisor | None = None
+    supervisor.start()
+    process = cast(subprocess.Popen[bytes], supervisor._process)
+    record_path = Path(os.fspath(supervisor.process_record_path))
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    image = record["executable_image"]
+    assert isinstance(image, dict)
+    assert image["sha256"] == hashlib.sha256(executable.read_bytes()).hexdigest()
+    image_identity = image["identity"]
+    assert isinstance(image_identity, dict)
+    assert image_identity["device"] >= 0
+    assert image_identity["inode"] >= 0
+    assert image_identity["nlink"] == 0
+    assert image_identity["size"] == executable.stat().st_size
+
+    supervisor._close_filesystem_authority()
+    try:
+        # The path is replaced and restored while reconnect authority is detached;
+        # the executed image remains the held object recorded above.
+        replacement = executable.with_name("runtime-replacement")
+        displaced = executable.with_name("runtime-displaced")
+        replacement.write_bytes(b"replacement image")
+        os.replace(os.fspath(executable), os.fspath(displaced))
+        os.replace(os.fspath(replacement), os.fspath(executable))
+        os.replace(os.fspath(executable), os.fspath(replacement))
+        os.replace(os.fspath(displaced), os.fspath(executable))
+        replacement.unlink()
+
+        tampered = json.loads(json.dumps(record))
+        tampered["executable_image"]["sha256"] = "0" * 64
+        record_path.write_bytes(json.dumps(tampered, indent=2, sort_keys=True).encode("utf-8"))
+        with pytest.raises(SolverOwnershipError, match="executable|image|digest"):
+            SolverSupervisor.reconnect(capability)
+        assert process.poll() is None
+
+        record_path.write_bytes(json.dumps(record, indent=2, sort_keys=True).encode("utf-8"))
+        reconnected = SolverSupervisor.reconnect(capability)
+        assert reconnected.pid == process.pid
+    finally:
+        if reconnected is not None:
+            with contextlib.suppress(BaseException):
+                reconnected.cancel()
+        elif process.poll() is None:
+            with contextlib.suppress(BaseException):
+                process.kill()
+            with contextlib.suppress(BaseException):
+                process.wait(timeout=5.0)
+        with contextlib.suppress(BaseException):
+            if supervisor._process_authority is not None:
+                supervisor._process_authority.close()
+        with contextlib.suppress(OSError):
+            record_path.unlink()
+
+
+def test_process_record_parser_accepts_zero_link_anonymous_input_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    capability = _capability(tmp_path, monkeypatch, code="pass")
+    supervisor = SolverSupervisor(capability)
+    expected_sha256, expected_identity = supervisor._recorded_input_binding()
+    identity = {
+        "device": 11,
+        "inode": 22,
+        "nlink": 0,
+        "size": 33,
+        "mtime_ns": 44,
+    }
+    record: dict[str, object] = {
+        "input_lease": {
+            "fd": 7,
+            "sha256": expected_sha256,
+            "identity": identity,
+        }
+    }
+
+    parsed_fd, parsed_sha256, parsed_identity = supervisor._parse_posix_input_lease_record(record)
+
+    assert parsed_fd == 7
+    assert parsed_sha256 == expected_sha256
+    assert parsed_identity == (
+        identity["device"],
+        identity["inode"],
+        identity["nlink"],
+        identity["size"],
+        identity["mtime_ns"],
+    )
+    assert expected_identity[2] == 1
+
+
+@pytest.mark.parametrize("nlink", [-1, 1, 2])
+def test_process_record_parser_rejects_nonanonymous_input_link_counts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, nlink: int
+) -> None:
+    capability = _capability(tmp_path, monkeypatch, code="pass")
+    supervisor = SolverSupervisor(capability)
+    expected_sha256, _expected_identity = supervisor._recorded_input_binding()
+    record: dict[str, object] = {
+        "input_lease": {
+            "fd": 7,
+            "sha256": expected_sha256,
+            "identity": {
+                "device": 11,
+                "inode": 22,
+                "nlink": nlink,
+                "size": 33,
+                "mtime_ns": 44,
+            },
+        }
+    }
+
+    with pytest.raises(SolverOwnershipError, match="identity"):
+        supervisor._parse_posix_input_lease_record(record)
+
+
+@pytest.mark.parametrize("field", ["device", "inode", "size", "mtime_ns"])
+def test_process_record_parser_rejects_negative_anonymous_input_identity_fields(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field: str
+) -> None:
+    capability = _capability(tmp_path, monkeypatch, code="pass")
+    supervisor = SolverSupervisor(capability)
+    expected_sha256, _expected_identity = supervisor._recorded_input_binding()
+    identity = {
+        "device": 11,
+        "inode": 22,
+        "nlink": 0,
+        "size": 33,
+        "mtime_ns": 44,
+    }
+    identity[field] = -1
+    record: dict[str, object] = {
+        "input_lease": {
+            "fd": 7,
+            "sha256": expected_sha256,
+            "identity": identity,
+        }
+    }
+
+    with pytest.raises(SolverOwnershipError, match="identity"):
+        supervisor._parse_posix_input_lease_record(record)
 
 
 def test_windows_input_lease_blocks_leaf_write_and_replace(
