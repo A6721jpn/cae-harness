@@ -721,8 +721,12 @@ class _WindowsProcessAuthority(ProcessAuthority):
             assigned = int(header.NumberOfAssignedProcesses)
             listed = int(header.NumberOfProcessIdsInList)
             if queried:
-                if assigned != listed or listed > capacity:
+                if listed > capacity or assigned < listed:
                     raise ProcessAuthorityError("attested job process list is incomplete")
+                if assigned > listed:
+                    capacity = max(capacity, assigned)
+                    time.sleep(0.01)
+                    continue
                 values = (ctypes.c_size_t * listed).from_address(ctypes.addressof(buffer) + offset)
                 pids = tuple(int(value) for value in values)
                 if any(pid <= 0 for pid in pids) or len(set(pids)) != len(pids):
@@ -809,6 +813,50 @@ class _WindowsProcessAuthority(ProcessAuthority):
         finally:
             k.CloseHandle(process)
 
+    def _restrict_to_reconnect_access(self, pid: int) -> None:
+        """Drop job-wide mutation authority before any child code can run."""
+
+        if not self._can_terminate_job:
+            return
+        if not self._handle:
+            raise ProcessAuthorityError("process authority handle is unavailable")
+        if pid != self._bound_pid or self._bound_creation_identity is None:
+            raise ProcessAuthorityError("process authority root process is not bound")
+
+        name = self._claim["name"]
+        if not isinstance(name, str):
+            raise ProcessAuthorityError("process authority job name is invalid")
+        k = self._kernel32()
+        limited_handle = k.OpenJobObjectW(self._JOB_RECONNECT_ACCESS, False, name)
+        if not limited_handle:
+            raise ProcessAuthorityError("unable to restrict process job authority")
+
+        keep_limited_handle = False
+        try:
+            process = k.OpenProcess(self._PROCESS_QUERY, False, pid)
+            if not process:
+                raise ProcessAuthorityError("attested process is not live")
+            try:
+                if self._live_creation_identity(pid, process) != self._bound_creation_identity:
+                    raise ProcessAuthorityError("process creation identity no longer matches")
+                in_job = ctypes.c_int()
+                if not k.IsProcessInJob(process, limited_handle, ctypes.byref(in_job)):
+                    raise ProcessAuthorityError("unable to verify restricted job authority")
+                if not in_job.value:
+                    raise ProcessAuthorityError("process is not in the restricted attested job")
+            finally:
+                k.CloseHandle(process)
+
+            full_handle = self._handle
+            if not k.CloseHandle(full_handle):
+                raise ProcessAuthorityError("unable to release full process job authority")
+            self._handle = limited_handle
+            self._can_terminate_job = False
+            keep_limited_handle = True
+        finally:
+            if not keep_limited_handle:
+                k.CloseHandle(limited_handle)
+
     def resume(self, pid: int) -> None:
         """Resume only threads belonging to the already-attested process."""
 
@@ -837,6 +885,7 @@ class _WindowsProcessAuthority(ProcessAuthority):
         if not thread_ids:
             self._fail_closed(pid, "attested process has no resumable primary thread")
 
+        threads: list[Any] = []
         try:
             for thread_id in thread_ids:
                 thread = k.OpenThread(
@@ -846,20 +895,22 @@ class _WindowsProcessAuthority(ProcessAuthority):
                 )
                 if not thread:
                     raise ProcessAuthorityError("unable to open attested process primary thread")
-                try:
-                    if k.GetProcessIdOfThread(thread) != pid:
-                        raise ProcessAuthorityError(
-                            "attested process primary thread identity changed"
-                        )
-                    previous_count = k.ResumeThread(thread)
-                    if previous_count == self._STILL_SUSPENDED or previous_count != 1:
-                        raise ProcessAuthorityError(
-                            "attested process primary thread was not suspended exactly once"
-                        )
-                finally:
-                    k.CloseHandle(thread)
+                threads.append(thread)
+                if k.GetProcessIdOfThread(thread) != pid:
+                    raise ProcessAuthorityError("attested process primary thread identity changed")
+
+            self._restrict_to_reconnect_access(pid)
+            for thread in threads:
+                previous_count = k.ResumeThread(thread)
+                if previous_count == self._STILL_SUSPENDED or previous_count != 1:
+                    raise ProcessAuthorityError(
+                        "attested process primary thread was not suspended exactly once"
+                    )
         except ProcessAuthorityError:
             self._fail_closed(pid, "unable to resume attested process primary thread")
+        finally:
+            for thread in threads:
+                k.CloseHandle(thread)
 
     def _fail_closed(self, pid: int, message: str) -> None:
         try:

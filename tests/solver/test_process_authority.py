@@ -528,6 +528,80 @@ def test_windows_child_job_handle_is_restricted_and_retains_job_lifetime(
         authority.close()
 
 
+def test_windows_full_job_handle_is_closed_before_adversarial_child_resumes(
+    tmp_path: Path,
+) -> None:
+    digest = "5" * 64
+    authority = authority_module._WindowsProcessAuthority.create(tmp_path, digest)
+    full_handle = int(authority._handle)
+    child_handle = authority.child_handle()
+    assert child_handle is not None
+    child_code = "\n".join(
+        (
+            "import ctypes, sys, time",
+            "k = ctypes.WinDLL('kernel32', use_last_error=True)",
+            "k.GetCurrentProcess.argtypes = []",
+            "k.GetCurrentProcess.restype = ctypes.c_void_p",
+            "k.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]",
+            "k.OpenProcess.restype = ctypes.c_void_p",
+            "k.DuplicateHandle.argtypes = [ctypes.c_void_p, ctypes.c_void_p, "
+            "ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p), ctypes.c_uint32, "
+            "ctypes.c_int, ctypes.c_uint32]",
+            "k.DuplicateHandle.restype = ctypes.c_int",
+            "k.CloseHandle.argtypes = [ctypes.c_void_p]",
+            "k.CloseHandle.restype = ctypes.c_int",
+            "source = k.OpenProcess(0x40, 0, int(sys.argv[1]))",
+            "current = k.GetCurrentProcess()",
+            "results = []",
+            "for access in (0x1, 0x2, 0x8, 0x10, 0x20, 0x10000, 0x40000, 0x80000):",
+            "    duplicate = ctypes.c_void_p()",
+            "    ok = source and k.DuplicateHandle(source, ctypes.c_void_p(int(sys.argv[2])), "
+            "current, ctypes.byref(duplicate), access, 0, 0)",
+            "    results.append(int(bool(ok)))",
+            "    if duplicate: k.CloseHandle(duplicate)",
+            "print('source', int(bool(source)), flush=True)",
+            "print('rights', *results, flush=True)",
+            "if source: k.CloseHandle(source)",
+            "time.sleep(30)",
+        )
+    )
+    startup_info = subprocess.STARTUPINFO()
+    startup_info.lpAttributeList = {"handle_list": [child_handle]}
+    root = subprocess.Popen(
+        [sys.executable, "-c", child_code, str(os.getpid()), str(full_handle)],
+        close_fds=True,
+        creationflags=supervisor_module._CREATE_SUSPENDED,
+        startupinfo=startup_info,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    unrelated = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        identity = supervisor_module._process_metadata(root.pid).creation_identity
+        authority.bind(root.pid, identity)
+        authority.resume(root.pid)
+
+        assert root.stdout is not None
+        assert root.stdout.readline().strip() == "source 1"
+        assert root.stdout.readline().strip() == "rights 0 0 0 0 0 0 0 0"
+        assert authority._can_terminate_job is False
+        assert unrelated.poll() is None
+    finally:
+        if root.poll() is None:
+            with contextlib.suppress(ProcessAuthorityError):
+                authority.terminate(root.pid)
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            root.wait(timeout=5)
+        if root.poll() is None:
+            root.kill()
+            root.wait(timeout=5)
+        if unrelated.poll() is None:
+            unrelated.kill()
+        unrelated.wait(timeout=5)
+        authority.close()
+
+
 def test_windows_child_job_handle_duplicate_failure_closes_full_handle_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
