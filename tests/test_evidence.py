@@ -1286,6 +1286,102 @@ def test_reopen_recovers_attempt_interrupted_before_recovery_backed_event(
     ]
 
 
+def test_attempt_recovery_marker_precedes_attempt_file_durability(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, case, intent = make_case(tmp_path)
+    store = EvidenceStore(case, intent)
+    original_replace = workspace_module._ExactCaseTransaction.replace_bytes
+    marker_publication_attempted = False
+
+    def fail_marker_publication(
+        self: Any,
+        relative_path: str | Path,
+        data: bytes,
+    ) -> None:
+        nonlocal marker_publication_attempted
+        if Path(relative_path).as_posix() == "90_Temporary/event-recovery.json":
+            marker_publication_attempted = True
+            raise OSError("injected recovery marker publication failure")
+        original_replace(self, relative_path, data)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            workspace_module._ExactCaseTransaction,
+            "replace_bytes",
+            fail_marker_publication,
+        )
+        with pytest.raises(EvidenceIntegrityError):
+            store.record_attempt("attempt-1", {"status": "prepared"})
+
+    reopened = EvidenceStore.open(case)
+
+    assert marker_publication_attempted
+    assert not (case.temporary_root / "attempts" / "attempt-1").exists()
+    assert reopened.events_path.read_bytes() == b""
+    assert reopened.manifest["events"]["count"] == 0
+    assert reopened.manifest["attempts"] == []
+
+
+def test_reopen_repairs_one_canonical_partial_attempt_event_idempotently(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, case, intent = make_case(tmp_path)
+    store = EvidenceStore(case, intent)
+    original_append = workspace_module._ExactCaseTransaction.append_bytes
+    appended_prefix = b""
+
+    def append_strict_prefix_then_fail(
+        self: Any,
+        relative_path: str | Path,
+        data: bytes,
+    ) -> None:
+        nonlocal appended_prefix
+        if not appended_prefix and Path(relative_path).as_posix() == EVENTS_FILE:
+            appended_prefix = data[: len(data) // 2]
+            assert appended_prefix and len(appended_prefix) < len(data)
+            original_append(self, relative_path, appended_prefix)
+            raise OSError("injected partial event append")
+        original_append(self, relative_path, data)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            workspace_module._ExactCaseTransaction,
+            "append_bytes",
+            append_strict_prefix_then_fail,
+        )
+        with pytest.raises(EvidenceIntegrityError):
+            store.record_attempt("attempt-1", {"status": "prepared"})
+
+    assert store.events_path.read_bytes() == appended_prefix
+
+    reopened = EvidenceStore.open(case)
+    repaired = reopened.events_path.read_bytes()
+    events = [json.loads(line) for line in repaired.decode("utf-8").splitlines()]
+    expected = (
+        json.dumps(
+            events[0],
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        + b"\n"
+    )
+
+    assert len(events) == 1
+    assert events[0]["event_type"] == "attempt_recorded"
+    assert events[0]["payload"]["attempt_id"] == "attempt-1"
+    assert repaired == expected
+    assert reopened.manifest["events"]["count"] == 1
+
+    reopened_again = EvidenceStore.open(case)
+    assert reopened_again.events_path.read_bytes() == repaired
+    assert reopened_again.manifest == reopened.manifest
+
+
 @pytest.mark.parametrize(
     "operation",
     [

@@ -1758,3 +1758,141 @@ def test_windows_close_handle_reports_lost_close_status(
 
     with pytest.raises(OSError, match="CloseHandle"):
         workspace_module._close_handle(17)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows rename sharing semantics")
+def test_new_replacement_blocks_substitution_after_final_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = make_workspace(tmp_path)
+    case = workspace.create_case("case-a")
+    relative = Path("90_Temporary") / "final-seam.txt"
+    target = case.case_root / relative
+    displaced = target.with_name("final-seam-owned.txt")
+    foreign = target.with_name("final-seam-foreign.txt")
+    foreign.write_bytes(b"foreign")
+    original_validate = workspace_module._ExactCaseTransaction.validate
+    blocked = False
+    substituted = False
+
+    def substitute_after_final_validation(self: Any) -> None:
+        nonlocal blocked, substituted
+        original_validate(self)
+        try:
+            target.rename(displaced)
+        except OSError:
+            blocked = True
+            return
+        foreign.rename(target)
+        substituted = True
+
+    monkeypatch.setattr(
+        workspace_module._ExactCaseTransaction,
+        "validate",
+        substitute_after_final_validation,
+    )
+
+    with case._exact_transaction() as exact:
+        exact.replace_bytes(relative, b"authoritative-new")
+
+    assert blocked
+    assert not substituted
+    assert target.read_bytes() == b"authoritative-new"
+    assert foreign.read_bytes() == b"foreign"
+    assert not displaced.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows exact-handle replacement")
+@pytest.mark.parametrize("failure_seam", ["precommit-restore-retry", "postcommit-old-cleanup"])
+def test_replacement_failure_retains_an_authoritative_version(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_seam: str,
+) -> None:
+    workspace = make_workspace(tmp_path)
+    case = workspace.create_case("case-a")
+    relative = Path("90_Temporary") / "rollback-seam.txt"
+    target = case.case_root / relative
+    case.write_bytes(relative, b"authoritative-old")
+
+    if failure_seam == "precommit-restore-retry":
+        original_rename = workspace_module._windows_rename_open_file
+        restoration_attempts = 0
+
+        def fail_commit_and_first_restore(
+            descriptor: int,
+            parent_handle: int,
+            parent_path: Path,
+            target_name: str,
+            *,
+            replace: bool,
+            label: str,
+        ) -> None:
+            nonlocal restoration_attempts
+            if label == "exact replacement temporary" and target_name == target.name:
+                raise WorkspaceBoundaryError("injected new commit failure")
+            if label == "exact replacement prior target recovery":
+                restoration_attempts += 1
+                if restoration_attempts == 1:
+                    raise WorkspaceBoundaryError("injected first restoration failure")
+            original_rename(
+                descriptor,
+                parent_handle,
+                parent_path,
+                target_name,
+                replace=replace,
+                label=label,
+            )
+
+        monkeypatch.setattr(
+            workspace_module,
+            "_windows_rename_open_file",
+            fail_commit_and_first_restore,
+        )
+
+        with pytest.raises(WorkspaceBoundaryError, match="injected new commit failure") as caught:
+            case.write_bytes(relative, b"authoritative-new")
+
+        assert restoration_attempts == 2
+        assert target.read_bytes() == b"authoritative-old"
+        assert any(
+            "first restoration failure" in note for note in getattr(caught.value, "__notes__", ())
+        )
+    else:
+        original_delete = workspace_module._delete_open_file
+        original_fstat = os.fstat
+        fail_next_identity = False
+        identity_failed = False
+
+        def delete_then_fail_identity(handle: int, label: str) -> None:
+            nonlocal fail_next_identity
+            original_delete(handle, label)
+            if label == "exact replacement prior target":
+                fail_next_identity = True
+
+        def fail_post_delete_identity(descriptor: int) -> os.stat_result:
+            nonlocal fail_next_identity, identity_failed
+            if fail_next_identity:
+                fail_next_identity = False
+                identity_failed = True
+                raise OSError("injected post-delete identity failure")
+            return original_fstat(descriptor)
+
+        monkeypatch.setattr(workspace_module, "_delete_open_file", delete_then_fail_identity)
+        monkeypatch.setattr(os, "fstat", fail_post_delete_identity)
+
+        with pytest.raises(WorkspaceBoundaryError, match="cannot replace exact file") as caught:
+            case.write_bytes(relative, b"authoritative-new")
+
+        assert identity_failed
+        assert target.read_bytes() == b"authoritative-new"
+        assert isinstance(caught.value.__cause__, OSError)
+        assert "post-delete identity failure" in str(caught.value.__cause__)
+
+    retained = {
+        child.read_bytes()
+        for child in target.parent.iterdir()
+        if child.is_file() and "rollback-seam" in child.name
+    }
+    assert b"authoritative-old" in retained or b"authoritative-new" in retained
