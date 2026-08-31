@@ -773,6 +773,104 @@ def test_windows_runtime_open_duplicates_raw_handle_before_crt_transfer(
                     runtime_module._windows_close_native_handle(native_handle)
 
 
+@pytest.mark.parametrize("drain_phase", ["duplicate", "open_osfhandle"])
+def test_windows_runtime_active_conversion_is_not_drainable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, drain_phase: str
+) -> None:
+    """Reentrant cleanup cannot drain H1 while it becomes H2 plus a CRT fd."""
+
+    if os.name != "nt":
+        pytest.fail("required Windows runtime conversion test executed on a non-Windows host")
+
+    import msvcrt
+
+    executable = _fake_file(tmp_path)
+    unrelated = tmp_path / "unrelated.bin"
+    unrelated.write_bytes(b"foreign owner")
+    unrelated_fd = os.open(os.fspath(unrelated), os.O_RDONLY | getattr(os, "O_BINARY", 0))
+    original_duplicate = runtime_module._windows_duplicate_native_handle
+    original_open_osfhandle = msvcrt.open_osfhandle
+    original_close_native = runtime_module._windows_close_native_handle
+    durable = runtime_module._RUNTIME_DURABLE_CLAIMS
+    prior_claims = list(durable)
+    durable[:] = []
+    published_during_conversion: list[bool] = []
+    closed_native: list[int] = []
+    result: int | None = None
+    claim: runtime_module._RuntimeLaunchClaim | None = None
+
+    def drain(raw_handle: int) -> None:
+        published_during_conversion.append(
+            any(getattr(held, "raw_handle", None) == raw_handle for held in durable)
+        )
+        runtime_module._drain_runtime_claims()
+
+    def duplicate(raw_handle: int) -> int:
+        raw_value = int(raw_handle)
+        if drain_phase == "duplicate":
+            drain(raw_value)
+        return original_duplicate(raw_value)
+
+    def open_osfhandle(raw_handle: int, descriptor_flags: int) -> int:
+        raw_value = int(raw_handle)
+        if drain_phase == "open_osfhandle":
+            drain(raw_value)
+        return original_open_osfhandle(raw_value, descriptor_flags)
+
+    def close_native(native_handle: int) -> None:
+        closed_native.append(native_handle)
+        original_close_native(native_handle)
+
+    monkeypatch.setattr(
+        runtime_module,
+        "_windows_duplicate_native_handle",
+        duplicate,
+        raising=False,
+    )
+    monkeypatch.setattr(msvcrt, "open_osfhandle", open_osfhandle)
+    monkeypatch.setattr(runtime_module, "_windows_close_native_handle", close_native)
+    try:
+        result = runtime_module._windows_open_runtime_claim(executable)
+        result_fd = int(result)
+        guard = getattr(result, "native_handle", None)
+        assert isinstance(guard, int)
+        assert published_during_conversion == [False]
+        assert closed_native == []
+        assert runtime_module._windows_fd_identity_matches(result_fd, guard) is True
+        assert runtime_module._same_image_snapshot(
+            runtime_module._snapshot(executable),
+            runtime_module._snapshot_from_handle(executable, result_fd),
+        )
+        os.fstat(unrelated_fd)
+
+        claim = runtime_module._RuntimeLaunchClaim(
+            path=executable,
+            snapshot=runtime_module._snapshot(executable),
+            handle=result_fd,
+            native_handle=guard,
+        )
+        result = None
+        claim.close()
+        assert claim.handle is None
+        assert claim.native_handle is None
+        assert closed_native == [guard]
+        os.fstat(unrelated_fd)
+    finally:
+        if result is not None:
+            native_handle = getattr(result, "native_handle", None)
+            with contextlib.suppress(OSError):
+                os.close(int(result))
+            if native_handle is not None:
+                with contextlib.suppress(OSError):
+                    original_close_native(native_handle)
+        if claim is not None and runtime_module._claim_has_owned_handles(claim):
+            with contextlib.suppress(BaseException):
+                claim.close()
+        with contextlib.suppress(OSError):
+            os.close(unrelated_fd)
+        durable[:] = prior_claims
+
+
 def test_windows_runtime_validation_failure_before_close_retains_exact_owner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

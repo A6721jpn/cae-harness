@@ -503,7 +503,6 @@ def _windows_convert_raw_handle(
         raw_handle=raw_handle,
         close_native_handle=close_native_handle,
     )
-    _retain_runtime_claim(owner)
     duplicate_native = duplicate_native_handle or _windows_duplicate_native_handle
     try:
         guard = duplicate_native(raw_handle)
