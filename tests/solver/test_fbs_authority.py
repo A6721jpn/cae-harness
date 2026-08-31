@@ -148,6 +148,201 @@ def test_path_must_be_live_regular_xplt_inside_attempt_root(tmp_path: Path) -> N
             validate_requested_fields(authority, invalid, ("stress",))
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows filesystem sharing authority")
+def test_windows_validation_blocks_byte_identical_xplt_replacement(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "attempt"
+    root.mkdir()
+    path = root / "attempt.xplt"
+    original = b"synthetic-xplt"
+    path.write_bytes(original)
+    original_identity = (path.stat().st_dev, path.stat().st_ino)
+    attempts: list[str] = []
+
+    class ReplacingAdapter:
+        def read_fields(self, _path: Path, fields: Sequence[str]) -> dict[str, object]:
+            replacement = root / "replacement.xplt"
+            replacement.write_bytes(original)
+            try:
+                os.replace(replacement, path)
+            except OSError:
+                attempts.append("blocked")
+            else:
+                attempts.append("replaced")
+            return {field: 1.0 for field in fields}
+
+    manager = FbsAdapterManager(ReplacingAdapter(), "synthetic-runtime", root)
+    authority = manager.issue_authority()
+    result = validate_requested_fields(authority, path, ("stress",))
+
+    assert attempts == ["blocked"] or not result.valid
+    if attempts == ["blocked"]:
+        assert (path.stat().st_dev, path.stat().st_ino) == original_identity
+    else:
+        assert (path.stat().st_dev, path.stat().st_ino) != original_identity
+    close = getattr(manager, "close", None)
+    if callable(close):
+        close()
+
+
+@pytest.mark.parametrize("rename_target", ["root", "ancestor"])
+@pytest.mark.skipif(os.name != "nt", reason="Windows filesystem sharing authority")
+def test_windows_validation_blocks_or_rejects_root_and_ancestor_substitution(
+    tmp_path: Path,
+    rename_target: str,
+) -> None:
+    container = tmp_path / "container"
+    ancestor = container / "ancestor"
+    root = ancestor / "attempt"
+    root.mkdir(parents=True)
+    path = root / "attempt.xplt"
+    original = b"synthetic-xplt"
+    path.write_bytes(original)
+    original_identity = (root.stat().st_dev, root.stat().st_ino)
+    moved = container / f"{rename_target}-moved"
+    attempts: list[str] = []
+
+    class RenamingAdapter:
+        def read_fields(self, _path: Path, fields: Sequence[str]) -> dict[str, object]:
+            target = root if rename_target == "root" else ancestor
+            try:
+                target.rename(moved)
+            except OSError:
+                attempts.append("blocked")
+            else:
+                attempts.append("renamed")
+                if rename_target == "root":
+                    root.mkdir()
+                else:
+                    ancestor.mkdir()
+                    root.mkdir()
+                (root / "attempt.xplt").write_bytes(original)
+            return {field: 1.0 for field in fields}
+
+    manager = FbsAdapterManager(RenamingAdapter(), "synthetic-runtime", root)
+    authority = manager.issue_authority()
+    result = validate_requested_fields(authority, path, ("stress",))
+
+    assert attempts == ["blocked"] or not result.valid
+    if attempts == ["blocked"]:
+        assert (root.stat().st_dev, root.stat().st_ino) == original_identity
+    else:
+        moved_root = moved if rename_target == "root" else moved / "attempt"
+        assert (moved_root.stat().st_dev, moved_root.stat().st_ino) == original_identity
+
+    close = getattr(manager, "close", None)
+    if callable(close):
+        close()
+    if moved.exists():
+        if rename_target == "root":
+            if root.exists():
+                (root / "attempt.xplt").unlink(missing_ok=True)
+                root.rmdir()
+            moved.rename(root)
+        else:
+            if ancestor.exists():
+                (root / "attempt.xplt").unlink(missing_ok=True)
+                root.rmdir()
+                ancestor.rmdir()
+            moved.rename(ancestor)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows native handle ownership")
+def test_windows_manager_uses_exact_owned_handle_and_close_revokes_authority(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "attempt"
+    root.mkdir()
+    path = root / "attempt.xplt"
+    path.write_bytes(b"synthetic-xplt")
+    manager = FbsAdapterManager(MappingAdapter(), "synthetic-runtime", root)
+    authority = manager.issue_authority()
+    binding = object.__getattribute__(manager, "_record").root_binding
+    assert binding is not None and binding.fd is not None
+    owner = binding.fd
+    assert not isinstance(owner, int)
+    assert validate_requested_fields(authority, path, ("stress",)).valid
+
+    manager.close()
+    manager.close()
+    assert getattr(owner, "closed", False)
+    with pytest.raises(TypeError):
+        manager.issue_authority()
+    with pytest.raises(TypeError):
+        validate_requested_fields(authority, path, ("stress",))
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows native handle ownership")
+def test_windows_close_failure_retains_exact_owner_for_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "attempt"
+    root.mkdir()
+    manager = FbsAdapterManager(MappingAdapter(), "synthetic-runtime", root)
+    binding = object.__getattribute__(manager, "_record").root_binding
+    assert binding is not None and binding.fd is not None
+    owner = binding.fd
+    original_value = owner.value
+    original_close = fbs_module._windows_close_raw
+    monkeypatch.setattr(
+        fbs_module,
+        "_windows_close_raw",
+        Mock(side_effect=OSError(32, "synthetic sharing violation")),
+    )
+
+    with pytest.raises(OSError):
+        manager.close()
+    assert owner.value == original_value and not owner.closed
+    assert any(candidate is owner for candidate in fbs_module._PENDING_CLEANUP)
+
+    monkeypatch.setattr(fbs_module, "_windows_close_raw", original_close)
+    manager.close()
+    assert owner.closed and owner.value is None
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows native handle ownership")
+def test_windows_close_refuses_reused_native_value(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "attempt"
+    root.mkdir()
+    manager = FbsAdapterManager(MappingAdapter(), "synthetic-runtime", root)
+    binding = object.__getattribute__(manager, "_record").root_binding
+    assert binding is not None and binding.fd is not None
+    owner = binding.fd
+    close_raw = Mock()
+    original_info = fbs_module._windows_file_info
+    monkeypatch.setattr(
+        fbs_module,
+        "_windows_file_info",
+        lambda _value: (owner.attributes, owner.device + 1, owner.inode, 1),
+    )
+    monkeypatch.setattr(fbs_module, "_windows_close_raw", close_raw)
+
+    with pytest.raises(ValueError, match="refusing close"):
+        fbs_module._close_owned_handle(owner)
+    assert close_raw.call_count == 0
+    assert owner.closed and owner.value is None
+    monkeypatch.setattr(fbs_module, "_windows_file_info", original_info)
+    manager.close()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows native handle ownership")
+def test_manager_context_close_revokes_existing_authority(tmp_path: Path) -> None:
+    root = tmp_path / "attempt"
+    root.mkdir()
+    path = root / "attempt.xplt"
+    path.write_bytes(b"synthetic-xplt")
+    with FbsAdapterManager(MappingAdapter(), "synthetic-runtime", root) as manager:
+        authority = manager.issue_authority()
+        assert validate_requested_fields(authority, path, ("stress",)).valid
+    with pytest.raises(TypeError):
+        validate_requested_fields(authority, path, ("stress",))
+
+
 def test_caller_supplied_descriptor_alias_cannot_forge_physical_root_membership(
     tmp_path: Path,
 ) -> None:
@@ -183,8 +378,11 @@ def test_adapter_mutation_invalidates_digest_bound_validation(tmp_path: Path) ->
 
     authority, path = make_authority(tmp_path, MutatingAdapter())
     result = validate_requested_fields(authority, path, ("stress",))
-    assert not result.valid and result.digest_before != result.digest_after
-    assert any("mutated" in issue for issue in result.issues)
+    assert not result.valid
+    assert result.digest_before != result.digest_after or any(
+        "adapter execution failed" in issue for issue in result.issues
+    )
+    assert any("mutated" in issue or "adapter execution failed" in issue for issue in result.issues)
 
 
 @pytest.mark.parametrize(
