@@ -571,21 +571,33 @@ def _close_owned_handle(owner: _OwnedHandle) -> None:
     if owner.windows:
         if not owner.windows_protected:
             if owner.windows_unprotected_for_close:
-                raise ValueError(
-                    "native filesystem handle close protection is unavailable; retaining owner"
-                )
-            if owner.identity_known:
-                _retire_owned_handle(owner)
-                raise ValueError("native filesystem handle is not protected; refusing close")
-            try:
-                _windows_close_raw(value)
-            except OSError as error:
-                if getattr(error, "winerror", error.errno) == _WINDOWS_ERROR_INVALID_HANDLE:
+                try:
+                    _windows_set_close_protection(value, True)
+                    flags = _windows_handle_flags(value)
+                except OSError as error:
+                    if getattr(error, "winerror", error.errno) == _WINDOWS_ERROR_INVALID_HANDLE:
+                        _retire_owned_handle(owner)
+                        return
+                    raise
+                if not flags & _WINDOWS_HANDLE_FLAG_PROTECT_FROM_CLOSE:
+                    raise ValueError(
+                        "native filesystem handle close protection is unavailable; retaining owner"
+                    )
+                owner.windows_protected = True
+                owner.windows_unprotected_for_close = False
+            else:
+                if owner.identity_known:
                     _retire_owned_handle(owner)
-                    return
-                raise
-            _retire_owned_handle(owner)
-            return
+                    raise ValueError("native filesystem handle is not protected; refusing close")
+                try:
+                    _windows_close_raw(value)
+                except OSError as error:
+                    if getattr(error, "winerror", error.errno) == _WINDOWS_ERROR_INVALID_HANDLE:
+                        _retire_owned_handle(owner)
+                        return
+                    raise
+                _retire_owned_handle(owner)
+                return
         try:
             flags = _windows_handle_flags(value)
         except OSError as error:
@@ -596,16 +608,17 @@ def _close_owned_handle(owner: _OwnedHandle) -> None:
         if not flags & _WINDOWS_HANDLE_FLAG_PROTECT_FROM_CLOSE:
             _retire_owned_handle(owner)
             raise ValueError("native filesystem handle is not protected; refusing close")
-        try:
-            _, device, inode, _ = _windows_file_info(value)
-        except OSError as error:
-            if getattr(error, "winerror", error.errno) == _WINDOWS_ERROR_INVALID_HANDLE:
+        if owner.identity_known:
+            try:
+                _, device, inode, _ = _windows_file_info(value)
+            except OSError as error:
+                if getattr(error, "winerror", error.errno) == _WINDOWS_ERROR_INVALID_HANDLE:
+                    _retire_owned_handle(owner)
+                    return
+                raise
+            if device != owner.device or inode != owner.inode:
                 _retire_owned_handle(owner)
-                return
-            raise
-        if device != owner.device or inode != owner.inode:
-            _retire_owned_handle(owner)
-            raise ValueError("native filesystem handle identity changed; refusing close")
+                raise ValueError("native filesystem handle identity changed; refusing close")
         try:
             _windows_set_close_protection(value, False)
             owner.windows_protected = False

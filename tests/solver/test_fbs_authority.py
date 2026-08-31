@@ -376,6 +376,137 @@ def test_windows_same_object_same_value_reuse_never_closes_foreign_handle(
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows native handle ownership")
+def test_windows_protected_acquisition_failure_closes_without_identity_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "attempt"
+    root.mkdir()
+    original_protect = fbs_module._windows_set_close_protection
+    original_close = fbs_module._windows_close_raw
+    original_best_effort = fbs_module._best_effort_close
+    captured: list[fbs_module._OwnedHandle] = []
+    captured_values: list[int | None] = []
+
+    def capture_best_effort(owner: fbs_module._OwnedHandle) -> None:
+        captured.append(owner)
+        captured_values.append(owner.value)
+        original_best_effort(owner)
+
+    metadata = Mock(side_effect=OSError(1234, "synthetic metadata failure"))
+    monkeypatch.setattr(fbs_module, "_best_effort_close", capture_best_effort)
+    monkeypatch.setattr(fbs_module, "_windows_file_info", metadata)
+
+    try:
+        with pytest.raises(OSError, match="synthetic metadata failure"):
+            fbs_module._windows_open_absolute(
+                root,
+                fbs_module._WINDOWS_FILE_LIST_DIRECTORY
+                | fbs_module._WINDOWS_FILE_READ_ATTRIBUTES
+                | fbs_module._WINDOWS_READ_CONTROL
+                | fbs_module._WINDOWS_SYNCHRONIZE,
+                fbs_module._WINDOWS_FILE_SHARE_READ | fbs_module._WINDOWS_FILE_SHARE_WRITE,
+                fbs_module._WINDOWS_FILE_FLAG_BACKUP_SEMANTICS
+                | fbs_module._WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT,
+            )
+        assert len(captured) == 1
+        owner = captured[0]
+        value = captured_values[0]
+        assert value is not None
+        assert owner.identity_known is False
+
+        live_flags: int | None = None
+        with contextlib.suppress(OSError):
+            live_flags = fbs_module._windows_handle_flags(value)
+        pending = any(candidate is owner for candidate in fbs_module._PENDING_CLEANUP)
+        assert not (
+            live_flags is not None
+            or not owner.closed
+            or owner.value is not None
+            or pending
+            or metadata.call_count != 1
+        ), (
+            "protected acquisition cleanup retained a live owner: "
+            f"value={value}, flags={live_flags}, closed={owner.closed}, "
+            f"owner_value={owner.value}, pending={pending}, "
+            f"metadata_calls={metadata.call_count}"
+        )
+    finally:
+        if captured and not captured[0].closed and captured[0].value is not None:
+            value = captured[0].value
+            original_protect(value, False)
+            original_close(value)
+            fbs_module._retire_owned_handle(captured[0])
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows native handle ownership")
+def test_windows_close_retry_reprotects_exact_owner_after_reprotect_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "attempt"
+    root.mkdir()
+    manager = FbsAdapterManager(MappingAdapter(), "synthetic-runtime", root)
+    binding = object.__getattribute__(manager, "_record").root_binding
+    assert binding is not None and binding.fd is not None
+    owner = binding.fd
+    value = owner.value
+    assert value is not None
+    original_close = fbs_module._windows_close_raw
+    original_protect = fbs_module._windows_set_close_protection
+    close_values: list[int] = []
+    protection_calls: list[tuple[int, bool]] = []
+    reprotect_failed = False
+
+    def close_once(value_to_close: int) -> None:
+        close_values.append(value_to_close)
+        if len(close_values) == 1:
+            raise OSError(32, "synthetic sharing violation")
+        original_close(value_to_close)
+
+    def fail_first_reprotect(value_to_protect: int, protected: bool) -> None:
+        nonlocal reprotect_failed
+        protection_calls.append((value_to_protect, protected))
+        if protected and not reprotect_failed:
+            reprotect_failed = True
+            raise OSError(32, "synthetic re-protect failure")
+        original_protect(value_to_protect, protected)
+
+    monkeypatch.setattr(fbs_module, "_windows_close_raw", close_once)
+    monkeypatch.setattr(fbs_module, "_windows_set_close_protection", fail_first_reprotect)
+
+    try:
+        with pytest.raises(OSError, match="synthetic sharing violation"):
+            manager.close()
+        assert owner.value == value and not owner.closed
+        assert not owner.windows_protected
+        assert owner.windows_unprotected_for_close
+        assert any(candidate is owner for candidate in fbs_module._PENDING_CLEANUP)
+
+        fbs_module._drain_pending_cleanup()
+
+        assert owner.closed and owner.value is None
+        assert not any(candidate is owner for candidate in fbs_module._PENDING_CLEANUP)
+        assert reprotect_failed
+        assert close_values == [value, value]
+        assert all(call_value == value for call_value, _ in protection_calls)
+        assert protection_calls == [
+            (value, False),
+            (value, True),
+            (value, True),
+            (value, False),
+        ]
+    finally:
+        monkeypatch.setattr(fbs_module, "_windows_close_raw", original_close)
+        monkeypatch.setattr(fbs_module, "_windows_set_close_protection", original_protect)
+        if not owner.closed and owner.value is not None:
+            original_protect(owner.value, False)
+            original_close(owner.value)
+            fbs_module._retire_owned_handle(owner)
+        manager.close()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows native handle ownership")
 def test_windows_close_failure_retains_exact_owner_for_retry(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
