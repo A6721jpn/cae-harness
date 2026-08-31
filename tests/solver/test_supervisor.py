@@ -2887,3 +2887,170 @@ def test_windows_owned_process_record_candidate_does_not_duplicate_after_crt_tra
         if record_path.exists():
             with contextlib.suppress(OSError):
                 record_path.unlink()
+
+
+def test_windows_record_registry_reuse_retains_object_owner_after_partial_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reused CRT slot cannot make registry cleanup lose its claim owner."""
+
+    if os.name != "nt":
+        pytest.fail("required Windows record-registry test executed on a non-Windows host")
+
+    capability = _capability(tmp_path, monkeypatch, code="pass")
+    supervisor = SolverSupervisor(capability)
+    record_path = Path(os.fspath(supervisor.process_record_path))
+    record_content = b"{}"
+    record_path.write_bytes(record_content)
+    record_fd = supervisor_module._windows_open_process_record(record_path, create=False)
+    claim = supervisor._own_process_record_candidate(
+        record_path,
+        handle=record_fd,
+        parent_fd=None,
+    )
+    claim.content = record_content
+    supervisor._process_record_claim = claim
+    updated_record: dict[str, object] = {"marker": "in-place"}
+    supervisor._write_process_record(updated_record)
+    record_content = json.dumps(updated_record, indent=2, sort_keys=True).encode("utf-8")
+    assert supervisor._process_record_claim is claim
+    target_fd = claim.handle
+    old_native = claim.native_handle
+    assert target_fd is not None and old_native is not None
+    record_key = supervisor_module._windows_record_claim_key(record_path)
+    entries = supervisor_module._WINDOWS_RECORD_CLAIMS.get(record_key)
+    assert entries is not None and len(entries) == 1
+    assert getattr(entries[0], "owner", None) is claim
+
+    original_close = os.close
+    original_open = os.open
+    unrelated_path = tmp_path / "registry-reuse.bin"
+    unrelated_fd: int | None = None
+    native_close_attempts: list[int] = []
+    close_guard_failure = True
+    original_close_native = runtime_module._windows_close_native_handle
+
+    def close_native(native_handle: int) -> None:
+        native_close_attempts.append(native_handle)
+        if close_guard_failure and native_handle == old_native:
+            raise OSError("synthetic transient native guard close failure")
+        original_close_native(native_handle)
+
+    def partial_close(fd: int) -> None:
+        nonlocal unrelated_fd
+        if fd == target_fd and unrelated_fd is None:
+            original_close(fd)
+            unrelated_fd = original_open(os.fspath(unrelated_path), os.O_RDWR | os.O_CREAT, 0o600)
+            if unrelated_fd != fd:
+                duplicated = os.dup2(unrelated_fd, fd)
+                original_close(unrelated_fd)
+                unrelated_fd = duplicated
+            assert unrelated_fd == fd
+            raise OSError("synthetic CRT close reported failure after retiring the slot")
+        original_close(fd)
+
+    monkeypatch.setattr(runtime_module, "_windows_close_native_handle", close_native)
+    monkeypatch.setattr(supervisor_module, "_windows_close_native_handle", close_native)
+    try:
+        with monkeypatch.context() as close_patch:
+            close_patch.setattr(os, "close", partial_close)
+            failures = supervisor._release_process_record_claim(claim)
+        assert failures
+        assert claim.handle is None
+        assert claim.native_handle == old_native
+        assert native_close_attempts == [old_native]
+        assert supervisor_module._WINDOWS_RECORD_CLAIMS.get(record_key) == entries
+
+        path_opens: list[Path] = []
+
+        def forbidden_path_open(path: Path, **kwargs: object) -> int:
+            del kwargs
+            path_opens.append(path)
+            raise AssertionError("registry uncertainty reopened process record by path")
+
+        with monkeypatch.context() as path_patch:
+            path_patch.setattr(
+                supervisor_module,
+                "_windows_open_process_record_handle",
+                forbidden_path_open,
+            )
+            with pytest.raises(SolverOwnershipError, match="claim|record|authority"):
+                supervisor_module._windows_open_process_record(record_path, create=False)
+
+        assert path_opens == []
+        assert claim.handle is None
+        assert claim.native_handle == old_native
+        assert native_close_attempts == [old_native]
+        assert supervisor_module._WINDOWS_RECORD_CLAIMS.get(record_key) == entries
+
+        close_guard_failure = False
+        assert supervisor._release_process_record_claim(claim) == ()
+        assert claim.handle is None
+        assert claim.native_handle is None
+        assert record_key not in supervisor_module._WINDOWS_RECORD_CLAIMS
+    finally:
+        close_guard_failure = False
+        if unrelated_fd is not None:
+            with contextlib.suppress(OSError):
+                original_close(unrelated_fd)
+        with contextlib.suppress(BaseException):
+            supervisor._close_filesystem_authority()
+        if record_path.exists():
+            with contextlib.suppress(OSError):
+                record_path.unlink()
+
+
+def test_windows_directory_close_failure_retries_only_original_handle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A transient directory close failure preserves the exact handle for retry."""
+
+    if os.name != "nt":
+        pytest.fail("required Windows directory-close test executed on a non-Windows host")
+
+    root = tmp_path / "attempt"
+    root.mkdir()
+    authority = supervisor_module._FilesystemAuthority(root)
+    original_entries = authority._entries
+    original_handles = {
+        handle.value
+        for _identity, handle in original_entries
+        if isinstance(handle, supervisor_module._WindowsDirectoryHandle)
+    }
+    assert original_handles
+    failed_handle = next(iter(original_handles))
+    close_attempts: list[int] = []
+    fail_once = True
+    original_close = supervisor_module._windows_close_directory
+
+    def flaky_close(handle: supervisor_module._WindowsDirectoryHandle) -> None:
+        nonlocal fail_once
+        close_attempts.append(handle.value)
+        if handle.value == failed_handle and fail_once:
+            fail_once = False
+            raise OSError("synthetic transient directory close failure")
+        original_close(handle)
+
+    monkeypatch.setattr(supervisor_module, "_windows_close_directory", flaky_close)
+    try:
+        with pytest.raises(SolverOwnershipError, match="closed"):
+            authority.close()
+
+        assert not authority._closed
+        retained_handles = {
+            handle.value
+            for _identity, handle in authority._entries
+            if isinstance(handle, supervisor_module._WindowsDirectoryHandle)
+        }
+        assert retained_handles == {failed_handle}
+        assert failed_handle in close_attempts
+        assert set(close_attempts) == original_handles
+
+        authority.close()
+        assert authority._closed
+        assert authority._entries == ()
+        assert close_attempts.count(failed_handle) == 2
+        assert set(close_attempts) == original_handles
+    finally:
+        with contextlib.suppress(BaseException):
+            authority.close()

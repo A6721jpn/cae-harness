@@ -171,11 +171,32 @@ class _WindowsHandleOwner:
     close_native_handle: Callable[[int], None] | None = None
 
     def close(self) -> None:
+        with _RUNTIME_DURABLE_CLAIMS_LOCK:
+            self._close_locked()
+
+    def _close_locked(self) -> None:
         close_native = self.close_native_handle or _windows_close_native_handle
         if self.raw_handle is not None:
             raw_handle = self.raw_handle
-            close_native(raw_handle)
-            if self.raw_handle == raw_handle:
+            native_handle = self.native_handle
+            if native_handle is not None:
+                identity_matches = _windows_compare_object_handles(raw_handle, native_handle)
+                if identity_matches is None:
+                    raise OSError("unable to verify raw Windows handle identity")
+                if not identity_matches:
+                    self.raw_handle = None
+                else:
+                    try:
+                        close_native(raw_handle)
+                    except BaseException:
+                        after_close = _windows_compare_object_handles(raw_handle, native_handle)
+                        if after_close is not False:
+                            raise
+                        self.raw_handle = None
+                    else:
+                        self.raw_handle = None
+            else:
+                close_native(raw_handle)
                 self.raw_handle = None
         if self.handle is not None or self.native_handle is not None:
             _windows_close_owned_fd(
@@ -187,6 +208,8 @@ class _WindowsHandleOwner:
 
 
 _RUNTIME_DURABLE_CLAIMS: list[object] = []
+_RUNTIME_DURABLE_CLAIMS_LOCK = threading.RLock()
+_RUNTIME_DRAINING_CLAIMS: list[object] = []
 
 
 def _claim_has_owned_handles(claim: object) -> bool:
@@ -197,14 +220,16 @@ def _claim_has_owned_handles(claim: object) -> bool:
 
 
 def _retain_runtime_claim(claim: object) -> None:
-    if _claim_has_owned_handles(claim) and not any(
-        held is claim for held in _RUNTIME_DURABLE_CLAIMS
-    ):
-        _RUNTIME_DURABLE_CLAIMS.append(claim)
+    with _RUNTIME_DURABLE_CLAIMS_LOCK:
+        if _claim_has_owned_handles(claim) and not any(
+            held is claim for held in _RUNTIME_DURABLE_CLAIMS
+        ):
+            _RUNTIME_DURABLE_CLAIMS.append(claim)
 
 
 def _discard_runtime_claim(claim: object) -> None:
-    _RUNTIME_DURABLE_CLAIMS[:] = [held for held in _RUNTIME_DURABLE_CLAIMS if held is not claim]
+    with _RUNTIME_DURABLE_CLAIMS_LOCK:
+        _RUNTIME_DURABLE_CLAIMS[:] = [held for held in _RUNTIME_DURABLE_CLAIMS if held is not claim]
 
 
 def _windows_raw_handle(value: object) -> int:
@@ -429,16 +454,25 @@ def _drain_runtime_claims(
     """Retry only exact module-owned conversion and validation claims."""
 
     for claim in tuple(claims):
-        if not _claim_has_owned_handles(claim):
-            _discard_runtime_claim(claim)
-            continue
+        with _RUNTIME_DURABLE_CLAIMS_LOCK:
+            if not _claim_has_owned_handles(claim):
+                _discard_runtime_claim(claim)
+                continue
+            if any(held is claim for held in _RUNTIME_DRAINING_CLAIMS):
+                continue
+            _RUNTIME_DRAINING_CLAIMS.append(claim)
         try:
             close = cast(Any, claim).close
             close()
         except BaseException:
             continue
-        if not _claim_has_owned_handles(claim):
-            _discard_runtime_claim(claim)
+        finally:
+            with _RUNTIME_DURABLE_CLAIMS_LOCK:
+                _RUNTIME_DRAINING_CLAIMS[:] = [
+                    held for held in _RUNTIME_DRAINING_CLAIMS if held is not claim
+                ]
+                if not _claim_has_owned_handles(claim):
+                    _discard_runtime_claim(claim)
 
 
 atexit.register(_drain_runtime_claims)

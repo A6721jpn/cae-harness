@@ -6,6 +6,7 @@ import hashlib
 import os
 import stat
 import subprocess
+import threading
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -722,3 +723,64 @@ def test_windows_runtime_conversion_failure_retains_exact_raw_owner(
 def test_probe_rejects_arbitrary_runner_arguments(tmp_path: Path) -> None:
     with pytest.raises(TypeError):
         probe_febio(tmp_path / "missing", runner_arguments=("--arbitrary",))  # type: ignore[call-arg]
+
+
+def test_windows_concurrent_durable_raw_handle_drains_are_serialized_and_retryable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Concurrent drains cannot close one exact raw handle at the same time."""
+
+    if os.name != "nt":
+        pytest.fail("required Windows durable raw-handle test executed on a non-Windows host")
+
+    raw_handle = 707070
+    attempts: list[int] = []
+    state_lock = threading.Lock()
+    rendezvous = threading.Barrier(2)
+    active = 0
+    max_active = 0
+    fail = True
+
+    def close_native(handle: int) -> None:
+        nonlocal active, max_active
+        with state_lock:
+            attempts.append(handle)
+            active += 1
+            max_active = max(max_active, active)
+        try:
+            if fail:
+                with contextlib.suppress(threading.BrokenBarrierError):
+                    rendezvous.wait(timeout=0.5)
+                raise OSError("synthetic transient raw-handle close failure")
+        finally:
+            with state_lock:
+                active -= 1
+
+    owner = runtime_module._WindowsHandleOwner(
+        raw_handle=raw_handle,
+        close_native_handle=close_native,
+    )
+    durable = runtime_module._RUNTIME_DURABLE_CLAIMS
+    prior_claims = list(durable)
+    durable[:] = [owner]
+    threads = [threading.Thread(target=runtime_module._drain_runtime_claims) for _ in range(2)]
+    try:
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=3.0)
+            assert not thread.is_alive()
+
+        assert max_active == 1
+        assert attempts
+        assert all(handle == raw_handle for handle in attempts)
+        assert owner.raw_handle == raw_handle
+        assert any(held is owner for held in durable)
+
+        fail = False
+        runtime_module._drain_runtime_claims()
+        assert owner.raw_handle is None
+        assert not any(held is owner for held in durable)
+        assert attempts[-1] == raw_handle
+    finally:
+        durable[:] = [held for held in prior_claims if held is not owner]
