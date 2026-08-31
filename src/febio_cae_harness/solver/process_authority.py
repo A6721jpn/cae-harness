@@ -109,6 +109,8 @@ class ProcessAuthority:
 
     def resume(self, pid: int) -> None: ...
 
+    def validate_inherited_event(self, pid: int, child_handle: int, event_handle: int) -> None: ...
+
     def verify(self, pid: int) -> None: ...
 
     def terminate(self, pid: int, *, force: bool = False) -> None: ...
@@ -413,6 +415,8 @@ class _WindowsProcessAuthority(ProcessAuthority):
     _PROCESS_ACCESS = 0x1101
     _PROCESS_TERMINATE_ACCESS = 0x1001
     _PROCESS_QUERY = 0x1000
+    _PROCESS_DUP_HANDLE = 0x0040
+    _PROCESS_QUERY_AND_DUPLICATE = _PROCESS_QUERY | _PROCESS_DUP_HANDLE
     _THREAD_SUSPEND_RESUME = 0x0002
     _THREAD_QUERY_LIMITED_INFORMATION = 0x0800
     _TH32CS_SNAPTHREAD = 0x00000004
@@ -420,6 +424,8 @@ class _WindowsProcessAuthority(ProcessAuthority):
     _ERROR_MORE_DATA = 234
     _ERROR_ACCESS_DENIED = 5
     _STILL_ACTIVE = 259
+    _WAIT_OBJECT_0 = 0x00000000
+    _EVENT_QUERY_STATE = 0x0001
     _STILL_SUSPENDED = 0xFFFFFFFF
 
     class _SecurityAttributes(ctypes.Structure):
@@ -505,6 +511,8 @@ class _WindowsProcessAuthority(ProcessAuthority):
         k.TerminateProcess.restype = ctypes.c_int
         k.GetExitCodeProcess.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
         k.GetExitCodeProcess.restype = ctypes.c_int
+        k.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        k.WaitForSingleObject.restype = ctypes.c_uint32
         k.GetCurrentProcess.argtypes = []
         k.GetCurrentProcess.restype = ctypes.c_void_p
         k.DuplicateHandle.argtypes = [
@@ -687,6 +695,121 @@ class _WindowsProcessAuthority(ProcessAuthority):
 
     def child_handle(self) -> int | None:
         return self._child_handle
+
+    def validate_inherited_event(self, pid: int, child_handle: int, event_handle: int) -> None:
+        """Require the named reconnect event to be the child's inherited object."""
+
+        pid = _validate_pid(pid)
+        if (
+            isinstance(child_handle, bool)
+            or not isinstance(child_handle, int)
+            or child_handle <= 0
+            or isinstance(event_handle, bool)
+            or not isinstance(event_handle, int)
+            or event_handle <= 0
+        ):
+            raise ProcessAuthorityError("inherited resume event handle is invalid")
+        if self._bound_pid != pid or self._bound_creation_identity is None:
+            raise ProcessAuthorityError("process authority root process is not bound")
+
+        # The caller has already authenticated the exact Job member/root.  Keep
+        # that proof local to this operation as well, before opening a process
+        # handle that can duplicate one of its private child handles.
+        try:
+            self.verify(pid)
+            k = self._kernel32()
+            process = k.OpenProcess(self._PROCESS_QUERY_AND_DUPLICATE, False, pid)
+        except ProcessAuthorityError:
+            raise
+        except BaseException as error:
+            raise ProcessAuthorityError(
+                "unable to open attested process for event validation"
+            ) from error
+        if not process:
+            raise ProcessAuthorityError("unable to open attested process for event validation")
+        duplicate = ctypes.c_void_p()
+        try:
+            before_identity = self._live_creation_identity(pid, process)
+            if before_identity != self._bound_creation_identity:
+                raise ProcessAuthorityError("attested process creation identity changed")
+            exit_code = ctypes.c_uint32()
+            if not k.GetExitCodeProcess(process, ctypes.byref(exit_code)):
+                raise ProcessAuthorityError("unable to query attested process state")
+            if exit_code.value != self._STILL_ACTIVE:
+                raise ProcessAuthorityError("attested process is not live")
+            in_job = ctypes.c_int()
+            if not k.IsProcessInJob(process, self._handle, ctypes.byref(in_job)):
+                raise ProcessAuthorityError("unable to verify attested process membership")
+            if not in_job.value:
+                raise ProcessAuthorityError("process is not in the attested job")
+
+            if k.WaitForSingleObject(ctypes.c_void_p(event_handle), 0) != self._WAIT_OBJECT_0:
+                raise ProcessAuthorityError("resume event is not a signaled Event")
+            current = k.GetCurrentProcess()
+            if (
+                not k.DuplicateHandle(
+                    process,
+                    ctypes.c_void_p(child_handle),
+                    current,
+                    ctypes.byref(duplicate),
+                    self._EVENT_QUERY_STATE | self._SYNCHRONIZE,
+                    False,
+                    0,
+                )
+                or not duplicate.value
+            ):
+                raise ProcessAuthorityError("unable to duplicate inherited resume event")
+            if k.WaitForSingleObject(duplicate, 0) != self._WAIT_OBJECT_0:
+                raise ProcessAuthorityError("inherited handle is not a signaled Event")
+            try:
+                from .runtime import _windows_compare_object_handles
+
+                same_object = _windows_compare_object_handles(int(duplicate.value), event_handle)
+            except BaseException as error:
+                raise ProcessAuthorityError(
+                    "resume Event object comparison is unavailable"
+                ) from error
+            if same_object is not True:
+                raise ProcessAuthorityError(
+                    "resume Event does not match the inherited child handle"
+                )
+
+            after_identity = self._live_creation_identity(pid, process)
+            if after_identity != before_identity or after_identity != self._bound_creation_identity:
+                raise ProcessAuthorityError("attested process creation identity changed")
+            if not k.GetExitCodeProcess(process, ctypes.byref(exit_code)):
+                raise ProcessAuthorityError("unable to revalidate attested process state")
+            if exit_code.value != self._STILL_ACTIVE:
+                raise ProcessAuthorityError("attested process is no longer live")
+        except ProcessAuthorityError:
+            raise
+        except BaseException as error:
+            raise ProcessAuthorityError("unable to validate inherited resume event") from error
+        finally:
+            close_failures: list[BaseException] = []
+            if duplicate.value:
+                try:
+                    result = k.CloseHandle(duplicate)
+                    if result is False or (
+                        isinstance(result, int) and not isinstance(result, bool) and result == 0
+                    ):
+                        raise ProcessAuthorityError("unable to close duplicated resume event")
+                except BaseException as error:
+                    close_failures.append(error)
+            try:
+                result = k.CloseHandle(process)
+                if result is False or (
+                    isinstance(result, int) and not isinstance(result, bool) and result == 0
+                ):
+                    raise ProcessAuthorityError(
+                        "unable to close attested process validation handle"
+                    )
+            except BaseException as error:
+                close_failures.append(error)
+            if close_failures:
+                raise ProcessAuthorityError(
+                    "temporary event validation handles could not be closed"
+                ) from close_failures[0]
 
     @classmethod
     def _duplicate_child_handle(cls, handle: Any) -> int:

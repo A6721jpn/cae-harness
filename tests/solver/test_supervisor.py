@@ -34,6 +34,7 @@ from febio_cae_harness.solver.process_authority import (
 from febio_cae_harness.solver.runtime import (
     FebioRuntimeDiagnostic,
     _acquire_runtime_launch_claim,
+    _windows_close_native_handle,
     _windows_close_owned_fd,
     _windows_convert_raw_handle,
     probe_febio,
@@ -46,6 +47,7 @@ from febio_cae_harness.solver.types import (
     SolverLaunchSpec,
     SolverOwnershipError,
     SolverState,
+    _json_digest,
 )
 from febio_cae_harness.workspace import AttemptWorkspace, ValidatedCaseWorkspace
 
@@ -133,6 +135,28 @@ def _windows_process_handle_count() -> int:
     return int(count.value)
 
 
+def _windows_event_wait_result(name: str) -> int:
+    import ctypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenEventW.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_wchar_p]
+    kernel32.OpenEventW.restype = ctypes.c_void_p
+    kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    kernel32.WaitForSingleObject.restype = ctypes.c_uint32
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_int
+    handle = kernel32.OpenEventW(
+        supervisor_module._WINDOWS_EVENT_RECONNECT_ACCESS,
+        False,
+        name,
+    )
+    assert handle
+    try:
+        return int(kernel32.WaitForSingleObject(handle, 0))
+    finally:
+        assert kernel32.CloseHandle(handle)
+
+
 def _assert_windows_record_mutation_blocked(record_path: Path) -> Path:
     try:
         foreign_fd = os.open(os.fspath(record_path), os.O_WRONLY)
@@ -195,62 +219,52 @@ def _prepare_windows_resume_recovery(
         pytest.fail("required Windows resume recovery test executed on a non-Windows host")
     capability = _capability(tmp_path, monkeypatch, code="import time; time.sleep(30)")
     supervisor = SolverSupervisor(capability)
+    original_resume = _WindowsProcessAuthority.resume
+    monkeypatch.setattr(supervisor, "_delete_resume_transaction", lambda: ())
+    if not resume_before_crash:
+        monkeypatch.setattr(_WindowsProcessAuthority, "resume", lambda _instance, _pid: None)
     supervisor.start()
+    if not resume_before_crash:
+        monkeypatch.setattr(_WindowsProcessAuthority, "resume", original_resume)
     process = cast(subprocess.Popen[bytes], supervisor._process)
     authority = supervisor._process_authority
     assert authority is not None
-    process_id = process.pid
     record_path = Path(os.fspath(supervisor.process_record_path))
     record_claim = supervisor._process_record_claim
     assert record_claim is not None and record_claim.handle is not None
+    transaction_claim = supervisor._resume_transaction_claim
+    assert transaction_claim is not None and transaction_claim.handle is not None
     running_record = json.loads(
         supervisor_module._read_record_fd(record_claim.handle).decode("utf-8")
     )
+    transaction = json.loads(
+        supervisor_module._read_record_fd(transaction_claim.handle).decode("utf-8")
+    )
     assert isinstance(running_record, dict)
+    assert isinstance(transaction, dict)
     assert running_record["state"] == SolverState.RUNNING.value
-    # The normal start path has already finalized its transaction.  Reserve a
-    # fresh journal/event for this synthetic crash fixture and bind both
-    # records to that exact new identity before publishing BOUND_SUSPENDED.
-    supervisor._reserve_windows_resume_transaction()
-    running_record["resume_transaction"] = supervisor._resume_transaction_record_binding()
-    bound_record = dict(running_record)
-    bound_record["state"] = "BOUND_SUSPENDED"
-    supervisor._write_process_record(bound_record)
-    supervisor._prepare_windows_resume_transaction(bound_record, running_record)
-    _suspend_windows_primary_thread(authority, process_id)
-    supervisor._signal_windows_resume_transaction()
-    if resume_before_crash:
-        authority.resume(process_id)
+    bound_record = transaction.get("bound_record")
+    transaction_running_record = transaction.get("running_record")
+    assert isinstance(bound_record, dict)
+    assert isinstance(transaction_running_record, dict)
+    assert transaction_running_record == running_record
+    if not resume_before_crash:
+        supervisor._write_process_record(bound_record)
+        assert bound_record["state"] == "BOUND_SUSPENDED"
 
     # Detach every coordinator-owned filesystem and process-authority handle;
     # the Popen object is retained only so the test can prove the child survives.
     resume_claim = supervisor._resume_transaction_claim
-    supervisor._resume_transaction_claim = None
-    if resume_claim is not None and (
-        resume_claim.handle is not None or resume_claim.native_handle is not None
-    ):
-        _windows_close_owned_fd(
-            resume_claim,
-            "handle",
-            "native_handle",
-        )
-    # The fallback transaction is prepared after the child already exists, so
-    # it cannot inherit the event handle. Keep only the creator event handle
-    # alive in this synthetic crash fixture; production start passes the
-    # restricted duplicate to the suspended child before creation.
     if resume_claim is not None:
         supervisor._test_resume_transaction_claim = resume_claim  # type: ignore[attr-defined]
-    supervisor._process = None
-    supervisor._process_authority = None
-    supervisor._close_filesystem_authority()
-    authority.close()
+    supervisor.__del__()
     return (
         capability,
         supervisor,
         process,
         authority,
-        bound_record,
-        running_record,
+        cast(dict[str, object], bound_record),
+        cast(dict[str, object], transaction_running_record),
         record_path,
     )
 
@@ -429,6 +443,175 @@ def test_windows_reconnect_rejects_self_consistent_rewritten_journal_and_fabrica
             with contextlib.suppress(BaseException):
                 helper.wait(timeout=5.0)
         _cleanup_windows_resume_recovery(capability, supervisor, process, bound_record, record_path)
+
+
+def test_windows_reconnect_rejects_forged_inherited_event_after_supervisor_loss(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A signaled replacement Event cannot stand in for the child-inherited Event."""
+
+    if os.name != "nt":
+        pytest.fail(
+            "required Windows inherited-event authority test executed on a non-Windows host"
+        )
+
+    marker = tmp_path / "child-started"
+    capability = _capability(
+        tmp_path,
+        monkeypatch,
+        code=(
+            f"from pathlib import Path; Path({str(marker)!r}).write_text('started'); "
+            "import time; time.sleep(30)"
+        ),
+    )
+    supervisor = SolverSupervisor(capability)
+    original_resume = _WindowsProcessAuthority.resume
+    original_clear_child_handle = supervisor._clear_resume_transaction_child_handle
+    inherited_child_handles: list[int] = []
+
+    def capture_child_handle() -> None:
+        claim = supervisor._resume_transaction_claim
+        if claim is not None and claim.child_handle is not None:
+            inherited_child_handles.append(claim.child_handle)
+        original_clear_child_handle()
+
+    monkeypatch.setattr(supervisor, "_signal_windows_resume_transaction", lambda: None)
+    monkeypatch.setattr(supervisor, "_delete_resume_transaction", lambda: ())
+    monkeypatch.setattr(supervisor, "_clear_resume_transaction_child_handle", capture_child_handle)
+    monkeypatch.setattr(_WindowsProcessAuthority, "resume", lambda _instance, _pid: None)
+
+    process: subprocess.Popen[bytes] | None = None
+    reconnected: SolverSupervisor | None = None
+    alternate_handle: int | None = None
+    original_record: dict[str, object] = {}
+    record_path = Path(os.fspath(supervisor.process_record_path))
+    transaction_path = record_path.with_name(".process.json.resume")
+    try:
+        supervisor.start()
+        process = cast(subprocess.Popen[bytes], supervisor._process)
+        assert process.poll() is None
+        assert not marker.exists()
+        assert len(inherited_child_handles) == 1
+        inherited_child_handle = inherited_child_handles[0]
+        transaction_claim = supervisor._resume_transaction_claim
+        assert transaction_claim is not None
+        original_event_name = transaction_claim.event_name
+        assert original_event_name
+        record_claim = supervisor._process_record_claim
+        assert record_claim is not None and record_claim.handle is not None
+        assert transaction_claim.handle is not None
+        original_record = json.loads(
+            supervisor_module._read_record_fd(record_claim.handle).decode("utf-8")
+        )
+        original_transaction = json.loads(
+            supervisor_module._read_record_fd(transaction_claim.handle).decode("utf-8")
+        )
+        assert isinstance(original_record, dict)
+        assert isinstance(original_transaction, dict)
+
+        monkeypatch.setattr(_WindowsProcessAuthority, "resume", original_resume)
+        supervisor.__del__()
+        assert process.poll() is None
+        assert not marker.exists()
+        assert (
+            _windows_event_wait_result(original_event_name)
+            == supervisor_module._WINDOWS_WAIT_TIMEOUT
+        )
+
+        replacement_record_path = record_path.with_name("process-replacement")
+        replacement_journal_path = transaction_path.with_name("resume-replacement")
+        replacement_record_path.write_bytes(b"placeholder")
+        replacement_record_identity = replacement_record_path.stat()
+        replacement_journal_path.write_bytes(b"placeholder")
+        replacement_journal_identity = replacement_journal_path.stat()
+        forged_token = "d" * 32
+        forged_event_name = supervisor_module._windows_resume_event_name(
+            capability.spec.attempt_root,
+            supervisor._launch_context_digest,
+            int(replacement_journal_identity.st_dev),
+            int(replacement_journal_identity.st_ino),
+            forged_token,
+        )
+        alternate_handle = supervisor_module._windows_create_resume_event(forged_event_name)
+        supervisor_module._windows_signal_resume_event(alternate_handle)
+        forged_binding = {
+            "journal_identity": {
+                "device": int(replacement_journal_identity.st_dev),
+                "inode": int(replacement_journal_identity.st_ino),
+            },
+            "event_name": forged_event_name,
+            "event_token": forged_token,
+            "child_handle": inherited_child_handle,
+        }
+        forged_record = dict(original_record)
+        forged_record["resume_transaction"] = forged_binding
+        forged_bound_record = dict(cast(dict[str, object], original_transaction["bound_record"]))
+        forged_bound_record["resume_transaction"] = forged_binding
+        forged_running_record = dict(
+            cast(dict[str, object], original_transaction["running_record"])
+        )
+        forged_running_record["resume_transaction"] = forged_binding
+        forged_transaction = dict(original_transaction)
+        forged_transaction.update(
+            {
+                "event_name": forged_event_name,
+                "event_token": forged_token,
+                "journal_identity": forged_binding["journal_identity"],
+                "record_identity": {
+                    "device": int(replacement_record_identity.st_dev),
+                    "inode": int(replacement_record_identity.st_ino),
+                },
+                "child_handle": inherited_child_handle,
+                "bound_record": forged_bound_record,
+                "running_record": forged_running_record,
+                "bound_digest": _json_digest(forged_bound_record),
+                "running_digest": _json_digest(forged_running_record),
+            }
+        )
+        replacement_record_path.write_bytes(
+            json.dumps(forged_record, indent=2, sort_keys=True).encode("utf-8")
+        )
+        replacement_journal_path.write_bytes(
+            json.dumps(forged_transaction, indent=2, sort_keys=True).encode("utf-8")
+        )
+        os.replace(os.fspath(replacement_record_path), os.fspath(record_path))
+        os.replace(os.fspath(replacement_journal_path), os.fspath(transaction_path))
+
+        handles_before_reconnect = _windows_process_handle_count()
+        with pytest.raises(SolverOwnershipError, match="event|authority|identity|transaction"):
+            reconnected = SolverSupervisor.reconnect(capability)
+        assert _windows_process_handle_count() == handles_before_reconnect
+
+        assert process.poll() is None
+        assert process.returncode is None
+        assert not marker.exists()
+    finally:
+        if reconnected is not None:
+            with contextlib.suppress(BaseException):
+                reconnected.cancel()
+        if alternate_handle is not None:
+            with contextlib.suppress(BaseException):
+                _windows_close_native_handle(alternate_handle)
+        if process is not None and process.poll() is None:
+            with contextlib.suppress(BaseException):
+                cleanup_authority = ProcessAuthority.from_claim(
+                    capability.spec.attempt_root,
+                    original_record["process_authority"],
+                    supervisor._launch_context_digest,
+                )
+                cleanup_authority.terminate(process.pid)
+                cleanup_authority.close()
+            with contextlib.suppress(BaseException):
+                process.wait(timeout=5.0)
+        for path in (
+            record_path,
+            transaction_path,
+            record_path.with_name("process-replacement"),
+            transaction_path.with_name("resume-replacement"),
+        ):
+            with contextlib.suppress(OSError):
+                path.unlink()
+        supervisor_module._drain_durable_cleanup()
 
 
 def test_windows_resume_event_dacl_blocks_external_mutation_and_setevent(
@@ -2184,6 +2367,10 @@ def test_windows_reconnect_recovers_crash_before_native_resume(
     transaction_path = record_path.with_name(".process.json.resume")
     try:
         assert transaction_path.is_file()
+        resume_claim = cast(Any, supervisor._test_resume_transaction_claim)  # type: ignore[attr-defined]
+        resume_binding = cast(dict[str, object], bound_record["resume_transaction"])
+        assert resume_binding["child_handle"] == resume_claim.inherited_child_handle
+        assert isinstance(resume_binding["child_handle"], int)
         reconnected = SolverSupervisor.reconnect(capability)
         assert reconnected.state is SolverState.RUNNING
         assert reconnected.pid == process.pid

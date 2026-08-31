@@ -1599,6 +1599,7 @@ class _WindowsResumeTransactionClaim:
     event_token: str = ""
     event_handle: int | None = None
     child_handle: int | None = None
+    inherited_child_handle: int | None = None
 
 
 class _DurableClaimCleanup:
@@ -3408,6 +3409,13 @@ class SolverSupervisor:
                     supervisor._validate_windows_resume_transaction(
                         transition[0], transition[1], record
                     )
+                    if authority is None:  # pragma: no cover - state guard
+                        raise SolverOwnershipError("recorded process authority is unavailable")
+                    supervisor._validate_windows_resume_event(
+                        authority,
+                        cast(int, authenticated_record["pid"]),
+                        expected_binding,
+                    )
                     recovering_transition = True
                     record = transition[1]
                 elif record.get("state") == SolverState.RUNNING.value:
@@ -3423,6 +3431,13 @@ class SolverSupervisor:
                     else:
                         supervisor._validate_windows_resume_transaction(
                             transition[0], transition[1], record
+                        )
+                        if authority is None:  # pragma: no cover - state guard
+                            raise SolverOwnershipError("recorded process authority is unavailable")
+                        supervisor._validate_windows_resume_event(
+                            authority,
+                            cast(int, record["pid"]),
+                            expected_binding,
                         )
                         recovering_transition = True
                 else:
@@ -3615,6 +3630,7 @@ class SolverSupervisor:
             or claim.native_handle is None
             or not claim.event_name
             or not claim.event_token
+            or claim.inherited_child_handle is None
         ):
             raise SolverOwnershipError("resume transaction authority is unavailable")
         parts = _windows_resume_event_parts(
@@ -3633,11 +3649,12 @@ class SolverSupervisor:
             },
             "event_name": claim.event_name,
             "event_token": claim.event_token,
+            "child_handle": claim.inherited_child_handle,
         }
 
     def _parse_resume_transaction_record_binding(
         self, record: dict[str, object]
-    ) -> tuple[int, int, str, str]:
+    ) -> tuple[int, int, str, str, int]:
         """Validate the journal/event binding carried by an authenticated record."""
 
         value = record.get("resume_transaction")
@@ -3659,10 +3676,14 @@ class SolverSupervisor:
             raise SolverOwnershipError("process record journal identity is invalid")
         event_name = value.get("event_name")
         event_token = value.get("event_token")
+        child_handle = value.get("child_handle")
         if (
             not isinstance(event_name, str)
             or not isinstance(event_token, str)
             or re.fullmatch(r"[0-9a-f]{32}", event_token) is None
+            or isinstance(child_handle, bool)
+            or not isinstance(child_handle, int)
+            or child_handle <= 0
         ):
             raise SolverOwnershipError("process record resume event binding is invalid")
         parts = _windows_resume_event_parts(
@@ -3674,7 +3695,7 @@ class SolverSupervisor:
         )
         if parts != (device, inode, event_token):
             raise SolverOwnershipError("process record resume event binding is invalid")
-        return device, inode, event_name, event_token
+        return device, inode, event_name, event_token, child_handle
 
     @staticmethod
     def _record_content(record: dict[str, object]) -> bytes:
@@ -3731,6 +3752,7 @@ class SolverSupervisor:
             claim.event_token = token
             claim.event_handle = _windows_create_resume_event(claim.event_name)
             claim.child_handle = _windows_duplicate_resume_event_handle(claim.event_handle)
+            claim.inherited_child_handle = claim.child_handle
         except BaseException:
             if self._resume_transaction_claim is None and handle is not None:
                 temporary_claim = _WindowsResumeTransactionClaim(
@@ -3775,6 +3797,8 @@ class SolverSupervisor:
         if claim is None or claim.child_handle is None:
             return
         child_handle = claim.child_handle
+        if claim.inherited_child_handle is None:
+            claim.inherited_child_handle = child_handle
         try:
             _windows_close_native_handle(child_handle)
         except BaseException:
@@ -3800,6 +3824,7 @@ class SolverSupervisor:
             or claim.event_handle is None
             or not claim.event_name
             or not claim.event_token
+            or claim.inherited_child_handle is None
         ):
             raise SolverOwnershipError("resume transaction authority is unavailable")
         process_claim = self._process_record_claim
@@ -3812,6 +3837,7 @@ class SolverSupervisor:
             claim.inode,
             claim.event_name,
             claim.event_token,
+            claim.inherited_child_handle,
         )
         if (
             self._parse_resume_transaction_record_binding(bound_record) != expected_binding
@@ -3823,6 +3849,7 @@ class SolverSupervisor:
             "kind": "windows-resume-transaction",
             "event_name": claim.event_name,
             "event_token": claim.event_token,
+            "child_handle": claim.inherited_child_handle,
             "journal_identity": {
                 "device": claim.device,
                 "inode": claim.inode,
@@ -3886,7 +3913,13 @@ class SolverSupervisor:
             not isinstance(current_record, dict)
             or current_record.get("state") != "BOUND_SUSPENDED"
             or self._parse_resume_transaction_record_binding(current_record)
-            != (claim.device, claim.inode, claim.event_name, claim.event_token)
+            != (
+                claim.device,
+                claim.inode,
+                claim.event_name,
+                claim.event_token,
+                claim.inherited_child_handle,
+            )
         ):
             raise SolverOwnershipError("owned process record binding changed before resume")
         self._verify_filesystem_authority()
@@ -3896,7 +3929,7 @@ class SolverSupervisor:
         self,
         content: bytes,
         process_claim: _ProcessRecordClaim,
-        expected_binding: tuple[int, int, str, str],
+        expected_binding: tuple[int, int, str, str, int],
     ) -> tuple[dict[str, object], dict[str, object]]:
         try:
             value = json.loads(content.decode("utf-8"))
@@ -3915,9 +3948,13 @@ class SolverSupervisor:
         transaction_claim = self._resume_transaction_claim
         if transaction_claim is None:
             raise SolverOwnershipError("resume transaction authority is unavailable")
-        expected_device, expected_inode, expected_event_name, expected_event_token = (
-            expected_binding
-        )
+        (
+            expected_device,
+            expected_inode,
+            expected_event_name,
+            expected_event_token,
+            expected_child_handle,
+        ) = expected_binding
         if (transaction_claim.device, transaction_claim.inode) != (
             expected_device,
             expected_inode,
@@ -3952,6 +3989,14 @@ class SolverSupervisor:
             raise SolverOwnershipError("resume transaction journal identity changed")
         if not isinstance(event_name, str) or not isinstance(event_token, str):
             raise SolverOwnershipError("resume event binding is invalid")
+        child_handle = value.get("child_handle")
+        if (
+            isinstance(child_handle, bool)
+            or not isinstance(child_handle, int)
+            or child_handle <= 0
+            or child_handle != expected_child_handle
+        ):
+            raise SolverOwnershipError("resume transaction child handle binding is invalid")
         record_path = value.get("record_path")
         if (
             not isinstance(record_path, str)
@@ -4005,10 +4050,26 @@ class SolverSupervisor:
             raise SolverOwnershipError("resume transaction record transition is invalid")
         return bound_record, running_record
 
+    def _validate_windows_resume_event(
+        self,
+        authority: ProcessAuthority,
+        pid: int,
+        expected_binding: tuple[int, int, str, str, int],
+    ) -> None:
+        claim = self._resume_transaction_claim
+        if claim is None or claim.event_handle is None:
+            raise SolverOwnershipError("resume event authority is unavailable")
+        try:
+            authority.validate_inherited_event(pid, expected_binding[4], claim.event_handle)
+        except ProcessAuthorityError as error:
+            raise SolverOwnershipError(
+                "resume event does not match the attested child handle"
+            ) from error
+
     def _read_windows_resume_transaction(
         self,
         process_claim: _ProcessRecordClaim,
-        expected_binding: tuple[int, int, str, str],
+        expected_binding: tuple[int, int, str, str, int],
     ) -> tuple[dict[str, object], dict[str, object]]:
         if not _NATIVE_WINDOWS:
             raise SolverOwnershipError("Windows resume transaction is unsupported")
@@ -4054,6 +4115,7 @@ class SolverSupervisor:
                 raise SolverOwnershipError("owned process record changed during recovery")
             claim.event_name = expected_binding[2]
             claim.event_token = expected_binding[3]
+            claim.inherited_child_handle = expected_binding[4]
             claim.event_handle = _windows_open_resume_event(expected_binding[2])
             return parsed
         except BaseException:
