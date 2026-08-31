@@ -1414,24 +1414,26 @@ class _ExactCaseTransaction:
         """Remove one exact empty directory without a pathname deletion fallback."""
 
         parts = self._parts(relative_path, "exact empty directory cleanup")
+        if os.name != "nt":
+            raise WorkspaceBoundaryError(
+                "exact empty directory deletion is unavailable on this platform"
+            )
         parent = self._directory(parts[:-1])
         current = self._directory(parts)
         expected = current.expected
         if len(parts) == 3 and parts[:2] == (_TEMPORARY_ROOT, "attempts"):
             claim_key = (self.root, self._root_stamp, parts[2])
             claim = cast(_AttemptRootClaim | None, _ATTEMPT_ROOT_STAMPS.get(claim_key))
-            if claim is not None:
-                if _expected_native_directory_identity(claim[1]) != expected:
-                    raise WorkspaceBoundaryError("pending attempt cleanup authority changed")
-                _release_attempt_root_claim(claim_key, claim)
-        if os.name != "nt":
-            current.validate()
-            try:
-                os.rmdir(parts[-1], dir_fd=parent.handle)
-            except OSError as error:
-                raise WorkspaceBoundaryError("cannot remove exact empty directory") from error
-            self._directories.pop(parts, None)
-            return
+            if claim is None:
+                raise WorkspaceBoundaryError("pending attempt cleanup authority is unavailable")
+            if (
+                claim[0] != self.root.joinpath(*parts)
+                or _expected_native_directory_identity(claim[1]) != expected
+                or claim[2].expected != expected
+            ):
+                raise WorkspaceBoundaryError("pending attempt cleanup authority changed")
+            claim[2].validate()
+            _release_attempt_root_claim(claim_key, claim)
 
         current.close()
         self._directories.pop(parts, None)
