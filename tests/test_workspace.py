@@ -441,8 +441,9 @@ def test_attempt_factory_reuses_only_recorded_exact_creation_identity(tmp_path: 
         "attempt-1"
     )
     attempt_root = case_a.temporary_root / "attempts" / "attempt-1"
+    reopened_case_a = workspace.open_case("case-a")
 
-    issued = AttemptWorkspace._from_manager(case_a, "attempt-1", attempt_root)
+    issued = AttemptWorkspace._from_manager(reopened_case_a, "attempt-1", attempt_root)
 
     assert issued.root == attempt_root
     displaced = case_a.temporary_root / "attempts" / "attempt-1-owned"
@@ -453,7 +454,7 @@ def test_attempt_factory_reuses_only_recorded_exact_creation_identity(tmp_path: 
     foreign.rename(attempt_root)
 
     with pytest.raises(WorkspaceBoundaryError):
-        AttemptWorkspace._from_manager(case_a, "attempt-1", attempt_root)
+        AttemptWorkspace._from_manager(reopened_case_a, "attempt-1", attempt_root)
     assert attempt_root.joinpath("foreign.txt").read_text(encoding="utf-8") == "foreign"
 
 
