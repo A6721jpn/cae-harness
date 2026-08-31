@@ -46,6 +46,7 @@ class _OriginalInputSource:
 _MANAGER_REGISTRY: dict[int, tuple[Any, ...]] = {}
 _CASE_REGISTRY: dict[int, tuple[Any, ...]] = {}
 _ATTEMPT_REGISTRY: dict[int, tuple[Any, ...]] = {}
+_ATTEMPT_ROOT_STAMPS: dict[tuple[int, str], tuple[Any, Path, _IdentityStamp]] = {}
 
 
 class WorkspaceBoundaryError(PermissionError):
@@ -998,6 +999,12 @@ class _ExactCaseTransaction:
         if owner.expected != _expected_native_directory_identity(created_stamp):
             raise WorkspaceBoundaryError("created exact directory was substituted")
         self._validate_root()
+        if len(parts) == 3 and parts[:2] == (_TEMPORARY_ROOT, "attempts"):
+            _ATTEMPT_ROOT_STAMPS[(id(self.case), parts[2])] = (
+                self.case,
+                self.root.joinpath(*parts),
+                created_stamp,
+            )
         return created_stamp
 
     def exists(self, relative_path: str | Path) -> bool:
@@ -1504,7 +1511,10 @@ class AttemptWorkspace:
         if actual_root != expected_root:
             raise WorkspaceBoundaryError("attempt root is not owned by the case workspace")
         if expected_root_stamp is None:
-            raise WorkspaceBoundaryError("attempt creation identity is required")
+            creation = _ATTEMPT_ROOT_STAMPS.get((id(case_workspace), attempt_id))
+            if creation is None or creation[0] is not case_workspace or creation[1] != actual_root:
+                raise WorkspaceBoundaryError("attempt creation identity is required")
+            expected_root_stamp = creation[2]
         root_stamp = _identity_stamp(actual_root, "attempt root", expected_root_stamp)
 
         instance = object.__new__(cls)

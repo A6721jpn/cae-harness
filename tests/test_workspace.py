@@ -433,6 +433,30 @@ def test_attempt_handle_rejects_reparse_alias(tmp_path: Path) -> None:
         AttemptWorkspace._from_manager(case, "attempt-1", attempt_alias)
 
 
+def test_attempt_factory_reuses_only_recorded_exact_creation_identity(tmp_path: Path) -> None:
+    workspace = make_workspace(tmp_path)
+    case_a = workspace.create_case("case-a")
+    case_b = workspace.create_case("case-b")
+    EvidenceStore(case_a, IntentContract(engineering_question="Attempt identity")).record_attempt(
+        "attempt-1"
+    )
+    attempt_root = case_a.temporary_root / "attempts" / "attempt-1"
+
+    issued = AttemptWorkspace._from_manager(case_a, "attempt-1", attempt_root)
+
+    assert issued.root == attempt_root
+    displaced = case_a.temporary_root / "attempts" / "attempt-1-owned"
+    foreign = case_b.temporary_root / "attempts" / "attempt-1"
+    foreign.mkdir()
+    foreign.joinpath("foreign.txt").write_text("foreign", encoding="utf-8")
+    attempt_root.rename(displaced)
+    foreign.rename(attempt_root)
+
+    with pytest.raises(WorkspaceBoundaryError):
+        AttemptWorkspace._from_manager(case_a, "attempt-1", attempt_root)
+    assert attempt_root.joinpath("foreign.txt").read_text(encoding="utf-8") == "foreign"
+
+
 def test_case_handle_rejects_reparse_write_alias_inside_owned_tree(tmp_path: Path) -> None:
     workspace = make_workspace(tmp_path)
     case = workspace.create_case("case-a")
