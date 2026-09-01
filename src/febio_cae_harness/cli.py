@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import secrets
 import sys
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
+from typing import cast
 
 from febio_cae_harness import __version__
 from febio_cae_harness.cli_context import (
@@ -17,10 +20,24 @@ from febio_cae_harness.cli_context import (
     load_intent_document,
     load_root_capability,
 )
+from febio_cae_harness.contracts import IntentState
+from febio_cae_harness.evidence import EvidenceIntegrityError
+from febio_cae_harness.model.completeness import assess_authoritative_completeness
 from febio_cae_harness.model.feb import inspect_feb_file
 from febio_cae_harness.model.preflight import PreflightResult, run_preflight
 from febio_cae_harness.model.step import inspect_step_file
+from febio_cae_harness.solver.execution import (
+    ExecutionAuthorityError,
+    claim_execution_outputs,
+    issue_execution_authority,
+)
+from febio_cae_harness.solver.headless import (
+    HeadlessConfigurationError,
+    run_headless_febio,
+)
 from febio_cae_harness.solver.runtime import RuntimeProbeError, probe_febio
+from febio_cae_harness.solver.types import SolverClassification, SolverState
+from febio_cae_harness.workspace import AttemptWorkspace, WorkspaceBoundaryError
 
 _PREFLIGHT_EXIT_CODES = {
     "INVALID_FEB_ROOT": 2,
@@ -39,6 +56,36 @@ _CONTEXT_EXIT_CODES = {
     "IO_OR_LOCK_FAILURE": 27,
     "INTERNAL_ERROR": 70,
 }
+
+_RUN_FAILURE_EXIT = 4
+_FBS_UNAVAILABLE_EXIT = 5
+
+
+class _RunCommandError(RuntimeError):
+    def __init__(self, code: str, message: str, *, retryable: bool = False) -> None:
+        super().__init__(message)
+        self.code = code
+        self.retryable = retryable
+
+
+def _positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("value must be a positive integer") from error
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be a positive integer")
+    return parsed
+
+
+def _positive_float(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("value must be a positive finite number") from error
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be a positive finite number")
+    return parsed
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -99,10 +146,23 @@ def build_parser() -> argparse.ArgumentParser:
     case_answer.add_argument("--question-id", required=True)
     case_answer.add_argument("--answer-file", required=True, type=Path, metavar="PATH")
 
-    commands.add_parser(
+    run_febio = commands.add_parser(
         "run-febio",
-        help="disabled until a safe case-context command can reconstruct authorities",
+        help="run one registered FEB case through the headless authority boundary",
     )
+    run_febio.add_argument("--capability-stdin", required=True, action="store_true")
+    run_febio.add_argument("--case-id", required=True)
+    run_febio.add_argument("--input-name")
+    run_febio.add_argument("--runtime-probe", required=True, type=Path, metavar="PATH")
+    run_febio.add_argument("--expected-steps", required=True, type=_positive_int)
+    run_febio.add_argument("--expected-final-time", required=True, type=_positive_float)
+    run_febio.add_argument(
+        "--requested-field",
+        required=True,
+        action="append",
+        metavar="FIELD",
+    )
+    run_febio.add_argument("--timeout-seconds", type=_positive_float)
     return parser
 
 
@@ -239,6 +299,242 @@ def _run_context_command(arguments: argparse.Namespace) -> int:
     return 0
 
 
+def _run_failure(
+    code: str,
+    message: str,
+    *,
+    retryable: bool = False,
+    attempt: Mapping[str, object] | None = None,
+    solver: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    payload = cli_failure(
+        "run-febio",
+        CaseContextError(code, message, retryable=retryable),
+    )
+    if attempt is not None:
+        payload["attempt"] = dict(attempt)
+    if solver is not None:
+        payload["solver"] = dict(solver)
+    return payload
+
+
+def _fail_run(error: _RunCommandError) -> int:
+    _emit_context_json(
+        _run_failure(error.code, str(error), retryable=error.retryable),
+        error=True,
+    )
+    return _RUN_FAILURE_EXIT
+
+
+def _select_feb_input(
+    inputs: object,
+    selected_name: object,
+) -> tuple[Path, str, str]:
+    if selected_name is not None and (
+        not isinstance(selected_name, str)
+        or not selected_name
+        or Path(selected_name).name != selected_name
+        or "/" in selected_name
+        or "\\" in selected_name
+    ):
+        raise _RunCommandError("INVALID_INPUT", "input_name must be one exact basename")
+    if not isinstance(inputs, list):
+        raise _RunCommandError("EVIDENCE_INTEGRITY_FAILURE", "case inputs are invalid")
+    candidates: list[tuple[Path, str, str]] = []
+    for raw in inputs:
+        if not isinstance(raw, Mapping):
+            raise _RunCommandError("EVIDENCE_INTEGRITY_FAILURE", "case inputs are invalid")
+        path_value = raw.get("path")
+        digest = raw.get("sha256")
+        if not isinstance(path_value, str) or not isinstance(digest, str):
+            raise _RunCommandError("EVIDENCE_INTEGRITY_FAILURE", "case inputs are invalid")
+        path = Path(path_value)
+        if path.suffix.casefold() != ".feb":
+            continue
+        name = path.name
+        if selected_name is None or name == selected_name:
+            candidates.append((path, name, digest))
+    if not candidates:
+        code = "INPUT_NOT_FOUND" if selected_name is not None else "INPUT_SELECTION_REQUIRED"
+        raise _RunCommandError(code, "registered FEB input selection failed")
+    if len(candidates) != 1:
+        raise _RunCommandError(
+            "INPUT_SELECTION_REQUIRED",
+            "multiple registered FEB inputs require one exact input_name",
+        )
+    return candidates[0]
+
+
+def _run_febio_command(arguments: argparse.Namespace) -> int:
+    try:
+        service = _case_service()
+        root_capability = _read_root_capability_stdin()
+        opened = service._open_context(root_capability, arguments.case_id)
+        if opened.result.state is not IntentState.BOUND or opened.result.question is not None:
+            raise _RunCommandError(
+                "ASK_AND_BLOCK",
+                "case intent is not authoritatively bound",
+            )
+        snapshot = opened.result.snapshot
+        completeness = assess_authoritative_completeness(snapshot)
+        if completeness.state != IntentState.BOUND.value:
+            raise _RunCommandError(
+                "ASK_AND_BLOCK",
+                "required physical conditions are not authoritatively bound",
+            )
+        manifest = opened.store.manifest
+        source_relative, input_name, expected_sha256 = _select_feb_input(
+            manifest.get("inputs"),
+            arguments.input_name,
+        )
+        if not arguments.runtime_probe.is_absolute():
+            raise _RunCommandError(
+                "INVALID_INPUT",
+                "runtime_probe must be one absolute executable path",
+            )
+        requested_fields = tuple(cast(list[str], arguments.requested_field))
+        if any(not field.strip() for field in requested_fields) or len(
+            set(requested_fields)
+        ) != len(requested_fields):
+            raise _RunCommandError(
+                "INVALID_INPUT",
+                "requested fields must be non-empty and unique",
+            )
+
+        attempt_id = f"run-{secrets.token_hex(16)}"
+        opened.store.record_attempt(attempt_id, {"status": "started"})
+        attempt = AttemptWorkspace._from_manager(
+            opened.case,
+            attempt_id,
+            opened.case.temporary_root / "attempts" / attempt_id,
+        )
+        snapshot = opened.store.issue_intent_snapshot()
+        completeness = assess_authoritative_completeness(snapshot)
+        if completeness.state != IntentState.BOUND.value:
+            raise _RunCommandError(
+                "ASK_AND_BLOCK",
+                "required physical conditions are not authoritatively bound",
+            )
+        destination_relative = Path("90_Temporary") / "attempts" / attempt_id / input_name
+        with opened.case._exact_transaction() as exact:
+            staged_input = exact.copy_create_new(
+                source_relative,
+                destination_relative,
+                expected_sha256,
+            )
+
+        inspection = inspect_feb_file(staged_input)
+        if inspection.sha256 != expected_sha256:
+            raise _RunCommandError(
+                "EVIDENCE_INTEGRITY_FAILURE",
+                "staged FEB input digest changed",
+            )
+        preflight = run_preflight(
+            feb=inspection,
+            completeness=completeness,
+            snapshot=snapshot,
+        )
+        if not preflight.ready:
+            codes = sorted({item.code for item in preflight.blocking_diagnostics})
+            detail = ",".join(codes) if codes else "UNKNOWN"
+            raise _RunCommandError(
+                "PREFLIGHT_BLOCKED",
+                f"FEB preflight is blocked: {detail}",
+            )
+
+        runtime = probe_febio(arguments.runtime_probe)
+        execution = issue_execution_authority(
+            attempt,
+            snapshot,
+            runtime,
+            staged_input,
+            requested_fields=requested_fields,
+            expected_steps=arguments.expected_steps,
+            expected_final_time=arguments.expected_final_time,
+        )
+        if execution.input_sha256 != inspection.sha256:
+            raise _RunCommandError(
+                "EVIDENCE_INTEGRITY_FAILURE",
+                "execution input changed after preflight",
+            )
+        diagnostic = run_headless_febio(
+            attempt,
+            snapshot,
+            runtime,
+            staged_input,
+            expected_steps=arguments.expected_steps,
+            expected_final_time=arguments.expected_final_time,
+            timeout_seconds=arguments.timeout_seconds,
+        )
+        solver = {
+            "classification": diagnostic.classification.value,
+            "return_code": diagnostic.return_code,
+            "state": diagnostic.state.value,
+        }
+        attempt_payload = {
+            "attempt_id": attempt_id,
+            "official_fbs": False,
+            "status": diagnostic.classification.value,
+        }
+        if (
+            diagnostic.state is not SolverState.NORMAL_EXIT
+            or diagnostic.classification is not SolverClassification.FBS_UNVERIFIED
+            or diagnostic.return_code != 0
+            or diagnostic.log_path != execution.log_path
+            or diagnostic.xplt_path != execution.xplt_path
+        ):
+            _emit_context_json(
+                _run_failure(
+                    "SOLVER_FAILED",
+                    "headless FEBio did not produce one claimable normal result",
+                    attempt=attempt_payload,
+                    solver=solver,
+                ),
+                error=True,
+            )
+            return _RUN_FAILURE_EXIT
+
+        execution_record = execution.record_path
+        with claim_execution_outputs(execution) as outputs:
+            log_path = outputs.log_path
+            xplt_path = outputs.xplt_path
+        for artifact in (staged_input, execution_record, log_path, xplt_path):
+            opened.store.record_artifact(artifact, attempt_id=attempt_id)
+
+        _emit_context_json(
+            _run_failure(
+                "FBS_UNAVAILABLE",
+                "official FBS validation is unavailable; solver outputs remain unverified",
+                attempt=attempt_payload,
+                solver=solver,
+            ),
+            error=True,
+        )
+        return _FBS_UNAVAILABLE_EXIT
+    except _RunCommandError as error:
+        return _fail_run(error)
+    except CaseContextError as error:
+        _emit_context_json(cli_failure("run-febio", error), error=True)
+        return _CONTEXT_EXIT_CODES.get(error.code, _RUN_FAILURE_EXIT)
+    except RuntimeProbeError:
+        return _fail_run(_RunCommandError("RUNTIME_PROBE_FAILED", "FEBio runtime probe failed"))
+    except (
+        EvidenceIntegrityError,
+        ExecutionAuthorityError,
+        HeadlessConfigurationError,
+        OSError,
+        ValueError,
+        WorkspaceBoundaryError,
+    ):
+        return _fail_run(
+            _RunCommandError("EXECUTION_FAILED", "headless execution authority failed")
+        )
+    except Exception:
+        return _fail_run(
+            _RunCommandError("INTERNAL_ERROR", "unexpected headless execution failure")
+        )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = build_parser().parse_args(argv)
     if arguments.command in {"inspect-feb", "inspect-step"}:
@@ -250,5 +546,5 @@ def main(argv: Sequence[str] | None = None) -> int:
     if arguments.command in {"root", "case"}:
         return _run_context_command(arguments)
     if arguments.command == "run-febio":
-        return _error("run-febio is disabled until a safe case-context command is available")
+        return _run_febio_command(arguments)
     return 0

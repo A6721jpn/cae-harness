@@ -298,13 +298,10 @@ def test_raw_run_febio_flags_cannot_be_parsed_as_a_launch(
     assert raised.value.code != 0
 
 
-def test_run_febio_is_disabled_until_case_context_is_available(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    assert cli_module.main(["run-febio"]) == 1
-    captured = capsys.readouterr()
-    assert captured.out == ""
-    assert "disabled" in captured.err
+def test_run_febio_requires_case_bound_authority_options() -> None:
+    with pytest.raises(SystemExit) as raised:
+        cli_module.build_parser().parse_args(["run-febio"])
+    assert raised.value.code == 2
 
 
 def test_case_context_unexpected_oserror_is_concise_and_path_free(
