@@ -423,6 +423,58 @@ def test_attempt_records_and_artifact_digests_are_projected(tmp_path: Path) -> N
         store.record_attempt("attempt-1", {"status": "duplicate"})
 
 
+def test_record_artifact_rejects_an_object_that_no_longer_matches_claimed_digest(
+    tmp_path: Path,
+) -> None:
+    _, case, intent = make_case(tmp_path)
+    store = EvidenceStore(case, intent)
+    store.record_attempt("attempt-1")
+    artifact = case.write_text(
+        Path("90_Temporary") / "attempts" / "attempt-1" / "result.log",
+        "original synthetic output",
+    )
+    claimed_sha256 = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    artifact.write_text("substituted synthetic output", encoding="utf-8")
+
+    with pytest.raises(EvidenceIntegrityError, match="claimed artifact digest changed"):
+        store.record_artifact(
+            artifact,
+            attempt_id="attempt-1",
+            expected_sha256=claimed_sha256,
+        )
+
+    assert not store.manifest["artifacts"]
+
+
+def test_record_artifact_rejects_same_bytes_object_replacement_against_claimed_identity(
+    tmp_path: Path,
+) -> None:
+    _, case, intent = make_case(tmp_path)
+    store = EvidenceStore(case, intent)
+    store.record_attempt("attempt-1")
+    artifact = case.write_text(
+        Path("90_Temporary") / "attempts" / "attempt-1" / "result.log",
+        "same synthetic output",
+    )
+    with case._exact_transaction() as exact:
+        relative = artifact.relative_to(case.case_root)
+        claimed_identity = exact.identity(relative)
+        claimed_sha256 = exact.digest(relative)
+    displaced = artifact.with_suffix(".displaced")
+    artifact.replace(displaced)
+    artifact.write_bytes(displaced.read_bytes())
+
+    with pytest.raises(EvidenceIntegrityError, match="claimed artifact identity changed"):
+        store.record_artifact(
+            artifact,
+            attempt_id="attempt-1",
+            expected_sha256=claimed_sha256,
+            expected_identity=claimed_identity,
+        )
+
+    assert not store.manifest["artifacts"]
+
+
 def test_reopen_validates_and_restores_persisted_state(tmp_path: Path) -> None:
     _, case, intent = make_case(tmp_path)
     store = EvidenceStore(case, intent)

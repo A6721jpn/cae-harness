@@ -1131,11 +1131,25 @@ class EvidenceStore:
         path: str | Path,
         *,
         attempt_id: str | None = None,
+        expected_sha256: str | None = None,
+        expected_identity: tuple[int, int, int, int] | None = None,
     ) -> dict[str, object]:
-        """Record a case-owned artifact digest and reject later mutations."""
+        """Record a case-owned artifact digest and reject substitutions."""
 
         if attempt_id is not None:
             _validate_segment(attempt_id, "attempt_id")
+        if expected_sha256 is not None and (
+            not isinstance(expected_sha256, str)
+            or len(expected_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in expected_sha256)
+        ):
+            raise ValueError("expected_sha256 must be one lowercase SHA-256 digest")
+        if expected_identity is not None and (
+            type(expected_identity) is not tuple
+            or len(expected_identity) != 4
+            or any(type(value) is not int for value in expected_identity)
+        ):
+            raise ValueError("expected_identity must be one exact four-integer file identity")
         with self._transaction():
             self._load_and_validate(None)
             artifact_path = self._safe_case_file(path)
@@ -1152,9 +1166,15 @@ class EvidenceStore:
                 if not relative.startswith(attempt_prefix):
                     raise ValueError("attempt artifact must be inside its attempt directory")
 
+            actual_identity = self._exact().identity(relative)
+            if expected_identity is not None and actual_identity != expected_identity:
+                raise EvidenceIntegrityError("claimed artifact identity changed")
+            actual_sha256 = self._exact().digest(relative)
+            if expected_sha256 is not None and actual_sha256 != expected_sha256:
+                raise EvidenceIntegrityError("claimed artifact digest changed")
             record: dict[str, object] = {
                 "path": relative,
-                "sha256": self._exact().digest(relative),
+                "sha256": actual_sha256,
                 "attempt_id": attempt_id,
             }
             existing = self._artifacts.get(relative)

@@ -208,6 +208,21 @@ def test_run_febio_solves_but_fails_closed_without_official_fbs(
     attempts = list((case_root / "90_Temporary" / "attempts").iterdir())
     assert len(attempts) == 1
     assert (attempts[0] / "execution.json").is_file()
+    events = [
+        json.loads(line)
+        for line in (case_root / "90_Temporary" / "events.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert events[-1]["event_type"] == "run_febio_terminal"
+    assert events[-1]["payload"] == {
+        "attempt_id": attempts[0].name,
+        "classification": "FBS_UNVERIFIED",
+        "official_fbs": False,
+        "return_code": 0,
+        "solver_state": "NORMAL_EXIT",
+        "status": "FBS_UNAVAILABLE",
+    }
     reports = case_root / "50_Reports"
     assert not reports.exists() or not any(reports.iterdir())
 
@@ -292,7 +307,7 @@ def test_run_febio_solver_failure_is_not_relabelled_as_fbs_unavailable(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    service, capability, _ = _register_case(tmp_path, intent=_complete_intent())
+    service, capability, case_root = _register_case(tmp_path, intent=_complete_intent())
     runtime = _issued_runtime(tmp_path, monkeypatch)
     _set_capability_stdin(monkeypatch, capability)
     monkeypatch.setattr(cli_module, "_case_service", lambda: service)
@@ -327,3 +342,11 @@ def test_run_febio_solver_failure_is_not_relabelled_as_fbs_unavailable(
     assert payload["attempt"]["official_fbs"] is False
     assert payload["attempt"]["status"] == "FATAL"
     assert payload["solver"]["classification"] == "FATAL"
+    events = [
+        json.loads(line)
+        for line in (case_root / "90_Temporary" / "events.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert events[-1]["event_type"] == "run_febio_terminal"
+    assert events[-1]["payload"]["status"] == "SOLVER_FAILED"

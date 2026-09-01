@@ -61,6 +61,7 @@ def _execution_outputs_module() -> ModuleType:
     required = {
         "ExecutionOutputsAuthority",
         "claim_execution_outputs",
+        "record_execution_output_artifacts",
         "validate_execution_outputs",
     }
     missing = sorted(name for name in required if not hasattr(module, name))
@@ -761,6 +762,51 @@ def test_execution_outputs_api_is_derived_opaque_live_and_closeable(
     with pytest.raises(module.ExecutionAuthorityError, match="closed|released"):
         _ = outputs.log_bytes
     outputs.close()
+
+
+def test_execution_output_artifact_recording_detects_same_bytes_post_record_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _context(tmp_path, monkeypatch)
+    module = _execution_outputs_module()
+    execution = _issue(context)
+    _write_synthetic_outputs(execution)
+    outputs = module.claim_execution_outputs(execution)
+    xplt_path = execution.xplt_path
+    original_record = EvidenceStore.record_artifact
+
+    def replace_after_record(
+        self: EvidenceStore,
+        path: str | Path,
+        *,
+        attempt_id: str | None = None,
+        expected_sha256: str | None = None,
+        expected_identity: tuple[int, int, int, int] | None = None,
+    ) -> dict[str, object]:
+        record = original_record(
+            self,
+            path,
+            attempt_id=attempt_id,
+            expected_sha256=expected_sha256,
+            expected_identity=expected_identity,
+        )
+        candidate = Path(path)
+        if candidate == xplt_path:
+            displaced = candidate.with_suffix(".post-record")
+            candidate.replace(displaced)
+            candidate.write_bytes(displaced.read_bytes())
+        return record
+
+    monkeypatch.setattr(EvidenceStore, "record_artifact", replace_after_record)
+    try:
+        with pytest.raises(
+            module.ExecutionAuthorityError,
+            match="output|LOG|XPLT|identity|changed|state",
+        ):
+            module.record_execution_output_artifacts(outputs, context.store)
+    finally:
+        outputs.close()
 
 
 @pytest.mark.parametrize(

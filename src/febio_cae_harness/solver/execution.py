@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import NoReturn, SupportsIndex, cast
 
-from ..evidence import IntentSnapshotAuthority
+from ..evidence import EvidenceIntegrityError, EvidenceStore, IntentSnapshotAuthority
 from ..workspace import (
     AttemptWorkspace,
     CaseWorkspace,
@@ -39,6 +39,7 @@ __all__ = [
     "ExecutionOutputsAuthority",
     "claim_execution_outputs",
     "issue_execution_authority",
+    "record_execution_output_artifacts",
     "reopen_execution_authority",
     "validate_execution_authority",
     "validate_execution_outputs",
@@ -1124,6 +1125,16 @@ def _validated_output_binding(value: object) -> _OutputBinding:
     binding = _output_binding(value)
     try:
         _validated_binding(binding.execution)
+        _validate_held_output_objects(binding)
+    except ExecutionAuthorityError:
+        raise
+    except (OSError, WorkspaceBoundaryError) as error:
+        raise ExecutionAuthorityError("execution output exact identity or state changed") from error
+    return binding
+
+
+def _validate_held_output_objects(binding: _OutputBinding) -> None:
+    try:
         binding.exact.validate()
         if binding.log_owner.expected != binding.log_state:
             raise ExecutionAuthorityError("LOG output held state changed")
@@ -1156,7 +1167,10 @@ def _validated_output_binding(value: object) -> _OutputBinding:
         raise
     except (OSError, WorkspaceBoundaryError) as error:
         raise ExecutionAuthorityError("execution output exact identity or state changed") from error
-    return binding
+
+
+def _evidence_identity(state: tuple[int, ...]) -> tuple[int, int, int, int]:
+    return (state[0], state[1], state[4], state[5])
 
 
 def _finalize_output_binding(binding: _OutputBinding) -> None:
@@ -1241,6 +1255,37 @@ def claim_execution_outputs(
         if isinstance(primary, (OSError, WorkspaceBoundaryError)):
             raise ExecutionAuthorityError("cannot claim exact execution outputs") from primary
         raise
+
+
+def record_execution_output_artifacts(
+    outputs: ExecutionOutputsAuthority,
+    store: EvidenceStore,
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Record both held output objects and revalidate them after projection."""
+
+    if type(store) is not EvidenceStore:
+        raise ExecutionAuthorityError("execution output recording requires an exact EvidenceStore")
+    binding = _validated_output_binding(outputs)
+    attempt_id = _validated_binding(binding.execution).data.attempt_id
+    try:
+        log_record = store.record_artifact(
+            binding.log_path,
+            attempt_id=attempt_id,
+            expected_sha256=binding.log_sha256,
+            expected_identity=_evidence_identity(binding.log_state),
+        )
+        xplt_record = store.record_artifact(
+            binding.xplt_path,
+            attempt_id=attempt_id,
+            expected_sha256=binding.xplt_sha256,
+            expected_identity=_evidence_identity(binding.xplt_state),
+        )
+        _validate_held_output_objects(binding)
+    except ExecutionAuthorityError:
+        raise
+    except (EvidenceIntegrityError, OSError, ValueError, WorkspaceBoundaryError) as error:
+        raise ExecutionAuthorityError("cannot record exact execution output artifacts") from error
+    return log_record, xplt_record
 
 
 def validate_execution_outputs(value: object) -> ExecutionOutputsAuthority:

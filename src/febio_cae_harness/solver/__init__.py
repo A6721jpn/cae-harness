@@ -1,5 +1,6 @@
 """Headless FEBio solver and synthetic FBS authority boundary."""
 
+from .execution import record_execution_output_artifacts
 from .fbs import (
     FbsAdapterAuthority,
     FbsAdapterManager,
@@ -73,6 +74,7 @@ __all__ = [
     "RuntimeProbeError",
     "probe_febio",
     "probe_runtime",
+    "record_execution_output_artifacts",
     "reconnect_headless_febio",
     "run_headless_febio",
     "validate_log",
