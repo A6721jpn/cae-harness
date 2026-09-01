@@ -82,6 +82,15 @@ def _digest(value: object) -> str:
     return hashlib.sha256(_canonical_bytes(value)).hexdigest()
 
 
+def _root_id_for(path: Path, stamp: tuple[int, int]) -> str:
+    projection = {
+        "schema_version": _REGISTRY_SCHEMA,
+        "path": os.path.normcase(os.fspath(path)),
+        "stamp": [stamp[0], stamp[1]],
+    }
+    return _ROOT_PREFIX + _digest(projection)
+
+
 def _validate_case_id(value: str) -> str:
     if not isinstance(value, str) or _CASE_ID.fullmatch(value) is None:
         raise CaseContextError(
@@ -99,6 +108,21 @@ def _validate_sha256(value: str, label: str) -> str:
 
 def _normal_path(value: Path) -> Path:
     return Path(os.path.abspath(os.fspath(value)))
+
+
+def _is_exact_ancestor(ancestor: Path, candidate: Path, label: str) -> bool:
+    ancestor_stamp = _identity_stamp(ancestor, f"{label} ancestor")
+    current = _reject_reparse_alias(candidate, f"{label} candidate")
+    while True:
+        if _identity_stamp(current, f"{label} candidate ancestor") == ancestor_stamp:
+            return True
+        if current == current.parent:
+            return False
+        current = current.parent
+
+
+def _exact_trees_overlap(first: Path, second: Path, label: str) -> bool:
+    return _is_exact_ancestor(first, second, label) or _is_exact_ancestor(second, first, label)
 
 
 def _local_app_data_known_folder() -> Path:
@@ -196,11 +220,20 @@ def _read_exact_bytes(path: Path, label: str) -> bytes:
 
 
 def _parse_json(data: bytes, label: str) -> object:
+    def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for name, value in pairs:
+            if name in result:
+                raise CaseContextError("INVALID_INPUT", f"{label} contains a duplicate field")
+            result[name] = value
+        return result
+
     try:
         text = data.decode("utf-8")
         return json.loads(
             text,
             parse_constant=lambda value: _reject_nonfinite(value, label),
+            object_pairs_hook=unique_object,
         )
     except CaseContextError:
         raise
@@ -213,26 +246,34 @@ def _reject_nonfinite(value: str, label: str) -> NoReturn:
 
 
 def load_intent_document(path: Path) -> IntentContract:
-    payload = _parse_json(_read_exact_bytes(path, "intent file"), "intent file")
+    data = _read_exact_bytes(path, "intent file")
+    payload = _parse_json(data, "intent file")
     if not isinstance(payload, dict):
         raise CaseContextError("INVALID_INPUT", "intent file must contain one JSON object")
+    if data != _canonical_bytes(payload) + b"\n":
+        raise CaseContextError("INVALID_INPUT", "intent file bytes are not canonical")
     try:
         intent = IntentContract.from_mapping(payload)
     except (TypeError, ValueError) as error:
-        raise CaseContextError("INVALID_INPUT", f"intent file is invalid: {error}") from error
+        raise CaseContextError(
+            "INVALID_INPUT", "intent file violates the intent contract"
+        ) from error
     if intent.to_dict() != payload:
         raise CaseContextError("INVALID_INPUT", "intent file is incomplete or non-canonical")
     return intent
 
 
 def load_answer_document(path: Path) -> tuple[JSONInput, str, str | None]:
-    payload = _parse_json(_read_exact_bytes(path, "answer file"), "answer file")
+    data = _read_exact_bytes(path, "answer file")
+    payload = _parse_json(data, "answer file")
     if not isinstance(payload, dict) or set(payload) - {"value", "source", "detail"}:
         raise CaseContextError(
             "INVALID_INPUT", "answer file must contain only value, source, and optional detail"
         )
     if set(payload) < {"value", "source"}:
         raise CaseContextError("INVALID_INPUT", "answer file requires value and source")
+    if data != _canonical_bytes(payload) + b"\n":
+        raise CaseContextError("INVALID_INPUT", "answer file bytes are not canonical")
     source = payload["source"]
     detail = payload.get("detail")
     if not isinstance(source, str) or not source.strip():
@@ -282,12 +323,14 @@ def _validate_registry(body: object) -> dict[str, object]:
             "root_id",
             "state",
             "stamp",
+            "reservation_id",
         }:
             raise CaseContextError("EVIDENCE_INTEGRITY_FAILURE", "registered case is invalid")
         case_id = record["case_id"]
         root_id = record["root_id"]
         state = record["state"]
         stamp = record["stamp"]
+        reservation_id = record["reservation_id"]
         if (
             not isinstance(case_id, str)
             or _CASE_ID.fullmatch(case_id) is None
@@ -295,10 +338,21 @@ def _validate_registry(body: object) -> dict[str, object]:
             or root_id not in root_ids
             or state not in {"PREPARING", "ACTIVE"}
             or not isinstance(stamp, list)
-            or (state == "PREPARING" and stamp)
+            or (
+                state == "PREPARING"
+                and (
+                    stamp
+                    or not isinstance(reservation_id, str)
+                    or _DIGEST.fullmatch(reservation_id) is None
+                )
+            )
             or (
                 state == "ACTIVE"
-                and (len(stamp) != 2 or any(type(part) is not int or part < 0 for part in stamp))
+                and (
+                    reservation_id is not None
+                    or len(stamp) != 2
+                    or any(type(part) is not int or part < 0 for part in stamp)
+                )
             )
         ):
             raise CaseContextError("EVIDENCE_INTEGRITY_FAILURE", "registered case is invalid")
@@ -316,7 +370,8 @@ def _read_registry(path: Path) -> dict[str, object]:
         return _initial_registry()
     except OSError as error:
         raise CaseContextError("IO_OR_LOCK_FAILURE", "cannot inspect case registry") from error
-    document = _parse_json(_read_exact_bytes(path, "case registry"), "case registry")
+    data = _read_exact_bytes(path, "case registry")
+    document = _parse_json(data, "case registry")
     if not isinstance(document, dict) or set(document) != {
         "schema_version",
         "roots",
@@ -324,6 +379,10 @@ def _read_registry(path: Path) -> dict[str, object]:
         "sha256",
     }:
         raise CaseContextError("EVIDENCE_INTEGRITY_FAILURE", "case registry is invalid")
+    if data != _canonical_bytes(document) + b"\n":
+        raise CaseContextError(
+            "EVIDENCE_INTEGRITY_FAILURE", "case registry bytes are not canonical"
+        )
     stored_digest = document["sha256"]
     body = {name: document[name] for name in ("schema_version", "roots", "cases")}
     if not isinstance(stored_digest, str) or stored_digest != _digest(body):
@@ -543,35 +602,31 @@ class CaseContextService:
                 raise CaseContextError(
                     "INVALID_INPUT", "cae_root must be an existing 02_CAE directory"
                 )
-            registry_root = _normal_path(self._registry_root)
-            tool_root = _normal_path(self._tool_root)
-            if (
-                exact_root in (registry_root, tool_root)
-                or exact_root.is_relative_to(registry_root)
-                or registry_root.is_relative_to(exact_root)
-                or exact_root.is_relative_to(tool_root)
-                or tool_root.is_relative_to(exact_root)
-            ):
-                raise CaseContextError(
-                    "BOUNDARY_OR_IDENTITY_VIOLATION",
-                    "02_CAE root overlaps the tool or registry tree",
-                )
             stamp = _identity_stamp(exact_root, "02_CAE root")
         except CaseContextError:
             raise
         except WorkspaceBoundaryError as error:
-            raise CaseContextError("BOUNDARY_OR_IDENTITY_VIOLATION", str(error)) from error
-        projection = {
-            "schema_version": _REGISTRY_SCHEMA,
-            "path": os.path.normcase(os.fspath(exact_root)),
-            "stamp": [stamp[0], stamp[1]],
-        }
-        root_id = _ROOT_PREFIX + _digest(projection)
+            raise CaseContextError(
+                "BOUNDARY_OR_IDENTITY_VIOLATION", "02_CAE root identity is invalid"
+            ) from error
+        root_id = _root_id_for(exact_root, stamp)
         with self._registry() as (registry_root, registry):
+            try:
+                if _exact_trees_overlap(exact_root, registry_root, "02_CAE and registry") or (
+                    _exact_trees_overlap(exact_root, self._tool_root, "02_CAE and tool")
+                ):
+                    raise CaseContextError(
+                        "BOUNDARY_OR_IDENTITY_VIOLATION",
+                        "02_CAE root overlaps the tool or registry tree",
+                    )
+            except WorkspaceBoundaryError as error:
+                raise CaseContextError(
+                    "BOUNDARY_OR_IDENTITY_VIOLATION", "root tree identity is invalid"
+                ) from error
             roots = self._roots(registry)
             for record in roots:
-                if os.path.normcase(str(record["path"])) == projection["path"]:
-                    if record["root_id"] != root_id or record["stamp"] != projection["stamp"]:
+                if os.path.normcase(str(record["path"])) == os.path.normcase(os.fspath(exact_root)):
+                    if record["root_id"] != root_id or record["stamp"] != [*stamp]:
                         raise CaseContextError(
                             "REGISTRATION_CONFLICT", "registered 02_CAE identity changed"
                         )
@@ -591,12 +646,56 @@ class CaseContextService:
             raise CaseContextError("EVIDENCE_INTEGRITY_FAILURE", "registered root stamp is invalid")
         expected = (int(raw_stamp[0]), int(raw_stamp[1]))
         try:
-            _identity_stamp(root, "registered 02_CAE root", expected)
-            return ValidatedCaseWorkspace(self._tool_root, root)
+            exact_root = _reject_reparse_alias(root, "registered 02_CAE root")
+            if exact_root.name.casefold() != "02_cae" or not exact_root.is_dir():
+                raise WorkspaceBoundaryError("registered root is not an exact 02_CAE directory")
+            stamp = _identity_stamp(exact_root, "registered 02_CAE root", expected)
+            if _root_id_for(exact_root, stamp) != root_id:
+                raise WorkspaceBoundaryError("registered root identifier does not match")
+            if _exact_trees_overlap(
+                exact_root, self._registry_root, "registered 02_CAE and registry"
+            ) or _exact_trees_overlap(exact_root, self._tool_root, "registered 02_CAE and tool"):
+                raise WorkspaceBoundaryError("registered root overlaps a private tree")
+            return ValidatedCaseWorkspace(self._tool_root, exact_root)
         except (OSError, ValueError, WorkspaceBoundaryError) as error:
             raise CaseContextError(
                 "BOUNDARY_OR_IDENTITY_VIOLATION", "registered 02_CAE root identity changed"
             ) from error
+
+    def _release_untouched_reservation(
+        self,
+        *,
+        root_id: str,
+        case_id: str,
+        reservation_id: str,
+    ) -> None:
+        with self._registry() as (registry_root, registry):
+            manager = self._validated_manager(registry, root_id)
+            case_path = manager.cae_root / case_id
+            try:
+                checked = _reject_reparse_alias(case_path, "failed case reservation")
+                checked.lstat()
+            except FileNotFoundError:
+                pass
+            except (OSError, WorkspaceBoundaryError):
+                return
+            else:
+                return
+            cases = self._cases(registry)
+            matches = [
+                record
+                for record in cases
+                if record["case_id"] == case_id
+                and record["root_id"] == root_id
+                and record["state"] == "PREPARING"
+                and record["reservation_id"] == reservation_id
+            ]
+            if len(matches) != 1:
+                raise CaseContextError(
+                    "EVIDENCE_INTEGRITY_FAILURE", "case reservation changed during rollback"
+                )
+            cases.remove(matches[0])
+            _write_registry(registry_root, {**registry, "cases": cases})
 
     def create_case(
         self,
@@ -614,6 +713,7 @@ class CaseContextService:
         source_paths = tuple(sources)
         if any(not isinstance(source, Path) for source in source_paths):
             raise CaseContextError("INVALID_INPUT", "case sources must be paths")
+        reservation_id = secrets.token_hex(32)
         with self._registry() as (registry_root, registry):
             manager = self._validated_manager(registry, root_id)
             if any(
@@ -623,7 +723,13 @@ class CaseContextService:
                 raise CaseContextError("REGISTRATION_CONFLICT", "case_id is already reserved")
             cases = self._cases(registry)
             cases.append(
-                {"case_id": case_id, "root_id": root_id, "state": "PREPARING", "stamp": []}
+                {
+                    "case_id": case_id,
+                    "root_id": root_id,
+                    "state": "PREPARING",
+                    "stamp": [],
+                    "reservation_id": reservation_id,
+                }
             )
             _write_registry(registry_root, {**registry, "cases": cases})
         try:
@@ -633,15 +739,31 @@ class CaseContextService:
             result = lifecycle.reconcile()
             case_stamp = _registered_case_stamp(case)
         except FileExistsError as error:
+            self._release_untouched_reservation(
+                root_id=root_id, case_id=case_id, reservation_id=reservation_id
+            )
             raise CaseContextError(
                 "REGISTRATION_CONFLICT", "case directory already exists and cannot be adopted"
             ) from error
         except WorkspaceBoundaryError as error:
-            raise CaseContextError("BOUNDARY_OR_IDENTITY_VIOLATION", str(error)) from error
+            self._release_untouched_reservation(
+                root_id=root_id, case_id=case_id, reservation_id=reservation_id
+            )
+            raise CaseContextError(
+                "BOUNDARY_OR_IDENTITY_VIOLATION", "case creation violated an identity boundary"
+            ) from error
         except EvidenceIntegrityError as error:
-            raise CaseContextError("EVIDENCE_INTEGRITY_FAILURE", str(error)) from error
+            self._release_untouched_reservation(
+                root_id=root_id, case_id=case_id, reservation_id=reservation_id
+            )
+            raise CaseContextError(
+                "EVIDENCE_INTEGRITY_FAILURE", "case evidence creation failed"
+            ) from error
         except (OSError, TypeError, ValueError) as error:
-            raise CaseContextError("INVALID_INPUT", str(error)) from error
+            self._release_untouched_reservation(
+                root_id=root_id, case_id=case_id, reservation_id=reservation_id
+            )
+            raise CaseContextError("INVALID_INPUT", "case input or intent is invalid") from error
         with self._registry() as (registry_root, registry):
             cases = self._cases(registry)
             reservation = next(
@@ -651,6 +773,7 @@ class CaseContextService:
                     if record["case_id"] == case_id
                     and record["root_id"] == root_id
                     and record["state"] == "PREPARING"
+                    and record["reservation_id"] == reservation_id
                 ),
                 None,
             )
@@ -660,6 +783,7 @@ class CaseContextService:
                 )
             reservation["state"] = "ACTIVE"
             reservation["stamp"] = [*case_stamp]
+            reservation["reservation_id"] = None
             _write_registry(registry_root, {**registry, "cases": cases})
         return self._project(root_id, case, store, lifecycle, result)
 
@@ -678,11 +802,17 @@ class CaseContextService:
                     raise WorkspaceBoundaryError("registered case identity changed")
                 store = EvidenceStore.open(case)
             except FileNotFoundError as error:
-                raise CaseContextError("CASE_NOT_REGISTERED", str(error)) from error
+                raise CaseContextError(
+                    "CASE_NOT_REGISTERED", "registered case directory is unavailable"
+                ) from error
             except WorkspaceBoundaryError as error:
-                raise CaseContextError("BOUNDARY_OR_IDENTITY_VIOLATION", str(error)) from error
+                raise CaseContextError(
+                    "BOUNDARY_OR_IDENTITY_VIOLATION", "registered case identity changed"
+                ) from error
             except EvidenceIntegrityError as error:
-                raise CaseContextError("EVIDENCE_INTEGRITY_FAILURE", str(error)) from error
+                raise CaseContextError(
+                    "EVIDENCE_INTEGRITY_FAILURE", "registered case evidence is invalid"
+                ) from error
         return root_id, case, store
 
     def _open_context(self, case_id: str) -> _OpenedContext:
@@ -691,7 +821,9 @@ class CaseContextService:
         try:
             result = lifecycle.reconcile()
         except EvidenceIntegrityError as error:
-            raise CaseContextError("EVIDENCE_INTEGRITY_FAILURE", str(error)) from error
+            raise CaseContextError(
+                "EVIDENCE_INTEGRITY_FAILURE", "case intent evidence is invalid"
+            ) from error
         return _OpenedContext(root_id, case, store, lifecycle, result)
 
     def open_case(self, case_id: str) -> dict[str, object]:
@@ -725,7 +857,9 @@ class CaseContextService:
         except CaseContextError:
             raise
         except EvidenceIntegrityError as error:
-            raise CaseContextError("STALE_INTENT_OR_QUESTION", str(error)) from error
+            raise CaseContextError(
+                "STALE_INTENT_OR_QUESTION", "intent changed or its evidence is invalid"
+            ) from error
         return self._project(root_id, case, store, lifecycle, result)
 
     def answer_case(
@@ -756,9 +890,11 @@ class CaseContextService:
         except CaseContextError:
             raise
         except (TypeError, ValueError) as error:
-            raise CaseContextError("INVALID_INPUT", str(error)) from error
+            raise CaseContextError("INVALID_INPUT", "answer is invalid") from error
         except EvidenceIntegrityError as error:
-            raise CaseContextError("STALE_INTENT_OR_QUESTION", str(error)) from error
+            raise CaseContextError(
+                "STALE_INTENT_OR_QUESTION", "intent or question evidence changed"
+            ) from error
         return self._project(root_id, case, store, lifecycle, result)
 
     @staticmethod
@@ -802,7 +938,9 @@ class CaseContextService:
                 "pending_questions": questions,
             }
         except (EvidenceIntegrityError, WorkspaceBoundaryError) as error:
-            raise CaseContextError("EVIDENCE_INTEGRITY_FAILURE", str(error)) from error
+            raise CaseContextError(
+                "EVIDENCE_INTEGRITY_FAILURE", "case projection evidence is invalid"
+            ) from error
 
 
 def cli_success(
