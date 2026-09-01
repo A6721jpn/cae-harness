@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
+from typing import BinaryIO
 
 import pytest
 
+import febio_cae_harness.launch.planner as planner_module
 from febio_cae_harness.launch import (
     LAUNCHER_NAME,
     BuildIdentity,
@@ -18,6 +22,7 @@ from febio_cae_harness.launch import (
     LaunchError,
     compute_payload_sha256,
     fixed_shortcut_descriptor,
+    launch_cli,
     plan_cli_launch,
     stage_latest_development,
 )
@@ -208,6 +213,509 @@ def test_launch_rejects_tampered_published_payload(tmp_path: Path) -> None:
         plan_cli_launch(receipt.layout, require_published=True)
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows executable sharing authority")
+def test_launch_holds_exact_launcher_against_replacement_during_spawn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source"
+    make_build(source)
+    receipt = stage_latest_development(source, tmp_path / "local", identity())
+    replacement = tmp_path / "replacement.exe"
+    replacement.write_bytes(b"replacement executable")
+    replacement_blocked = False
+    parent_replacement_blocked = False
+    app_root_replacement_blocked = False
+    local_root_replacement_blocked = False
+    write_blocked = False
+
+    def spawn_while_replacing(
+        command: tuple[str, ...],
+        **_kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        nonlocal app_root_replacement_blocked, local_root_replacement_blocked
+        nonlocal parent_replacement_blocked, replacement_blocked, write_blocked
+        assert command[0] == str(receipt.layout.launcher)
+        try:
+            os.replace(replacement, receipt.layout.launcher)
+        except OSError:
+            replacement_blocked = True
+        try:
+            receipt.layout.launcher.write_bytes(b"modified in place")
+        except OSError:
+            write_blocked = True
+        try:
+            os.replace(receipt.layout.latest, tmp_path / "displaced-latest")
+        except OSError:
+            parent_replacement_blocked = True
+        try:
+            os.replace(receipt.layout.app_root, tmp_path / "displaced-app")
+        except OSError:
+            app_root_replacement_blocked = True
+        try:
+            os.replace(receipt.layout.local_app_data, tmp_path / "displaced-local")
+        except OSError:
+            local_root_replacement_blocked = True
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(subprocess, "run", spawn_while_replacing)
+
+    completed = launch_cli(layout=receipt.layout)
+
+    assert completed.returncode == 0
+    assert replacement_blocked
+    assert write_blocked
+    assert parent_replacement_blocked
+    assert app_root_replacement_blocked
+    assert local_root_replacement_blocked
+    assert replacement.exists()
+    os.replace(replacement, receipt.layout.launcher)
+    assert not replacement.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows CreateProcess proof")
+def test_launch_executes_the_real_image_while_its_exact_handle_is_held(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    shutil.copy2(os.environ["COMSPEC"], source / LAUNCHER_NAME)
+    (source / "README.txt").write_text("synthetic native launcher", encoding="utf-8")
+    receipt = stage_latest_development(source, tmp_path / "local", identity())
+
+    completed = launch_cli(("/d", "/c", "exit", "0"), layout=receipt.layout)
+
+    assert completed.returncode == 0
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows CreateProcess race proof")
+def test_real_create_process_keeps_launcher_and_ancestors_bound_until_child_exit(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    shutil.copy2(os.environ["COMSPEC"], source / LAUNCHER_NAME)
+    (source / "README.txt").write_text("synthetic native launcher", encoding="utf-8")
+    receipt = stage_latest_development(source, tmp_path / "local", identity())
+    marker = receipt.layout.latest / "child-started.txt"
+    command = "echo started>child-started.txt & ping -n 4 127.0.0.1 >nul"
+    completed: list[subprocess.CompletedProcess[str]] = []
+    failures: list[BaseException] = []
+
+    def run_child() -> None:
+        try:
+            completed.append(launch_cli(("/d", "/c", command), layout=receipt.layout))
+        except BaseException as error:
+            failures.append(error)
+
+    launcher_thread = threading.Thread(target=run_child)
+    launcher_thread.start()
+    deadline = time.monotonic() + 10
+    while not marker.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert marker.exists() and launcher_thread.is_alive()
+
+    replacement = tmp_path / "replacement.exe"
+    replacement.write_bytes(b"replacement executable")
+    attempts = (
+        (replacement, receipt.layout.launcher),
+        (receipt.layout.latest, tmp_path / "displaced-latest"),
+        (receipt.layout.app_root, tmp_path / "displaced-app"),
+        (receipt.layout.local_app_data, tmp_path / "displaced-local"),
+    )
+    for original, displaced in attempts:
+        with pytest.raises(OSError):
+            os.replace(original, displaced)
+
+    launcher_thread.join(timeout=10)
+    assert not launcher_thread.is_alive()
+    assert failures == []
+    assert len(completed) == 1 and completed[0].returncode == 0
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows executable sharing authority")
+def test_launch_rejects_a_preexisting_writer_before_spawn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source"
+    make_build(source)
+    receipt = stage_latest_development(source, tmp_path / "local", identity())
+    spawned = False
+
+    def unexpected_spawn(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        nonlocal spawned
+        spawned = True
+        return subprocess.CompletedProcess((), 0)
+
+    monkeypatch.setattr(subprocess, "run", unexpected_spawn)
+    with (
+        receipt.layout.launcher.open("r+b"),
+        pytest.raises(LaunchError, match="hold exact launcher"),
+    ):
+        launch_cli(layout=receipt.layout)
+
+    assert not spawned
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows executable sharing authority")
+def test_launch_close_failure_becomes_indeterminate_without_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source"
+    make_build(source)
+    receipt = stage_latest_development(source, tmp_path / "local", identity())
+    replacement = tmp_path / "replacement.exe"
+    replacement.write_bytes(b"replacement executable")
+    real_close = planner_module._windows_close_launcher
+    close_calls = 0
+
+    def fail_close_once(value: int) -> bool:
+        nonlocal close_calls
+        close_calls += 1
+        return False if close_calls == 1 else real_close(value)
+
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda command, **_kwargs: subprocess.CompletedProcess(command, 0),
+    )
+    monkeypatch.setattr(planner_module, "_windows_close_launcher", fail_close_once)
+
+    indeterminate = None
+    try:
+        with pytest.raises(LaunchError, match="close exact launcher handle"):
+            launch_cli(layout=receipt.layout)
+        assert planner_module._PENDING_LAUNCHER_CLAIMS == []
+        assert len(planner_module._INDETERMINATE_LAUNCHER_CLAIMS) == 1
+        indeterminate = planner_module._INDETERMINATE_LAUNCHER_CLAIMS[0]
+        assert indeterminate.value is None and indeterminate.indeterminate
+        assert indeterminate.last_native_value is not None
+        with pytest.raises(OSError):
+            os.replace(replacement, receipt.layout.launcher)
+
+        planner_module._drain_launcher_claims()
+
+        assert close_calls == 1
+        assert planner_module._PENDING_LAUNCHER_CLAIMS == []
+    finally:
+        if indeterminate is not None:
+            assert indeterminate.last_native_value is not None
+            assert real_close(indeterminate.last_native_value)
+            planner_module._INDETERMINATE_LAUNCHER_CLAIMS.remove(indeterminate)
+    os.replace(replacement, receipt.layout.launcher)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows executable sharing authority")
+def test_launch_cleanup_failure_does_not_mask_the_spawn_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source"
+    make_build(source)
+    receipt = stage_latest_development(source, tmp_path / "local", identity())
+    real_close = planner_module._windows_close_launcher
+
+    def fail_spawn(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        raise OSError("primary spawn failure")
+
+    monkeypatch.setattr(subprocess, "run", fail_spawn)
+    monkeypatch.setattr(planner_module, "_windows_close_launcher", lambda _value: False)
+
+    with pytest.raises(LaunchError, match="cannot execute launcher") as caught:
+        launch_cli(layout=receipt.layout)
+
+    assert any("cannot close exact launcher handle" in note for note in caught.value.__notes__)
+    assert planner_module._PENDING_LAUNCHER_CLAIMS == []
+    assert len(planner_module._INDETERMINATE_LAUNCHER_CLAIMS) == 1
+    indeterminate = planner_module._INDETERMINATE_LAUNCHER_CLAIMS[0]
+    assert indeterminate.value is None and indeterminate.indeterminate
+    assert indeterminate.last_native_value is not None
+    assert real_close(indeterminate.last_native_value)
+    planner_module._INDETERMINATE_LAUNCHER_CLAIMS.remove(indeterminate)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows exact handle cleanup")
+def test_transient_close_inspection_failure_retains_the_protected_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source"
+    make_build(source)
+    receipt = stage_latest_development(source, tmp_path / "local", identity())
+    real_info = planner_module._launcher_handle_info
+    inspection_calls = 0
+
+    def fail_fourth_inspection(value: int) -> tuple[int, int, int, int]:
+        nonlocal inspection_calls
+        inspection_calls += 1
+        if inspection_calls == 4:
+            raise planner_module._LauncherHandleInspectionError(5)
+        return real_info(value)
+
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda command, **_kwargs: subprocess.CompletedProcess(command, 0),
+    )
+    monkeypatch.setattr(planner_module, "_launcher_handle_info", fail_fourth_inspection)
+
+    with pytest.raises(LaunchError, match="inspect exact launcher handle"):
+        launch_cli(layout=receipt.layout)
+    assert inspection_calls == 4
+    assert len(planner_module._PENDING_LAUNCHER_CLAIMS) == 1
+    pending = planner_module._PENDING_LAUNCHER_CLAIMS[0]
+    assert pending.value is not None and pending.protected
+
+    monkeypatch.setattr(planner_module, "_launcher_handle_info", real_info)
+    planner_module._drain_launcher_claims()
+    assert planner_module._PENDING_LAUNCHER_CLAIMS == []
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows exact handle cleanup")
+def test_cleanup_inspection_base_exception_retains_the_protected_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source"
+    make_build(source)
+    receipt = stage_latest_development(source, tmp_path / "local", identity())
+    real_info = planner_module._launcher_handle_info
+    inspection_calls = 0
+
+    def interrupt_fourth_inspection(value: int) -> tuple[int, int, int, int]:
+        nonlocal inspection_calls
+        inspection_calls += 1
+        if inspection_calls == 4:
+            raise KeyboardInterrupt
+        return real_info(value)
+
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda command, **_kwargs: subprocess.CompletedProcess(command, 0),
+    )
+    monkeypatch.setattr(planner_module, "_launcher_handle_info", interrupt_fourth_inspection)
+
+    with pytest.raises(KeyboardInterrupt):
+        launch_cli(layout=receipt.layout)
+    assert inspection_calls == 4
+    assert len(planner_module._PENDING_LAUNCHER_CLAIMS) == 1
+    pending = planner_module._PENDING_LAUNCHER_CLAIMS[0]
+    assert pending.value is not None and pending.protected
+
+    monkeypatch.setattr(planner_module, "_launcher_handle_info", real_info)
+    planner_module._drain_launcher_claims()
+    assert planner_module._PENDING_LAUNCHER_CLAIMS == []
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows exact handle cleanup")
+def test_cleanup_base_exception_after_unprotect_never_closes_a_foreign_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    source = tmp_path / "source"
+    make_build(source)
+    receipt = stage_latest_development(source, tmp_path / "local", identity())
+    replacement = tmp_path / "replacement.exe"
+    replacement.write_bytes(b"replacement executable")
+    launcher_bytes = receipt.layout.launcher.read_bytes()
+    real_protect = planner_module._windows_set_launcher_protection
+    real_close = planner_module._windows_close_launcher
+    interrupted = False
+    foreign: BinaryIO | None = None
+    other_values: list[int] = []
+    kernel32 = planner_module._windows_kernel32()
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+
+    def interrupt_after_unprotect(value: int, protected: bool) -> None:
+        nonlocal foreign, interrupted
+        real_protect(value, protected)
+        if not protected and not interrupted:
+            interrupted = True
+            assert real_close(value)
+            for _ in range(256):
+                raw = create_file(
+                    os.fspath(receipt.layout.launcher),
+                    planner_module._GENERIC_READ,
+                    planner_module._FILE_SHARE_READ,
+                    None,
+                    planner_module._OPEN_EXISTING,
+                    planner_module._FILE_ATTRIBUTE_NORMAL,
+                    None,
+                )
+                candidate_value = ctypes.cast(raw, ctypes.c_void_p).value
+                assert candidate_value is not None
+                if candidate_value == value:
+                    descriptor = msvcrt.open_osfhandle(
+                        candidate_value,
+                        os.O_RDONLY | os.O_BINARY,
+                    )
+                    foreign = os.fdopen(descriptor, "rb")
+                    break
+                other_values.append(candidate_value)
+            assert foreign is not None, "Windows did not reuse the interrupted handle value"
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda command, **_kwargs: subprocess.CompletedProcess(command, 0),
+    )
+    monkeypatch.setattr(
+        planner_module,
+        "_windows_set_launcher_protection",
+        interrupt_after_unprotect,
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        launch_cli(layout=receipt.layout)
+    assert planner_module._PENDING_LAUNCHER_CLAIMS == []
+    assert len(planner_module._INDETERMINATE_LAUNCHER_CLAIMS) == 1
+    indeterminate = planner_module._INDETERMINATE_LAUNCHER_CLAIMS[0]
+    assert indeterminate.value is None and indeterminate.indeterminate
+    monkeypatch.setattr(planner_module, "_windows_set_launcher_protection", real_protect)
+    for other_value in other_values:
+        assert real_close(other_value)
+    assert foreign is not None
+    try:
+        planner_module._drain_launcher_claims()
+        assert foreign.read() == launcher_bytes
+    finally:
+        foreign.close()
+        planner_module._INDETERMINATE_LAUNCHER_CLAIMS.remove(indeterminate)
+    os.replace(replacement, receipt.layout.launcher)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows exact handle cleanup")
+def test_launcher_acquisition_base_exception_releases_the_exact_handle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source"
+    make_build(source)
+    receipt = stage_latest_development(source, tmp_path / "local", identity())
+    replacement = tmp_path / "replacement.exe"
+    replacement.write_bytes(b"replacement executable")
+
+    def interrupt_final_path(_value: int) -> str:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(planner_module, "_launcher_final_path", interrupt_final_path)
+
+    with pytest.raises(KeyboardInterrupt):
+        launch_cli(layout=receipt.layout)
+
+    assert planner_module._PENDING_LAUNCHER_CLAIMS == []
+    os.replace(replacement, receipt.layout.launcher)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows native handle reuse")
+def test_ambiguous_close_never_retries_a_same_file_foreign_handle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    source = tmp_path / "source"
+    make_build(source)
+    receipt = stage_latest_development(source, tmp_path / "local", identity())
+    real_close = planner_module._windows_close_launcher
+    close_calls = 0
+    closed_value: int | None = None
+    launcher_bytes = receipt.layout.launcher.read_bytes()
+    foreign: BinaryIO | None = None
+    other_values: list[int] = []
+    kernel32 = planner_module._windows_kernel32()
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+
+    def close_but_report_failure(value: int) -> bool:
+        nonlocal close_calls, closed_value, foreign
+        close_calls += 1
+        closed_value = value
+        assert real_close(value)
+        for _ in range(256):
+            raw = create_file(
+                os.fspath(receipt.layout.launcher),
+                planner_module._GENERIC_READ,
+                planner_module._FILE_SHARE_READ,
+                None,
+                planner_module._OPEN_EXISTING,
+                planner_module._FILE_ATTRIBUTE_NORMAL,
+                None,
+            )
+            candidate_value = ctypes.cast(raw, ctypes.c_void_p).value
+            assert candidate_value is not None
+            if candidate_value == value:
+                descriptor = msvcrt.open_osfhandle(
+                    candidate_value,
+                    os.O_RDONLY | os.O_BINARY,
+                )
+                foreign = os.fdopen(descriptor, "rb")
+                break
+            other_values.append(candidate_value)
+        assert foreign is not None, "Windows did not reuse the ambiguous native handle value"
+        return False
+
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda command, **_kwargs: subprocess.CompletedProcess(command, 0),
+    )
+    monkeypatch.setattr(
+        planner_module,
+        "_windows_close_launcher",
+        close_but_report_failure,
+    )
+
+    with pytest.raises(LaunchError, match="close exact launcher handle"):
+        launch_cli(layout=receipt.layout)
+    assert planner_module._PENDING_LAUNCHER_CLAIMS == []
+    assert len(planner_module._INDETERMINATE_LAUNCHER_CLAIMS) == 1
+    indeterminate = planner_module._INDETERMINATE_LAUNCHER_CLAIMS[0]
+    stale_value = indeterminate.last_native_value
+    assert stale_value is not None
+    assert indeterminate.value is None and indeterminate.indeterminate
+    monkeypatch.setattr(planner_module, "_windows_close_launcher", real_close)
+    for other_value in other_values:
+        assert real_close(other_value)
+    assert foreign is not None
+    assert planner_module._launcher_handle_info(stale_value)[:2] == indeterminate.identity
+    try:
+        planner_module._drain_launcher_claims()
+        assert planner_module._PENDING_LAUNCHER_CLAIMS == []
+        assert foreign.read() == launcher_bytes
+    finally:
+        foreign.close()
+        planner_module._INDETERMINATE_LAUNCHER_CLAIMS.remove(indeterminate)
+    assert close_calls == 1
+
+
 def test_stage_rejects_mismatched_claimed_payload_sha256_before_publish(
     tmp_path: Path,
 ) -> None:
@@ -287,7 +795,15 @@ with deployment_lock(layout):
             if contender.poll() is None:
                 contender.kill()
                 contender.wait(timeout=5)
+            if contender.stdout is not None:
+                contender.stdout.close()
+            if contender.stderr is not None:
+                contender.stderr.close()
     finally:
         if owner.poll() is None:
             owner.kill()
             owner.wait(timeout=5)
+        if owner.stdout is not None:
+            owner.stdout.close()
+        if owner.stderr is not None:
+            owner.stderr.close()
