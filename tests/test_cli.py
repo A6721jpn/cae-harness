@@ -305,3 +305,28 @@ def test_run_febio_is_disabled_until_case_context_is_available(
     captured = capsys.readouterr()
     assert captured.out == ""
     assert "disabled" in captured.err
+
+
+def test_case_context_unexpected_oserror_is_concise_and_path_free(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cae_root = tmp_path / "02_CAE"
+    cae_root.mkdir()
+
+    class FailingService:
+        def register_root(self, path: Path) -> object:
+            del path
+            raise OSError(f"synthetic failure at {tmp_path}")
+
+    monkeypatch.setattr(cli_module, "_case_service", FailingService)
+
+    assert (
+        cli_module.main(["root", "register", "--cae-root", str(cae_root), "--emit-capability"])
+        == 27
+    )
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "Traceback" not in captured.err
+    assert str(tmp_path) not in captured.err

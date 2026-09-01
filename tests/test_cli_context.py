@@ -6,7 +6,9 @@ import io
 import json
 import multiprocessing
 import os
+import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -47,6 +49,19 @@ def _windows_short_path(path: Path) -> Path:
     if result == 0 or result >= len(buffer) or Path(buffer.value) == path:
         pytest.skip("8.3 short names are unavailable on this volume")
     return Path(buffer.value)
+
+
+def _make_directory_junction(link: Path, target: Path) -> None:
+    if os.name != "nt":
+        pytest.skip("Windows junction regression")
+    completed = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", os.fspath(link), os.fspath(target)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        pytest.skip("directory junction creation is unavailable")
 
 
 def _complete_intent(**overrides: object) -> IntentContract:
@@ -381,6 +396,154 @@ def test_registered_root_identity_replacement_is_rejected(tmp_path: Path) -> Non
     with pytest.raises(module.CaseContextError) as repeated:
         service.register_root(cae_root)
     assert repeated.value.code == "REGISTRATION_CONFLICT"
+
+
+def test_registered_root_replacement_during_manager_issuance_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _context_module()
+    service = _service(tmp_path)
+    cae_root = tmp_path / "02_CAE"
+    cae_root.mkdir()
+    registered = service.register_root(cae_root)
+    source = tmp_path / "synthetic.feb"
+    source.write_text("<febio_spec />", encoding="utf-8")
+    displaced = tmp_path / "displaced-02_CAE"
+    manager_type = module.ValidatedCaseWorkspace
+
+    def replace_before_manager(tool_root: Path, exact_root: Path, **kwargs: object) -> object:
+        cae_root.rename(displaced)
+        cae_root.mkdir()
+        return manager_type(tool_root, exact_root, **kwargs)
+
+    monkeypatch.setattr(module, "ValidatedCaseWorkspace", replace_before_manager)
+
+    with pytest.raises(module.CaseContextError) as raised:
+        service.create_case(
+            root_capability=registered["capability"],
+            case_id="case-a",
+            sources=(source,),
+            intent=_complete_intent(),
+        )
+
+    assert raised.value.code == "BOUNDARY_OR_IDENTITY_VIOLATION"
+    assert not (cae_root / "case-a").exists()
+    assert not (displaced / "case-a").exists()
+
+
+@pytest.mark.parametrize(
+    "corrupt",
+    [
+        lambda data: data.replace(b'"roots":[', b'"roots":[],"roots":[', 1),
+        lambda data: data.replace(b'"sha256":', b'"nonfinite":NaN,"sha256":', 1),
+    ],
+    ids=("duplicate-field", "nonfinite-value"),
+)
+def test_corrupt_registry_json_is_evidence_failure(
+    tmp_path: Path, corrupt: Callable[[bytes], bytes]
+) -> None:
+    module = _context_module()
+    service = _service(tmp_path)
+    cae_root = tmp_path / "02_CAE"
+    cae_root.mkdir()
+    service.register_root(cae_root)
+    registry = tmp_path / "registry" / "registry.json"
+    corrupt_bytes = corrupt(registry.read_bytes())
+    assert corrupt_bytes != registry.read_bytes()
+    registry.write_bytes(corrupt_bytes)
+    other = tmp_path / "other" / "02_CAE"
+    other.mkdir(parents=True)
+
+    with pytest.raises(module.CaseContextError) as raised:
+        service.register_root(other)
+
+    assert raised.value.code == "EVIDENCE_INTEGRITY_FAILURE"
+
+
+def test_registry_root_alias_is_rejected_before_foreign_tree_creation(tmp_path: Path) -> None:
+    module = _context_module()
+    foreign = tmp_path / "foreign"
+    foreign.mkdir()
+    alias = tmp_path / "registry-alias"
+    _make_directory_junction(alias, foreign)
+    service = module.CaseContextService._for_tests(
+        registry_root=alias / "registry",
+        tool_root=tmp_path / "tool",
+    )
+    cae_root = tmp_path / "02_CAE"
+    cae_root.mkdir()
+
+    with pytest.raises(module.CaseContextError) as raised:
+        service.register_root(cae_root)
+
+    assert raised.value.code == "REGISTRY_AUTHORITY_REQUIRED"
+    assert not (foreign / "registry").exists()
+
+
+def test_first_registry_lock_is_acquired_before_initialization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if os.name != "nt":
+        pytest.skip("Windows byte-range lock ordering")
+    import msvcrt
+
+    service = _service(tmp_path)
+    cae_root = tmp_path / "02_CAE"
+    cae_root.mkdir()
+    observed_sizes: list[int] = []
+    original_locking = msvcrt.locking
+
+    def inspect_lock(descriptor: int, mode: int, count: int) -> None:
+        if mode == msvcrt.LK_LOCK:
+            observed_sizes.append(os.fstat(descriptor).st_size)
+        original_locking(descriptor, mode, count)
+
+    monkeypatch.setattr(msvcrt, "locking", inspect_lock)
+
+    service.register_root(cae_root)
+
+    assert observed_sizes == [0]
+
+
+def test_registry_temp_cleanup_retains_ambiguous_object_without_raw_oserror(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _context_module()
+    temporary = tmp_path / "registry.tmp"
+    temporary.write_bytes(b"temporary")
+    identity = module._file_identity(temporary.lstat())
+    original_lstat = Path.lstat
+
+    def deny_lstat(path: Path) -> os.stat_result:
+        if path == temporary:
+            raise PermissionError("synthetic denied path")
+        return original_lstat(path)
+
+    monkeypatch.setattr(Path, "lstat", deny_lstat)
+
+    module._remove_owned_temp(temporary, identity)
+
+
+def test_cli_case_projection_does_not_echo_question_path_text(tmp_path: Path) -> None:
+    module = _context_module()
+    question_id = "a" * 64
+    payload = module.cli_success(
+        "case.show",
+        case={
+            "intent": {"sha256": "b" * 64, "document": {}},
+            "pending_questions": [
+                {
+                    "question_id": question_id,
+                    "condition": os.fspath(tmp_path),
+                    "prompt": f"inspect {tmp_path}",
+                }
+            ],
+        },
+    )
+
+    rendered = json.dumps(payload)
+    assert os.fspath(tmp_path) not in rendered
+    assert payload["case"]["pending_questions"] == [{"question_id": question_id}]
 
 
 def test_case_create_preserves_source_and_writes_no_tool_or_root_control_file(

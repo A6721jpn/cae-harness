@@ -427,6 +427,20 @@ def test_manager_rejects_windows_short_path_overlap_with_tool_tree(tmp_path: Pat
     assert tuple(cae_root.iterdir()) == ()
 
 
+def test_manager_rejects_nonexistent_short_path_child_without_creating_it(
+    tmp_path: Path,
+) -> None:
+    tool_root = tmp_path / "tool-root-with-a-long-name"
+    tool_root.mkdir()
+    alias = windows_short_path(tool_root)
+    cae_root = alias / "02_CAE"
+
+    with pytest.raises((ValueError, WorkspaceBoundaryError)):
+        ValidatedCaseWorkspace(tool_root=tool_root, cae_root=cae_root)
+
+    assert not (tool_root / "02_CAE").exists()
+
+
 def test_open_case_rejects_case_alias_instead_of_issuing_cross_case_authority(
     tmp_path: Path,
 ) -> None:
