@@ -4,6 +4,7 @@ import importlib
 import importlib.util
 import json
 import multiprocessing
+import os
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +33,18 @@ def _service(root: Path) -> Any:
         registry_root=root / "registry",
         tool_root=tool_root,
     )
+
+
+def _windows_short_path(path: Path) -> Path:
+    if os.name != "nt":
+        pytest.skip("Windows alternate-path regression")
+    import ctypes
+
+    buffer = ctypes.create_unicode_buffer(32_768)
+    result = ctypes.windll.kernel32.GetShortPathNameW(os.fspath(path), buffer, len(buffer))
+    if result == 0 or result >= len(buffer) or Path(buffer.value) == path:
+        pytest.skip("8.3 short names are unavailable on this volume")
+    return Path(buffer.value)
 
 
 def _complete_intent(**overrides: object) -> IntentContract:
@@ -388,3 +401,141 @@ def test_production_registry_ignores_environment_override(
 
     assert (known_folder / "FEBioCaeWorkbench" / "case-registry-v1" / "registry.json").is_file()
     assert not forged_environment.exists()
+
+
+def test_registered_root_rejects_tool_tree_windows_short_path_alias(
+    tmp_path: Path,
+) -> None:
+    module = _context_module()
+    tool_root = tmp_path / "tool-root-with-a-long-name"
+    cae_root = tool_root / "nested-location-with-a-long-name" / "02_CAE"
+    cae_root.mkdir(parents=True)
+    service = module.CaseContextService._for_tests(
+        registry_root=tmp_path / "registry",
+        tool_root=tool_root,
+    )
+    alias = _windows_short_path(cae_root)
+
+    with pytest.raises(module.CaseContextError) as raised:
+        service.register_root(alias)
+    assert raised.value.code == "BOUNDARY_OR_IDENTITY_VIOLATION"
+    assert not (tmp_path / "registry" / "registry.json").exists()
+
+
+def test_forged_registry_root_record_cannot_redirect_case_creation(tmp_path: Path) -> None:
+    module = _context_module()
+    service = _service(tmp_path)
+    cae_root = tmp_path / "02_CAE"
+    cae_root.mkdir()
+    registered = service.register_root(cae_root)
+    foreign = tmp_path / "foreign"
+    foreign.mkdir()
+    registry_path = tmp_path / "registry" / "registry.json"
+    document = json.loads(registry_path.read_bytes())
+    document["roots"][0]["path"] = os.fspath(foreign)
+    document["roots"][0]["stamp"] = [*module._identity_stamp(foreign, "foreign")]
+    body = {name: document[name] for name in ("schema_version", "roots", "cases")}
+    document["sha256"] = module._digest(body)
+    registry_path.write_bytes(module._canonical_bytes(document) + b"\n")
+    source = tmp_path / "synthetic.feb"
+    source.write_text("<febio_spec />", encoding="utf-8")
+
+    with pytest.raises(module.CaseContextError) as raised:
+        service.create_case(
+            root_id=registered["root_id"],
+            case_id="case-a",
+            sources=(source,),
+            intent=_complete_intent(),
+        )
+    assert raised.value.code in {
+        "BOUNDARY_OR_IDENTITY_VIOLATION",
+        "EVIDENCE_INTEGRITY_FAILURE",
+    }
+    assert tuple(foreign.iterdir()) == ()
+
+
+def test_failed_case_creation_releases_only_untouched_preparing_reservation(
+    tmp_path: Path,
+) -> None:
+    module = _context_module()
+    service = _service(tmp_path)
+    cae_root = tmp_path / "02_CAE"
+    cae_root.mkdir()
+    registered = service.register_root(cae_root)
+    missing = tmp_path / "private-missing-source.feb"
+
+    with pytest.raises(module.CaseContextError):
+        service.create_case(
+            root_id=registered["root_id"],
+            case_id="case-a",
+            sources=(missing,),
+            intent=_complete_intent(),
+        )
+    registry = json.loads((tmp_path / "registry" / "registry.json").read_bytes())
+    assert registry["cases"] == []
+
+    source = tmp_path / "synthetic.feb"
+    source.write_text("<febio_spec />", encoding="utf-8")
+    created = service.create_case(
+        root_id=registered["root_id"],
+        case_id="case-a",
+        sources=(source,),
+        intent=_complete_intent(),
+    )
+    assert created["case_id"] == "case-a"
+
+
+def test_json_documents_require_canonical_bytes_and_unique_keys(tmp_path: Path) -> None:
+    module = _context_module()
+    intent_path = tmp_path / "intent.json"
+    intent_path.write_text(json.dumps(_complete_intent().to_dict(), indent=2), encoding="utf-8")
+    with pytest.raises(module.CaseContextError) as intent_error:
+        module.load_intent_document(intent_path)
+    assert intent_error.value.code == "INVALID_INPUT"
+
+    answer_path = tmp_path / "answer.json"
+    answer_path.write_text(
+        '{"source":"first","source":"second","value":{"mode":"synthetic"}}\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(module.CaseContextError) as answer_error:
+        module.load_answer_document(answer_path)
+    assert answer_error.value.code == "INVALID_INPUT"
+
+
+def test_case_cli_error_omits_absolute_input_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    module = _context_module()
+    service = _service(tmp_path)
+    monkeypatch.setattr(cli_module, "_case_service", lambda: service)
+    cae_root = tmp_path / "02_CAE"
+    cae_root.mkdir()
+    registered = service.register_root(cae_root)
+    intent_path = tmp_path / "intent.json"
+    intent_path.write_bytes(module._canonical_bytes(_complete_intent().to_dict()) + b"\n")
+    missing = tmp_path / "private-missing-source.feb"
+
+    assert (
+        cli_module.main(
+            [
+                "case",
+                "create",
+                "--root-id",
+                registered["root_id"],
+                "--case-id",
+                "case-a",
+                "--intent-file",
+                str(intent_path),
+                "--input",
+                str(missing),
+            ]
+        )
+        == 20
+    )
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert str(tmp_path) not in captured.err
+    assert missing.name not in captured.err
