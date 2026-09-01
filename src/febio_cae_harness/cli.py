@@ -12,8 +12,10 @@ from febio_cae_harness.cli_context import (
     CaseContextService,
     cli_failure,
     cli_success,
+    dump_root_capability,
     load_answer_document,
     load_intent_document,
+    load_root_capability,
 )
 from febio_cae_harness.model.feb import inspect_feb_file
 from febio_cae_harness.model.preflight import PreflightResult, run_preflight
@@ -70,25 +72,29 @@ def build_parser() -> argparse.ArgumentParser:
         "register", help="register one existing exact 02_CAE root"
     )
     root_register.add_argument("--cae-root", required=True, type=Path, metavar="PATH")
+    root_register.add_argument("--emit-capability", required=True, action="store_true")
 
     case = commands.add_parser("case", help="operate on registered case contexts")
     case_commands = case.add_subparsers(dest="case_command", required=True)
     case_create = case_commands.add_parser("create", help="create one registered case")
-    case_create.add_argument("--root-id", required=True)
     case_create.add_argument("--case-id", required=True)
+    case_create.add_argument("--capability-stdin", required=True, action="store_true")
     case_create.add_argument("--intent-file", required=True, type=Path, metavar="PATH")
     case_create.add_argument("--input", action="append", default=[], type=Path, metavar="PATH")
     for name in ("open", "show", "reconcile"):
         case_read = case_commands.add_parser(name, help=f"{name} one registered case")
         case_read.add_argument("--case-id", required=True)
+        case_read.add_argument("--capability-stdin", required=True, action="store_true")
     case_revise = case_commands.add_parser("revise", help="append one complete intent revision")
     case_revise.add_argument("--case-id", required=True)
+    case_revise.add_argument("--capability-stdin", required=True, action="store_true")
     case_revise.add_argument("--if-intent-sha256", required=True)
     case_revise.add_argument("--intent-file", required=True, type=Path, metavar="PATH")
     case_answer = case_commands.add_parser(
         "answer", help="answer the exact current authoritative question"
     )
     case_answer.add_argument("--case-id", required=True)
+    case_answer.add_argument("--capability-stdin", required=True, action="store_true")
     case_answer.add_argument("--if-intent-sha256", required=True)
     case_answer.add_argument("--question-id", required=True)
     case_answer.add_argument("--answer-file", required=True, type=Path, metavar="PATH")
@@ -159,34 +165,57 @@ def _context_command_name(arguments: argparse.Namespace) -> str:
     return f"case.{arguments.case_command}"
 
 
+def _read_root_capability_stdin() -> object:
+    try:
+        data = sys.stdin.buffer.read(16_385)
+    except (AttributeError, OSError) as error:
+        raise CaseContextError(
+            "REGISTRY_AUTHORITY_REQUIRED", "cannot read root capability from stdin"
+        ) from error
+    return load_root_capability(data)
+
+
 def _run_context_command(arguments: argparse.Namespace) -> int:
     command = _context_command_name(arguments)
     try:
         service = _case_service()
         if command == "root.register":
-            payload = cli_success(command, root=service.register_root(arguments.cae_root))
+            registered = service.register_root(arguments.cae_root)
+            if arguments.emit_capability:
+                sys.stdout.write(dump_root_capability(registered["capability"]).decode("utf-8"))
+                return 0
+            payload = cli_success(command, root={"root_id": registered["root_id"]})
         elif command == "case.create":
+            root_capability = _read_root_capability_stdin()
             intent = load_intent_document(arguments.intent_file)
             case = service.create_case(
-                root_id=arguments.root_id,
+                root_capability=root_capability,
                 case_id=arguments.case_id,
                 sources=tuple(arguments.input),
                 intent=intent,
             )
             payload = cli_success(command, case=case)
         elif command in {"case.open", "case.show", "case.reconcile"}:
-            payload = cli_success(command, case=service.open_case(arguments.case_id))
+            root_capability = _read_root_capability_stdin()
+            payload = cli_success(
+                command,
+                case=service.open_case(root_capability=root_capability, case_id=arguments.case_id),
+            )
         elif command == "case.revise":
+            root_capability = _read_root_capability_stdin()
             intent = load_intent_document(arguments.intent_file)
             case = service.revise_case(
+                root_capability=root_capability,
                 case_id=arguments.case_id,
                 expected_intent_sha256=arguments.if_intent_sha256,
                 intent=intent,
             )
             payload = cli_success(command, case=case)
         elif command == "case.answer":
+            root_capability = _read_root_capability_stdin()
             value, source, detail = load_answer_document(arguments.answer_file)
             case = service.answer_case(
+                root_capability=root_capability,
                 case_id=arguments.case_id,
                 expected_intent_sha256=arguments.if_intent_sha256,
                 question_id=arguments.question_id,

@@ -1,14 +1,12 @@
 """Registered-root case context for the installed headless CLI.
 
-Only initial root registration accepts a filesystem root.  Every later operation
-reconstructs a case from the durable registry, revalidates its exact directory
-identities, and then delegates evidence changes to the existing authority owners.
+Only initial root registration accepts a filesystem root. Every later operation
+requires the caller-held root capability, revalidates its exact directory identity,
+and then delegates evidence changes to the existing authority owners.
 """
 
 from __future__ import annotations
 
-import base64
-import binascii
 import hashlib
 import json
 import os
@@ -18,7 +16,7 @@ import stat
 import threading
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import BinaryIO, NoReturn, cast
 
@@ -35,7 +33,13 @@ from .workspace import (
     _reject_reparse_alias,
 )
 
-__all__ = ["CaseContextError", "CaseContextService"]
+__all__ = [
+    "CaseContextError",
+    "CaseContextService",
+    "RootCapability",
+    "dump_root_capability",
+    "load_root_capability",
+]
 
 _CLI_SCHEMA = "febio-cae-cli/v1"
 _REGISTRY_SCHEMA = "case-registry-v1"
@@ -46,7 +50,8 @@ _CASE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 _REGISTRY_THREAD_LOCK = threading.RLock()
 _TEST_FACTORY = object()
-_DPAPI_ENTROPY = b"FEBioCaeWorkbench/case-registry-v1/root-authority"
+_ROOT_PROJECTION_SCHEMA = "root-projection-v1"
+_ROOT_CAPABILITY_SCHEMA = "root-capability-v1"
 
 
 class CaseContextError(RuntimeError):
@@ -69,6 +74,16 @@ class _OpenedContext:
     result: IntentLifecycleResult
 
 
+@dataclass(frozen=True, slots=True)
+class RootCapability:
+    """Caller-held authority binding one exact registered 02_CAE root."""
+
+    root_id: str
+    path: Path
+    stamp: tuple[int, int]
+    _secret: bytes = field(repr=False)
+
+
 def _canonical_bytes(value: object) -> bytes:
     try:
         return json.dumps(
@@ -88,121 +103,117 @@ def _digest(value: object) -> str:
 
 def _root_projection(path: Path, stamp: tuple[int, int]) -> dict[str, object]:
     return {
-        "schema_version": _REGISTRY_SCHEMA,
+        "schema_version": _ROOT_PROJECTION_SCHEMA,
+        "kind": "02_CAE",
         "path": os.path.normcase(os.fspath(path)),
         "stamp": [stamp[0], stamp[1]],
     }
 
 
-def _root_id_for(path: Path, stamp: tuple[int, int]) -> str:
-    return _ROOT_PREFIX + _digest(_root_projection(path, stamp))
+def _canonical_exact_root(
+    path: Path, expected: tuple[int, int] | None = None
+) -> tuple[Path, tuple[int, int]]:
+    lexical = _reject_reparse_alias(path, "02_CAE root")
+    lexical_stamp = _identity_stamp(lexical, "02_CAE root", expected)
+    canonical = _reject_reparse_alias(Path(os.path.realpath(lexical)), "canonical 02_CAE root")
+    canonical_stamp = _identity_stamp(canonical, "canonical 02_CAE root", lexical_stamp)
+    _identity_stamp(lexical, "02_CAE root", canonical_stamp)
+    return canonical, canonical_stamp
 
 
-def _windows_dpapi(data: bytes, *, protect: bool) -> bytes:
-    if os.name != "nt":
-        raise CaseContextError(
-            "REGISTRY_AUTHORITY_REQUIRED", "Windows root authority sealing is unavailable"
-        )
-    import ctypes
+def _capability_projection(capability: object) -> tuple[RootCapability, dict[str, object]]:
+    if type(capability) is not RootCapability:
+        raise CaseContextError("REGISTRY_AUTHORITY_REQUIRED", "exact root capability is required")
+    exact = capability
+    if (
+        not isinstance(exact.root_id, str)
+        or not exact.root_id.startswith(_ROOT_PREFIX)
+        or _DIGEST.fullmatch(exact.root_id[len(_ROOT_PREFIX) :]) is None
+        or not isinstance(exact.path, Path)
+        or not exact.path.is_absolute()
+        or not isinstance(exact.stamp, tuple)
+        or len(exact.stamp) != 2
+        or any(type(part) is not int or part < 0 for part in exact.stamp)
+        or not isinstance(exact._secret, bytes)
+        or len(exact._secret) != 32
+    ):
+        raise CaseContextError("REGISTRY_AUTHORITY_REQUIRED", "root capability is invalid")
+    expected_root_id = _ROOT_PREFIX + hashlib.sha256(exact._secret).hexdigest()
+    if not secrets.compare_digest(exact.root_id, expected_root_id):
+        raise CaseContextError("REGISTRY_AUTHORITY_REQUIRED", "root capability is invalid")
+    return exact, _root_projection(exact.path, exact.stamp)
 
-    class DataBlob(ctypes.Structure):
-        _fields_ = [
-            ("size", ctypes.c_uint32),
-            ("data", ctypes.POINTER(ctypes.c_ubyte)),
-        ]
 
-    def blob(value: bytes) -> tuple[object, DataBlob]:
-        buffer = (ctypes.c_ubyte * len(value)).from_buffer_copy(value)
-        return buffer, DataBlob(len(value), ctypes.cast(buffer, ctypes.POINTER(ctypes.c_ubyte)))
+def _root_binding(secret: bytes, projection: object) -> str:
+    return hashlib.sha256(secret + _canonical_bytes(projection)).hexdigest()
 
-    _input_buffer, input_blob = blob(data)
-    _entropy_buffer, entropy_blob = blob(_DPAPI_ENTROPY)
-    output_blob = DataBlob()
-    crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
-    if protect:
-        protect_data = crypt32.CryptProtectData
-        protect_data.argtypes = [
-            ctypes.POINTER(DataBlob),
-            ctypes.c_wchar_p,
-            ctypes.POINTER(DataBlob),
-            ctypes.c_void_p,
-            ctypes.c_void_p,
-            ctypes.c_uint32,
-            ctypes.POINTER(DataBlob),
-        ]
-        protect_data.restype = ctypes.c_int
-        succeeded = protect_data(
-            ctypes.byref(input_blob),
-            "FEBio CAE registered root authority",
-            ctypes.byref(entropy_blob),
-            None,
-            None,
-            1,
-            ctypes.byref(output_blob),
-        )
-    else:
-        unprotect_data = crypt32.CryptUnprotectData
-        unprotect_data.argtypes = [
-            ctypes.POINTER(DataBlob),
-            ctypes.c_void_p,
-            ctypes.POINTER(DataBlob),
-            ctypes.c_void_p,
-            ctypes.c_void_p,
-            ctypes.c_uint32,
-            ctypes.POINTER(DataBlob),
-        ]
-        unprotect_data.restype = ctypes.c_int
-        succeeded = unprotect_data(
-            ctypes.byref(input_blob),
-            None,
-            ctypes.byref(entropy_blob),
-            None,
-            None,
-            1,
-            ctypes.byref(output_blob),
-        )
-    if not succeeded:
-        code = "REGISTRY_AUTHORITY_REQUIRED" if protect else "EVIDENCE_INTEGRITY_FAILURE"
-        message = (
-            "cannot seal registered root authority"
-            if protect
-            else "registered root authority seal is invalid"
-        )
-        raise CaseContextError(code, message)
+
+def _root_projection_selector(projection: Mapping[str, object]) -> str:
+    return _digest(
+        {
+            "schema_version": projection["schema_version"],
+            "kind": projection["kind"],
+            "path": projection["path"],
+        }
+    )
+
+
+def dump_root_capability(capability: object) -> bytes:
+    exact, projection = _capability_projection(capability)
+    document = {
+        "schema_version": _ROOT_CAPABILITY_SCHEMA,
+        "root_id": exact.root_id,
+        "secret": exact._secret.hex(),
+        "projection": projection,
+    }
+    return _canonical_bytes(document) + b"\n"
+
+
+def load_root_capability(data: bytes) -> RootCapability:
+    if not isinstance(data, bytes) or len(data) > 16_384:
+        raise CaseContextError("REGISTRY_AUTHORITY_REQUIRED", "root capability is invalid")
     try:
-        return bytes(ctypes.string_at(output_blob.data, output_blob.size))
-    finally:
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel32.LocalFree.argtypes = [ctypes.c_void_p]
-        kernel32.LocalFree.restype = ctypes.c_void_p
-        kernel32.LocalFree(ctypes.cast(output_blob.data, ctypes.c_void_p))
-
-
-def _seal_root_projection(projection: object) -> str:
-    sealed = _windows_dpapi(_canonical_bytes(projection), protect=True)
-    return base64.b64encode(sealed).decode("ascii")
-
-
-def _decode_root_seal(value: object) -> bytes:
-    if not isinstance(value, str) or not value or len(value) > 16_384:
-        raise CaseContextError("EVIDENCE_INTEGRITY_FAILURE", "registered root seal is invalid")
-    try:
-        sealed = base64.b64decode(value, validate=True)
-    except (ValueError, binascii.Error) as error:
+        document = _parse_json(data, "root capability")
+    except CaseContextError as error:
         raise CaseContextError(
-            "EVIDENCE_INTEGRITY_FAILURE", "registered root seal is invalid"
+            "REGISTRY_AUTHORITY_REQUIRED", "root capability is invalid"
         ) from error
-    if not sealed:
-        raise CaseContextError("EVIDENCE_INTEGRITY_FAILURE", "registered root seal is invalid")
-    return sealed
-
-
-def _verify_root_seal(value: object, projection: object) -> None:
-    unsealed = _windows_dpapi(_decode_root_seal(value), protect=False)
-    if not secrets.compare_digest(unsealed, _canonical_bytes(projection)):
-        raise CaseContextError(
-            "EVIDENCE_INTEGRITY_FAILURE", "registered root authority does not match"
-        )
+    if not isinstance(document, dict) or set(document) != {
+        "schema_version",
+        "root_id",
+        "secret",
+        "projection",
+    }:
+        raise CaseContextError("REGISTRY_AUTHORITY_REQUIRED", "root capability is invalid")
+    if data != _canonical_bytes(document) + b"\n":
+        raise CaseContextError("REGISTRY_AUTHORITY_REQUIRED", "root capability is not canonical")
+    projection = document["projection"]
+    if (
+        document["schema_version"] != _ROOT_CAPABILITY_SCHEMA
+        or not isinstance(projection, dict)
+        or set(projection) != {"schema_version", "kind", "path", "stamp"}
+        or projection["schema_version"] != _ROOT_PROJECTION_SCHEMA
+        or projection["kind"] != "02_CAE"
+        or not isinstance(projection["path"], str)
+        or not Path(projection["path"]).is_absolute()
+        or not isinstance(projection["stamp"], list)
+        or len(projection["stamp"]) != 2
+        or any(type(part) is not int or part < 0 for part in projection["stamp"])
+        or not isinstance(document["secret"], str)
+        or _DIGEST.fullmatch(document["secret"]) is None
+        or not isinstance(document["root_id"], str)
+    ):
+        raise CaseContextError("REGISTRY_AUTHORITY_REQUIRED", "root capability is invalid")
+    capability = RootCapability(
+        root_id=document["root_id"],
+        path=Path(projection["path"]),
+        stamp=(int(projection["stamp"][0]), int(projection["stamp"][1])),
+        _secret=bytes.fromhex(document["secret"]),
+    )
+    _, rebuilt = _capability_projection(capability)
+    if rebuilt != projection:
+        raise CaseContextError("REGISTRY_AUTHORITY_REQUIRED", "root capability changed")
+    return capability
 
 
 def _validate_case_id(value: str) -> str:
@@ -392,39 +403,31 @@ def _validate_registry(body: object) -> dict[str, object]:
     if not isinstance(roots, list) or not isinstance(cases, list):
         raise CaseContextError("EVIDENCE_INTEGRITY_FAILURE", "case registry lists are invalid")
     root_ids: set[str] = set()
-    root_paths: set[str] = set()
-    root_stamps: set[tuple[int, int]] = set()
+    root_projections: set[str] = set()
     for record in roots:
         if not isinstance(record, dict) or set(record) != {
             "root_id",
-            "path",
-            "stamp",
-            "seal",
+            "projection_sha256",
+            "binding_sha256",
         }:
             raise CaseContextError("EVIDENCE_INTEGRITY_FAILURE", "registered root is invalid")
         root_id = record["root_id"]
-        path = record["path"]
-        stamp = record["stamp"]
-        seal = record["seal"]
+        projection_sha256 = record["projection_sha256"]
+        binding_sha256 = record["binding_sha256"]
         if (
             not isinstance(root_id, str)
             or not root_id.startswith(_ROOT_PREFIX)
             or _DIGEST.fullmatch(root_id[len(_ROOT_PREFIX) :]) is None
-            or not isinstance(path, str)
-            or not Path(path).is_absolute()
-            or not isinstance(stamp, list)
-            or len(stamp) != 2
-            or any(type(part) is not int or part < 0 for part in stamp)
+            or not isinstance(projection_sha256, str)
+            or _DIGEST.fullmatch(projection_sha256) is None
+            or not isinstance(binding_sha256, str)
+            or _DIGEST.fullmatch(binding_sha256) is None
         ):
             raise CaseContextError("EVIDENCE_INTEGRITY_FAILURE", "registered root is invalid")
-        _decode_root_seal(seal)
-        path_key = os.path.normcase(path)
-        stamp_key = (int(stamp[0]), int(stamp[1]))
-        if root_id in root_ids or path_key in root_paths or stamp_key in root_stamps:
+        if root_id in root_ids or projection_sha256 in root_projections:
             raise CaseContextError("EVIDENCE_INTEGRITY_FAILURE", "registered root is duplicated")
         root_ids.add(root_id)
-        root_paths.add(path_key)
-        root_stamps.add(stamp_key)
+        root_projections.add(projection_sha256)
     case_ids: set[str] = set()
     for record in cases:
         if not isinstance(record, dict) or set(record) != {
@@ -445,7 +448,7 @@ def _validate_registry(body: object) -> dict[str, object]:
             or _CASE_ID.fullmatch(case_id) is None
             or not isinstance(root_id, str)
             or root_id not in root_ids
-            or state not in {"PREPARING", "ACTIVE"}
+            or state not in {"PREPARING", "ACTIVE", "QUARANTINED"}
             or not isinstance(stamp, list)
             or (
                 state == "PREPARING"
@@ -463,6 +466,7 @@ def _validate_registry(body: object) -> dict[str, object]:
                     or any(type(part) is not int or part < 0 for part in stamp)
                 )
             )
+            or (state == "QUARANTINED" and (stamp or reservation_id is not None))
         ):
             raise CaseContextError("EVIDENCE_INTEGRITY_FAILURE", "registered case is invalid")
         key = case_id.casefold()
@@ -706,19 +710,19 @@ class CaseContextService:
         if not isinstance(cae_root, Path) or not cae_root.is_absolute():
             raise CaseContextError("INVALID_INPUT", "cae_root must be an absolute path")
         try:
-            exact_root = _reject_reparse_alias(cae_root, "02_CAE root")
+            exact_root, stamp = _canonical_exact_root(cae_root)
             if exact_root.name.casefold() != "02_cae" or not exact_root.is_dir():
                 raise CaseContextError(
                     "INVALID_INPUT", "cae_root must be an existing 02_CAE directory"
                 )
-            stamp = _identity_stamp(exact_root, "02_CAE root")
         except CaseContextError:
             raise
         except WorkspaceBoundaryError as error:
             raise CaseContextError(
                 "BOUNDARY_OR_IDENTITY_VIOLATION", "02_CAE root identity is invalid"
             ) from error
-        root_id = _root_id_for(exact_root, stamp)
+        projection = _root_projection(exact_root, stamp)
+        projection_sha256 = _root_projection_selector(projection)
         with self._registry() as (registry_root, registry):
             try:
                 if _exact_directory_trees_overlap(
@@ -736,52 +740,51 @@ class CaseContextService:
                 ) from error
             roots = self._roots(registry)
             for record in roots:
-                if record["stamp"] == [*stamp]:
-                    existing_root_id = str(record["root_id"])
-                    self._validated_manager(registry, existing_root_id)
-                    return {"root_id": existing_root_id}
-                if os.path.normcase(str(record["path"])) == os.path.normcase(os.fspath(exact_root)):
-                    if record["root_id"] != root_id or record["stamp"] != [*stamp]:
-                        raise CaseContextError(
-                            "REGISTRATION_CONFLICT", "registered 02_CAE identity changed"
-                        )
-                    return {"root_id": root_id}
+                if record["projection_sha256"] == projection_sha256:
+                    raise CaseContextError(
+                        "REGISTRATION_CONFLICT",
+                        "02_CAE root is already registered; retain its capability",
+                    )
+            secret = secrets.token_bytes(32)
+            root_id = _ROOT_PREFIX + hashlib.sha256(secret).hexdigest()
+            capability = RootCapability(root_id, exact_root, stamp, secret)
             roots.append(
                 {
                     "root_id": root_id,
-                    "path": os.fspath(exact_root),
-                    "stamp": [*stamp],
-                    "seal": _seal_root_projection(_root_projection(exact_root, stamp)),
+                    "projection_sha256": projection_sha256,
+                    "binding_sha256": _root_binding(secret, projection),
                 }
             )
             updated = {**registry, "roots": roots}
             _write_registry(registry_root, updated)
-        return {"root_id": root_id}
+        return {"root_id": root_id, "capability": capability}
 
     def _validated_manager(
-        self, registry: Mapping[str, object], root_id: str
-    ) -> ValidatedCaseWorkspace:
-        record = self._root_record(registry, root_id)
-        root = Path(str(record["path"]))
-        raw_stamp = record["stamp"]
-        if not isinstance(raw_stamp, list) or len(raw_stamp) != 2:
-            raise CaseContextError("EVIDENCE_INTEGRITY_FAILURE", "registered root stamp is invalid")
-        expected = (int(raw_stamp[0]), int(raw_stamp[1]))
+        self, registry: Mapping[str, object], root_capability: object
+    ) -> tuple[str, ValidatedCaseWorkspace]:
+        capability, projection = _capability_projection(root_capability)
+        record = self._root_record(registry, capability.root_id)
+        if not secrets.compare_digest(
+            str(record["projection_sha256"]), _root_projection_selector(projection)
+        ) or not secrets.compare_digest(
+            str(record["binding_sha256"]), _root_binding(capability._secret, projection)
+        ):
+            raise CaseContextError(
+                "EVIDENCE_INTEGRITY_FAILURE", "registered root capability binding changed"
+            )
         try:
-            exact_root = _reject_reparse_alias(root, "registered 02_CAE root")
+            exact_root, stamp = _canonical_exact_root(capability.path, capability.stamp)
             if exact_root.name.casefold() != "02_cae" or not exact_root.is_dir():
                 raise WorkspaceBoundaryError("registered root is not an exact 02_CAE directory")
-            stamp = _identity_stamp(exact_root, "registered 02_CAE root", expected)
-            if _root_id_for(exact_root, stamp) != root_id:
-                raise WorkspaceBoundaryError("registered root identifier does not match")
-            _verify_root_seal(record["seal"], _root_projection(exact_root, stamp))
+            if _root_projection(exact_root, stamp) != projection:
+                raise WorkspaceBoundaryError("registered root projection changed")
             if _exact_directory_trees_overlap(
                 exact_root, self._registry_root, "registered 02_CAE and registry"
             ) or _exact_directory_trees_overlap(
                 exact_root, self._tool_root, "registered 02_CAE and tool"
             ):
                 raise WorkspaceBoundaryError("registered root overlaps a private tree")
-            return ValidatedCaseWorkspace(self._tool_root, exact_root)
+            return capability.root_id, ValidatedCaseWorkspace(self._tool_root, exact_root)
         except (OSError, ValueError, WorkspaceBoundaryError) as error:
             raise CaseContextError(
                 "BOUNDARY_OR_IDENTITY_VIOLATION", "registered 02_CAE root identity changed"
@@ -790,14 +793,12 @@ class CaseContextService:
     def create_case(
         self,
         *,
-        root_id: str,
+        root_capability: object,
         case_id: str,
         sources: Sequence[Path],
         intent: IntentContract,
     ) -> dict[str, object]:
         _validate_case_id(case_id)
-        if not isinstance(root_id, str) or not root_id.startswith(_ROOT_PREFIX):
-            raise CaseContextError("INVALID_INPUT", "root_id is invalid")
         if type(intent) is not IntentContract:
             raise CaseContextError("INVALID_INPUT", "intent must be a complete IntentContract")
         source_paths = tuple(sources)
@@ -805,7 +806,7 @@ class CaseContextService:
             raise CaseContextError("INVALID_INPUT", "case sources must be paths")
         reservation_id = secrets.token_hex(32)
         with self._registry() as (registry_root, registry):
-            manager = self._validated_manager(registry, root_id)
+            root_id, manager = self._validated_manager(registry, root_capability)
             cases = self._cases(registry)
             existing = next(
                 (
@@ -829,10 +830,16 @@ class CaseContextService:
                     cases.remove(existing)
                     _write_registry(registry_root, {**registry, "cases": cases})
                 except (OSError, WorkspaceBoundaryError):
+                    existing["state"] = "QUARANTINED"
+                    existing["reservation_id"] = None
+                    _write_registry(registry_root, {**registry, "cases": cases})
                     raise CaseContextError(
                         "REGISTRATION_CONFLICT", "interrupted case reservation is quarantined"
                     ) from None
                 else:
+                    existing["state"] = "QUARANTINED"
+                    existing["reservation_id"] = None
+                    _write_registry(registry_root, {**registry, "cases": cases})
                     raise CaseContextError(
                         "REGISTRATION_CONFLICT", "interrupted case tree is quarantined"
                     )
@@ -896,12 +903,17 @@ class CaseContextService:
             _write_registry(registry_root, {**registry, "cases": cases})
             return self._project(root_id, case, store, lifecycle, result)
 
-    def _open_store(self, case_id: str) -> tuple[str, CaseWorkspace, EvidenceStore]:
+    def _open_store(
+        self, root_capability: object, case_id: str
+    ) -> tuple[str, CaseWorkspace, EvidenceStore]:
         _validate_case_id(case_id)
         with self._registry() as (_, registry):
+            root_id, manager = self._validated_manager(registry, root_capability)
             record = self._case_record(registry, case_id)
-            root_id = str(record["root_id"])
-            manager = self._validated_manager(registry, root_id)
+            if record["root_id"] != root_id:
+                raise CaseContextError(
+                    "REGISTRY_AUTHORITY_REQUIRED", "case is outside the supplied root authority"
+                )
             try:
                 case = manager.open_case(case_id)
                 raw_stamp = record["stamp"]
@@ -924,8 +936,8 @@ class CaseContextService:
                 ) from error
         return root_id, case, store
 
-    def _open_context(self, case_id: str) -> _OpenedContext:
-        root_id, case, store = self._open_store(case_id)
+    def _open_context(self, root_capability: object, case_id: str) -> _OpenedContext:
+        root_id, case, store = self._open_store(root_capability, case_id)
         lifecycle = IntentLifecycle(store)
         try:
             result = lifecycle.reconcile()
@@ -935,8 +947,8 @@ class CaseContextService:
             ) from error
         return _OpenedContext(root_id, case, store, lifecycle, result)
 
-    def open_case(self, case_id: str) -> dict[str, object]:
-        opened = self._open_context(case_id)
+    def open_case(self, *, root_capability: object, case_id: str) -> dict[str, object]:
+        opened = self._open_context(root_capability, case_id)
         return self._project(
             opened.root_id,
             opened.case,
@@ -948,6 +960,7 @@ class CaseContextService:
     def revise_case(
         self,
         *,
+        root_capability: object,
         case_id: str,
         expected_intent_sha256: str,
         intent: IntentContract,
@@ -955,7 +968,7 @@ class CaseContextService:
         expected = _validate_sha256(expected_intent_sha256, "expected intent")
         if type(intent) is not IntentContract:
             raise CaseContextError("INVALID_INPUT", "intent must be a complete IntentContract")
-        root_id, case, store = self._open_store(case_id)
+        root_id, case, store = self._open_store(root_capability, case_id)
         try:
             snapshot = store.issue_intent_snapshot()
             if snapshot.intent_sha256 != expected:
@@ -974,6 +987,7 @@ class CaseContextService:
     def answer_case(
         self,
         *,
+        root_capability: object,
         case_id: str,
         expected_intent_sha256: str,
         question_id: str,
@@ -983,7 +997,7 @@ class CaseContextService:
     ) -> dict[str, object]:
         expected = _validate_sha256(expected_intent_sha256, "expected intent")
         supplied_question = _validate_sha256(question_id, "question_id")
-        root_id, case, store = self._open_store(case_id)
+        root_id, case, store = self._open_store(root_capability, case_id)
         try:
             snapshot = store.issue_intent_snapshot()
             if snapshot.intent_sha256 != expected:
