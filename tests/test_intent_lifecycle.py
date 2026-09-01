@@ -371,9 +371,18 @@ def test_answer_rejects_stale_foreign_fabricated_unknown_and_invalid_inputs_with
     assert unknown_store.events_path.read_bytes() == unknown_before
 
 
-def _single_blocker(tmp_path: Path, *, case_id: str = "case-a", **intent_overrides: object) -> tuple[Any, EvidenceStore, Any]:
+def _single_blocker(
+    tmp_path: Path, *, case_id: str = "case-a", **intent_overrides: object
+) -> tuple[Any, EvidenceStore, Any]:
     module = _lifecycle_module()
-    blocker = ({"authoritative": True, "condition": "contact", "current": True, "source": "synthetic-user"},)
+    blocker = (
+        {
+            "authoritative": True,
+            "condition": "contact",
+            "current": True,
+            "source": "synthetic-user",
+        },
+    )
     values = {"contact": None, "unresolved": blocker}
     values.update(intent_overrides)
     _, _, store = _make_store(tmp_path, _complete_intent(**values), case_id=case_id)
@@ -400,7 +409,9 @@ def test_answer_rejects_fabricated_question_object_without_append(tmp_path: Path
     assert store.events_path.read_bytes() == before
 
 
-def test_answer_rejects_question_from_same_labels_different_case_root_without_append(tmp_path: Path) -> None:
+def test_answer_rejects_question_from_same_labels_different_case_root_without_append(
+    tmp_path: Path,
+) -> None:
     lifecycle, store, _ = _single_blocker(tmp_path / "a", case_id="Case-A")
     _, _, other_question = _single_blocker(tmp_path / "b", case_id="case-a")
     before = store.events_path.read_bytes()
@@ -418,8 +429,20 @@ def test_answer_rejects_stale_issued_question_after_revision_without_append(tmp_
     assert store.events_path.read_bytes() == before
 
 
-def test_unicode_casefold_alias_cannot_select_canonical_intent_field_without_append(tmp_path: Path) -> None:
-    lifecycle, store, question = _single_blocker(tmp_path, unresolved=({"authoritative": True, "condition": "CONTACT", "current": True, "source": "synthetic-user"},))
+def test_unicode_casefold_alias_cannot_select_canonical_intent_field_without_append(
+    tmp_path: Path,
+) -> None:
+    lifecycle, store, question = _single_blocker(
+        tmp_path,
+        unresolved=(
+            {
+                "authoritative": True,
+                "condition": "CONTACT",
+                "current": True,
+                "source": "synthetic-user",
+            },
+        ),
+    )
     before = store.events_path.read_bytes()
     with pytest.raises(EvidenceIntegrityError):
         lifecycle.answer(question, "x", "synthetic-user")
@@ -430,8 +453,59 @@ def test_answer_removes_nested_mapping_blocker_and_advances(tmp_path: Path) -> N
     lifecycle, store, question = _single_blocker(
         tmp_path,
         contact=None,
-        unresolved=({"authoritative": True, "condition": "contact", "current": True, "source": "synthetic-user"},),
+        unresolved=(
+            {
+                "authoritative": True,
+                "condition": "contact",
+                "current": True,
+                "source": "synthetic-user",
+            },
+        ),
     )
     result = lifecycle.answer(question, {"mode": "new"}, "synthetic-user")
     assert result.state is IntentState.BOUND
     assert result.snapshot.intent.to_dict()["unresolved"] == []
+
+
+def test_answer_removes_nested_blocker_under_nonmatching_mapping_key(tmp_path: Path) -> None:
+    module = _lifecycle_module()
+    preserved = {
+        "before": {"detail": ["synthetic", {"keep": True}]},
+        "after": {
+            "authoritative": False,
+            "condition": "material",
+            "current": True,
+            "source": "synthetic-observation",
+        },
+    }
+    unresolved = {
+        "before": preserved["before"],
+        "slot": {
+            "authoritative": True,
+            "condition": "contact",
+            "current": True,
+            "source": "synthetic-user",
+        },
+        "after": preserved["after"],
+    }
+    _, _, store = _make_store(
+        tmp_path,
+        _complete_intent(contact=None, unresolved=unresolved),
+    )
+    lifecycle = module.IntentLifecycle(store)
+    initial = lifecycle.reconcile()
+    assert initial.state is IntentState.ASK_AND_BLOCK
+    question = initial.question
+    assert question is not None
+    assert question.condition == "contact"
+
+    result = lifecycle.answer(question, {"mode": "new"}, "synthetic-user")
+
+    assert result.state is IntentState.BOUND
+    assert result.question is None
+    remaining = result.snapshot.intent.to_dict()["unresolved"]
+    assert isinstance(remaining, dict)
+    assert list(remaining.items()) == list(preserved.items())
+    reconciled = lifecycle.reconcile()
+    assert reconciled.state is IntentState.BOUND
+    assert reconciled.question is None
