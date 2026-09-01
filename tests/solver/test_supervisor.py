@@ -1790,7 +1790,7 @@ def test_windows_active_supervisor_finalizer_releases_process_record_lease(
     if os.name != "nt":
         pytest.fail("required Windows finalizer transaction test executed on a non-Windows host")
 
-    capability = _capability(tmp_path, monkeypatch, code="import time; time.sleep(30)")
+    capability = _capability(tmp_path, monkeypatch, code="import time; time.sleep(300)")
     supervisor = SolverSupervisor(capability)
     process: subprocess.Popen[bytes] | None = None
     process_authority: ProcessAuthority | None = None
