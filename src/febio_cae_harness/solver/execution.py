@@ -1063,15 +1063,16 @@ def _retain_output_cleanup(exact: _ExactCaseTransaction) -> None:
 
 
 def _release_output_transaction(exact: _ExactCaseTransaction) -> None:
-    try:
-        exact.close()
-    except BaseException:
-        if _transaction_released(exact):
-            _forget_output_cleanup(exact)
-        else:
-            _retain_output_cleanup(exact)
-        raise
-    _forget_output_cleanup(exact)
+    with _OUTPUT_CLEANUP_LOCK:
+        try:
+            exact.close()
+        except BaseException:
+            if _transaction_released(exact):
+                _forget_output_cleanup(exact)
+            else:
+                _retain_output_cleanup(exact)
+            raise
+        _forget_output_cleanup(exact)
 
 
 def _close_failed_output_transaction(
