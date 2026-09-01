@@ -731,6 +731,11 @@ def test_retry_rejects_foreign_case_root_with_same_case_and_intent_digests(
     assert decision.decision is RetryDecision.STOP
     assert decision.ledger is ledger
     assert ledger.used == 0
+    AttemptWorkspace._from_manager(
+        local_case_workspace,
+        "attempt-a",
+        local_case_workspace.temporary_root / "attempts" / "attempt-a",
+    )
     del local_workspace_temp, foreign_workspace_temp
 
 
@@ -815,6 +820,12 @@ def test_retry_rejects_mutated_capability_before_accounting(
     assert decision.decision is RetryDecision.STOP
     assert decision.ledger is ledger
     assert ledger.used == 0
+    foreign_case_workspace = object.__getattribute__(foreign_snapshot, "_case_workspace")
+    AttemptWorkspace._from_manager(
+        foreign_case_workspace,
+        "attempt-a",
+        foreign_case_workspace.temporary_root / "attempts" / "attempt-a",
+    )
     del local_workspace_temp, foreign_workspace_temp
 
 
@@ -864,6 +875,12 @@ def test_retry_rejects_mutated_capability_inside_accounting_lock(
     assert decision.decision is RetryDecision.STOP
     assert decision.ledger is ledger
     assert ledger.used == 0
+    foreign_case_workspace = object.__getattribute__(foreign_snapshot, "_case_workspace")
+    AttemptWorkspace._from_manager(
+        foreign_case_workspace,
+        "attempt-a",
+        foreign_case_workspace.temporary_root / "attempts" / "attempt-a",
+    )
     del local_workspace_temp, foreign_workspace_temp
 
 
