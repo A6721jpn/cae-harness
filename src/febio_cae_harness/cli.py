@@ -34,10 +34,16 @@ from febio_cae_harness.solver.execution import (
 )
 from febio_cae_harness.solver.headless import (
     HeadlessConfigurationError,
+    recover_headless_febio,
     run_headless_febio,
 )
 from febio_cae_harness.solver.runtime import RuntimeProbeError, probe_febio
-from febio_cae_harness.solver.types import SolverClassification, SolverState
+from febio_cae_harness.solver.types import (
+    SolverClassification,
+    SolverConfigurationError,
+    SolverOwnershipError,
+    SolverState,
+)
 from febio_cae_harness.workspace import AttemptWorkspace, WorkspaceBoundaryError
 
 _PREFLIGHT_EXIT_CODES = {
@@ -164,6 +170,15 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="FIELD",
     )
     run_febio.add_argument("--timeout-seconds", type=_positive_float)
+
+    reconnect_febio = commands.add_parser(
+        "reconnect-febio",
+        help="recover one recorded running FEBio attempt through exact authorities",
+    )
+    reconnect_febio.add_argument("--capability-stdin", required=True, action="store_true")
+    reconnect_febio.add_argument("--case-id", required=True)
+    reconnect_febio.add_argument("--attempt-id", required=True)
+    reconnect_febio.add_argument("--runtime-probe", required=True, type=Path, metavar="PATH")
     return parser
 
 
@@ -304,12 +319,13 @@ def _run_failure(
     code: str,
     message: str,
     *,
+    command: str = "run-febio",
     retryable: bool = False,
     attempt: Mapping[str, object] | None = None,
     solver: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     payload = cli_failure(
-        "run-febio",
+        command,
         CaseContextError(code, message, retryable=retryable),
     )
     if attempt is not None:
@@ -319,9 +335,14 @@ def _run_failure(
     return payload
 
 
-def _fail_run(error: _RunCommandError) -> int:
+def _fail_run(error: _RunCommandError, *, command: str = "run-febio") -> int:
     _emit_context_json(
-        _run_failure(error.code, str(error), retryable=error.retryable),
+        _run_failure(
+            error.code,
+            str(error),
+            command=command,
+            retryable=error.retryable,
+        ),
         error=True,
     )
     return _RUN_FAILURE_EXIT
@@ -348,10 +369,30 @@ def _append_run_terminal(
             }
         )
     try:
-        store.append_event("run_febio_terminal", payload)
+        store.record_attempt_terminal(attempt_id, payload)
     except (EvidenceIntegrityError, OSError, ValueError, WorkspaceBoundaryError):
         return False
     return True
+
+
+def _fail_run_after_terminal(
+    store: EvidenceStore | None,
+    attempt_id: str | None,
+    status: str,
+    error: _RunCommandError,
+    *,
+    command: str = "run-febio",
+) -> int:
+    if (
+        store is not None
+        and attempt_id is not None
+        and not _append_run_terminal(store, attempt_id, status)
+    ):
+        error = _RunCommandError(
+            "EVIDENCE_INTEGRITY_FAILURE",
+            "run terminal evidence could not be recorded",
+        )
+    return _fail_run(error, command=command)
 
 
 def _select_feb_input(
@@ -482,6 +523,7 @@ def _run_febio_command(arguments: argparse.Namespace) -> int:
             requested_fields=requested_fields,
             expected_steps=arguments.expected_steps,
             expected_final_time=arguments.expected_final_time,
+            timeout_seconds=arguments.timeout_seconds,
         )
         if execution.input_sha256 != inspection.sha256:
             raise _RunCommandError(
@@ -496,6 +538,7 @@ def _run_febio_command(arguments: argparse.Namespace) -> int:
             expected_steps=arguments.expected_steps,
             expected_final_time=arguments.expected_final_time,
             timeout_seconds=arguments.timeout_seconds,
+            requested_fields=requested_fields,
         )
         solver = {
             "classification": diagnostic.classification.value,
@@ -514,12 +557,18 @@ def _run_febio_command(arguments: argparse.Namespace) -> int:
             or diagnostic.log_path != execution.log_path
             or diagnostic.xplt_path != execution.xplt_path
         ):
-            _append_run_terminal(
+            if not _append_run_terminal(
                 opened.store,
                 attempt_id,
                 "SOLVER_FAILED",
                 solver=solver,
-            )
+            ):
+                return _fail_run(
+                    _RunCommandError(
+                        "EVIDENCE_INTEGRITY_FAILURE",
+                        "run terminal evidence could not be recorded",
+                    )
+                )
             _emit_context_json(
                 _run_failure(
                     "SOLVER_FAILED",
@@ -532,10 +581,18 @@ def _run_febio_command(arguments: argparse.Namespace) -> int:
             return _RUN_FAILURE_EXIT
 
         execution_record = execution.record_path
+        execution_input_sha256 = execution.input_sha256
         with claim_execution_outputs(execution) as outputs:
             record_execution_output_artifacts(outputs, opened.store)
-        opened.store.record_artifact(staged_input, attempt_id=attempt_id)
-        opened.store.record_artifact(execution_record, attempt_id=attempt_id)
+        opened.store.record_artifact(
+            staged_input,
+            attempt_id=attempt_id,
+            expected_sha256=execution_input_sha256,
+        )
+        opened.store.record_artifact(
+            execution_record,
+            attempt_id=attempt_id,
+        )
 
         if not _append_run_terminal(
             opened.store,
@@ -559,18 +616,33 @@ def _run_febio_command(arguments: argparse.Namespace) -> int:
         )
         return _FBS_UNAVAILABLE_EXIT
     except _RunCommandError as error:
-        if terminal_store is not None and attempt_id is not None:
-            _append_run_terminal(terminal_store, attempt_id, error.code)
-        return _fail_run(error)
+        return _fail_run_after_terminal(
+            terminal_store,
+            attempt_id,
+            error.code,
+            error,
+        )
     except CaseContextError as error:
-        if terminal_store is not None and attempt_id is not None:
-            _append_run_terminal(terminal_store, attempt_id, error.code)
+        if (
+            terminal_store is not None
+            and attempt_id is not None
+            and not _append_run_terminal(terminal_store, attempt_id, error.code)
+        ):
+            return _fail_run(
+                _RunCommandError(
+                    "EVIDENCE_INTEGRITY_FAILURE",
+                    "run terminal evidence could not be recorded",
+                )
+            )
         _emit_context_json(cli_failure("run-febio", error), error=True)
         return _CONTEXT_EXIT_CODES.get(error.code, _RUN_FAILURE_EXIT)
     except RuntimeProbeError:
-        if terminal_store is not None and attempt_id is not None:
-            _append_run_terminal(terminal_store, attempt_id, "RUNTIME_PROBE_FAILED")
-        return _fail_run(_RunCommandError("RUNTIME_PROBE_FAILED", "FEBio runtime probe failed"))
+        return _fail_run_after_terminal(
+            terminal_store,
+            attempt_id,
+            "RUNTIME_PROBE_FAILED",
+            _RunCommandError("RUNTIME_PROBE_FAILED", "FEBio runtime probe failed"),
+        )
     except (
         EvidenceIntegrityError,
         ExecutionAuthorityError,
@@ -579,16 +651,189 @@ def _run_febio_command(arguments: argparse.Namespace) -> int:
         ValueError,
         WorkspaceBoundaryError,
     ):
-        if terminal_store is not None and attempt_id is not None:
-            _append_run_terminal(terminal_store, attempt_id, "EXECUTION_FAILED")
-        return _fail_run(
-            _RunCommandError("EXECUTION_FAILED", "headless execution authority failed")
+        return _fail_run_after_terminal(
+            terminal_store,
+            attempt_id,
+            "EXECUTION_FAILED",
+            _RunCommandError("EXECUTION_FAILED", "headless execution authority failed"),
         )
     except Exception:
-        if terminal_store is not None and attempt_id is not None:
-            _append_run_terminal(terminal_store, attempt_id, "INTERNAL_ERROR")
-        return _fail_run(
-            _RunCommandError("INTERNAL_ERROR", "unexpected headless execution failure")
+        return _fail_run_after_terminal(
+            terminal_store,
+            attempt_id,
+            "INTERNAL_ERROR",
+            _RunCommandError("INTERNAL_ERROR", "unexpected headless execution failure"),
+        )
+
+
+def _reconnect_febio_command(arguments: argparse.Namespace) -> int:
+    command = "reconnect-febio"
+    terminal_store: EvidenceStore | None = None
+    attempt_id = arguments.attempt_id
+    try:
+        service = _case_service()
+        root_capability = _read_root_capability_stdin()
+        opened = service._open_context(root_capability, arguments.case_id)
+        if opened.result.state is not IntentState.BOUND or opened.result.question is not None:
+            raise _RunCommandError("ASK_AND_BLOCK", "case intent is not authoritatively bound")
+        snapshot = opened.store.issue_intent_snapshot()
+        completeness = assess_authoritative_completeness(snapshot)
+        if completeness.state != IntentState.BOUND.value:
+            raise _RunCommandError(
+                "ASK_AND_BLOCK",
+                "required physical conditions are not authoritatively bound",
+            )
+        if not arguments.runtime_probe.is_absolute():
+            raise _RunCommandError(
+                "INVALID_INPUT",
+                "runtime_probe must be one absolute executable path",
+            )
+        runtime = probe_febio(arguments.runtime_probe)
+        session = recover_headless_febio(
+            opened.store,
+            snapshot,
+            runtime,
+            attempt_id,
+        )
+        terminal_store = opened.store
+        result = session.supervisor.wait()
+        solver = {
+            "classification": result.classification.value,
+            "return_code": result.return_code,
+            "state": result.state.value,
+        }
+        attempt_payload = {
+            "attempt_id": attempt_id,
+            "official_fbs": False,
+            "status": result.classification.value,
+        }
+        execution = session.execution
+        if (
+            result.state is not SolverState.NORMAL_EXIT
+            or result.classification is not SolverClassification.FBS_UNVERIFIED
+            or result.return_code != 0
+            or result.log_path != execution.log_path
+            or result.xplt_path != execution.xplt_path
+        ):
+            if not _append_run_terminal(
+                opened.store,
+                attempt_id,
+                "SOLVER_FAILED",
+                solver=solver,
+            ):
+                return _fail_run(
+                    _RunCommandError(
+                        "EVIDENCE_INTEGRITY_FAILURE",
+                        "reconnect terminal evidence could not be recorded",
+                    ),
+                    command=command,
+                )
+            _emit_context_json(
+                _run_failure(
+                    "SOLVER_FAILED",
+                    "reconnected FEBio did not produce one claimable normal result",
+                    command=command,
+                    attempt=attempt_payload,
+                    solver=solver,
+                ),
+                error=True,
+            )
+            return _RUN_FAILURE_EXIT
+
+        execution_input = execution.input_path
+        execution_input_sha256 = execution.input_sha256
+        execution_record = execution.record_path
+        with claim_execution_outputs(execution) as outputs:
+            record_execution_output_artifacts(outputs, opened.store)
+        opened.store.record_artifact(
+            execution_input,
+            attempt_id=attempt_id,
+            expected_sha256=execution_input_sha256,
+        )
+        opened.store.record_artifact(
+            execution_record,
+            attempt_id=attempt_id,
+        )
+        if not _append_run_terminal(
+            opened.store,
+            attempt_id,
+            "FBS_UNAVAILABLE",
+            solver=solver,
+        ):
+            return _fail_run(
+                _RunCommandError(
+                    "EVIDENCE_INTEGRITY_FAILURE",
+                    "reconnect terminal evidence could not be recorded",
+                ),
+                command=command,
+            )
+        _emit_context_json(
+            _run_failure(
+                "FBS_UNAVAILABLE",
+                "official FBS validation is unavailable; solver outputs remain unverified",
+                command=command,
+                attempt=attempt_payload,
+                solver=solver,
+            ),
+            error=True,
+        )
+        return _FBS_UNAVAILABLE_EXIT
+    except _RunCommandError as error:
+        return _fail_run_after_terminal(
+            terminal_store,
+            attempt_id,
+            error.code,
+            error,
+            command=command,
+        )
+    except CaseContextError as error:
+        if terminal_store is not None and not _append_run_terminal(
+            terminal_store, attempt_id, error.code
+        ):
+            return _fail_run(
+                _RunCommandError(
+                    "EVIDENCE_INTEGRITY_FAILURE",
+                    "reconnect terminal evidence could not be recorded",
+                ),
+                command=command,
+            )
+        _emit_context_json(cli_failure(command, error), error=True)
+        return _CONTEXT_EXIT_CODES.get(error.code, _RUN_FAILURE_EXIT)
+    except RuntimeProbeError:
+        return _fail_run_after_terminal(
+            terminal_store,
+            attempt_id,
+            "RUNTIME_PROBE_FAILED",
+            _RunCommandError("RUNTIME_PROBE_FAILED", "FEBio runtime probe failed"),
+            command=command,
+        )
+    except (
+        EvidenceIntegrityError,
+        ExecutionAuthorityError,
+        HeadlessConfigurationError,
+        SolverConfigurationError,
+        SolverOwnershipError,
+        OSError,
+        ValueError,
+        WorkspaceBoundaryError,
+    ):
+        return _fail_run_after_terminal(
+            terminal_store,
+            attempt_id,
+            "RECONNECT_FAILED",
+            _RunCommandError(
+                "RECONNECT_FAILED",
+                "recorded headless execution could not be authenticated",
+            ),
+            command=command,
+        )
+    except Exception:
+        return _fail_run_after_terminal(
+            terminal_store,
+            attempt_id,
+            "INTERNAL_ERROR",
+            _RunCommandError("INTERNAL_ERROR", "unexpected reconnect failure"),
+            command=command,
         )
 
 
@@ -604,4 +849,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_context_command(arguments)
     if arguments.command == "run-febio":
         return _run_febio_command(arguments)
+    if arguments.command == "reconnect-febio":
+        return _reconnect_febio_command(arguments)
     return 0

@@ -10,9 +10,11 @@ from .fbs import (
 )
 from .headless import (
     HeadlessConfigurationError,
+    HeadlessReconnectSession,
     HeadlessRunDiagnostic,
     headless_exit_code,
     reconnect_headless_febio,
+    recover_headless_febio,
     run_headless_febio,
 )
 from .log import LogValidation, LogValidator, validate_log, validate_solver_log
@@ -46,6 +48,7 @@ from .types import (
 __all__ = [
     "FailureClassification",
     "HeadlessConfigurationError",
+    "HeadlessReconnectSession",
     "HeadlessRunDiagnostic",
     "FbsAdapterAuthority",
     "FbsAdapterManager",
@@ -75,6 +78,7 @@ __all__ = [
     "probe_febio",
     "probe_runtime",
     "record_execution_output_artifacts",
+    "recover_headless_febio",
     "reconnect_headless_febio",
     "run_headless_febio",
     "validate_log",

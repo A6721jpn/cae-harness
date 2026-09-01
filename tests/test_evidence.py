@@ -423,6 +423,39 @@ def test_attempt_records_and_artifact_digests_are_projected(tmp_path: Path) -> N
         store.record_attempt("attempt-1", {"status": "duplicate"})
 
 
+def test_attempt_terminal_is_recorded_once_and_rejects_conflicting_replay(
+    tmp_path: Path,
+) -> None:
+    _, case, intent = make_case(tmp_path)
+    store = EvidenceStore(case, intent)
+    store.record_attempt("attempt-1", {"status": "started"})
+    payload = {
+        "attempt_id": "attempt-1",
+        "official_fbs": False,
+        "status": "SOLVER_FAILED",
+    }
+
+    first = store.record_attempt_terminal("attempt-1", payload)
+    replay = store.record_attempt_terminal("attempt-1", payload)
+
+    assert replay == first
+    events = [
+        json.loads(line) for line in store.events_path.read_text(encoding="utf-8").splitlines()
+    ]
+    terminal = [event for event in events if event["event_type"] == "run_febio_terminal"]
+    assert len(terminal) == 1
+    with pytest.raises(EvidenceIntegrityError, match="terminal.*conflict"):
+        store.record_attempt_terminal(
+            "attempt-1",
+            {**payload, "status": "FBS_UNAVAILABLE"},
+        )
+    with pytest.raises(EvidenceIntegrityError, match="not recorded"):
+        store.record_attempt_terminal(
+            "attempt-missing",
+            {**payload, "attempt_id": "attempt-missing"},
+        )
+
+
 def test_record_artifact_rejects_an_object_that_no_longer_matches_claimed_digest(
     tmp_path: Path,
 ) -> None:

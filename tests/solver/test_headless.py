@@ -12,6 +12,7 @@ import pytest
 from febio_cae_harness.contracts import IntentContract
 from febio_cae_harness.evidence import EvidenceStore, IntentSnapshotAuthority
 from febio_cae_harness.solver import headless as headless_module
+from febio_cae_harness.solver.execution import issue_execution_authority
 from febio_cae_harness.solver.headless import (
     HeadlessConfigurationError,
     headless_exit_code,
@@ -208,6 +209,68 @@ def test_headless_derives_context_and_preserves_fbs_unverified(
     assert diagnostic.classification is SolverClassification.FBS_UNVERIFIED
     assert diagnostic.success is False
     assert headless_exit_code(diagnostic) == 5
+
+
+def test_recover_headless_uses_only_recorded_execution_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempt, intent, input_path = _authority_context(tmp_path, case_id="case-a")
+    runtime = _issued_runtime(tmp_path, monkeypatch)
+    execution = issue_execution_authority(
+        attempt,
+        intent,
+        runtime,
+        input_path,
+        requested_fields=("displacement",),
+        expected_steps=4,
+        expected_final_time=2.5,
+        timeout_seconds=17.0,
+    )
+    store = object.__getattribute__(intent, "_store")
+    reopened_store = EvidenceStore.open(store.case_workspace)
+    reopened_intent = reopened_store.issue_intent_snapshot()
+    captured: SolverLaunchCapability | None = None
+
+    class FakeSupervisor:
+        @classmethod
+        def reconnect(cls, capability: SolverLaunchCapability) -> object:
+            nonlocal captured
+            captured = capability
+            return object()
+
+    monkeypatch.setattr(headless_module, "SolverSupervisor", FakeSupervisor)
+    recover = getattr(headless_module, "recover_headless_febio", None)
+    assert callable(recover), "recorded headless recovery API is missing"
+
+    session = recover(reopened_store, reopened_intent, runtime, "attempt-a")
+
+    assert captured is not None
+    assert captured.spec.attempt_root == attempt.root
+    assert captured.spec.input_path == execution.input_path
+    assert captured.spec.expected_steps == 4
+    assert captured.spec.expected_final_time == 2.5
+    assert captured.spec.timeout_seconds == 17.0
+    assert captured.spec.requested_fields == ("displacement",)
+    assert session.execution.record_sha256 == execution.record_sha256
+    assert session.attempt.attempt_id == "attempt-a"
+    assert session.supervisor is not None
+
+
+def test_recover_headless_rejects_unrecorded_attempt_before_reconnect(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempt, intent, _ = _authority_context(tmp_path, case_id="case-a")
+    runtime = _issued_runtime(tmp_path, monkeypatch)
+    store = object.__getattribute__(intent, "_store")
+    recover = getattr(headless_module, "recover_headless_febio", None)
+    assert callable(recover), "recorded headless recovery API is missing"
+
+    with pytest.raises(HeadlessConfigurationError, match="recorded"):
+        recover(store, intent, runtime, "attempt-missing")
+
+    assert not (attempt.root.parent / "attempt-missing").exists()
 
 
 def _capture_capability(

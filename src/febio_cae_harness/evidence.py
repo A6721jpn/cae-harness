@@ -1040,6 +1040,10 @@ class EvidenceStore:
             raise EvidenceIntegrityError(
                 "intent revision events must be recorded through their dedicated API"
             )
+        if event_type == "run_febio_terminal":
+            raise EvidenceIntegrityError(
+                "attempt terminal events must be recorded through their dedicated API"
+            )
         if event_type in {
             "attempt_recorded",
             "artifact_verified",
@@ -1052,6 +1056,36 @@ class EvidenceStore:
         with self._transaction():
             self._load_and_validate(None)
             return self._append_event(event_type, payload)
+
+    def record_attempt_terminal(
+        self,
+        attempt_id: str,
+        payload: Mapping[str, Any],
+    ) -> dict[str, object]:
+        """Atomically append one idempotent terminal event for a recorded attempt."""
+
+        _validate_segment(attempt_id, "attempt_id")
+        normalised = self._normalise_payload(payload)
+        if normalised.get("attempt_id") != attempt_id:
+            raise EvidenceIntegrityError("attempt terminal identity mismatch")
+        with self._transaction():
+            self._load_and_validate(None)
+            attempts = self._read_attempts()
+            if sum(item.get("attempt_id") == attempt_id for item in attempts) != 1:
+                raise EvidenceIntegrityError("attempt terminal target is not recorded")
+            events, _ = self._read_events()
+            existing = [
+                event
+                for event in events
+                if event.get("event_type") == "run_febio_terminal"
+                and isinstance(event.get("payload"), dict)
+                and event["payload"].get("attempt_id") == attempt_id
+            ]
+            if existing:
+                if len(existing) != 1 or existing[0]["payload"] != normalised:
+                    raise EvidenceIntegrityError("attempt terminal event conflicts")
+                return dict(existing[0])
+            return self._append_event("run_febio_terminal", normalised)
 
     def revise_intent(
         self,

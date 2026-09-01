@@ -46,7 +46,7 @@ __all__ = [
 ]
 
 _SCHEMA = "febio-cae-execution"
-_VERSION = 1
+_VERSION = 2
 _RECORD_NAME = "execution.json"
 _RECORD_FACTORY = object()
 _OUTPUT_FACTORY = object()
@@ -92,6 +92,7 @@ class _RecordData:
     requested_fields: tuple[str, ...]
     expected_steps: int | None
     expected_final_time: float | None
+    timeout_seconds: float | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -204,6 +205,10 @@ class ExecutionAuthority:
     @property
     def expected_final_time(self) -> float | None:
         return _validated_binding(self).data.expected_final_time
+
+    @property
+    def timeout_seconds(self) -> float | None:
+        return _validated_binding(self).data.timeout_seconds
 
 
 @dataclass(slots=True)
@@ -389,6 +394,19 @@ def _normalise_expectations(
     ):
         raise ExecutionAuthorityError("expected final time must be finite")
     return expected_steps, (None if expected_final_time is None else float(expected_final_time))
+
+
+def _normalise_timeout(timeout_seconds: float | None) -> float | None:
+    if timeout_seconds is None:
+        return None
+    if (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, (int, float))
+        or not math.isfinite(float(timeout_seconds))
+        or timeout_seconds <= 0
+    ):
+        raise ExecutionAuthorityError("timeout seconds must be positive and finite")
+    return float(timeout_seconds)
 
 
 def _validate_live_context(
@@ -600,6 +618,7 @@ def _payload(
     requested_fields: tuple[str, ...],
     expected_steps: int | None,
     expected_final_time: float | None,
+    timeout_seconds: float | None,
 ) -> dict[str, object]:
     return {
         "case": {
@@ -610,6 +629,7 @@ def _payload(
         "expectations": {
             "expected_final_time": expected_final_time,
             "expected_steps": expected_steps,
+            "timeout_seconds": timeout_seconds,
         },
         "input": {
             "identity": {
@@ -733,7 +753,7 @@ def _decode_record(raw: bytes) -> _RecordData:
     expectations = _require_mapping(
         record["expectations"],
         "expectations",
-        {"expected_final_time", "expected_steps"},
+        {"expected_final_time", "expected_steps", "timeout_seconds"},
     )
 
     fields_value = record["requested_fields"]
@@ -753,6 +773,17 @@ def _decode_record(raw: bytes) -> _RecordData:
         expected_final_time = float(final_time_value)
         if not math.isfinite(expected_final_time):
             raise ExecutionAuthorityError("execution record expected final time must be finite")
+    timeout_value = expectations["timeout_seconds"]
+    if timeout_value is None:
+        timeout_seconds = None
+    elif isinstance(timeout_value, bool) or not isinstance(timeout_value, (int, float)):
+        raise ExecutionAuthorityError("execution record timeout seconds is invalid")
+    else:
+        timeout_seconds = float(timeout_value)
+        if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+            raise ExecutionAuthorityError(
+                "execution record timeout seconds must be positive and finite"
+            )
 
     nlink = _require_nonnegative_int(identity["nlink"], "input link count")
     if nlink != 1:
@@ -782,6 +813,7 @@ def _decode_record(raw: bytes) -> _RecordData:
         fields,
         expected_steps,
         expected_final_time,
+        timeout_seconds,
     )
 
 
@@ -874,12 +906,14 @@ def issue_execution_authority(
     requested_fields: Sequence[str] = (),
     expected_steps: int | None = None,
     expected_final_time: float | None = None,
+    timeout_seconds: float | None = None,
 ) -> ExecutionAuthority:
     """Create exactly one durable record and issue its sole in-process capability."""
 
     context = _validate_live_context(attempt_workspace, intent_snapshot, runtime_diagnostic)
     fields = _normalise_fields(requested_fields)
     steps, final_time = _normalise_expectations(expected_steps, expected_final_time)
+    timeout = _normalise_timeout(timeout_seconds)
     input_relative = _input_relative(input_path, context)
     log_relative, xplt_relative = _derived_outputs(input_relative)
     record_relative = context.attempt_relative / _RECORD_NAME
@@ -904,6 +938,7 @@ def issue_execution_authority(
                 fields,
                 steps,
                 final_time,
+                timeout,
             )
             try:
                 record_raw, record_sha256 = _record_bytes(payload)

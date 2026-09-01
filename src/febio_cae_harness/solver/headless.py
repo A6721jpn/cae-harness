@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import os
 import stat
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
-from ..evidence import IntentSnapshotAuthority
-from ..workspace import AttemptWorkspace
+from ..evidence import EvidenceStore, IntentSnapshotAuthority
+from ..workspace import AttemptWorkspace, _identity_stamp
+from .execution import ExecutionAuthority, reopen_execution_authority
 from .runtime import (
     FebioRuntimeDiagnostic,
     validate_runtime_diagnostic,
@@ -25,8 +27,10 @@ from .types import (
 
 __all__ = [
     "HeadlessConfigurationError",
+    "HeadlessReconnectSession",
     "HeadlessRunDiagnostic",
     "headless_exit_code",
+    "recover_headless_febio",
     "reconnect_headless_febio",
     "run_headless_febio",
 ]
@@ -128,6 +132,15 @@ class HeadlessRunDiagnostic:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class HeadlessReconnectSession:
+    """Authenticated recovery state for one recorded execution attempt."""
+
+    attempt: AttemptWorkspace
+    execution: ExecutionAuthority
+    supervisor: SolverSupervisor
+
+
 def run_headless_febio(
     attempt_workspace: AttemptWorkspace,
     intent_snapshot: IntentSnapshotAuthority,
@@ -137,6 +150,7 @@ def run_headless_febio(
     expected_steps: int | None = None,
     expected_final_time: float | None = None,
     timeout_seconds: float | None = None,
+    requested_fields: Sequence[str] = (),
 ) -> HeadlessRunDiagnostic:
     """Run one attempt using only live, manager-issued context capabilities."""
 
@@ -154,6 +168,7 @@ def run_headless_febio(
         expected_steps=expected_steps,
         expected_final_time=expected_final_time,
         timeout_seconds=timeout_seconds,
+        requested_fields=requested_fields,
     )
     result = SolverSupervisor(capability).run()
     return HeadlessRunDiagnostic(
@@ -177,6 +192,7 @@ def reconnect_headless_febio(
     expected_steps: int | None = None,
     expected_final_time: float | None = None,
     timeout_seconds: float | None = None,
+    requested_fields: Sequence[str] = (),
 ) -> SolverSupervisor:
     """Reconnect to one attempt using the same authority-bound launch contract."""
 
@@ -194,8 +210,67 @@ def reconnect_headless_febio(
         expected_steps=expected_steps,
         expected_final_time=expected_final_time,
         timeout_seconds=timeout_seconds,
+        requested_fields=requested_fields,
     )
     return SolverSupervisor.reconnect(capability)
+
+
+def recover_headless_febio(
+    store: EvidenceStore,
+    intent_snapshot: IntentSnapshotAuthority,
+    runtime_diagnostic: FebioRuntimeDiagnostic,
+    attempt_id: str,
+) -> HeadlessReconnectSession:
+    """Rebuild recorded launch context, then authenticate its live process.
+
+    The executable is never learned from untrusted crash state.  Callers must
+    provide a current probe-issued runtime, while input and launch expectations
+    come only from the exact durable execution record.
+    """
+
+    if type(store) is not EvidenceStore:
+        raise HeadlessConfigurationError("recovery requires an exact EvidenceStore")
+    if type(intent_snapshot) is not IntentSnapshotAuthority:
+        raise HeadlessConfigurationError(
+            "recovery requires an exact IntentSnapshotAuthority capability"
+        )
+    try:
+        store._validate_intent_snapshot(intent_snapshot)
+        manifest = store.manifest
+        attempts = manifest.get("attempts")
+        if not isinstance(attempts, list) or not any(
+            isinstance(item, dict) and item.get("attempt_id") == attempt_id for item in attempts
+        ):
+            raise HeadlessConfigurationError("recovery attempt is not recorded")
+        case = store.case_workspace
+        attempt_root = case.temporary_root / "attempts" / attempt_id
+        attempt_stamp = _identity_stamp(attempt_root, "recovery attempt root")
+        attempt = AttemptWorkspace._from_manager(
+            case,
+            attempt_id,
+            attempt_root,
+            expected_root_stamp=attempt_stamp,
+        )
+        execution = reopen_execution_authority(
+            attempt,
+            intent_snapshot,
+            runtime_diagnostic,
+        )
+        supervisor = reconnect_headless_febio(
+            attempt,
+            intent_snapshot,
+            runtime_diagnostic,
+            execution.input_path,
+            expected_steps=execution.expected_steps,
+            expected_final_time=execution.expected_final_time,
+            timeout_seconds=execution.timeout_seconds,
+            requested_fields=execution.requested_fields,
+        )
+    except HeadlessConfigurationError:
+        raise
+    except (AttributeError, TypeError, ValueError) as error:
+        raise HeadlessConfigurationError("recorded recovery context is invalid") from error
+    return HeadlessReconnectSession(attempt, execution, supervisor)
 
 
 def _validate_context(
@@ -234,6 +309,7 @@ def _issue_launch_capability(
     expected_steps: int | None,
     expected_final_time: float | None,
     timeout_seconds: float | None,
+    requested_fields: Sequence[str] = (),
 ) -> SolverLaunchCapability:
     """Build the sole supervisor input after the public boundary checks."""
 
@@ -248,6 +324,7 @@ def _issue_launch_capability(
         timeout_seconds=timeout_seconds,
         expected_steps=expected_steps,
         expected_final_time=expected_final_time,
+        requested_fields=tuple(requested_fields),
     )
     return SolverLaunchCapability._issue(
         # The capability itself retains the exact authority objects.  The

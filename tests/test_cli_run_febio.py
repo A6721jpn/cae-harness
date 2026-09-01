@@ -5,6 +5,7 @@ import json
 import stat
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -12,9 +13,15 @@ import pytest
 from febio_cae_harness import cli as cli_module
 from febio_cae_harness.cli_context import CaseContextService, dump_root_capability
 from febio_cae_harness.contracts import IntentContract, IntentState
+from febio_cae_harness.solver.execution import issue_execution_authority
 from febio_cae_harness.solver.headless import HeadlessRunDiagnostic
-from febio_cae_harness.solver.runtime import FebioRuntimeDiagnostic, probe_febio
+from febio_cae_harness.solver.runtime import (
+    FebioRuntimeDiagnostic,
+    RuntimeProbeError,
+    probe_febio,
+)
 from febio_cae_harness.solver.types import SolverClassification, SolverState
+from febio_cae_harness.workspace import AttemptWorkspace
 
 
 def _complete_intent() -> IntentContract:
@@ -123,6 +130,20 @@ def _run_arguments(runtime: Path, *extra: str) -> list[str]:
     ]
 
 
+def _reconnect_arguments(runtime: Path, *extra: str) -> list[str]:
+    return [
+        "reconnect-febio",
+        "--capability-stdin",
+        "--case-id",
+        "case-a",
+        "--attempt-id",
+        "run-existing",
+        "--runtime-probe",
+        str(runtime),
+        *extra,
+    ]
+
+
 def _contains_path_key(value: object) -> bool:
     if isinstance(value, dict):
         return any(
@@ -151,6 +172,179 @@ def test_run_febio_parser_accepts_only_case_bound_launch_inputs(tmp_path: Path) 
         "arguments",
         "fbs_adapter",
     }.intersection(vars(parsed))
+
+
+def test_reconnect_febio_parser_cannot_redefine_recorded_launch_context(
+    tmp_path: Path,
+) -> None:
+    parsed = cli_module.build_parser().parse_args(_reconnect_arguments(tmp_path / "febio.exe"))
+
+    assert parsed.command == "reconnect-febio"
+    assert parsed.capability_stdin is True
+    assert parsed.case_id == "case-a"
+    assert parsed.attempt_id == "run-existing"
+    assert not {
+        "input",
+        "input_name",
+        "expected_steps",
+        "expected_final_time",
+        "requested_field",
+        "timeout_seconds",
+        "arguments",
+    }.intersection(vars(parsed))
+
+
+def test_reconnect_runtime_probe_failure_does_not_append_orphan_terminal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    service, capability, case_root = _register_case(tmp_path, intent=_complete_intent())
+    opened = service._open_context(capability, "case-a")
+    opened.store.record_attempt("run-existing", {"status": "started"})
+    _set_capability_stdin(monkeypatch, capability)
+    monkeypatch.setattr(cli_module, "_case_service", lambda: service)
+
+    def reject_probe(path: Path) -> None:
+        del path
+        raise RuntimeProbeError("synthetic probe failure")
+
+    monkeypatch.setattr(cli_module, "probe_febio", reject_probe)
+
+    assert cli_module.main(_reconnect_arguments(tmp_path / "febio.exe")) == 4
+
+    payload = json.loads(capsys.readouterr().err)
+    assert payload["error"]["code"] == "RUNTIME_PROBE_FAILED"
+    events = [
+        json.loads(line)
+        for line in (case_root / "90_Temporary" / "events.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert events[-1]["event_type"] == "attempt_recorded"
+    assert not any(event["event_type"] == "run_febio_terminal" for event in events)
+
+
+def test_reconnect_febio_reports_authenticated_solver_failure_without_new_attempt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    service, capability, case_root = _register_case(tmp_path, intent=_complete_intent())
+    opened = service._open_context(capability, "case-a")
+    opened.store.record_attempt("run-existing", {"status": "started"})
+    runtime = _issued_runtime(tmp_path, monkeypatch)
+    _set_capability_stdin(monkeypatch, capability)
+    monkeypatch.setattr(cli_module, "_case_service", lambda: service)
+    monkeypatch.setattr(cli_module, "probe_febio", lambda path: runtime)
+
+    result = SimpleNamespace(
+        state=SolverState.FAILED,
+        classification=SolverClassification.FATAL,
+        return_code=1,
+        pid=123,
+        log_path=case_root / "90_Temporary" / "attempts" / "run-existing" / "model.log",
+        xplt_path=case_root / "90_Temporary" / "attempts" / "run-existing" / "model.xplt",
+    )
+    supervisor = SimpleNamespace(wait=lambda: result)
+    execution = SimpleNamespace(log_path=result.log_path, xplt_path=result.xplt_path)
+    session = SimpleNamespace(supervisor=supervisor, execution=execution)
+    monkeypatch.setattr(
+        cli_module,
+        "recover_headless_febio",
+        lambda store, snapshot, runtime_diagnostic, attempt_id: session,
+        raising=False,
+    )
+
+    assert cli_module.main(_reconnect_arguments(runtime.path)) == 4
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    payload = json.loads(captured.err)
+    assert payload["command"] == "reconnect-febio"
+    assert payload["error"]["code"] == "SOLVER_FAILED"
+    assert payload["attempt"] == {
+        "attempt_id": "run-existing",
+        "official_fbs": False,
+        "status": "FATAL",
+    }
+    attempts = list((case_root / "90_Temporary" / "attempts").iterdir())
+    assert [attempt.name for attempt in attempts] == ["run-existing"]
+    events = [
+        json.loads(line)
+        for line in (case_root / "90_Temporary" / "events.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert events[-1]["event_type"] == "run_febio_terminal"
+    assert events[-1]["payload"]["status"] == "SOLVER_FAILED"
+
+
+def test_reconnect_febio_claims_exact_outputs_but_remains_fbs_unverified(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    service, capability, case_root = _register_case(tmp_path, intent=_complete_intent())
+    opened = service._open_context(capability, "case-a")
+    opened.store.record_attempt("run-existing", {"status": "started"})
+    attempt = AttemptWorkspace._from_manager(
+        opened.case,
+        "run-existing",
+        opened.case.temporary_root / "attempts" / "run-existing",
+    )
+    input_path = attempt.write_text("model.feb", "<febio_spec version='4.0' />")
+    runtime = _issued_runtime(tmp_path, monkeypatch)
+    execution = issue_execution_authority(
+        attempt,
+        opened.store.issue_intent_snapshot(),
+        runtime,
+        input_path,
+        requested_fields=("displacement",),
+        expected_steps=1,
+        expected_final_time=1.0,
+        timeout_seconds=30.0,
+    )
+    execution.log_path.write_bytes(b"synthetic normal termination\n")
+    execution.xplt_path.write_bytes(b"synthetic XPLT\n")
+    result = SimpleNamespace(
+        state=SolverState.NORMAL_EXIT,
+        classification=SolverClassification.FBS_UNVERIFIED,
+        return_code=0,
+        pid=123,
+        log_path=execution.log_path,
+        xplt_path=execution.xplt_path,
+    )
+    session = SimpleNamespace(
+        supervisor=SimpleNamespace(wait=lambda: result),
+        execution=execution,
+    )
+    _set_capability_stdin(monkeypatch, capability)
+    monkeypatch.setattr(cli_module, "_case_service", lambda: service)
+    monkeypatch.setattr(cli_module, "probe_febio", lambda path: runtime)
+    monkeypatch.setattr(
+        cli_module,
+        "recover_headless_febio",
+        lambda store, snapshot, runtime_diagnostic, attempt_id: session,
+    )
+
+    assert cli_module.main(_reconnect_arguments(runtime.path)) == 5
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.err)
+    assert payload["command"] == "reconnect-febio"
+    assert payload["error"]["code"] == "FBS_UNAVAILABLE"
+    assert payload["attempt"]["official_fbs"] is False
+    manifest = service._open_context(capability, "case-a").store.manifest
+    paths = {artifact["path"] for artifact in manifest["artifacts"]}
+    prefix = "90_Temporary/attempts/run-existing/"
+    assert paths == {
+        f"{prefix}execution.json",
+        f"{prefix}model.feb",
+        f"{prefix}model.log",
+        f"{prefix}model.xplt",
+    }
+    assert not (case_root / "50_Reports").exists()
 
 
 def test_run_febio_solves_but_fails_closed_without_official_fbs(

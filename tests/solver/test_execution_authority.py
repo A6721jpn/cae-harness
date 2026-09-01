@@ -190,6 +190,7 @@ def test_execution_authority_api_has_no_caller_selected_labels_or_outputs() -> N
         "requested_fields",
         "expected_steps",
         "expected_final_time",
+        "timeout_seconds",
     )
     assert tuple(reopen_parameters) == (
         "attempt_workspace",
@@ -222,6 +223,7 @@ def test_issue_writes_one_canonical_deterministic_record_and_reopen_is_fresh(
         requested_fields=("displacement", "stress"),
         expected_steps=2,
         expected_final_time=1.25,
+        timeout_seconds=30.0,
     )
     record_path = _record_path(context)
     original = record_path.read_bytes()
@@ -237,7 +239,11 @@ def test_issue_writes_one_canonical_deterministic_record_and_reopen_is_fresh(
             "case_id": "case-a",
             "root": os.path.normcase(os.path.realpath(context.attempt.root.parents[2])),
         },
-        "expectations": {"expected_final_time": 1.25, "expected_steps": 2},
+        "expectations": {
+            "expected_final_time": 1.25,
+            "expected_steps": 2,
+            "timeout_seconds": 30.0,
+        },
         "input": {
             "identity": {
                 "device": context.input_path.stat().st_dev,
@@ -259,7 +265,7 @@ def test_issue_writes_one_canonical_deterministic_record_and_reopen_is_fresh(
             "version": context.runtime.version,
         },
         "schema": "febio-cae-execution",
-        "version": 1,
+        "version": 2,
     }
     assert type(authority) is module.ExecutionAuthority
     assert authority.record_path == record_path
@@ -272,6 +278,7 @@ def test_issue_writes_one_canonical_deterministic_record_and_reopen_is_fresh(
     assert authority.requested_fields == ("displacement", "stress")
     assert authority.expected_steps == 2
     assert authority.expected_final_time == 1.25
+    assert authority.timeout_seconds == 30.0
     assert module.validate_execution_authority(authority) is authority
 
     reopened = _reopen(context)
@@ -535,6 +542,8 @@ def test_reopen_requires_the_current_matching_probe_issued_runtime(
         {"expected_steps": True},
         {"expected_final_time": math.inf},
         {"expected_final_time": math.nan},
+        {"timeout_seconds": 0},
+        {"timeout_seconds": math.inf},
     ],
 )
 def test_issue_rejects_invalid_requested_fields_and_nonfinite_expectations(
