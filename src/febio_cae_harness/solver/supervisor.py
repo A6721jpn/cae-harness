@@ -3530,6 +3530,10 @@ class SolverSupervisor:
                 self._terminate_owned_process(process)
             except BaseException as error:
                 self._fail_terminal_operation(error)
+            try:
+                self._drain_owned_descendants_after_root_exit(process)
+            except BaseException as error:
+                self._fail_terminal_operation(error)
             return self._complete(SolverState.TIMED_OUT, process.poll())
         try:
             self._drain_owned_descendants_after_root_exit(process)
