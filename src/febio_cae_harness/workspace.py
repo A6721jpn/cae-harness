@@ -2556,7 +2556,13 @@ class ValidatedCaseWorkspace:
     tool_root: Path
     cae_root: Path
 
-    def __init__(self, tool_root: Path, cae_root: Path) -> None:
+    def __init__(
+        self,
+        tool_root: Path,
+        cae_root: Path,
+        *,
+        _expected_cae_stamp: _IdentityStamp | None = None,
+    ) -> None:
         if type(self) is not ValidatedCaseWorkspace:
             raise TypeError("workspace managers cannot be subclassed")
         if id(self) in _MANAGER_REGISTRY:
@@ -2567,15 +2573,26 @@ class ValidatedCaseWorkspace:
             raise ValueError("tool_root and cae_root must be different roots")
         if tool_root.is_relative_to(cae_root) or cae_root.is_relative_to(tool_root):
             raise ValueError("tool_root and cae_root must not overlap")
+        physical_tool_root = Path(os.path.realpath(os.fspath(tool_root)))
+        physical_cae_root = Path(os.path.realpath(os.fspath(cae_root)))
+        if (
+            physical_tool_root == physical_cae_root
+            or physical_tool_root.is_relative_to(physical_cae_root)
+            or physical_cae_root.is_relative_to(physical_tool_root)
+        ):
+            raise WorkspaceBoundaryError("tool_root and cae_root must not overlap")
+        if _expected_cae_stamp is not None:
+            _identity_stamp(cae_root, "cae root", _expected_cae_stamp)
         try:
             tool_root.mkdir(parents=True, exist_ok=True)
-            cae_root.mkdir(parents=True, exist_ok=True)
+            if _expected_cae_stamp is None:
+                cae_root.mkdir(parents=True, exist_ok=True)
         except OSError as error:
             raise WorkspaceBoundaryError("cannot create workspace roots") from error
         if _exact_directory_trees_overlap(tool_root, cae_root, "tool and CAE roots"):
             raise WorkspaceBoundaryError("tool_root and cae_root must not overlap")
         tool_stamp = _identity_stamp(tool_root, "tool root")
-        cae_stamp = _identity_stamp(cae_root, "cae root")
+        cae_stamp = _identity_stamp(cae_root, "cae root", _expected_cae_stamp)
         object.__setattr__(self, "tool_root", tool_root)
         object.__setattr__(self, "cae_root", cae_root)
         _MANAGER_REGISTRY[id(self)] = (self, tool_root, cae_root, tool_stamp, cae_stamp)

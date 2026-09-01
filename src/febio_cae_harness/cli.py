@@ -229,6 +229,12 @@ def _run_context_command(arguments: argparse.Namespace) -> int:
     except CaseContextError as error:
         _emit_context_json(cli_failure(command, error), error=True)
         return _CONTEXT_EXIT_CODES.get(error.code, 70)
+    except OSError:
+        context_error = CaseContextError(
+            "IO_OR_LOCK_FAILURE", "case context I/O failed", retryable=True
+        )
+        _emit_context_json(cli_failure(command, context_error), error=True)
+        return _CONTEXT_EXIT_CODES[context_error.code]
     _emit_context_json(payload)
     return 0
 

@@ -484,7 +484,14 @@ def _read_registry(path: Path) -> dict[str, object]:
     except OSError as error:
         raise CaseContextError("IO_OR_LOCK_FAILURE", "cannot inspect case registry") from error
     data = _read_exact_bytes(path, "case registry")
-    document = _parse_json(data, "case registry")
+    try:
+        document = _parse_json(data, "case registry")
+    except CaseContextError as error:
+        if error.code != "INVALID_INPUT":
+            raise
+        raise CaseContextError(
+            "EVIDENCE_INTEGRITY_FAILURE", "case registry JSON is invalid"
+        ) from error
     if not isinstance(document, dict) or set(document) != {
         "schema_version",
         "roots",
@@ -508,7 +515,7 @@ def _remove_owned_temp(path: Path, identity: tuple[int, int]) -> None:
         metadata = path.lstat()
         if _file_identity(metadata) == identity and stat.S_ISREG(metadata.st_mode):
             path.unlink()
-    except FileNotFoundError:
+    except OSError:
         return
 
 
@@ -540,6 +547,7 @@ def _write_registry(root: Path, body: Mapping[str, object]) -> None:
 @contextmanager
 def _registry_lock(root: Path) -> Iterator[Path]:
     try:
+        _reject_reparse_alias(root, "case registry root")
         root.parent.mkdir(parents=True, exist_ok=True)
         root.mkdir(parents=False, exist_ok=True)
         exact_root = _reject_reparse_alias(root, "case registry root")
@@ -566,17 +574,11 @@ def _registry_lock(root: Path) -> Iterator[Path]:
                 or int(held_lock.st_nlink) != 1
                 or int(path_lock.st_nlink) != 1
                 or _file_identity(held_lock) != _file_identity(path_lock)
-                or int(held_lock.st_size) not in {0, 1}
             ):
                 raise CaseContextError(
                     "EVIDENCE_INTEGRITY_FAILURE", "case registry lock identity is invalid"
                 )
             lock_identity = _file_identity(held_lock)
-            lock_stream.seek(0, os.SEEK_END)
-            if lock_stream.tell() == 0:
-                lock_stream.write(b"\0")
-                lock_stream.flush()
-                os.fsync(lock_stream.fileno())
             lock_stream.seek(0)
             if os.name == "nt":
                 import msvcrt
@@ -590,9 +592,26 @@ def _registry_lock(root: Path) -> Iterator[Path]:
                     fcntl.LOCK_EX,  # type: ignore[attr-defined]
                 )
             locked = True
-            if _file_identity(lock_path.lstat()) != lock_identity:
+            held_lock = os.fstat(lock_stream.fileno())
+            path_lock = lock_path.lstat()
+            if (
+                _file_identity(held_lock) != lock_identity
+                or _file_identity(path_lock) != lock_identity
+                or int(held_lock.st_size) not in {0, 1}
+                or int(path_lock.st_size) != int(held_lock.st_size)
+            ):
                 raise CaseContextError(
                     "EVIDENCE_INTEGRITY_FAILURE", "case registry lock identity changed"
+                )
+            if int(held_lock.st_size) == 0:
+                lock_stream.seek(0)
+                lock_stream.write(b"\0")
+                lock_stream.flush()
+                os.fsync(lock_stream.fileno())
+            lock_stream.seek(0)
+            if lock_stream.read(1) != b"\0":
+                raise CaseContextError(
+                    "EVIDENCE_INTEGRITY_FAILURE", "case registry lock content is invalid"
                 )
             _identity_stamp(exact_root, "case registry root", root_stamp)
             yield exact_root
@@ -784,7 +803,11 @@ class CaseContextService:
                 exact_root, self._tool_root, "registered 02_CAE and tool"
             ):
                 raise WorkspaceBoundaryError("registered root overlaps a private tree")
-            return capability.root_id, ValidatedCaseWorkspace(self._tool_root, exact_root)
+            return capability.root_id, ValidatedCaseWorkspace(
+                self._tool_root,
+                exact_root,
+                _expected_cae_stamp=stamp,
+            )
         except (OSError, ValueError, WorkspaceBoundaryError) as error:
             raise CaseContextError(
                 "BOUNDARY_OR_IDENTITY_VIOLATION", "registered 02_CAE root identity changed"
@@ -1093,8 +1116,6 @@ def _redact_case(value: object) -> object:
         redacted["pending_questions"] = [
             {
                 "question_id": question.get("question_id"),
-                "condition": question.get("condition"),
-                "prompt": question.get("prompt"),
             }
             for question in questions
             if isinstance(question, dict)
