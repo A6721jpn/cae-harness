@@ -430,7 +430,7 @@ def test_answer_removes_nested_mapping_blocker_and_advances(tmp_path: Path) -> N
     lifecycle, store, question = _single_blocker(
         tmp_path,
         contact=None,
-        unresolved=({"condition": "contact", "name": "mode", "field": "mode", "nested": {"name": "mode"}},),
+        unresolved=({"authoritative": True, "condition": "contact", "current": True, "source": "synthetic-user"},),
     )
     result = lifecycle.answer(question, {"mode": "new"}, "synthetic-user")
     assert result.state is IntentState.BOUND
