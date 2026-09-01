@@ -34,6 +34,16 @@ def make_workspace(tmp_path: Path) -> ValidatedCaseWorkspace:
     return ValidatedCaseWorkspace(tool_root=tool_root, cae_root=cae_root)
 
 
+def windows_short_path(path: Path) -> Path:
+    if os.name != "nt":
+        pytest.skip("Windows alternate-path regression")
+    buffer = ctypes.create_unicode_buffer(32_768)
+    result = ctypes.windll.kernel32.GetShortPathNameW(os.fspath(path), buffer, len(buffer))
+    if result == 0 or result >= len(buffer) or Path(buffer.value) == path:
+        pytest.skip("8.3 short names are unavailable on this volume")
+    return Path(buffer.value)
+
+
 def make_directory_junction(link: Path, target: Path) -> None:
     subprocess.run(
         ["cmd", "/c", "mklink", "/J", str(link), str(target)],
@@ -404,6 +414,17 @@ def test_manager_rejects_reparse_cae_root_alias(tmp_path: Path) -> None:
 
     with pytest.raises(WorkspaceBoundaryError):
         ValidatedCaseWorkspace(tool_root=tmp_path / "tool", cae_root=cae_alias)
+
+
+def test_manager_rejects_windows_short_path_overlap_with_tool_tree(tmp_path: Path) -> None:
+    tool_root = tmp_path / "tool-root-with-a-long-name"
+    cae_root = tool_root / "nested-location-with-a-long-name" / "02_CAE"
+    cae_root.mkdir(parents=True)
+    alias = windows_short_path(cae_root)
+
+    with pytest.raises((ValueError, WorkspaceBoundaryError)):
+        ValidatedCaseWorkspace(tool_root=tool_root, cae_root=alias)
+    assert tuple(cae_root.iterdir()) == ()
 
 
 def test_open_case_rejects_case_alias_instead_of_issuing_cross_case_authority(

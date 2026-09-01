@@ -539,3 +539,57 @@ def test_case_cli_error_omits_absolute_input_path(
     assert captured.out == ""
     assert str(tmp_path) not in captured.err
     assert missing.name not in captured.err
+
+
+def test_same_registered_root_alias_reuses_exact_object_identity(tmp_path: Path) -> None:
+    module = _context_module()
+    tool_root = tmp_path / "tool"
+    tool_root.mkdir()
+    cae_root = tmp_path / "external-location-with-a-long-name" / "02_CAE"
+    cae_root.mkdir(parents=True)
+    service = module.CaseContextService._for_tests(
+        registry_root=tmp_path / "registry",
+        tool_root=tool_root,
+    )
+
+    registered = service.register_root(cae_root)
+    repeated = service.register_root(_windows_short_path(cae_root))
+
+    assert repeated == registered
+    registry = json.loads((tmp_path / "registry" / "registry.json").read_bytes())
+    assert len(registry["roots"]) == 1
+
+
+def test_interrupted_preparing_without_case_tree_recovers_on_retry(tmp_path: Path) -> None:
+    module = _context_module()
+    service = _service(tmp_path)
+    cae_root = tmp_path / "02_CAE"
+    cae_root.mkdir()
+    registered = service.register_root(cae_root)
+    registry_path = tmp_path / "registry" / "registry.json"
+    document = json.loads(registry_path.read_bytes())
+    document["cases"] = [
+        {
+            "case_id": "case-a",
+            "root_id": registered["root_id"],
+            "state": "PREPARING",
+            "stamp": [],
+            "reservation_id": "a" * 64,
+        }
+    ]
+    body = {name: document[name] for name in ("schema_version", "roots", "cases")}
+    document["sha256"] = module._digest(body)
+    registry_path.write_bytes(module._canonical_bytes(document) + b"\n")
+    source = tmp_path / "synthetic.feb"
+    source.write_text("<febio_spec />", encoding="utf-8")
+
+    created = service.create_case(
+        root_id=registered["root_id"],
+        case_id="case-a",
+        sources=(source,),
+        intent=_complete_intent(),
+    )
+
+    assert created["case_id"] == "case-a"
+    registry = json.loads(registry_path.read_bytes())
+    assert registry["cases"][0]["state"] == "ACTIVE"
