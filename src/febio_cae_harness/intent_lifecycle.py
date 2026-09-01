@@ -223,19 +223,21 @@ def _replace_condition_source(
             or (isinstance(item, Mapping) and _matches_condition(item, condition))
         ]
         if not matching_keys:
-            result = dict(value)
-            result[condition] = canonical
-            return result
+            mapping_result = dict(value)
+            mapping_result[condition] = canonical
+            return mapping_result
         first = matching_keys[0]
-        result: dict[str, object] = {}
+        replaced_mapping: dict[str, object] = {}
         for key, item in value.items():
             if key == first:
-                result[key] = canonical
+                replaced_mapping[key] = canonical
             elif key not in matching_keys:
-                result[key] = item
-        return result
+                replaced_mapping[key] = item
+        return replaced_mapping
 
-    records = list(value) if isinstance(value, (list, tuple)) else ([] if value is None else [value])
+    records = (
+        list(value) if isinstance(value, (list, tuple)) else ([] if value is None else [value])
+    )
     retained: list[object] = []
     insertion: int | None = None
     for record in records:
