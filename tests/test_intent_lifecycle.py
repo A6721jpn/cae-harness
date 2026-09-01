@@ -5,6 +5,7 @@ import importlib
 import importlib.util
 import json
 import multiprocessing
+from dataclasses import FrozenInstanceError
 from pathlib import Path
 from typing import Any
 
@@ -181,6 +182,10 @@ def test_authoritative_unresolved_question_is_durable_deterministic_and_fresh_pr
     assert projection["question_id"] == expected_id == question.question_id
     assert "authoritative" in question.prompt.casefold()
     assert "contact" in question.prompt
+    with pytest.raises(TypeError):
+        module.IntentQuestion()
+    with pytest.raises(FrozenInstanceError):
+        question.prompt = "changed"
 
     reopened = module.IntentLifecycle(EvidenceStore.open(case)).reconcile()
     assert reopened.question is not None
@@ -266,8 +271,13 @@ def test_answer_is_event_backed_reconciled_and_advances_to_the_next_blocker(
     final_intent = after_material.snapshot.intent.to_dict()
     assert final_intent["unresolved"] == []
     sources = final_intent["condition_sources"]
-    assert isinstance(sources, list)
-    contact_source = next(record for record in sources if record["condition"] == "contact")
+    assert isinstance(sources, dict)
+    assert sources["engineering_question"] == {
+        "authoritative": True,
+        "current": True,
+        "source": "synthetic-user",
+    }
+    contact_source = sources["contact"]
     assert contact_source == {
         "authoritative": True,
         "condition": "contact",
