@@ -419,18 +419,18 @@ def test_answer_rejects_stale_issued_question_after_revision_without_append(tmp_
 
 
 def test_unicode_casefold_alias_cannot_select_canonical_intent_field_without_append(tmp_path: Path) -> None:
-    lifecycle, store, question = _single_blocker(tmp_path)
+    lifecycle, store, question = _single_blocker(tmp_path, unresolved=({"authoritative": True, "condition": "CONTACT", "current": True, "source": "synthetic-user"},))
     before = store.events_path.read_bytes()
     with pytest.raises(EvidenceIntegrityError):
-        lifecycle.answer(question, "x", "synthetic-user", detail="İCONTACT")
+        lifecycle.answer(question, "x", "synthetic-user")
     assert store.events_path.read_bytes() == before
 
 
 def test_answer_removes_nested_mapping_blocker_and_advances(tmp_path: Path) -> None:
     lifecycle, store, question = _single_blocker(
         tmp_path,
-        contact={"mode": "old"},
-        unresolved={"contact": {"condition": "contact", "name": "mode", "field": "mode"}},
+        contact=None,
+        unresolved=({"condition": "contact", "name": "mode", "field": "mode", "nested": {"name": "mode"}},),
     )
     result = lifecycle.answer(question, {"mode": "new"}, "synthetic-user")
     assert result.state is IntentState.BOUND

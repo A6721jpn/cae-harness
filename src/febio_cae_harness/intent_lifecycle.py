@@ -191,9 +191,9 @@ def _record_condition(value: object) -> str | None:
 
 def _matches_condition(value: object, condition: str) -> bool:
     if isinstance(value, str):
-        return value.strip().casefold() == condition.casefold()
+        return value.strip() == condition
     candidate = _record_condition(value)
-    return candidate is not None and candidate.casefold() == condition.casefold()
+    return candidate is not None and candidate == condition
 
 
 def _replace_condition_source(
@@ -219,7 +219,7 @@ def _replace_condition_source(
         matching_keys = [
             key
             for key, item in value.items()
-            if key.casefold() == condition.casefold()
+            if key == condition
             or (isinstance(item, Mapping) and _matches_condition(item, condition))
         ]
         if not matching_keys:
@@ -258,7 +258,7 @@ def _remove_matching_unresolved(value: object, condition: str) -> object:
         if set(value) & set((*_RECORD_NAME_FIELDS, "authoritative", "resolved", "status")):
             return [] if _matches_condition(value, condition) else dict(value)
         return {
-            key: item for key, item in value.items() if str(key).casefold() != condition.casefold()
+            key: item for key, item in value.items() if key != condition
         }
     if isinstance(value, (list, tuple)):
         return [item for item in value if not _matches_condition(item, condition)]
@@ -284,12 +284,13 @@ def _value_is_explicit(value: object) -> bool:
 class IntentLifecycle:
     """Durable lifecycle owner bound to exactly one evidence store."""
 
-    __slots__ = ("_store",)
+    __slots__ = ("_store", "_issued_question")
 
     def __init__(self, store: EvidenceStore) -> None:
         if type(store) is not EvidenceStore:
             raise TypeError("intent lifecycle requires an EvidenceStore")
         self._store = store
+        self._issued_question: IntentQuestion | None = None
 
     def _question(
         self,
@@ -302,12 +303,14 @@ class IntentLifecycle:
         blockers = unresolved_authoritative_conditions(snapshot)
         if not blockers or blockers != authority.blocking_conditions:
             raise EvidenceIntegrityError("ASK_AND_BLOCK lacks a current authoritative blocker")
-        return IntentQuestion._issue(
+        issued = IntentQuestion._issue(
             case_id=snapshot.case_id,
             intent_sha256=snapshot.intent_sha256,
             ordinal=0,
             blocker=blockers[0],
         )
+        self._issued_question = issued
+        return issued
 
     def _result(
         self,
@@ -349,7 +352,7 @@ class IntentLifecycle:
 
     def answer(
         self,
-        question_id: str,
+        question_id: IntentQuestion,
         value: JSONInput,
         source: str,
         *,
@@ -361,17 +364,19 @@ class IntentLifecycle:
         authority = transition_intent(snapshot)
         if authority.current is not snapshot.intent.state:
             raise EvidenceIntegrityError("intent must be reconciled before answering")
+        issued_question = self._issued_question
         question = self._question(snapshot, authority)
+        self._issued_question = issued_question
         if question is None:
             raise EvidenceIntegrityError("intent has no current authoritative question")
-        if not isinstance(question_id, str) or question_id != question.question_id:
-            raise EvidenceIntegrityError("question_id is not the exact current question")
+        if type(question_id) is not IntentQuestion or question_id is not issued_question:
+            raise EvidenceIntegrityError("question is not the exact issued current question")
 
         current_payload = snapshot.intent.to_dict()
         field_by_name = {
-            name.casefold(): name for name in current_payload if name not in _NON_ANSWER_FIELDS
+            name: name for name in current_payload if name not in _NON_ANSWER_FIELDS
         }
-        condition_field = field_by_name.get(question.condition.casefold())
+        condition_field = field_by_name.get(question.condition)
         if condition_field is None:
             raise EvidenceIntegrityError(
                 "current question condition is not an intent contract field"
