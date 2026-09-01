@@ -906,6 +906,55 @@ def test_execution_outputs_close_is_idempotent_after_foreign_descriptor_reuse(
             original_close(reused)
 
 
+def test_concurrent_execution_outputs_close_serializes_exact_release(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _context(tmp_path, monkeypatch)
+    module = _execution_outputs_module()
+    execution = _issue(context)
+    _write_synthetic_outputs(execution)
+    outputs = module.claim_execution_outputs(execution)
+    binding = module._OUTPUT_STATES[outputs]
+    exact = binding.exact
+    original_close = module._ExactCaseTransaction.close
+    first_entered = threading.Event()
+    second_entered = threading.Event()
+    release_first = threading.Event()
+    calls = 0
+    calls_lock = threading.Lock()
+
+    def controlled_close(transaction: object) -> None:
+        nonlocal calls
+        if transaction is not exact:
+            original_close(transaction)
+            return
+        with calls_lock:
+            calls += 1
+            invocation = calls
+        if invocation == 1:
+            first_entered.set()
+            assert release_first.wait(timeout=5.0)
+            original_close(transaction)
+            return
+        second_entered.set()
+
+    monkeypatch.setattr(module._ExactCaseTransaction, "close", controlled_close)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(outputs.close)
+        assert first_entered.wait(timeout=5.0)
+        second = pool.submit(outputs.close)
+        serialized = not second_entered.wait(timeout=0.25)
+        release_first.set()
+        first.result(timeout=5.0)
+        second.result(timeout=5.0)
+
+    assert serialized
+    assert calls == 2
+    with pytest.raises(module.ExecutionAuthorityError, match="closed|released"):
+        module.validate_execution_outputs(outputs)
+
+
 def test_unclosed_execution_outputs_are_collectible_without_a_strong_registry(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
