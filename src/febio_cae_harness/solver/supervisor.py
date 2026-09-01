@@ -3569,6 +3569,13 @@ class SolverSupervisor:
             self._terminate_owned_process(process)
         except BaseException as error:
             self._fail_terminal_operation(error)
+        try:
+            # Termination is a no-op when the root already exited; in every
+            # case drain the exact held authority before completion validates
+            # outputs or publishes a result.
+            self._drain_owned_descendants_after_root_exit(process)
+        except BaseException as error:
+            self._fail_terminal_operation(error)
         return self._complete(SolverState.CANCELLED, process.poll())
 
     def _make_input_lease_record(self) -> dict[str, object]:
