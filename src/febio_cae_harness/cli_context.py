@@ -27,6 +27,7 @@ from .workspace import (
     CaseWorkspace,
     ValidatedCaseWorkspace,
     WorkspaceBoundaryError,
+    _exact_directory_trees_overlap,
     _identity_stamp,
     _registered_case_stamp,
     _reject_reparse_alias,
@@ -108,21 +109,6 @@ def _validate_sha256(value: str, label: str) -> str:
 
 def _normal_path(value: Path) -> Path:
     return Path(os.path.abspath(os.fspath(value)))
-
-
-def _is_exact_ancestor(ancestor: Path, candidate: Path, label: str) -> bool:
-    ancestor_stamp = _identity_stamp(ancestor, f"{label} ancestor")
-    current = _reject_reparse_alias(candidate, f"{label} candidate")
-    while True:
-        if _identity_stamp(current, f"{label} candidate ancestor") == ancestor_stamp:
-            return True
-        if current == current.parent:
-            return False
-        current = current.parent
-
-
-def _exact_trees_overlap(first: Path, second: Path, label: str) -> bool:
-    return _is_exact_ancestor(first, second, label) or _is_exact_ancestor(second, first, label)
 
 
 def _local_app_data_known_folder() -> Path:
@@ -294,6 +280,7 @@ def _validate_registry(body: object) -> dict[str, object]:
         raise CaseContextError("EVIDENCE_INTEGRITY_FAILURE", "case registry lists are invalid")
     root_ids: set[str] = set()
     root_paths: set[str] = set()
+    root_stamps: set[tuple[int, int]] = set()
     for record in roots:
         if not isinstance(record, dict) or set(record) != {"root_id", "path", "stamp"}:
             raise CaseContextError("EVIDENCE_INTEGRITY_FAILURE", "registered root is invalid")
@@ -312,10 +299,12 @@ def _validate_registry(body: object) -> dict[str, object]:
         ):
             raise CaseContextError("EVIDENCE_INTEGRITY_FAILURE", "registered root is invalid")
         path_key = os.path.normcase(path)
-        if root_id in root_ids or path_key in root_paths:
+        stamp_key = (int(stamp[0]), int(stamp[1]))
+        if root_id in root_ids or path_key in root_paths or stamp_key in root_stamps:
             raise CaseContextError("EVIDENCE_INTEGRITY_FAILURE", "registered root is duplicated")
         root_ids.add(root_id)
         root_paths.add(path_key)
+        root_stamps.add(stamp_key)
     case_ids: set[str] = set()
     for record in cases:
         if not isinstance(record, dict) or set(record) != {
@@ -612,8 +601,10 @@ class CaseContextService:
         root_id = _root_id_for(exact_root, stamp)
         with self._registry() as (registry_root, registry):
             try:
-                if _exact_trees_overlap(exact_root, registry_root, "02_CAE and registry") or (
-                    _exact_trees_overlap(exact_root, self._tool_root, "02_CAE and tool")
+                if _exact_directory_trees_overlap(
+                    exact_root, registry_root, "02_CAE and registry"
+                ) or (
+                    _exact_directory_trees_overlap(exact_root, self._tool_root, "02_CAE and tool")
                 ):
                     raise CaseContextError(
                         "BOUNDARY_OR_IDENTITY_VIOLATION",
@@ -625,6 +616,10 @@ class CaseContextService:
                 ) from error
             roots = self._roots(registry)
             for record in roots:
+                if record["stamp"] == [*stamp]:
+                    existing_root_id = str(record["root_id"])
+                    self._validated_manager(registry, existing_root_id)
+                    return {"root_id": existing_root_id}
                 if os.path.normcase(str(record["path"])) == os.path.normcase(os.fspath(exact_root)):
                     if record["root_id"] != root_id or record["stamp"] != [*stamp]:
                         raise CaseContextError(
@@ -652,50 +647,17 @@ class CaseContextService:
             stamp = _identity_stamp(exact_root, "registered 02_CAE root", expected)
             if _root_id_for(exact_root, stamp) != root_id:
                 raise WorkspaceBoundaryError("registered root identifier does not match")
-            if _exact_trees_overlap(
+            if _exact_directory_trees_overlap(
                 exact_root, self._registry_root, "registered 02_CAE and registry"
-            ) or _exact_trees_overlap(exact_root, self._tool_root, "registered 02_CAE and tool"):
+            ) or _exact_directory_trees_overlap(
+                exact_root, self._tool_root, "registered 02_CAE and tool"
+            ):
                 raise WorkspaceBoundaryError("registered root overlaps a private tree")
             return ValidatedCaseWorkspace(self._tool_root, exact_root)
         except (OSError, ValueError, WorkspaceBoundaryError) as error:
             raise CaseContextError(
                 "BOUNDARY_OR_IDENTITY_VIOLATION", "registered 02_CAE root identity changed"
             ) from error
-
-    def _release_untouched_reservation(
-        self,
-        *,
-        root_id: str,
-        case_id: str,
-        reservation_id: str,
-    ) -> None:
-        with self._registry() as (registry_root, registry):
-            manager = self._validated_manager(registry, root_id)
-            case_path = manager.cae_root / case_id
-            try:
-                checked = _reject_reparse_alias(case_path, "failed case reservation")
-                checked.lstat()
-            except FileNotFoundError:
-                pass
-            except (OSError, WorkspaceBoundaryError):
-                return
-            else:
-                return
-            cases = self._cases(registry)
-            matches = [
-                record
-                for record in cases
-                if record["case_id"] == case_id
-                and record["root_id"] == root_id
-                and record["state"] == "PREPARING"
-                and record["reservation_id"] == reservation_id
-            ]
-            if len(matches) != 1:
-                raise CaseContextError(
-                    "EVIDENCE_INTEGRITY_FAILURE", "case reservation changed during rollback"
-                )
-            cases.remove(matches[0])
-            _write_registry(registry_root, {**registry, "cases": cases})
 
     def create_case(
         self,
@@ -716,76 +678,95 @@ class CaseContextService:
         reservation_id = secrets.token_hex(32)
         with self._registry() as (registry_root, registry):
             manager = self._validated_manager(registry, root_id)
-            if any(
-                str(record["case_id"]).casefold() == case_id.casefold()
-                for record in self._cases(registry)
-            ):
-                raise CaseContextError("REGISTRATION_CONFLICT", "case_id is already reserved")
             cases = self._cases(registry)
-            cases.append(
-                {
-                    "case_id": case_id,
-                    "root_id": root_id,
-                    "state": "PREPARING",
-                    "stamp": [],
-                    "reservation_id": reservation_id,
-                }
-            )
-            _write_registry(registry_root, {**registry, "cases": cases})
-        try:
-            case = manager.create_case(case_id, source_paths)
-            store = EvidenceStore(case, intent)
-            lifecycle = IntentLifecycle(store)
-            result = lifecycle.reconcile()
-            case_stamp = _registered_case_stamp(case)
-        except FileExistsError as error:
-            self._release_untouched_reservation(
-                root_id=root_id, case_id=case_id, reservation_id=reservation_id
-            )
-            raise CaseContextError(
-                "REGISTRATION_CONFLICT", "case directory already exists and cannot be adopted"
-            ) from error
-        except WorkspaceBoundaryError as error:
-            self._release_untouched_reservation(
-                root_id=root_id, case_id=case_id, reservation_id=reservation_id
-            )
-            raise CaseContextError(
-                "BOUNDARY_OR_IDENTITY_VIOLATION", "case creation violated an identity boundary"
-            ) from error
-        except EvidenceIntegrityError as error:
-            self._release_untouched_reservation(
-                root_id=root_id, case_id=case_id, reservation_id=reservation_id
-            )
-            raise CaseContextError(
-                "EVIDENCE_INTEGRITY_FAILURE", "case evidence creation failed"
-            ) from error
-        except (OSError, TypeError, ValueError) as error:
-            self._release_untouched_reservation(
-                root_id=root_id, case_id=case_id, reservation_id=reservation_id
-            )
-            raise CaseContextError("INVALID_INPUT", "case input or intent is invalid") from error
-        with self._registry() as (registry_root, registry):
-            cases = self._cases(registry)
-            reservation = next(
+            existing = next(
                 (
                     record
                     for record in cases
-                    if record["case_id"] == case_id
-                    and record["root_id"] == root_id
-                    and record["state"] == "PREPARING"
-                    and record["reservation_id"] == reservation_id
+                    if str(record["case_id"]).casefold() == case_id.casefold()
                 ),
                 None,
             )
-            if reservation is None:
+            if existing is not None:
+                if (
+                    existing["state"] != "PREPARING"
+                    or existing["case_id"] != case_id
+                    or existing["root_id"] != root_id
+                ):
+                    raise CaseContextError("REGISTRATION_CONFLICT", "case_id is already reserved")
+                stale_path = manager.cae_root / case_id
+                try:
+                    _reject_reparse_alias(stale_path, "interrupted case reservation").lstat()
+                except FileNotFoundError:
+                    cases.remove(existing)
+                    _write_registry(registry_root, {**registry, "cases": cases})
+                except (OSError, WorkspaceBoundaryError):
+                    raise CaseContextError(
+                        "REGISTRATION_CONFLICT", "interrupted case reservation is quarantined"
+                    ) from None
+                else:
+                    raise CaseContextError(
+                        "REGISTRATION_CONFLICT", "interrupted case tree is quarantined"
+                    )
+            reservation: dict[str, object] = {
+                "case_id": case_id,
+                "root_id": root_id,
+                "state": "PREPARING",
+                "stamp": [],
+                "reservation_id": reservation_id,
+            }
+            cases.append(reservation)
+            _write_registry(registry_root, {**registry, "cases": cases})
+            try:
+                case = manager.create_case(case_id, source_paths)
+                store = EvidenceStore(case, intent)
+                lifecycle = IntentLifecycle(store)
+                result = lifecycle.reconcile()
+                case_stamp = _registered_case_stamp(case)
+            except (
+                FileExistsError,
+                WorkspaceBoundaryError,
+                EvidenceIntegrityError,
+                OSError,
+                TypeError,
+                ValueError,
+            ) as error:
+                try:
+                    _reject_reparse_alias(
+                        manager.cae_root / case_id, "failed case reservation"
+                    ).lstat()
+                except FileNotFoundError:
+                    if all(record is not reservation for record in cases):
+                        raise CaseContextError(
+                            "EVIDENCE_INTEGRITY_FAILURE",
+                            "case reservation changed during rollback",
+                        ) from error
+                    cases[:] = [record for record in cases if record is not reservation]
+                    _write_registry(registry_root, {**registry, "cases": cases})
+                except (OSError, WorkspaceBoundaryError):
+                    pass
+                if isinstance(error, FileExistsError):
+                    raise CaseContextError(
+                        "REGISTRATION_CONFLICT",
+                        "case directory already exists and cannot be adopted",
+                    ) from error
+                if isinstance(error, WorkspaceBoundaryError):
+                    raise CaseContextError(
+                        "BOUNDARY_OR_IDENTITY_VIOLATION",
+                        "case creation violated an identity boundary",
+                    ) from error
+                if isinstance(error, EvidenceIntegrityError):
+                    raise CaseContextError(
+                        "EVIDENCE_INTEGRITY_FAILURE", "case evidence creation failed"
+                    ) from error
                 raise CaseContextError(
-                    "EVIDENCE_INTEGRITY_FAILURE", "case reservation changed during creation"
-                )
+                    "INVALID_INPUT", "case input or intent is invalid"
+                ) from error
             reservation["state"] = "ACTIVE"
             reservation["stamp"] = [*case_stamp]
             reservation["reservation_id"] = None
             _write_registry(registry_root, {**registry, "cases": cases})
-        return self._project(root_id, case, store, lifecycle, result)
+            return self._project(root_id, case, store, lifecycle, result)
 
     def _open_store(self, case_id: str) -> tuple[str, CaseWorkspace, EvidenceStore]:
         _validate_case_id(case_id)

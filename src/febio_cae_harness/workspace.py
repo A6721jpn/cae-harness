@@ -124,6 +124,23 @@ def _identity_stamp(
     return stamp
 
 
+def _is_exact_directory_ancestor(ancestor: Path, candidate: Path, label: str) -> bool:
+    ancestor_stamp = _identity_stamp(ancestor, f"{label} ancestor")
+    current = _reject_reparse_alias(candidate, f"{label} candidate")
+    while True:
+        if _identity_stamp(current, f"{label} candidate ancestor") == ancestor_stamp:
+            return True
+        if current == current.parent:
+            return False
+        current = current.parent
+
+
+def _exact_directory_trees_overlap(first: Path, second: Path, label: str) -> bool:
+    return _is_exact_directory_ancestor(first, second, label) or _is_exact_directory_ancestor(
+        second, first, label
+    )
+
+
 def _file_state(metadata: os.stat_result) -> _FileState:
     return (
         int(metadata.st_dev),
@@ -2555,6 +2572,8 @@ class ValidatedCaseWorkspace:
             cae_root.mkdir(parents=True, exist_ok=True)
         except OSError as error:
             raise WorkspaceBoundaryError("cannot create workspace roots") from error
+        if _exact_directory_trees_overlap(tool_root, cae_root, "tool and CAE roots"):
+            raise WorkspaceBoundaryError("tool_root and cae_root must not overlap")
         tool_stamp = _identity_stamp(tool_root, "tool root")
         cae_stamp = _identity_stamp(cae_root, "cae root")
         object.__setattr__(self, "tool_root", tool_root)
