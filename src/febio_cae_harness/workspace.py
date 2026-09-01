@@ -6,6 +6,7 @@ not inspect or infer the physical meaning of any input, model, or result.
 
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import os
 import secrets
@@ -36,6 +37,65 @@ _REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
 
 type _IdentityStamp = tuple[int, int]
 type _FileState = tuple[int, int, int, int, int, int, int]
+
+
+class _WindowsFileTime(ctypes.Structure):
+    _fields_ = [
+        ("dwLowDateTime", ctypes.c_uint32),
+        ("dwHighDateTime", ctypes.c_uint32),
+    ]
+
+
+class _WindowsByHandleFileInformation(ctypes.Structure):
+    _fields_ = [
+        ("dwFileAttributes", ctypes.c_uint32),
+        ("ftCreationTime", _WindowsFileTime),
+        ("ftLastAccessTime", _WindowsFileTime),
+        ("ftLastWriteTime", _WindowsFileTime),
+        ("dwVolumeSerialNumber", ctypes.c_uint32),
+        ("nFileSizeHigh", ctypes.c_uint32),
+        ("nFileSizeLow", ctypes.c_uint32),
+        ("nNumberOfLinks", ctypes.c_uint32),
+        ("nFileIndexHigh", ctypes.c_uint32),
+        ("nFileIndexLow", ctypes.c_uint32),
+    ]
+
+
+class _WindowsUnicodeString(ctypes.Structure):
+    _fields_ = [
+        ("Length", ctypes.c_ushort),
+        ("MaximumLength", ctypes.c_ushort),
+        ("Buffer", ctypes.c_wchar_p),
+    ]
+
+
+class _WindowsObjectAttributes(ctypes.Structure):
+    _fields_ = [
+        ("Length", ctypes.c_ulong),
+        ("RootDirectory", ctypes.c_void_p),
+        ("ObjectName", ctypes.POINTER(_WindowsUnicodeString)),
+        ("Attributes", ctypes.c_ulong),
+        ("SecurityDescriptor", ctypes.c_void_p),
+        ("SecurityQualityOfService", ctypes.c_void_p),
+    ]
+
+
+class _WindowsIoStatusBlock(ctypes.Structure):
+    _fields_ = [("Status", ctypes.c_void_p), ("Information", ctypes.c_size_t)]
+
+
+class _WindowsFileBasicInfo(ctypes.Structure):
+    _fields_ = [
+        ("CreationTime", ctypes.c_int64),
+        ("LastAccessTime", ctypes.c_int64),
+        ("LastWriteTime", ctypes.c_int64),
+        ("ChangeTime", ctypes.c_int64),
+        ("FileAttributes", ctypes.c_uint32),
+    ]
+
+
+class _WindowsFileDispositionInfo(ctypes.Structure):
+    _fields_ = [("DeleteFile", ctypes.c_ubyte)]
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,8 +248,6 @@ def _stream_sha256(stream: BinaryIO) -> str:
 def _windows_create(
     path: Path, access: int, share: int, disposition: int, flags: int, label: str
 ) -> int:
-    import ctypes
-
     create_file = ctypes.WinDLL("kernel32", use_last_error=True).CreateFileW
     create_file.restype = ctypes.c_void_p
     handle = create_file(
@@ -203,8 +261,6 @@ def _windows_create(
 
 def _close_handle(handle: int) -> None:
     if os.name == "nt":
-        import ctypes
-
         close_handle = ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle
         close_handle.argtypes = [ctypes.c_void_p]
         close_handle.restype = ctypes.c_int
@@ -237,17 +293,6 @@ def _set_open_file_mode(descriptor: int, mode: int, label: str) -> None:
             raise WorkspaceBoundaryError(f"cannot set {label} mode") from error
         return
 
-    import ctypes
-
-    class FileBasicInfo(ctypes.Structure):
-        _fields_ = [
-            ("CreationTime", ctypes.c_int64),
-            ("LastAccessTime", ctypes.c_int64),
-            ("LastWriteTime", ctypes.c_int64),
-            ("ChangeTime", ctypes.c_int64),
-            ("FileAttributes", ctypes.c_uint32),
-        ]
-
     native = _windows_descriptor_handle(descriptor)
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     get_information = kernel32.GetFileInformationByHandleEx
@@ -266,7 +311,7 @@ def _set_open_file_mode(descriptor: int, mode: int, label: str) -> None:
         ctypes.c_uint32,
     ]
     set_information.restype = ctypes.c_int
-    information = FileBasicInfo()
+    information = _WindowsFileBasicInfo()
     if not get_information(
         ctypes.c_void_p(native),
         0,
@@ -305,8 +350,6 @@ def _windows_rename_open_file(
     if os.name != "nt":
         raise WorkspaceBoundaryError(f"Windows exact rename is unavailable for {label}")
 
-    import ctypes
-
     if not target_name:
         raise WorkspaceBoundaryError(f"cannot rename {label} to an empty name")
     target_path = target_name
@@ -319,21 +362,18 @@ def _windows_rename_open_file(
             ("FileName", ctypes.c_wchar * (len(target_path) + 1)),
         ]
 
-    class IoStatusBlock(ctypes.Structure):
-        _fields_ = [("Status", ctypes.c_void_p), ("Information", ctypes.c_size_t)]
-
     native = _windows_descriptor_handle(descriptor)
     information = FileRenameInfo()
     information.ReplaceIfExists = int(replace)
     information.RootDirectory = ctypes.c_void_p(parent_handle)
     information.FileNameLength = len(target_path.encode("utf-16-le"))
     information.FileName = target_path
-    status_block = IoStatusBlock()
+    status_block = _WindowsIoStatusBlock()
     ntdll = ctypes.WinDLL("ntdll")
     set_information = ntdll.NtSetInformationFile
     set_information.argtypes = [
         ctypes.c_void_p,
-        ctypes.POINTER(IoStatusBlock),
+        ctypes.POINTER(_WindowsIoStatusBlock),
         ctypes.c_void_p,
         ctypes.c_ulong,
         ctypes.c_int,
@@ -362,11 +402,6 @@ def _delete_open_handle(handle: int, label: str) -> None:
     if os.name != "nt":
         raise WorkspaceBoundaryError(f"handle-bound deletion is unavailable for {label}")
 
-    import ctypes
-
-    class FileDispositionInfo(ctypes.Structure):
-        _fields_ = [("DeleteFile", ctypes.c_ubyte)]
-
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     set_file_information = kernel32.SetFileInformationByHandle
     set_file_information.argtypes = [
@@ -376,7 +411,7 @@ def _delete_open_handle(handle: int, label: str) -> None:
         ctypes.c_uint32,
     ]
     set_file_information.restype = ctypes.c_int
-    disposition = FileDispositionInfo(1)
+    disposition = _WindowsFileDispositionInfo(1)
     if not set_file_information(
         ctypes.c_void_p(handle),
         4,
@@ -465,36 +500,14 @@ def _windows_file_identity(handle: int, label: str) -> tuple[_IdentityStamp, boo
     if os.name != "nt":
         raise WorkspaceBoundaryError(f"Windows file identity is unavailable for {label}")
 
-    import ctypes
-
-    class FileTime(ctypes.Structure):
-        _fields_ = [
-            ("dwLowDateTime", ctypes.c_uint32),
-            ("dwHighDateTime", ctypes.c_uint32),
-        ]
-
-    class ByHandleFileInformation(ctypes.Structure):
-        _fields_ = [
-            ("dwFileAttributes", ctypes.c_uint32),
-            ("ftCreationTime", FileTime),
-            ("ftLastAccessTime", FileTime),
-            ("ftLastWriteTime", FileTime),
-            ("dwVolumeSerialNumber", ctypes.c_uint32),
-            ("nFileSizeHigh", ctypes.c_uint32),
-            ("nFileSizeLow", ctypes.c_uint32),
-            ("nNumberOfLinks", ctypes.c_uint32),
-            ("nFileIndexHigh", ctypes.c_uint32),
-            ("nFileIndexLow", ctypes.c_uint32),
-        ]
-
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     get_file_information = kernel32.GetFileInformationByHandle
     get_file_information.argtypes = [
         ctypes.c_void_p,
-        ctypes.POINTER(ByHandleFileInformation),
+        ctypes.POINTER(_WindowsByHandleFileInformation),
     ]
     get_file_information.restype = ctypes.c_int
-    information = ByHandleFileInformation()
+    information = _WindowsByHandleFileInformation()
     if not get_file_information(ctypes.c_void_p(handle), ctypes.byref(information)):
         error = ctypes.get_last_error()
         raise WorkspaceBoundaryError(f"cannot inspect {label} handle ({error})")
@@ -596,41 +609,20 @@ def _open_exact_file_descriptor(
             mode,
             dir_fd=parent_handle,
         )
-    import ctypes
     import msvcrt
-
-    class UnicodeString(ctypes.Structure):
-        _fields_ = [
-            ("Length", ctypes.c_ushort),
-            ("MaximumLength", ctypes.c_ushort),
-            ("Buffer", ctypes.c_wchar_p),
-        ]
-
-    class ObjectAttributes(ctypes.Structure):
-        _fields_ = [
-            ("Length", ctypes.c_ulong),
-            ("RootDirectory", ctypes.c_void_p),
-            ("ObjectName", ctypes.POINTER(UnicodeString)),
-            ("Attributes", ctypes.c_ulong),
-            ("SecurityDescriptor", ctypes.c_void_p),
-            ("SecurityQualityOfService", ctypes.c_void_p),
-        ]
-
-    class IoStatusBlock(ctypes.Structure):
-        _fields_ = [("Status", ctypes.c_void_p), ("Information", ctypes.c_size_t)]
 
     nt_disposition = {1: 2, 3: 1}.get(disposition)
     if nt_disposition is None:
         raise WorkspaceBoundaryError("unsupported exact file open disposition")
     name_buffer = ctypes.create_unicode_buffer(name)
     encoded_length = len(name.encode("utf-16-le"))
-    unicode_name = UnicodeString(
+    unicode_name = _WindowsUnicodeString(
         encoded_length,
         encoded_length + ctypes.sizeof(ctypes.c_wchar),
         ctypes.cast(name_buffer, ctypes.c_wchar_p),
     )
-    attributes = ObjectAttributes(
-        ctypes.sizeof(ObjectAttributes),
+    attributes = _WindowsObjectAttributes(
+        ctypes.sizeof(_WindowsObjectAttributes),
         ctypes.c_void_p(parent_handle),
         ctypes.pointer(unicode_name),
         0x00000040,
@@ -638,14 +630,14 @@ def _open_exact_file_descriptor(
         None,
     )
     result = ctypes.c_void_p()
-    status_block = IoStatusBlock()
+    status_block = _WindowsIoStatusBlock()
     ntdll = ctypes.WinDLL("ntdll")
     create_file = ntdll.NtCreateFile
     create_file.argtypes = [
         ctypes.POINTER(ctypes.c_void_p),
         ctypes.c_ulong,
-        ctypes.POINTER(ObjectAttributes),
-        ctypes.POINTER(IoStatusBlock),
+        ctypes.POINTER(_WindowsObjectAttributes),
+        ctypes.POINTER(_WindowsIoStatusBlock),
         ctypes.c_void_p,
         ctypes.c_ulong,
         ctypes.c_ulong,
@@ -698,37 +690,15 @@ def _create_exact_directory(
         except OSError:
             raise
 
-    import ctypes
-
-    class UnicodeString(ctypes.Structure):
-        _fields_ = [
-            ("Length", ctypes.c_ushort),
-            ("MaximumLength", ctypes.c_ushort),
-            ("Buffer", ctypes.c_wchar_p),
-        ]
-
-    class ObjectAttributes(ctypes.Structure):
-        _fields_ = [
-            ("Length", ctypes.c_ulong),
-            ("RootDirectory", ctypes.c_void_p),
-            ("ObjectName", ctypes.POINTER(UnicodeString)),
-            ("Attributes", ctypes.c_ulong),
-            ("SecurityDescriptor", ctypes.c_void_p),
-            ("SecurityQualityOfService", ctypes.c_void_p),
-        ]
-
-    class IoStatusBlock(ctypes.Structure):
-        _fields_ = [("Status", ctypes.c_void_p), ("Information", ctypes.c_size_t)]
-
     name_buffer = ctypes.create_unicode_buffer(name)
     encoded_length = len(name.encode("utf-16-le"))
-    unicode_name = UnicodeString(
+    unicode_name = _WindowsUnicodeString(
         encoded_length,
         encoded_length + ctypes.sizeof(ctypes.c_wchar),
         ctypes.cast(name_buffer, ctypes.c_wchar_p),
     )
-    attributes = ObjectAttributes(
-        ctypes.sizeof(ObjectAttributes),
+    attributes = _WindowsObjectAttributes(
+        ctypes.sizeof(_WindowsObjectAttributes),
         ctypes.c_void_p(parent_handle),
         ctypes.pointer(unicode_name),
         0x00000040,
@@ -736,14 +706,14 @@ def _create_exact_directory(
         None,
     )
     result = ctypes.c_void_p()
-    status_block = IoStatusBlock()
+    status_block = _WindowsIoStatusBlock()
     ntdll = ctypes.WinDLL("ntdll")
     create_file = ntdll.NtCreateFile
     create_file.argtypes = [
         ctypes.POINTER(ctypes.c_void_p),
         ctypes.c_ulong,
-        ctypes.POINTER(ObjectAttributes),
-        ctypes.POINTER(IoStatusBlock),
+        ctypes.POINTER(_WindowsObjectAttributes),
+        ctypes.POINTER(_WindowsIoStatusBlock),
         ctypes.c_void_p,
         ctypes.c_ulong,
         ctypes.c_ulong,
@@ -786,37 +756,15 @@ def _open_exact_cleanup_directory(
     if os.name != "nt":
         raise WorkspaceBoundaryError(f"exact directory cleanup is unavailable for {label}")
 
-    import ctypes
-
-    class UnicodeString(ctypes.Structure):
-        _fields_ = [
-            ("Length", ctypes.c_ushort),
-            ("MaximumLength", ctypes.c_ushort),
-            ("Buffer", ctypes.c_wchar_p),
-        ]
-
-    class ObjectAttributes(ctypes.Structure):
-        _fields_ = [
-            ("Length", ctypes.c_ulong),
-            ("RootDirectory", ctypes.c_void_p),
-            ("ObjectName", ctypes.POINTER(UnicodeString)),
-            ("Attributes", ctypes.c_ulong),
-            ("SecurityDescriptor", ctypes.c_void_p),
-            ("SecurityQualityOfService", ctypes.c_void_p),
-        ]
-
-    class IoStatusBlock(ctypes.Structure):
-        _fields_ = [("Status", ctypes.c_void_p), ("Information", ctypes.c_size_t)]
-
     name_buffer = ctypes.create_unicode_buffer(name)
     encoded_length = len(name.encode("utf-16-le"))
-    unicode_name = UnicodeString(
+    unicode_name = _WindowsUnicodeString(
         encoded_length,
         encoded_length + ctypes.sizeof(ctypes.c_wchar),
         ctypes.cast(name_buffer, ctypes.c_wchar_p),
     )
-    attributes = ObjectAttributes(
-        ctypes.sizeof(ObjectAttributes),
+    attributes = _WindowsObjectAttributes(
+        ctypes.sizeof(_WindowsObjectAttributes),
         ctypes.c_void_p(parent_handle),
         ctypes.pointer(unicode_name),
         0x00000040,
@@ -824,14 +772,14 @@ def _open_exact_cleanup_directory(
         None,
     )
     result = ctypes.c_void_p()
-    status_block = IoStatusBlock()
+    status_block = _WindowsIoStatusBlock()
     ntdll = ctypes.WinDLL("ntdll")
     open_file = ntdll.NtOpenFile
     open_file.argtypes = [
         ctypes.POINTER(ctypes.c_void_p),
         ctypes.c_ulong,
-        ctypes.POINTER(ObjectAttributes),
-        ctypes.POINTER(IoStatusBlock),
+        ctypes.POINTER(_WindowsObjectAttributes),
+        ctypes.POINTER(_WindowsIoStatusBlock),
         ctypes.c_ulong,
         ctypes.c_ulong,
     ]

@@ -1781,6 +1781,36 @@ def test_atomic_replace_never_mutates_a_substituted_foreign_hard_link(
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires Windows handle-relative rename")
+def test_windows_exact_file_primitives_reuse_ctypes_declarations(tmp_path: Path) -> None:
+    source = tmp_path / "source.txt"
+    source.write_bytes(b"source")
+    parent_handle = workspace_module._open_directory(tmp_path, "exact parent")
+    pointer_cache = cast(dict[object, object], vars(ctypes)["_pointer_type_cache"])
+
+    def inspect_once() -> None:
+        workspace_module._windows_file_identity(parent_handle, "exact parent")
+        descriptor = workspace_module._open_exact_file_descriptor(
+            parent_handle,
+            tmp_path,
+            source.name,
+            flags=os.O_RDONLY,
+            access=0x80000000,
+            share=0x0001 | 0x0002,
+            disposition=3,
+        )
+        os.close(descriptor)
+
+    try:
+        inspect_once()
+        baseline = len(pointer_cache)
+        for _ in range(32):
+            inspect_once()
+        assert len(pointer_cache) == baseline
+    finally:
+        workspace_module._close_handle(parent_handle)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows handle-relative rename")
 def test_windows_exact_rename_is_rooted_in_held_parent_not_foreign_path(tmp_path: Path) -> None:
     owned_parent = tmp_path / "owned"
     foreign_parent = tmp_path / "foreign"
