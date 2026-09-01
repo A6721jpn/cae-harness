@@ -2686,6 +2686,49 @@ class _CleanupFailureAuthority(_OrderingAuthority):
         raise ProcessAuthorityError("synthetic close failure")
 
 
+def test_normal_exit_drain_failure_precedes_validation_and_cannot_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    validator = supervisor_module.LogValidator()
+    original_validate = validator.validate
+
+    def track_validation(path: str | Path) -> supervisor_module.LogValidation:
+        events.append("validate")
+        return original_validate(path)
+
+    monkeypatch.setattr(validator, "validate", track_validation)
+    supervisor = SolverSupervisor(
+        _capability(tmp_path, monkeypatch, code="pass"),
+        log_validator=validator,
+    ).start()
+    authority = supervisor._process_authority
+    assert authority is not None
+    original_drain = authority.drain
+    drain_attempts = 0
+
+    def fail_first_drain() -> None:
+        nonlocal drain_attempts
+        drain_attempts += 1
+        events.append(f"drain:{drain_attempts}")
+        if drain_attempts == 1:
+            raise ProcessAuthorityError("synthetic early drain failure")
+        original_drain()
+
+    monkeypatch.setattr(authority, "drain", fail_first_drain)
+
+    with pytest.raises(SolverOwnershipError, match="drain|terminal cleanup"):
+        supervisor.wait(timeout_seconds=5)
+
+    assert events == ["drain:1", "drain:2"]
+    assert supervisor.state is SolverState.FAILED
+    assert supervisor._result is None
+    assert supervisor._result_latch is None
+    assert supervisor._process is None
+    assert supervisor._process_authority is None
+
+
 def test_windows_persists_bound_record_before_resume(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
