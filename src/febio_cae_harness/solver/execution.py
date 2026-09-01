@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import atexit
 import hashlib
 import json
 import math
 import os
 import stat
+import threading
+import weakref
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,15 +36,19 @@ from .runtime import (
 __all__ = [
     "ExecutionAuthority",
     "ExecutionAuthorityError",
+    "ExecutionOutputsAuthority",
+    "claim_execution_outputs",
     "issue_execution_authority",
     "reopen_execution_authority",
     "validate_execution_authority",
+    "validate_execution_outputs",
 ]
 
 _SCHEMA = "febio-cae-execution"
 _VERSION = 1
 _RECORD_NAME = "execution.json"
 _RECORD_FACTORY = object()
+_OUTPUT_FACTORY = object()
 
 type _FileIdentity = tuple[int, int, int, int, int]
 
@@ -97,13 +104,10 @@ class _AuthorityBinding:
     record_identity: _FileIdentity
 
 
-_AUTHORITY_STATES: dict[int, tuple[ExecutionAuthority, _AuthorityBinding]] = {}
-
-
 class ExecutionAuthority:
     """Opaque, immutable authority for one exact durable ``execution.json``."""
 
-    __slots__ = ("_token",)
+    __slots__ = ("_token", "__weakref__")
 
     def __init__(self, *, _factory: object | None = None) -> None:
         if type(self) is not ExecutionAuthority or _factory is not _RECORD_FACTORY:
@@ -199,6 +203,132 @@ class ExecutionAuthority:
     @property
     def expected_final_time(self) -> float | None:
         return _validated_binding(self).data.expected_final_time
+
+
+@dataclass(slots=True)
+class _OutputBinding:
+    token: object
+    execution: ExecutionAuthority
+    exact: _ExactCaseTransaction
+    log_owner: _ExactOwner
+    log_parts: tuple[str, ...]
+    log_path: Path
+    log_state: tuple[int, ...]
+    log_bytes: bytes
+    log_sha256: str
+    xplt_owner: _ExactOwner
+    xplt_parts: tuple[str, ...]
+    xplt_path: Path
+    xplt_state: tuple[int, ...]
+    xplt_bytes: bytes
+    xplt_sha256: str
+    closed: bool = False
+    finalizer: weakref.finalize[[_OutputBinding], ExecutionOutputsAuthority] | None = None
+
+
+class ExecutionOutputsAuthority:
+    """Opaque live claim over the exact derived LOG and XPLT file objects."""
+
+    __slots__ = ("_token", "__weakref__")
+
+    def __init__(self, *, _factory: object | None = None) -> None:
+        if type(self) is not ExecutionOutputsAuthority or _factory is not _OUTPUT_FACTORY:
+            raise TypeError("execution output authorities are issued by the execution module")
+        object.__setattr__(self, "_token", object())
+
+    def __init_subclass__(cls, **kwargs: object) -> NoReturn:
+        del kwargs
+        raise TypeError("execution output authorities cannot be subclassed")
+
+    def __repr__(self) -> str:
+        return "ExecutionOutputsAuthority(<opaque>)"
+
+    __str__ = __repr__
+
+    def __setattr__(self, name: str, value: object) -> NoReturn:
+        del name, value
+        raise AttributeError("execution output authorities are immutable")
+
+    def __delattr__(self, name: str) -> NoReturn:
+        del name
+        raise AttributeError("execution output authorities are immutable")
+
+    def __copy__(self) -> NoReturn:
+        raise TypeError("execution output authorities cannot be copied")
+
+    def __deepcopy__(self, memo: dict[int, object]) -> NoReturn:
+        del memo
+        raise TypeError("execution output authorities cannot be copied")
+
+    def __reduce__(self) -> NoReturn:
+        raise TypeError("execution output authorities cannot be pickled")
+
+    def __reduce_ex__(self, protocol: SupportsIndex) -> NoReturn:
+        del protocol
+        raise TypeError("execution output authorities cannot be pickled")
+
+    def __getstate__(self) -> NoReturn:
+        raise TypeError("execution output authorities cannot be serialized")
+
+    def __enter__(self) -> ExecutionOutputsAuthority:
+        validate_execution_outputs(self)
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: object,
+    ) -> None:
+        del exc_type, exc_value, traceback
+        self.close()
+
+    def close(self) -> None:
+        """Release the held exact objects once; later use fails closed."""
+
+        _close_execution_outputs(self)
+
+    @property
+    def log_path(self) -> Path:
+        return _validated_output_binding(self).log_path
+
+    @property
+    def xplt_path(self) -> Path:
+        return _validated_output_binding(self).xplt_path
+
+    @property
+    def log_bytes(self) -> bytes:
+        return _validated_output_binding(self).log_bytes
+
+    @property
+    def xplt_bytes(self) -> bytes:
+        return _validated_output_binding(self).xplt_bytes
+
+    @property
+    def log_sha256(self) -> str:
+        return _validated_output_binding(self).log_sha256
+
+    @property
+    def xplt_sha256(self) -> str:
+        return _validated_output_binding(self).xplt_sha256
+
+    @property
+    def log_size(self) -> int:
+        return len(_validated_output_binding(self).log_bytes)
+
+    @property
+    def xplt_size(self) -> int:
+        return len(_validated_output_binding(self).xplt_bytes)
+
+
+_AUTHORITY_STATES: weakref.WeakKeyDictionary[ExecutionAuthority, _AuthorityBinding] = (
+    weakref.WeakKeyDictionary()
+)
+_OUTPUT_STATES: weakref.WeakKeyDictionary[ExecutionOutputsAuthority, _OutputBinding] = (
+    weakref.WeakKeyDictionary()
+)
+_OUTPUT_CLEANUP_LOCK = threading.RLock()
+_PENDING_OUTPUT_CLEANUP: list[_ExactCaseTransaction] = []
 
 
 def _canonical_path(path: Path) -> str:
@@ -730,7 +860,7 @@ def _bind_authority(
         record_raw,
         record_identity,
     )
-    _AUTHORITY_STATES[id(authority)] = (authority, binding)
+    _AUTHORITY_STATES[authority] = binding
     return authority
 
 
@@ -818,10 +948,9 @@ def reopen_execution_authority(
 def _binding(value: object) -> _AuthorityBinding:
     if type(value) is not ExecutionAuthority:
         raise ExecutionAuthorityError("value is not an exact issued ExecutionAuthority")
-    state = _AUTHORITY_STATES.get(id(value))
-    if state is None or state[0] is not value:
+    binding = _AUTHORITY_STATES.get(value)
+    if binding is None:
         raise ExecutionAuthorityError("execution authority was not issued")
-    binding = state[1]
     try:
         token = object.__getattribute__(value, "_token")
     except AttributeError as error:
@@ -853,3 +982,268 @@ def validate_execution_authority(value: object) -> ExecutionAuthority:
 
     _validated_binding(value)
     return cast(ExecutionAuthority, value)
+
+
+def _read_claimed_output(
+    exact: _ExactCaseTransaction,
+    parts: tuple[str, ...],
+    owner: _ExactOwner,
+    label: str,
+) -> bytes:
+    owner.validate()
+    exact._verify_file(parts, owner, label)
+    try:
+        os.lseek(owner.handle, 0, os.SEEK_SET)
+        chunks: list[bytes] = []
+        while chunk := os.read(owner.handle, 1024 * 1024):
+            chunks.append(chunk)
+    except OSError as error:
+        raise ExecutionAuthorityError(f"cannot read exact {label} output") from error
+    owner.validate()
+    exact._verify_file(parts, owner, label)
+    return b"".join(chunks)
+
+
+def _open_claimed_output(
+    exact: _ExactCaseTransaction,
+    relative_path: Path,
+    label: str,
+) -> tuple[_ExactOwner, tuple[str, ...], bytes]:
+    parts = exact._parts(relative_path, f"{label} output")
+    parent = exact._directory(parts[:-1])
+    parent_path = exact.root.joinpath(*parts[:-1])
+    metadata = exact._entry_state(parts[:-1], parts[-1], f"{label} output")
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        raise ExecutionAuthorityError(f"{label} output must be a fresh singly-linked regular file")
+    initial = _stable_file_state(metadata)
+    try:
+        descriptor = _open_exact_file_descriptor(
+            parent.handle,
+            parent_path,
+            parts[-1],
+            flags=os.O_RDONLY,
+            access=0x80000000,
+            share=0x0001 | 0x0002 | 0x0004,
+            disposition=3,
+        )
+    except OSError as error:
+        raise ExecutionAuthorityError(f"cannot open exact {label} output") from error
+    owner = _ExactOwner(
+        descriptor,
+        initial,
+        lambda value: _stable_file_state(os.fstat(value)),
+        lambda value: os.close(value),
+        f"{label} output",
+    )
+    exact._owners.append(owner)
+    owner.validate()
+    exact._verify_file(parts, owner, f"{label} output")
+    exact._files[Path(*parts).as_posix()] = owner
+    return owner, parts, _read_claimed_output(exact, parts, owner, label)
+
+
+def _transaction_released(exact: _ExactCaseTransaction) -> bool:
+    return all(owner.released for owner in exact._owners)
+
+
+def _forget_output_cleanup(exact: _ExactCaseTransaction) -> None:
+    with _OUTPUT_CLEANUP_LOCK:
+        _PENDING_OUTPUT_CLEANUP[:] = [
+            pending for pending in _PENDING_OUTPUT_CLEANUP if pending is not exact
+        ]
+
+
+def _retain_output_cleanup(exact: _ExactCaseTransaction) -> None:
+    with _OUTPUT_CLEANUP_LOCK:
+        if _transaction_released(exact):
+            _forget_output_cleanup(exact)
+            return
+        if not any(pending is exact for pending in _PENDING_OUTPUT_CLEANUP):
+            _PENDING_OUTPUT_CLEANUP.append(exact)
+
+
+def _release_output_transaction(exact: _ExactCaseTransaction) -> None:
+    try:
+        exact.close()
+    except BaseException:
+        if _transaction_released(exact):
+            _forget_output_cleanup(exact)
+        else:
+            _retain_output_cleanup(exact)
+        raise
+    _forget_output_cleanup(exact)
+
+
+def _close_failed_output_transaction(
+    exact: _ExactCaseTransaction,
+    primary: BaseException,
+) -> None:
+    try:
+        _release_output_transaction(exact)
+    except BaseException as cleanup:
+        primary.add_note(f"execution output claim cleanup failed: {cleanup}")
+
+
+def _drain_pending_output_cleanup() -> None:
+    with _OUTPUT_CLEANUP_LOCK:
+        pending = tuple(_PENDING_OUTPUT_CLEANUP)
+        _PENDING_OUTPUT_CLEANUP.clear()
+    for exact in pending:
+        try:
+            _release_output_transaction(exact)
+        except BaseException:
+            continue
+
+
+atexit.register(_drain_pending_output_cleanup)
+
+
+def _output_binding(
+    value: object,
+    *,
+    allow_closed: bool = False,
+) -> _OutputBinding:
+    if type(value) is not ExecutionOutputsAuthority:
+        raise ExecutionAuthorityError("value is not an exact issued ExecutionOutputsAuthority")
+    binding = _OUTPUT_STATES.get(value)
+    if binding is None:
+        raise ExecutionAuthorityError("execution output authority was not issued")
+    try:
+        token = object.__getattribute__(value, "_token")
+    except AttributeError as error:
+        raise ExecutionAuthorityError("execution output authority state is invalid") from error
+    if token is not binding.token:
+        raise ExecutionAuthorityError("execution output authority binding was modified")
+    if binding.closed and not allow_closed:
+        raise ExecutionAuthorityError("execution output authority is closed and released")
+    return binding
+
+
+def _validated_output_binding(value: object) -> _OutputBinding:
+    binding = _output_binding(value)
+    try:
+        _validated_binding(binding.execution)
+        binding.exact.validate()
+        if binding.log_owner.expected != binding.log_state:
+            raise ExecutionAuthorityError("LOG output held state changed")
+        log_bytes = _read_claimed_output(
+            binding.exact,
+            binding.log_parts,
+            binding.log_owner,
+            "LOG",
+        )
+        if (
+            log_bytes != binding.log_bytes
+            or hashlib.sha256(log_bytes).hexdigest() != binding.log_sha256
+        ):
+            raise ExecutionAuthorityError("LOG output bytes or digest changed")
+        if binding.xplt_owner.expected != binding.xplt_state:
+            raise ExecutionAuthorityError("XPLT output held state changed")
+        xplt_bytes = _read_claimed_output(
+            binding.exact,
+            binding.xplt_parts,
+            binding.xplt_owner,
+            "XPLT",
+        )
+        if (
+            xplt_bytes != binding.xplt_bytes
+            or hashlib.sha256(xplt_bytes).hexdigest() != binding.xplt_sha256
+        ):
+            raise ExecutionAuthorityError("XPLT output bytes or digest changed")
+        binding.exact.validate()
+    except ExecutionAuthorityError:
+        raise
+    except (OSError, WorkspaceBoundaryError) as error:
+        raise ExecutionAuthorityError("execution output exact identity or state changed") from error
+    return binding
+
+
+def _finalize_output_binding(binding: _OutputBinding) -> None:
+    binding.closed = True
+    try:
+        _release_output_transaction(binding.exact)
+    except BaseException:
+        return
+
+
+def _close_execution_outputs(value: object) -> None:
+    binding = _output_binding(value, allow_closed=True)
+    binding.closed = True
+    try:
+        _release_output_transaction(binding.exact)
+    except BaseException as error:
+        if _transaction_released(binding.exact) and binding.finalizer is not None:
+            binding.finalizer.detach()
+        raise ExecutionAuthorityError(
+            "execution output cleanup failed; exact ownership was retained or released safely"
+        ) from error
+    if binding.finalizer is not None:
+        binding.finalizer.detach()
+
+
+def claim_execution_outputs(
+    execution_authority: ExecutionAuthority,
+) -> ExecutionOutputsAuthority:
+    """Claim the exact derived LOG and XPLT objects bound by one execution."""
+
+    execution_binding = _validated_binding(execution_authority)
+    context = _validate_live_context(
+        execution_binding.attempt,
+        execution_binding.intent,
+        execution_binding.runtime,
+    )
+    log_relative = context.attempt_relative / Path(execution_binding.data.log_relative)
+    xplt_relative = context.attempt_relative / Path(execution_binding.data.xplt_relative)
+    exact = context.case._exact_transaction()
+    try:
+        exact.__enter__()
+        _exact_attempt(exact, context)
+        log_owner, log_parts, log_bytes = _open_claimed_output(exact, log_relative, "LOG")
+        xplt_owner, xplt_parts, xplt_bytes = _open_claimed_output(
+            exact,
+            xplt_relative,
+            "XPLT",
+        )
+        exact.validate()
+        if _validated_binding(execution_authority) is not execution_binding:
+            raise ExecutionAuthorityError("execution authority binding changed during claim")
+        if _read_claimed_output(exact, log_parts, log_owner, "LOG") != log_bytes:
+            raise ExecutionAuthorityError("LOG output changed during claim")
+        if _read_claimed_output(exact, xplt_parts, xplt_owner, "XPLT") != xplt_bytes:
+            raise ExecutionAuthorityError("XPLT output changed during claim")
+        exact.validate()
+        authority = ExecutionOutputsAuthority(_factory=_OUTPUT_FACTORY)
+        binding = _OutputBinding(
+            object.__getattribute__(authority, "_token"),
+            execution_authority,
+            exact,
+            log_owner,
+            log_parts,
+            context.attempt_root / Path(execution_binding.data.log_relative),
+            tuple(log_owner.expected),
+            log_bytes,
+            hashlib.sha256(log_bytes).hexdigest(),
+            xplt_owner,
+            xplt_parts,
+            context.attempt_root / Path(execution_binding.data.xplt_relative),
+            tuple(xplt_owner.expected),
+            xplt_bytes,
+            hashlib.sha256(xplt_bytes).hexdigest(),
+        )
+        binding.finalizer = weakref.finalize(authority, _finalize_output_binding, binding)
+        _OUTPUT_STATES[authority] = binding
+        return authority
+    except BaseException as primary:
+        _close_failed_output_transaction(exact, primary)
+        if isinstance(primary, ExecutionAuthorityError):
+            raise
+        if isinstance(primary, (OSError, WorkspaceBoundaryError)):
+            raise ExecutionAuthorityError("cannot claim exact execution outputs") from primary
+        raise
+
+
+def validate_execution_outputs(value: object) -> ExecutionOutputsAuthority:
+    """Fail closed unless both claimed output paths still name the held objects."""
+
+    _validated_output_binding(value)
+    return cast(ExecutionOutputsAuthority, value)
