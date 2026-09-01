@@ -429,6 +429,69 @@ def test_answer_rejects_stale_issued_question_after_revision_without_append(tmp_
     assert store.events_path.read_bytes() == before
 
 
+def test_answer_rejects_issued_question_when_external_revision_changes_blocker(
+    tmp_path: Path,
+) -> None:
+    module = _lifecycle_module()
+    contact = {
+        "authoritative": True,
+        "condition": "contact",
+        "current": True,
+        "source": "synthetic-user",
+    }
+    material = {
+        "authoritative": True,
+        "condition": "material",
+        "current": True,
+        "source": "synthetic-user",
+    }
+    _, case, store = _make_store(
+        tmp_path,
+        _complete_intent(
+            contact=None,
+            material=None,
+            unresolved=(contact, material),
+        ),
+    )
+    lifecycle = module.IntentLifecycle(store)
+    initial = lifecycle.reconcile()
+    stale_question = initial.question
+    assert stale_question is not None
+    assert stale_question.condition == "contact"
+
+    external_store = EvidenceStore.open(case)
+    external_snapshot = external_store.issue_intent_snapshot()
+    external_store.revise_intent(
+        _complete_intent(
+            contact={"mode": "externally-resolved-contact"},
+            material=None,
+            unresolved=(material,),
+            state=IntentState.ASK_AND_BLOCK,
+        ),
+        expected_snapshot=external_snapshot,
+    )
+    current = external_store.issue_intent_snapshot()
+    assert current.intent.material is None
+    assert current.intent.contact == {"mode": "externally-resolved-contact"}
+    before = {
+        path: path.read_bytes()
+        for path in (store.events_path, store.intent_path, store.manifest_path)
+    }
+
+    with pytest.raises(EvidenceIntegrityError, match="question|current|changed"):
+        lifecycle.answer(
+            stale_question,
+            {"name": "value-for-stale-contact-question"},
+            "synthetic-user",
+        )
+
+    assert all(path.read_bytes() == content for path, content in before.items())
+    unchanged = EvidenceStore.open(case).issue_intent_snapshot().intent
+    assert unchanged.material is None
+    assert unchanged.contact == {"mode": "externally-resolved-contact"}
+    assert unchanged.state is IntentState.ASK_AND_BLOCK
+
+
 def test_unicode_casefold_alias_cannot_select_canonical_intent_field_without_append(
     tmp_path: Path,
 ) -> None:
