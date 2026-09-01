@@ -16,7 +16,7 @@ from copy import copy, deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -373,7 +373,7 @@ def test_issue_detects_input_change_during_record_construction_and_leaves_no_rec
 
     def mutate_during_build(value: object) -> bytes:
         nonlocal changed
-        encoded = original(value)
+        encoded = cast(bytes, original(value))
         if not changed and isinstance(value, dict) and value.get("schema") == "febio-cae-execution":
             changed = True
             context.input_path.write_bytes(b"concurrent replacement bytes")
@@ -611,9 +611,7 @@ def test_execution_authority_is_opaque_immutable_noncopyable_and_nonserializable
     with pytest.raises(TypeError):
         json.dumps(authority)
     with pytest.raises(TypeError):
-
-        class Forged(module.ExecutionAuthority):
-            pass
+        type("ForgedExecutionAuthority", (module.ExecutionAuthority,), {})
 
 
 def test_record_replacement_with_identical_bytes_invalidates_issued_authority(
