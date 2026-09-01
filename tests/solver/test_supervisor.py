@@ -796,7 +796,7 @@ def test_windows_active_finalizer_closes_only_own_process_authority_and_reconnec
     if os.name != "nt":
         pytest.fail("required Windows active finalizer test executed on a non-Windows host")
 
-    capability = _capability(tmp_path, monkeypatch, code="import time; time.sleep(30)")
+    capability = _capability(tmp_path, monkeypatch, code="import time; time.sleep(300)")
     supervisor = SolverSupervisor(capability)
     supervisor.start()
     process = cast(subprocess.Popen[bytes], supervisor._process)
