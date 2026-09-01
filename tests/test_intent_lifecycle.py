@@ -14,7 +14,6 @@ from febio_cae_harness.contracts import IntentContract, IntentState
 from febio_cae_harness.evidence import EvidenceIntegrityError, EvidenceStore
 from febio_cae_harness.workspace import CaseWorkspace, ValidatedCaseWorkspace
 
-
 _QUESTION_HASH_FIELDS = (
     "schema",
     "case_id",
@@ -99,7 +98,7 @@ def _fresh_process_question(
         workspace = ValidatedCaseWorkspace(Path(tool_root), Path(cae_root))
         store = EvidenceStore.open(workspace.open_case(case_id))
         module = _lifecycle_module()
-        lifecycle = getattr(module, "IntentLifecycle")(store)
+        lifecycle = module.IntentLifecycle(store)
         result = lifecycle.reconcile()
         question = result.question
         results.put(("ok", None if question is None else question.to_dict()))
@@ -116,7 +115,7 @@ def test_reconcile_persists_gathering_for_incomplete_intent_without_question(
         IntentContract(state=IntentState.BOUND),
     )
 
-    result = getattr(module, "IntentLifecycle")(store).reconcile()
+    result = module.IntentLifecycle(store).reconcile()
 
     assert result.state is IntentState.GATHERING
     assert result.authority.current is IntentState.GATHERING
@@ -131,7 +130,7 @@ def test_reconcile_persists_bound_only_for_complete_current_authority(tmp_path: 
     module = _lifecycle_module()
     _, case, store = _make_store(tmp_path, _complete_intent())
 
-    result = getattr(module, "IntentLifecycle")(store).reconcile()
+    result = module.IntentLifecycle(store).reconcile()
 
     assert result.state is IntentState.BOUND
     assert result.snapshot.intent.state is IntentState.BOUND
@@ -157,7 +156,7 @@ def test_authoritative_unresolved_question_is_durable_deterministic_and_fresh_pr
         tmp_path,
         _complete_intent(contact=None, unresolved=unresolved),
     )
-    lifecycle = getattr(module, "IntentLifecycle")(store)
+    lifecycle = module.IntentLifecycle(store)
 
     result = lifecycle.reconcile()
 
@@ -183,7 +182,7 @@ def test_authoritative_unresolved_question_is_durable_deterministic_and_fresh_pr
     assert "authoritative" in question.prompt.casefold()
     assert "contact" in question.prompt
 
-    reopened = getattr(module, "IntentLifecycle")(EvidenceStore.open(case)).reconcile()
+    reopened = module.IntentLifecycle(EvidenceStore.open(case)).reconcile()
     assert reopened.question is not None
     assert reopened.question.to_dict() == projection
 
@@ -230,7 +229,7 @@ def test_answer_is_event_backed_reconciled_and_advances_to_the_next_blocker(
         tmp_path,
         _complete_intent(contact=None, material=None, unresolved=unresolved),
     )
-    lifecycle = getattr(module, "IntentLifecycle")(store)
+    lifecycle = module.IntentLifecycle(store)
     first = lifecycle.reconcile()
     assert first.question is not None
     assert first.question.condition == "contact"
@@ -283,7 +282,7 @@ def test_answer_rejects_stale_foreign_fabricated_unknown_and_invalid_inputs_with
     tmp_path: Path,
 ) -> None:
     module = _lifecycle_module()
-    lifecycle_type = getattr(module, "IntentLifecycle")
+    lifecycle_type = module.IntentLifecycle
     blocker = (
         {
             "authoritative": True,
@@ -337,7 +336,9 @@ def test_answer_rejects_stale_foreign_fabricated_unknown_and_invalid_inputs_with
             "source": "synthetic-user",
         },
     )
-    unknown_sources = dict(_complete_intent().to_dict()["condition_sources"])
+    source_projection = _complete_intent().to_dict()["condition_sources"]
+    assert isinstance(source_projection, dict)
+    unknown_sources = dict(source_projection)
     unknown_sources["not_a_contract_field"] = {
         "authoritative": True,
         "current": True,

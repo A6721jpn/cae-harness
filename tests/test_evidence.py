@@ -489,6 +489,7 @@ def test_revise_intent_expected_snapshot_cas_allows_one_cross_store_race_winner(
 
     def revise(store: EvidenceStore, candidate: IntentContract) -> None:
         barrier.wait(timeout=5)
+        result: tuple[str, object]
         try:
             event = store.revise_intent(candidate, expected_snapshot=expected_snapshot)
         except BaseException as error:  # pragma: no cover - assertions inspect it
