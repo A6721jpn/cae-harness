@@ -240,7 +240,7 @@ def test_answer_is_event_backed_reconciled_and_advances_to_the_next_blocker(
     assert first.question.condition == "contact"
 
     after_contact = lifecycle.answer(
-        first.question.question_id,
+        first.question,
         {"mode": "explicit-synthetic-contact"},
         "synthetic-user",
         detail="Explicit synthetic answer.",
@@ -260,7 +260,7 @@ def test_answer_is_event_backed_reconciled_and_advances_to_the_next_blocker(
     assert [record["condition"] for record in answer_intent["unresolved"]] == ["material"]
 
     after_material = lifecycle.answer(
-        after_contact.question.question_id,
+        after_contact.question,
         {"name": "explicit-synthetic-material"},
         "synthetic-user",
     )
@@ -324,18 +324,18 @@ def test_answer_rejects_stale_foreign_fabricated_unknown_and_invalid_inputs_with
         assert store.events_path.read_bytes() == before
     for value, source in ((None, "synthetic-user"), (object(), "synthetic-user"), ("x", "")):
         with pytest.raises((TypeError, ValueError, EvidenceIntegrityError)):
-            lifecycle.answer(current.question.question_id, value, source)
+            lifecycle.answer(current.question, value, source)
         assert store.events_path.read_bytes() == before
 
     advanced = lifecycle.answer(
-        current.question.question_id,
+        current.question,
         "explicit-synthetic-contact",
         "synthetic-user",
     )
     assert advanced.state is IntentState.BOUND
     after_advance = store.events_path.read_bytes()
     with pytest.raises(EvidenceIntegrityError):
-        lifecycle.answer(current.question.question_id, "stale", "synthetic-user")
+        lifecycle.answer(current.question, "stale", "synthetic-user")
     assert store.events_path.read_bytes() == after_advance
 
     unknown = (
@@ -364,8 +364,74 @@ def test_answer_rejects_stale_foreign_fabricated_unknown_and_invalid_inputs_with
     unknown_before = unknown_store.events_path.read_bytes()
     with pytest.raises(EvidenceIntegrityError):
         unknown_lifecycle.answer(
-            unknown_result.question.question_id,
+            unknown_result.question,
             "explicit",
             "synthetic-user",
         )
     assert unknown_store.events_path.read_bytes() == unknown_before
+
+
+def _single_blocker(tmp_path: Path, *, case_id: str = "case-a", **intent_overrides: object) -> tuple[Any, EvidenceStore, Any]:
+    module = _lifecycle_module()
+    blocker = ({"authoritative": True, "condition": "contact", "current": True, "source": "synthetic-user"},)
+    values = {"contact": None, "unresolved": blocker}
+    values.update(intent_overrides)
+    _, _, store = _make_store(tmp_path, _complete_intent(**values), case_id=case_id)
+    lifecycle = module.IntentLifecycle(store)
+    result = lifecycle.reconcile()
+    assert result.question is not None
+    return lifecycle, store, result.question
+
+
+def test_answer_rejects_bare_computed_current_question_id_without_append(tmp_path: Path) -> None:
+    lifecycle, store, question = _single_blocker(tmp_path)
+    before = store.events_path.read_bytes()
+    with pytest.raises(EvidenceIntegrityError):
+        lifecycle.answer(question.question_id, "x", "synthetic-user")
+    assert store.events_path.read_bytes() == before
+
+
+def test_answer_rejects_fabricated_question_object_without_append(tmp_path: Path) -> None:
+    lifecycle, store, question = _single_blocker(tmp_path)
+    fabricated = object.__new__(type(question))
+    before = store.events_path.read_bytes()
+    with pytest.raises(EvidenceIntegrityError):
+        lifecycle.answer(fabricated, "x", "synthetic-user")
+    assert store.events_path.read_bytes() == before
+
+
+def test_answer_rejects_question_from_same_labels_different_case_root_without_append(tmp_path: Path) -> None:
+    lifecycle, store, _ = _single_blocker(tmp_path / "a", case_id="Case-A")
+    _, _, other_question = _single_blocker(tmp_path / "b", case_id="case-a")
+    before = store.events_path.read_bytes()
+    with pytest.raises(EvidenceIntegrityError):
+        lifecycle.answer(other_question, "x", "synthetic-user")
+    assert store.events_path.read_bytes() == before
+
+
+def test_answer_rejects_stale_issued_question_after_revision_without_append(tmp_path: Path) -> None:
+    lifecycle, store, question = _single_blocker(tmp_path)
+    lifecycle.reconcile()
+    before = store.events_path.read_bytes()
+    with pytest.raises(EvidenceIntegrityError):
+        lifecycle.answer(question, "x", "synthetic-user")
+    assert store.events_path.read_bytes() == before
+
+
+def test_unicode_casefold_alias_cannot_select_canonical_intent_field_without_append(tmp_path: Path) -> None:
+    lifecycle, store, question = _single_blocker(tmp_path)
+    before = store.events_path.read_bytes()
+    with pytest.raises(EvidenceIntegrityError):
+        lifecycle.answer(question, "x", "synthetic-user", detail="İCONTACT")
+    assert store.events_path.read_bytes() == before
+
+
+def test_answer_removes_nested_mapping_blocker_and_advances(tmp_path: Path) -> None:
+    lifecycle, store, question = _single_blocker(
+        tmp_path,
+        contact={"mode": "old"},
+        unresolved={"contact": {"condition": "contact", "name": "mode", "field": "mode"}},
+    )
+    result = lifecycle.answer(question, {"mode": "new"}, "synthetic-user")
+    assert result.state is IntentState.BOUND
+    assert result.snapshot.intent.to_dict()["unresolved"] == []
