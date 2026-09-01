@@ -498,6 +498,9 @@ def test_answer_removes_nested_blocker_under_nonmatching_mapping_key(tmp_path: P
     question = initial.question
     assert question is not None
     assert question.condition == "contact"
+    initial_unresolved = initial.snapshot.intent.to_dict()["unresolved"]
+    assert isinstance(initial_unresolved, dict)
+    expected_remaining = [(key, item) for key, item in initial_unresolved.items() if key != "slot"]
 
     result = lifecycle.answer(question, {"mode": "new"}, "synthetic-user")
 
@@ -505,7 +508,8 @@ def test_answer_removes_nested_blocker_under_nonmatching_mapping_key(tmp_path: P
     assert result.question is None
     remaining = result.snapshot.intent.to_dict()["unresolved"]
     assert isinstance(remaining, dict)
-    assert list(remaining.items()) == list(preserved.items())
+    assert "slot" not in remaining
+    assert list(remaining.items()) == expected_remaining
     reconciled = lifecycle.reconcile()
     assert reconciled.state is IntentState.BOUND
     assert reconciled.question is None
