@@ -7,6 +7,8 @@ identities, and then delegates evidence changes to the existing authority owners
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import json
 import os
@@ -44,6 +46,7 @@ _CASE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 _REGISTRY_THREAD_LOCK = threading.RLock()
 _TEST_FACTORY = object()
+_DPAPI_ENTROPY = b"FEBioCaeWorkbench/case-registry-v1/root-authority"
 
 
 class CaseContextError(RuntimeError):
@@ -83,13 +86,123 @@ def _digest(value: object) -> str:
     return hashlib.sha256(_canonical_bytes(value)).hexdigest()
 
 
-def _root_id_for(path: Path, stamp: tuple[int, int]) -> str:
-    projection = {
+def _root_projection(path: Path, stamp: tuple[int, int]) -> dict[str, object]:
+    return {
         "schema_version": _REGISTRY_SCHEMA,
         "path": os.path.normcase(os.fspath(path)),
         "stamp": [stamp[0], stamp[1]],
     }
-    return _ROOT_PREFIX + _digest(projection)
+
+
+def _root_id_for(path: Path, stamp: tuple[int, int]) -> str:
+    return _ROOT_PREFIX + _digest(_root_projection(path, stamp))
+
+
+def _windows_dpapi(data: bytes, *, protect: bool) -> bytes:
+    if os.name != "nt":
+        raise CaseContextError(
+            "REGISTRY_AUTHORITY_REQUIRED", "Windows root authority sealing is unavailable"
+        )
+    import ctypes
+
+    class DataBlob(ctypes.Structure):
+        _fields_ = [
+            ("size", ctypes.c_uint32),
+            ("data", ctypes.POINTER(ctypes.c_ubyte)),
+        ]
+
+    def blob(value: bytes) -> tuple[object, DataBlob]:
+        buffer = (ctypes.c_ubyte * len(value)).from_buffer_copy(value)
+        return buffer, DataBlob(len(value), ctypes.cast(buffer, ctypes.POINTER(ctypes.c_ubyte)))
+
+    _input_buffer, input_blob = blob(data)
+    _entropy_buffer, entropy_blob = blob(_DPAPI_ENTROPY)
+    output_blob = DataBlob()
+    crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
+    if protect:
+        protect_data = crypt32.CryptProtectData
+        protect_data.argtypes = [
+            ctypes.POINTER(DataBlob),
+            ctypes.c_wchar_p,
+            ctypes.POINTER(DataBlob),
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.POINTER(DataBlob),
+        ]
+        protect_data.restype = ctypes.c_int
+        succeeded = protect_data(
+            ctypes.byref(input_blob),
+            "FEBio CAE registered root authority",
+            ctypes.byref(entropy_blob),
+            None,
+            None,
+            1,
+            ctypes.byref(output_blob),
+        )
+    else:
+        unprotect_data = crypt32.CryptUnprotectData
+        unprotect_data.argtypes = [
+            ctypes.POINTER(DataBlob),
+            ctypes.c_void_p,
+            ctypes.POINTER(DataBlob),
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.POINTER(DataBlob),
+        ]
+        unprotect_data.restype = ctypes.c_int
+        succeeded = unprotect_data(
+            ctypes.byref(input_blob),
+            None,
+            ctypes.byref(entropy_blob),
+            None,
+            None,
+            1,
+            ctypes.byref(output_blob),
+        )
+    if not succeeded:
+        code = "REGISTRY_AUTHORITY_REQUIRED" if protect else "EVIDENCE_INTEGRITY_FAILURE"
+        message = (
+            "cannot seal registered root authority"
+            if protect
+            else "registered root authority seal is invalid"
+        )
+        raise CaseContextError(code, message)
+    try:
+        return bytes(ctypes.string_at(output_blob.data, output_blob.size))
+    finally:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+        kernel32.LocalFree.restype = ctypes.c_void_p
+        kernel32.LocalFree(ctypes.cast(output_blob.data, ctypes.c_void_p))
+
+
+def _seal_root_projection(projection: object) -> str:
+    sealed = _windows_dpapi(_canonical_bytes(projection), protect=True)
+    return base64.b64encode(sealed).decode("ascii")
+
+
+def _decode_root_seal(value: object) -> bytes:
+    if not isinstance(value, str) or not value or len(value) > 16_384:
+        raise CaseContextError("EVIDENCE_INTEGRITY_FAILURE", "registered root seal is invalid")
+    try:
+        sealed = base64.b64decode(value, validate=True)
+    except (ValueError, binascii.Error) as error:
+        raise CaseContextError(
+            "EVIDENCE_INTEGRITY_FAILURE", "registered root seal is invalid"
+        ) from error
+    if not sealed:
+        raise CaseContextError("EVIDENCE_INTEGRITY_FAILURE", "registered root seal is invalid")
+    return sealed
+
+
+def _verify_root_seal(value: object, projection: object) -> None:
+    unsealed = _windows_dpapi(_decode_root_seal(value), protect=False)
+    if not secrets.compare_digest(unsealed, _canonical_bytes(projection)):
+        raise CaseContextError(
+            "EVIDENCE_INTEGRITY_FAILURE", "registered root authority does not match"
+        )
 
 
 def _validate_case_id(value: str) -> str:
@@ -282,11 +395,17 @@ def _validate_registry(body: object) -> dict[str, object]:
     root_paths: set[str] = set()
     root_stamps: set[tuple[int, int]] = set()
     for record in roots:
-        if not isinstance(record, dict) or set(record) != {"root_id", "path", "stamp"}:
+        if not isinstance(record, dict) or set(record) != {
+            "root_id",
+            "path",
+            "stamp",
+            "seal",
+        }:
             raise CaseContextError("EVIDENCE_INTEGRITY_FAILURE", "registered root is invalid")
         root_id = record["root_id"]
         path = record["path"]
         stamp = record["stamp"]
+        seal = record["seal"]
         if (
             not isinstance(root_id, str)
             or not root_id.startswith(_ROOT_PREFIX)
@@ -298,6 +417,7 @@ def _validate_registry(body: object) -> dict[str, object]:
             or any(type(part) is not int or part < 0 for part in stamp)
         ):
             raise CaseContextError("EVIDENCE_INTEGRITY_FAILURE", "registered root is invalid")
+        _decode_root_seal(seal)
         path_key = os.path.normcase(path)
         stamp_key = (int(stamp[0]), int(stamp[1]))
         if root_id in root_ids or path_key in root_paths or stamp_key in root_stamps:
@@ -626,7 +746,14 @@ class CaseContextService:
                             "REGISTRATION_CONFLICT", "registered 02_CAE identity changed"
                         )
                     return {"root_id": root_id}
-            roots.append({"root_id": root_id, "path": os.fspath(exact_root), "stamp": [*stamp]})
+            roots.append(
+                {
+                    "root_id": root_id,
+                    "path": os.fspath(exact_root),
+                    "stamp": [*stamp],
+                    "seal": _seal_root_projection(_root_projection(exact_root, stamp)),
+                }
+            )
             updated = {**registry, "roots": roots}
             _write_registry(registry_root, updated)
         return {"root_id": root_id}
@@ -647,6 +774,7 @@ class CaseContextService:
             stamp = _identity_stamp(exact_root, "registered 02_CAE root", expected)
             if _root_id_for(exact_root, stamp) != root_id:
                 raise WorkspaceBoundaryError("registered root identifier does not match")
+            _verify_root_seal(record["seal"], _root_projection(exact_root, stamp))
             if _exact_directory_trees_overlap(
                 exact_root, self._registry_root, "registered 02_CAE and registry"
             ) or _exact_directory_trees_overlap(
