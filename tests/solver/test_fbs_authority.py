@@ -741,14 +741,14 @@ def test_windows_unprotected_retry_never_closes_reused_protected_foreign_handle(
 
     def fail_close_once(value_to_close: int) -> None:
         nonlocal close_failed
-        if not close_failed:
+        if value_to_close == value and not close_failed:
             close_failed = True
             raise OSError(32, "synthetic sharing violation")
         original_close(value_to_close)
 
     def fail_reprotect_once(value_to_protect: int, protected: bool) -> None:
         nonlocal reprotect_failed
-        if protected and not reprotect_failed:
+        if value_to_protect == value and protected and not reprotect_failed:
             reprotect_failed = True
             raise OSError(32, "synthetic re-protect failure")
         original_protect(value_to_protect, protected)
@@ -756,6 +756,7 @@ def test_windows_unprotected_retry_never_closes_reused_protected_foreign_handle(
     monkeypatch.setattr(fbs_module, "_windows_close_raw", fail_close_once)
     monkeypatch.setattr(fbs_module, "_windows_set_close_protection", fail_reprotect_once)
     foreign: fbs_module._OwnedHandle | None = None
+    other_candidates: list[fbs_module._OwnedHandle] = []
     try:
         with pytest.raises(OSError, match="sharing violation"):
             fbs_module._close_owned_handle(owner)
@@ -777,7 +778,7 @@ def test_windows_unprotected_retry_never_closes_reused_protected_foreign_handle(
             if candidate.value == value:
                 foreign = candidate
                 break
-            fbs_module._close_owned_handle(candidate)
+            other_candidates.append(candidate)
         assert foreign is not None, "Windows did not reuse the native handle value"
 
         with pytest.raises(ValueError, match="stale|refusing"):
@@ -789,6 +790,13 @@ def test_windows_unprotected_retry_never_closes_reused_protected_foreign_handle(
         )
         assert fbs_module._windows_file_info(value)[1:3] == (owner.device, owner.inode)
     finally:
+        for candidate in other_candidates:
+            if not candidate.closed and candidate.value is not None:
+                with contextlib.suppress(OSError):
+                    original_protect(candidate.value, False)
+                with contextlib.suppress(OSError):
+                    original_close(candidate.value)
+                fbs_module._retire_owned_handle(candidate)
         if foreign is not None and not foreign.closed and foreign.value is not None:
             with contextlib.suppress(OSError):
                 original_protect(foreign.value, False)
