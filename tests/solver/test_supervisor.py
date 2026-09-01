@@ -2730,6 +2730,44 @@ def test_normal_exit_drain_failure_precedes_validation_and_cannot_publish(
     assert supervisor._process_authority is None
 
 
+def test_timeout_drain_failure_precedes_completion_and_retries_same_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events: list[str] = []
+    supervisor = SolverSupervisor(
+        _capability(tmp_path, monkeypatch, code="import time; time.sleep(30)")
+    ).start()
+    authority = supervisor._process_authority
+    assert authority is not None
+    original_drain = authority.drain
+    drain_attempts = 0
+
+    def fail_first_drain() -> None:
+        nonlocal drain_attempts
+        drain_attempts += 1
+        events.append(f"drain:{drain_attempts}")
+        if drain_attempts == 1:
+            raise ProcessAuthorityError("synthetic timeout drain failure")
+        original_drain()
+
+    monkeypatch.setattr(authority, "drain", fail_first_drain)
+    monkeypatch.setattr(
+        supervisor,
+        "_complete",
+        lambda *_args: events.append("complete"),
+    )
+
+    with pytest.raises(SolverOwnershipError, match="drain|terminal cleanup"):
+        supervisor.wait(timeout_seconds=0.01)
+
+    assert events == ["drain:1", "drain:2"]
+    assert supervisor.state is SolverState.FAILED
+    assert supervisor._result is None
+    assert supervisor._result_latch is None
+    assert supervisor._process is None
+    assert supervisor._process_authority is None
+
+
 def test_cancel_drains_after_root_already_exited_before_completion(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
