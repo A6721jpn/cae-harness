@@ -65,7 +65,7 @@ def _complete_intent(**overrides: object) -> IntentContract:
     return IntentContract(**values)  # type: ignore[arg-type]
 
 
-def _registered_case(root: Path, intent: IntentContract) -> tuple[Any, Path, dict[str, object]]:
+def _registered_case(root: Path, intent: IntentContract) -> tuple[Any, Path, dict[str, Any]]:
     service = _service(root)
     cae_root = root / "02_CAE"
     cae_root.mkdir(parents=True)
@@ -100,6 +100,10 @@ def _fresh_process_open(
 
 def test_case_subcommands_expose_no_free_path_reopen_options(tmp_path: Path) -> None:
     parser = cli_module.build_parser()
+    parsed = parser.parse_args(("case", "open", "--case-id", "case-a"))
+    assert parsed.command == "case"
+    assert parsed.case_command == "open"
+    assert parsed.case_id == "case-a"
     for arguments in (
         ("case", "open", "--case-id", "case-a", "--cae-root", str(tmp_path)),
         ("case", "revise", "--case-id", "case-a", "--tool-root", str(tmp_path)),
@@ -277,3 +281,110 @@ def test_case_cli_emits_canonical_json_and_stable_error_exit(
     }
     assert "Traceback" not in missing_output.err
     assert missing_output.err == json.dumps(failure, sort_keys=True) + "\n"
+
+
+def test_registered_root_identity_replacement_is_rejected(tmp_path: Path) -> None:
+    module = _context_module()
+    service = _service(tmp_path)
+    cae_root = tmp_path / "02_CAE"
+    cae_root.mkdir()
+    registered = service.register_root(cae_root)
+    displaced = tmp_path / "displaced-02_CAE"
+    cae_root.rename(displaced)
+    cae_root.mkdir()
+    source = tmp_path / "synthetic.feb"
+    source.write_text("<febio_spec />", encoding="utf-8")
+
+    with pytest.raises(module.CaseContextError) as raised:
+        service.create_case(
+            root_id=registered["root_id"],
+            case_id="case-a",
+            sources=(source,),
+            intent=_complete_intent(),
+        )
+    assert raised.value.code == "BOUNDARY_OR_IDENTITY_VIOLATION"
+    assert tuple(cae_root.iterdir()) == ()
+
+    with pytest.raises(module.CaseContextError) as repeated:
+        service.register_root(cae_root)
+    assert repeated.value.code == "REGISTRATION_CONFLICT"
+
+
+def test_case_create_preserves_source_and_writes_no_tool_or_root_control_file(
+    tmp_path: Path,
+) -> None:
+    source_bytes = b"<febio_spec version='4.0' />"
+    source = tmp_path / "source.feb"
+    source.write_bytes(source_bytes)
+    service = _service(tmp_path)
+    cae_root = tmp_path / "02_CAE"
+    cae_root.mkdir()
+    registered = service.register_root(cae_root)
+
+    service.create_case(
+        root_id=registered["root_id"],
+        case_id="case-a",
+        sources=(source,),
+        intent=_complete_intent(),
+    )
+
+    assert source.read_bytes() == source_bytes
+    assert [path for path in (tmp_path / "tool").rglob("*") if path.is_file()] == []
+    assert sorted(path.name for path in cae_root.iterdir()) == ["case-a"]
+    assert not (cae_root / "registry.json").exists()
+
+
+def test_json_inputs_reject_unknown_fields_and_nonfinite_values(tmp_path: Path) -> None:
+    module = _context_module()
+    intent_path = tmp_path / "intent.json"
+    invalid_intent = _complete_intent().to_dict()
+    invalid_intent["caller_extension"] = True
+    intent_path.write_text(json.dumps(invalid_intent), encoding="utf-8")
+    with pytest.raises(module.CaseContextError) as intent_error:
+        module.load_intent_document(intent_path)
+    assert intent_error.value.code == "INVALID_INPUT"
+
+    answer_path = tmp_path / "answer.json"
+    answer_path.write_text('{"source":"synthetic-user","value":NaN}', encoding="utf-8")
+    with pytest.raises(module.CaseContextError) as answer_error:
+        module.load_answer_document(answer_path)
+    assert answer_error.value.code == "INVALID_INPUT"
+
+
+def test_cli_case_projection_omits_intent_values_and_absolute_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    service, _, _ = _registered_case(tmp_path, _complete_intent())
+    monkeypatch.setattr(cli_module, "_case_service", lambda: service)
+
+    assert cli_module.main(["case", "open", "--case-id", "case-a"]) == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    payload = json.loads(captured.out)
+    encoded = captured.out
+    assert payload["case"]["intent"] == {"sha256": payload["case"]["intent"]["sha256"]}
+    assert "synthetic-material" not in encoded
+    assert str(tmp_path) not in encoded
+    assert "attempt" not in payload["case"]
+
+
+def test_production_registry_ignores_environment_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _context_module()
+    known_folder = tmp_path / "known-folder"
+    known_folder.mkdir()
+    forged_environment = tmp_path / "forged-local-app-data"
+    monkeypatch.setenv("LOCALAPPDATA", str(forged_environment))
+    monkeypatch.setattr(module, "_local_app_data_known_folder", lambda: known_folder)
+    service = module.CaseContextService()
+    cae_root = tmp_path / "02_CAE"
+    cae_root.mkdir()
+
+    service.register_root(cae_root)
+
+    assert (known_folder / "FEBioCaeWorkbench" / "case-registry-v1" / "registry.json").is_file()
+    assert not forged_environment.exists()
