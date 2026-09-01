@@ -100,7 +100,11 @@ def _normal_spec(tmp_path: Path) -> SolverLaunchSpec:
 
 @pytest.mark.parametrize(
     ("terminal", "expected_state"),
-    (("normal", SolverState.NORMAL_EXIT), ("cancel", SolverState.CANCELLED)),
+    (
+        ("normal", SolverState.NORMAL_EXIT),
+        ("failed", SolverState.FAILED),
+        ("cancel", SolverState.CANCELLED),
+    ),
 )
 def test_terminal_completion_releases_parent_process_authority(
     tmp_path: Path,
@@ -108,16 +112,22 @@ def test_terminal_completion_releases_parent_process_authority(
     terminal: str,
     expected_state: SolverState,
 ) -> None:
-    code = "pass" if terminal == "normal" else "import time; time.sleep(30)"
+    code = {
+        "normal": "pass",
+        "failed": "import os; os._exit(7)",
+        "cancel": "import time; time.sleep(30)",
+    }[terminal]
     supervisor = SolverSupervisor(_capability(tmp_path, monkeypatch, code=code)).start()
     authority = supervisor._process_authority
     assert authority is not None
     close = Mock(wraps=authority.close)
     monkeypatch.setattr(authority, "close", close)
 
-    result = supervisor.wait() if terminal == "normal" else supervisor.cancel()
+    result = supervisor.cancel() if terminal == "cancel" else supervisor.wait()
 
     assert result.state is expected_state
+    if terminal == "failed":
+        assert result.return_code == 7
     close.assert_called_once_with()
     assert supervisor._process_authority is None
 
