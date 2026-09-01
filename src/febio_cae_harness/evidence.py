@@ -1773,7 +1773,12 @@ class EvidenceStore:
             "event_sha256",
         }
         attempt_keys = {"attempt_id", "attempt_sha256"}
-        if set(marker) not in (base_keys, base_keys | attempt_keys):
+        terminal_keys = {"event_payload", "event_type"}
+        if set(marker) not in (
+            base_keys,
+            base_keys | attempt_keys,
+            base_keys | terminal_keys,
+        ):
             raise EvidenceIntegrityError("event recovery record has unexpected fields")
         previous_sha256 = marker["previous_sha256"]
         if previous_sha256 is not None:
@@ -1804,6 +1809,24 @@ class EvidenceStore:
                 marker["attempt_sha256"], "event recovery attempt"
             )
             self._validate_pre_file_attempt_recovery(recovery)
+        elif terminal_keys <= marker.keys():
+            if marker["event_type"] != "run_febio_terminal":
+                raise EvidenceIntegrityError("event recovery terminal type is invalid")
+            payload = self._normalise_payload(
+                _as_mapping(marker["event_payload"], "event recovery terminal payload")
+            )
+            attempt_id = payload.get("attempt_id")
+            if not isinstance(attempt_id, str):
+                raise EvidenceIntegrityError("event recovery terminal attempt is invalid")
+            try:
+                _validate_segment(attempt_id, "event recovery terminal attempt")
+            except ValueError as error:
+                raise EvidenceIntegrityError(
+                    "event recovery terminal attempt is invalid"
+                ) from error
+            recovery["event_type"] = "run_febio_terminal"
+            recovery["event_payload"] = payload
+            self._validate_pre_file_terminal_recovery(recovery)
         return recovery
 
     def _validate_pre_file_attempt_recovery(self, recovery: Mapping[str, Any]) -> None:
@@ -1830,6 +1853,28 @@ class EvidenceStore:
         }
         if _digest(body) != recovery["event_sha256"]:
             raise EvidenceIntegrityError("pending attempt recovery event binding is invalid")
+
+    def _validate_pre_file_terminal_recovery(self, recovery: Mapping[str, Any]) -> None:
+        if set(recovery) != {
+            "schema_version",
+            "case_id",
+            "sequence",
+            "previous_sha256",
+            "event_sha256",
+            "event_type",
+            "event_payload",
+        }:
+            raise EvidenceIntegrityError("pending terminal recovery binding is incomplete")
+        body = {
+            "schema_version": SCHEMA_VERSION,
+            "case_id": self.case_workspace.case_id,
+            "sequence": recovery["sequence"],
+            "event_type": "run_febio_terminal",
+            "payload": recovery["event_payload"],
+            "previous_sha256": recovery["previous_sha256"],
+        }
+        if _digest(body) != recovery["event_sha256"]:
+            raise EvidenceIntegrityError("pending terminal recovery event binding is invalid")
 
     @staticmethod
     def _recovery_matches_event(
@@ -1881,6 +1926,19 @@ class EvidenceStore:
                 raise EvidenceIntegrityError("partial event does not match pending recovery")
             return events, last_event_sha256
 
+        if recovery.get("event_type") == "run_febio_terminal":
+            return self._recover_pending_terminal_event(
+                recovery,
+                manifest,
+                persisted_payload,
+                intent_payload,
+                intent_sha256,
+                events,
+                last_event_sha256,
+                attempts,
+                pending_event_prefix,
+            )
+
         matches: list[tuple[int, dict[str, Any]]] = []
         for index, attempt in enumerate(attempts):
             payload = {
@@ -1930,6 +1988,65 @@ class EvidenceStore:
             self._exact().append_bytes(EVENTS_FILE, remaining)
         except (OSError, WorkspaceBoundaryError) as error:
             raise EvidenceIntegrityError("pending attempt event could not be recovered") from error
+        return [*events, event], cast(str, event["sha256"])
+
+    def _recover_pending_terminal_event(
+        self,
+        recovery: Mapping[str, Any],
+        manifest: Mapping[str, Any],
+        persisted_payload: Mapping[str, Any],
+        intent_payload: Mapping[str, Any],
+        intent_sha256: str,
+        events: list[dict[str, Any]],
+        last_event_sha256: str | None,
+        attempts: list[dict[str, object]],
+        pending_event_prefix: bytes,
+    ) -> tuple[list[dict[str, Any]], str]:
+        payload = _as_mapping(recovery.get("event_payload"), "terminal recovery payload")
+        attempt_id = payload.get("attempt_id")
+        if sum(attempt.get("attempt_id") == attempt_id for attempt in attempts) != 1:
+            raise EvidenceIntegrityError("pending terminal recovery attempt is not recorded")
+        if any(
+            event.get("event_type") == "run_febio_terminal"
+            and isinstance(event.get("payload"), dict)
+            and event["payload"].get("attempt_id") == attempt_id
+            for event in events
+        ):
+            raise EvidenceIntegrityError("pending terminal recovery conflicts with event chain")
+        body: dict[str, object] = {
+            "schema_version": SCHEMA_VERSION,
+            "case_id": self.case_workspace.case_id,
+            "sequence": len(events) + 1,
+            "event_type": "run_febio_terminal",
+            "payload": dict(payload),
+            "previous_sha256": last_event_sha256,
+        }
+        event = dict(body)
+        event["sha256"] = _digest(body)
+        if not self._recovery_matches_event(recovery, event):
+            raise EvidenceIntegrityError("pending terminal recovery binding changed")
+        previous_manifest = self._project_manifest(
+            intent_payload,
+            intent_sha256,
+            events,
+            last_event_sha256,
+            attempts,
+        )
+        if persisted_payload != intent_payload or manifest != previous_manifest:
+            raise EvidenceIntegrityError("pending terminal predecessor projection is invalid")
+        event_bytes = _json_text(event).encode("utf-8")
+        if pending_event_prefix and (
+            len(pending_event_prefix) >= len(event_bytes)
+            or not event_bytes.startswith(pending_event_prefix)
+        ):
+            raise EvidenceIntegrityError("partial terminal event is not a canonical prefix")
+        try:
+            self._exact().append_bytes(
+                EVENTS_FILE,
+                event_bytes[len(pending_event_prefix) :],
+            )
+        except (OSError, WorkspaceBoundaryError) as error:
+            raise EvidenceIntegrityError("pending terminal event could not be recovered") from error
         return [*events, event], cast(str, event["sha256"])
 
     def _attempts_before_terminal(
@@ -2399,6 +2516,11 @@ class EvidenceStore:
             payload = _as_mapping(event.get("payload"), "attempt recovery payload")
             recovery["attempt_id"] = payload["attempt_id"]
             recovery["attempt_sha256"] = payload["sha256"]
+        elif event.get("event_type") == "run_febio_terminal":
+            recovery["event_type"] = "run_febio_terminal"
+            recovery["event_payload"] = dict(
+                _as_mapping(event.get("payload"), "terminal recovery payload")
+            )
         try:
             self._exact().replace_bytes(
                 _EVENT_RECOVERY_FILE,

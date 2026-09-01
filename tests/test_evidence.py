@@ -454,6 +454,118 @@ def test_attempt_terminal_is_recorded_once_and_rejects_conflicting_replay(
             "attempt-missing",
             {**payload, "attempt_id": "attempt-missing"},
         )
+    with pytest.raises(EvidenceIntegrityError, match="dedicated API"):
+        store.append_event("run_febio_terminal", payload)
+
+
+@pytest.mark.parametrize("mode", ["before_append", "partial_append"])
+def test_reopen_recovers_one_interrupted_attempt_terminal_event(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+) -> None:
+    _, case, intent = make_case(tmp_path)
+    store = EvidenceStore(case, intent)
+    store.record_attempt("attempt-1", {"status": "started"})
+    original_append = workspace_module._ExactCaseTransaction.append_bytes
+    interrupted = False
+
+    def interrupt_terminal_once(
+        self: Any,
+        relative_path: str | Path,
+        data: bytes,
+    ) -> None:
+        nonlocal interrupted
+        if not interrupted and b'"event_type":"run_febio_terminal"' in data:
+            interrupted = True
+            if mode == "partial_append":
+                original_append(self, relative_path, data[: len(data) // 2])
+            raise OSError("simulated terminal append interruption")
+        original_append(self, relative_path, data)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            workspace_module._ExactCaseTransaction,
+            "append_bytes",
+            interrupt_terminal_once,
+        )
+        with pytest.raises(EvidenceIntegrityError):
+            store.record_attempt_terminal(
+                "attempt-1",
+                {
+                    "attempt_id": "attempt-1",
+                    "official_fbs": False,
+                    "status": "SOLVER_FAILED",
+                },
+            )
+
+    assert interrupted
+    reopened = EvidenceStore.open(case)
+    events = [
+        json.loads(line) for line in reopened.events_path.read_text(encoding="utf-8").splitlines()
+    ]
+    terminal = [event for event in events if event["event_type"] == "run_febio_terminal"]
+    assert len(terminal) == 1
+    assert terminal[0]["payload"]["attempt_id"] == "attempt-1"
+    assert terminal[0]["payload"]["status"] == "SOLVER_FAILED"
+    assert (case.temporary_root / "event-recovery.json").read_bytes() == b""
+
+    reopened_again = EvidenceStore.open(case)
+    assert reopened_again.events_path.read_bytes() == reopened.events_path.read_bytes()
+
+
+def test_reopen_rejects_tampered_terminal_recovery_payload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, case, intent = make_case(tmp_path)
+    store = EvidenceStore(case, intent)
+    store.record_attempt("attempt-1", {"status": "started"})
+
+    def interrupt_terminal(
+        self: Any,
+        relative_path: str | Path,
+        data: bytes,
+    ) -> None:
+        del self, relative_path
+        if b'"event_type":"run_febio_terminal"' in data:
+            raise OSError("simulated terminal append interruption")
+        raise AssertionError("unexpected append")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            workspace_module._ExactCaseTransaction,
+            "append_bytes",
+            interrupt_terminal,
+        )
+        with pytest.raises(EvidenceIntegrityError):
+            store.record_attempt_terminal(
+                "attempt-1",
+                {
+                    "attempt_id": "attempt-1",
+                    "official_fbs": False,
+                    "status": "SOLVER_FAILED",
+                },
+            )
+
+    marker_path = case.temporary_root / "event-recovery.json"
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    marker["event_payload"]["status"] = "FBS_UNAVAILABLE"
+    marker_path.write_bytes(
+        (
+            json.dumps(
+                marker,
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode("utf-8")
+    )
+
+    with pytest.raises(EvidenceIntegrityError, match="terminal recovery event binding"):
+        EvidenceStore.open(case)
 
 
 def test_record_artifact_rejects_an_object_that_no_longer_matches_claimed_digest(
