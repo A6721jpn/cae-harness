@@ -6,16 +6,21 @@ import json
 import multiprocessing
 import os
 import pickle
+import stat
+import sys
 import threading
 import time
+from collections.abc import Callable
 from copy import copy, deepcopy
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
 
 import febio_cae_harness.evidence as evidence_module
+import febio_cae_harness.workspace as workspace_module
 from febio_cae_harness.contracts import IntentContract, IntentState
 from febio_cae_harness.evidence import (
     EVENT_LOCK_FILE,
@@ -318,7 +323,7 @@ def test_replaced_event_lock_path_cannot_create_second_append_authority(
     child_lock_relative_path = EVENT_LOCK_FILE
 
     try:
-        with store._event_lock():
+        with store._transaction():
             try:
                 os.replace(replacement_path, lock_path)
             except PermissionError:
@@ -563,7 +568,7 @@ def test_internal_intent_revision_event_cannot_be_fabricated_through_generic_eve
 
 
 @pytest.mark.parametrize("interrupted_file", ["intent.json", "CASE_MANIFEST.json"])
-def test_revise_intent_recovers_from_interrupted_projection_write(
+def test_recovery_replace_keeps_exact_temporary_owner_until_replacement(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     interrupted_file: str,
@@ -574,36 +579,51 @@ def test_revise_intent_recovers_from_interrupted_projection_write(
         engineering_question=f"Revision interrupted before {interrupted_file}",
         state=IntentState.BOUND,
     )
-    original_write = CaseWorkspace._write_control_text
+    original_write = workspace_module._ExactCaseTransaction.replace_bytes
     interrupted = False
 
     def interrupt_projection_once(
-        self: CaseWorkspace,
+        self: Any,
         relative_path: str | Path,
-        text: str,
-        *,
-        encoding: str = "utf-8",
-    ) -> Path:
+        data: bytes,
+    ) -> None:
         nonlocal interrupted
         if not interrupted and Path(relative_path).as_posix() == interrupted_file:
             interrupted = True
             raise OSError("simulated projection interruption")
-        return original_write(self, relative_path, text, encoding=encoding)
+        original_write(self, relative_path, data)
 
     with monkeypatch.context() as patch:
-        patch.setattr(CaseWorkspace, "_write_control_text", interrupt_projection_once)
+        patch.setattr(
+            workspace_module._ExactCaseTransaction,
+            "replace_bytes",
+            interrupt_projection_once,
+        )
         with pytest.raises(EvidenceIntegrityError, match="intent revision projection"):
             store.revise_intent(revised)
 
     terminal_event = json.loads(store.events_path.read_text(encoding="utf-8").splitlines()[-1])
     assert terminal_event["event_type"] == "intent_revised"
 
+    original_replace = workspace_module._replace_exact_entry
+    observed: list[tuple[None, bool]] = []
+
+    def observe_replace(*args: Any, **kwargs: Any) -> None:
+        temporary = kwargs["temporary"]
+        observed.append((temporary.validate(), temporary.released))
+        original_replace(*args, **kwargs)
+
+    monkeypatch.setattr(workspace_module, "_replace_exact_entry", observe_replace)
+
     reopened = EvidenceStore.open(case)
 
+    assert observed and all(item == (None, False) for item in observed)
     assert reopened.intent == revised
     assert json.loads(reopened.intent_path.read_text(encoding="utf-8")) == revised.to_dict()
     assert reopened.manifest["intent"]["sha256"] == _canonical_digest(revised.to_dict())
     assert reopened.manifest["events"]["last_sha256"] == terminal_event["sha256"]
+    assert not tuple(case.case_root.glob(".intent.json.*"))
+    assert not tuple(case.case_root.glob(".CASE_MANIFEST.json.*"))
 
 
 @pytest.mark.parametrize("tamper", ["intent", "event", "attempt", "manifest"])
@@ -654,19 +674,17 @@ def test_concurrent_store_event_writers_do_not_race_sequence_or_predecessor(
     _, case, intent = make_case(tmp_path)
     store_a = EvidenceStore(case, intent)
     store_b = EvidenceStore.open(case)
-    original_append_text = CaseWorkspace.append_text
+    original_append = workspace_module._ExactCaseTransaction.append_bytes
     state_lock = threading.Lock()
     started = threading.Barrier(2)
     active_event_appends = 0
     overlapped_event_appends = False
 
     def delayed_append(
-        self: CaseWorkspace,
+        self: Any,
         relative_path: str | Path,
-        text: str,
-        *,
-        encoding: str = "utf-8",
-    ) -> Path:
+        data: bytes,
+    ) -> None:
         nonlocal active_event_appends, overlapped_event_appends
         if Path(relative_path).as_posix() == EVENTS_FILE:
             with state_lock:
@@ -674,13 +692,18 @@ def test_concurrent_store_event_writers_do_not_race_sequence_or_predecessor(
                 overlapped_event_appends = overlapped_event_appends or active_event_appends > 1
             try:
                 time.sleep(0.05)
-                return original_append_text(self, relative_path, text, encoding=encoding)
+                original_append(self, relative_path, data)
+                return
             finally:
                 with state_lock:
                     active_event_appends -= 1
-        return original_append_text(self, relative_path, text, encoding=encoding)
+        original_append(self, relative_path, data)
 
-    monkeypatch.setattr(CaseWorkspace, "append_text", delayed_append)
+    monkeypatch.setattr(
+        workspace_module._ExactCaseTransaction,
+        "append_bytes",
+        delayed_append,
+    )
 
     errors: list[BaseException] = []
     events: list[dict[str, object]] = []
@@ -701,7 +724,7 @@ def test_concurrent_store_event_writers_do_not_race_sequence_or_predecessor(
 
     assert not first.is_alive()
     assert not second.is_alive()
-    assert not errors
+    assert not errors, [(error, error.__cause__) for error in errors]
     assert not overlapped_event_appends
     assert sorted(cast(int, event["sequence"]) for event in events) == [1, 2]
     assert store_a.reopen() is store_a
@@ -1048,3 +1071,523 @@ def test_receipt_token_construction_and_reopen_store_are_not_authority(
         object.__new__(VerificationReceipt)
     with pytest.raises(TypeError):
         type("ForgedReceipt", (VerificationReceipt,), {})
+
+
+def test_posix_lock_descriptor_open_is_relative_to_exact_root() -> None:
+    calls: list[tuple[str, int, int | None]] = []
+
+    def fake_open(path: str, flags: int, *, dir_fd: int | None = None) -> int:
+        calls.append((path, flags, dir_fd))
+        return 103
+
+    evidence_module._open_posix_lock_descriptor(71, opener=fake_open)
+    assert calls == [(".", calls[0][1], 71)]
+
+
+def test_posix_lock_acquire_never_double_closes_a_reused_descriptor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    close_calls: list[int] = []
+    fake_fcntl = SimpleNamespace(
+        LOCK_EX=1,
+        flock=lambda descriptor, operation: (_ for _ in ()).throw(OSError("lock failed")),
+    )
+
+    monkeypatch.setitem(sys.modules, "fcntl", fake_fcntl)
+    monkeypatch.setattr(evidence_module, "_open_posix_lock_descriptor", lambda _root: 103)
+    monkeypatch.setattr(
+        os,
+        "fstat",
+        lambda _descriptor: SimpleNamespace(
+            st_dev=1,
+            st_ino=2,
+            st_mode=stat.S_IFDIR,
+        ),
+    )
+    monkeypatch.setattr(os, "close", lambda descriptor: close_calls.append(descriptor))
+
+    with pytest.raises(EvidenceIntegrityError, match="cannot acquire"):
+        evidence_module._acquire_posix_event_lock(71)
+
+    assert close_calls == [103]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows mutex cleanup")
+def test_windows_event_lock_reports_lost_close_status() -> None:
+    class Kernel32:
+        @staticmethod
+        def ReleaseMutex(_handle: object) -> int:
+            return 1
+
+        @staticmethod
+        def CloseHandle(_handle: object) -> int:
+            return 0
+
+    with pytest.raises(EvidenceIntegrityError, match="close case event lock"):
+        evidence_module._release_windows_event_lock((Kernel32(), 17))
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows rename substitution")
+def test_record_attempt_rejects_cross_case_directory_substitution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = ValidatedCaseWorkspace(tmp_path / "tool", tmp_path / "02_CAE")
+    case_a = workspace.create_case("case-a")
+    case_b = workspace.create_case("case-b")
+    intent = IntentContract(engineering_question="Attempt authority")
+    store_a = EvidenceStore(case_a, intent)
+    store_b = EvidenceStore(case_b, intent)
+    foreign_record = store_b.record_attempt("attempt-1", {"owner": "case-b"})
+    relative = Path("90_Temporary") / "attempts" / "attempt-1"
+    foreign = case_b.case_root / relative
+    displaced = case_a.temporary_root / "attempts" / "attempt-1-owned"
+    original_directory = workspace_module._ExactCaseTransaction._directory
+    substituted = False
+    blocked = False
+
+    def substitute_before_open(self: Any, parts: tuple[str, ...]) -> Any:
+        nonlocal blocked, substituted
+        target = self.root.joinpath(*parts)
+        if not substituted and target == case_a.case_root / relative and target.exists():
+            try:
+                target.rename(displaced)
+            except OSError:
+                blocked = True
+            else:
+                foreign.rename(target)
+                substituted = True
+        return original_directory(self, parts)
+
+    monkeypatch.setattr(
+        workspace_module._ExactCaseTransaction,
+        "_directory",
+        substitute_before_open,
+    )
+
+    try:
+        owned_record = store_a.record_attempt("attempt-1", {"owner": "case-a"})
+    except (WorkspaceBoundaryError, EvidenceIntegrityError):
+        owned_record = None
+
+    assert blocked or (substituted and owned_record is None)
+    if blocked:
+        assert owned_record is not None
+        persisted = json.loads(
+            (case_a.case_root / relative / "ATTEMPT.json").read_text(encoding="utf-8")
+        )
+        foreign_persisted = json.loads(foreign.joinpath("ATTEMPT.json").read_text(encoding="utf-8"))
+        assert persisted["sha256"] == owned_record["sha256"]
+        assert persisted["payload"] == {"owner": "case-a"}
+        assert foreign_persisted["sha256"] == foreign_record["sha256"]
+        assert foreign_persisted["payload"] == {"owner": "case-b"}
+        assert not displaced.exists()
+    else:
+        persisted = json.loads(
+            (case_a.case_root / relative / "ATTEMPT.json").read_text(encoding="utf-8")
+        )
+        assert persisted["sha256"] == foreign_record["sha256"]
+        assert persisted["payload"] == {"owner": "case-b"}
+        assert tuple(displaced.iterdir()) == ()
+
+
+@pytest.mark.parametrize("operation", ["event", "attempt"])
+def test_reopen_rolls_forward_acknowledged_event_after_manifest_interruption(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    _, case, intent = make_case(tmp_path)
+    store = EvidenceStore(case, intent)
+    original_replace = workspace_module._ExactCaseTransaction.replace_bytes
+    interrupted = False
+
+    def interrupt_manifest_once(
+        self: Any,
+        relative_path: str | Path,
+        data: bytes,
+    ) -> None:
+        nonlocal interrupted
+        if not interrupted and Path(relative_path).as_posix() == "CASE_MANIFEST.json":
+            interrupted = True
+            raise OSError("simulated manifest interruption")
+        original_replace(self, relative_path, data)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            workspace_module._ExactCaseTransaction,
+            "replace_bytes",
+            interrupt_manifest_once,
+        )
+        with pytest.raises((OSError, EvidenceIntegrityError)):
+            if operation == "event":
+                store.append_event("ordinary_acknowledged", {"status": "durable"})
+            else:
+                store.record_attempt("attempt-1", {"status": "durable"})
+
+    acknowledged = json.loads(store.events_path.read_text(encoding="utf-8").splitlines()[-1])
+    reopened = EvidenceStore.open(case)
+
+    assert interrupted
+    assert reopened.manifest["events"]["last_sha256"] == acknowledged["sha256"]
+    assert reopened.manifest["events"]["count"] == 1
+    if operation == "attempt":
+        assert reopened.manifest["attempts"][0]["attempt_id"] == "attempt-1"
+    assert not tuple(case.case_root.glob(".CASE_MANIFEST.json.*"))
+
+
+def test_reopen_recovers_attempt_interrupted_before_recovery_backed_event(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, case, intent = make_case(tmp_path)
+    store = EvidenceStore(case, intent)
+    original_append = workspace_module._ExactCaseTransaction.append_bytes
+    interrupted = False
+
+    def interrupt_attempt_event_once(
+        self: Any,
+        relative_path: str | Path,
+        data: bytes,
+    ) -> None:
+        nonlocal interrupted
+        if not interrupted and Path(relative_path).as_posix() == EVENTS_FILE:
+            interrupted = True
+            raise OSError("simulated attempt event interruption")
+        original_append(self, relative_path, data)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            workspace_module._ExactCaseTransaction,
+            "append_bytes",
+            interrupt_attempt_event_once,
+        )
+        with pytest.raises(EvidenceIntegrityError):
+            store.record_attempt("attempt-1", {"status": "prepared"})
+
+    assert interrupted
+    assert store.events_path.read_text(encoding="utf-8") == ""
+    assert (case.temporary_root / "attempts" / "attempt-1" / "ATTEMPT.json").is_file()
+
+    reopened = EvidenceStore.open(case)
+    events = [
+        json.loads(line) for line in reopened.events_path.read_text(encoding="utf-8").splitlines()
+    ]
+
+    assert len(events) == 1
+    assert events[0]["event_type"] == "attempt_recorded"
+    assert events[0]["payload"]["attempt_id"] == "attempt-1"
+    assert reopened.manifest["attempts"] == [
+        {
+            "attempt_id": "attempt-1",
+            "path": "90_Temporary/attempts/attempt-1/ATTEMPT.json",
+            "sha256": events[0]["payload"]["sha256"],
+        }
+    ]
+
+
+def test_attempt_recovery_marker_publication_failure_is_evidence_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, case, intent = make_case(tmp_path)
+    store = EvidenceStore(case, intent)
+    original_replace = workspace_module._ExactCaseTransaction.replace_bytes
+    interruption_attempted = False
+
+    def fail_marker_publication(
+        self: Any,
+        relative_path: str | Path,
+        data: bytes,
+    ) -> None:
+        nonlocal interruption_attempted
+        relative = Path(relative_path).as_posix()
+        if relative == "90_Temporary/event-recovery.json":
+            interruption_attempted = True
+            raise OSError("injected recovery marker publication failure")
+        original_replace(self, relative_path, data)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            workspace_module._ExactCaseTransaction,
+            "replace_bytes",
+            fail_marker_publication,
+        )
+        with pytest.raises(
+            EvidenceIntegrityError,
+            match="event log is missing or unreadable",
+        ):
+            store.record_attempt("attempt-1", {"status": "prepared"})
+
+    reopened = EvidenceStore.open(case)
+
+    assert interruption_attempted
+    assert not (case.temporary_root / "attempts" / "attempt-1").exists()
+    assert reopened.events_path.read_bytes() == b""
+    assert reopened.manifest["events"]["count"] == 0
+    assert reopened.manifest["attempts"] == []
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows exact directory cleanup")
+def test_attempt_recovery_after_directory_uses_live_same_process_claim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, case, intent = make_case(tmp_path)
+    store = EvidenceStore(case, intent)
+    original_replace = workspace_module._ExactCaseTransaction.replace_bytes
+    interruption_attempted = False
+
+    def fail_attempt_file_publication(
+        self: Any,
+        relative_path: str | Path,
+        data: bytes,
+    ) -> None:
+        nonlocal interruption_attempted
+        if Path(relative_path).as_posix().endswith("/ATTEMPT.json"):
+            interruption_attempted = True
+            raise OSError("injected interruption before attempt file durability")
+        original_replace(self, relative_path, data)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            workspace_module._ExactCaseTransaction,
+            "replace_bytes",
+            fail_attempt_file_publication,
+        )
+        with pytest.raises(
+            OSError,
+            match="injected interruption before attempt file durability",
+        ):
+            store.record_attempt("attempt-1", {"status": "prepared"})
+
+    reopened = EvidenceStore.open(case)
+
+    assert interruption_attempted
+    assert not (case.temporary_root / "attempts" / "attempt-1").exists()
+    assert reopened.events_path.read_bytes() == b""
+    assert reopened.manifest["events"]["count"] == 0
+    assert reopened.manifest["attempts"] == []
+
+
+def test_fresh_process_reopen_retains_empty_attempt_and_marker_without_claim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, case, intent = make_case(tmp_path)
+    store = EvidenceStore(case, intent)
+    original_replace = workspace_module._ExactCaseTransaction.replace_bytes
+
+    def fail_attempt_file_publication(
+        self: Any,
+        relative_path: str | Path,
+        data: bytes,
+    ) -> None:
+        if Path(relative_path).as_posix().endswith("/ATTEMPT.json"):
+            raise OSError("injected interruption before attempt file durability")
+        original_replace(self, relative_path, data)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            workspace_module._ExactCaseTransaction,
+            "replace_bytes",
+            fail_attempt_file_publication,
+        )
+        with pytest.raises(
+            OSError,
+            match="injected interruption before attempt file durability",
+        ):
+            store.record_attempt("attempt-1", {"status": "prepared"})
+
+    attempt_root = case.temporary_root / "attempts" / "attempt-1"
+    marker_path = case.temporary_root / "event-recovery.json"
+    case_stamp = workspace_module._registered_case_stamp(case)
+    claim_key = (case.case_root, case_stamp, "attempt-1")
+    claim = workspace_module._ATTEMPT_ROOT_STAMPS[claim_key]
+    workspace_module._release_attempt_root_claim(claim_key, claim)
+
+    with pytest.raises(
+        EvidenceIntegrityError,
+        match="empty pending attempt directory could not be recovered",
+    ):
+        EvidenceStore.open(case)
+
+    assert claim_key not in workspace_module._ATTEMPT_ROOT_STAMPS
+    assert attempt_root.is_dir()
+    assert marker_path.is_file()
+
+
+def test_reopen_rejects_invalid_enhanced_attempt_marker_before_directory(
+    tmp_path: Path,
+) -> None:
+    _, case, intent = make_case(tmp_path)
+    EvidenceStore(case, intent)
+    marker = {
+        "schema_version": evidence_module.SCHEMA_VERSION,
+        "case_id": case.case_id,
+        "sequence": 1,
+        "previous_sha256": None,
+        "event_sha256": "0" * 64,
+        "attempt_id": "attempt-1",
+        "attempt_sha256": "1" * 64,
+    }
+    marker_path = case.temporary_root / "event-recovery.json"
+    marker_path.write_bytes(
+        (json.dumps(marker, separators=(",", ":"), sort_keys=True) + "\n").encode("utf-8")
+    )
+
+    with pytest.raises(
+        EvidenceIntegrityError,
+        match="pending attempt recovery event binding is invalid",
+    ):
+        EvidenceStore.open(case)
+
+    assert marker_path.is_file()
+    assert not (case.temporary_root / "attempts" / "attempt-1").exists()
+
+
+def test_reopen_repairs_one_canonical_partial_attempt_event_idempotently(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, case, intent = make_case(tmp_path)
+    store = EvidenceStore(case, intent)
+    original_append = workspace_module._ExactCaseTransaction.append_bytes
+    appended_prefix = b""
+
+    def append_strict_prefix_then_fail(
+        self: Any,
+        relative_path: str | Path,
+        data: bytes,
+    ) -> None:
+        nonlocal appended_prefix
+        if not appended_prefix and Path(relative_path).as_posix() == EVENTS_FILE:
+            appended_prefix = data[: len(data) // 2]
+            assert appended_prefix and len(appended_prefix) < len(data)
+            original_append(self, relative_path, appended_prefix)
+            raise OSError("injected partial event append")
+        original_append(self, relative_path, data)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            workspace_module._ExactCaseTransaction,
+            "append_bytes",
+            append_strict_prefix_then_fail,
+        )
+        with pytest.raises(EvidenceIntegrityError):
+            store.record_attempt("attempt-1", {"status": "prepared"})
+
+    assert store.events_path.read_bytes() == appended_prefix
+
+    reopened = EvidenceStore.open(case)
+    repaired = reopened.events_path.read_bytes()
+    events = [json.loads(line) for line in repaired.decode("utf-8").splitlines()]
+    expected = (
+        json.dumps(
+            events[0],
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        + b"\n"
+    )
+
+    assert len(events) == 1
+    assert events[0]["event_type"] == "attempt_recorded"
+    assert events[0]["payload"]["attempt_id"] == "attempt-1"
+    assert repaired == expected
+    assert reopened.manifest["events"]["count"] == 1
+
+    reopened_again = EvidenceStore.open(case)
+    assert reopened_again.events_path.read_bytes() == repaired
+    assert reopened_again.manifest == reopened.manifest
+
+
+@pytest.mark.parametrize(
+    "operation",
+    [
+        "append",
+        "revise",
+        "attempt",
+        "artifact",
+        "verification",
+        "artifact_source",
+        "verification_source",
+    ],
+)
+def test_public_transactions_reject_case_or_source_substitution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    _, case, intent = make_case(tmp_path)
+    attempted = False
+
+    def replace_source(source: Path) -> bool:
+        nonlocal attempted
+        attempted = True
+        try:
+            source.rename(source.with_suffix(".displaced"))
+        except OSError:
+            return True
+        source.write_text("foreign", encoding="utf-8")  # pragma: no cover - POSIX gate
+        return True
+
+    source_attack = operation.endswith("_source")
+    action = operation.removesuffix("_source")
+    validator = replace_source if source_attack else lambda _: True
+    manager, authority = make_authority(validator=validator)
+    store = EvidenceStore(case, intent, manager)
+    if action == "verification":
+        store.record_attempt("attempt-1")
+    prefix = "90_Temporary/attempts/attempt-1" if action == "verification" else "90_Temporary"
+    operand = case.write_text(f"{prefix}/derived.feb", "owned")
+    original_load = EvidenceStore._load_and_validate
+
+    def substitute_after_validation(
+        self: EvidenceStore,
+        supplied_intent: IntentContract | None,
+    ) -> None:
+        nonlocal attempted
+        original_load(self, supplied_intent)
+        attempted = True
+        try:
+            case.case_root.rename(tmp_path / "displaced-case")
+        except OSError:
+            return
+        case.case_root.mkdir()  # pragma: no cover - POSIX gate
+        case.case_root.joinpath("foreign.txt").write_text("foreign", encoding="utf-8")
+
+    if operation == "artifact_source":
+        original_file = EvidenceStore._safe_case_file
+
+        def replace_after_snapshot(self: EvidenceStore, path: str | Path) -> Path:
+            result = original_file(self, path)
+            replace_source(operand)
+            return result
+
+        monkeypatch.setattr(EvidenceStore, "_safe_case_file", replace_after_snapshot)
+    elif not source_attack:
+        monkeypatch.setattr(EvidenceStore, "_load_and_validate", substitute_after_validation)
+    operations: dict[str, Callable[[], object]] = {
+        "append": lambda: store.append_event("exact_append"),
+        "revise": lambda: store.revise_intent(IntentContract(engineering_question="revised")),
+        "attempt": lambda: store.record_attempt("attempt-2"),
+        "artifact": lambda: store.record_artifact(operand),
+        "verification": lambda: store.record_verification(
+            operand, "02_Model/derived.feb", attempt_id="attempt-1", authority=authority
+        ),
+    }
+    if os.name == "nt" or not source_attack:
+        operations[action]()
+    else:  # pragma: no cover - POSIX gate
+        with pytest.raises((EvidenceIntegrityError, WorkspaceBoundaryError)):
+            operations[action]()
+    assert attempted
+    if source_attack:
+        persisted = case.case_root.joinpath("CASE_MANIFEST.json").read_text(encoding="utf-8")
+        persisted += case.case_root.joinpath(EVENTS_FILE).read_text(encoding="utf-8")
+        assert hashlib.sha256(b"foreign").hexdigest() not in persisted
+    if os.name != "nt" and not source_attack:  # pragma: no cover - POSIX gate
+        assert tuple(path.name for path in case.case_root.iterdir()) == ("foreign.txt",)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import ctypes
 import dataclasses
 import json
 import os
@@ -9,7 +10,8 @@ import shutil
 import subprocess
 from collections.abc import Callable
 from pathlib import Path
-from typing import IO, Any
+from types import SimpleNamespace
+from typing import IO, Any, cast
 
 import pytest
 
@@ -432,6 +434,195 @@ def test_attempt_handle_rejects_reparse_alias(tmp_path: Path) -> None:
         AttemptWorkspace._from_manager(case, "attempt-1", attempt_alias)
 
 
+def test_attempt_factory_reuses_only_recorded_exact_creation_identity(tmp_path: Path) -> None:
+    workspace = make_workspace(tmp_path)
+    case_a = workspace.create_case("case-a")
+    case_b = workspace.create_case("case-b")
+    EvidenceStore(case_a, IntentContract(engineering_question="Attempt identity")).record_attempt(
+        "attempt-1"
+    )
+    attempt_root = case_a.temporary_root / "attempts" / "attempt-1"
+    reopened_case_a = workspace.open_case("case-a")
+
+    issued = AttemptWorkspace._from_manager(reopened_case_a, "attempt-1", attempt_root)
+
+    assert issued.root == attempt_root
+    displaced = case_a.temporary_root / "attempts" / "attempt-1-owned"
+    foreign = case_b.temporary_root / "attempts" / "attempt-1"
+    foreign.mkdir()
+    foreign.joinpath("foreign.txt").write_text("foreign", encoding="utf-8")
+    attempt_root.rename(displaced)
+    foreign.rename(attempt_root)
+
+    with pytest.raises(WorkspaceBoundaryError):
+        AttemptWorkspace._from_manager(reopened_case_a, "attempt-1", attempt_root)
+    assert attempt_root.joinpath("foreign.txt").read_text(encoding="utf-8") == "foreign"
+
+
+def test_attempt_creation_identity_is_single_use_and_cross_case_scoped(tmp_path: Path) -> None:
+    workspace = make_workspace(tmp_path)
+    case_a = workspace.create_case("case-a")
+    case_b = workspace.create_case("case-b")
+    intent = IntentContract(engineering_question="Attempt identity lifetime")
+    EvidenceStore(case_a, intent).record_attempt("attempt-1")
+    EvidenceStore(case_b, intent).record_attempt("attempt-1")
+    root_a = case_a.temporary_root / "attempts" / "attempt-1"
+    root_b = case_b.temporary_root / "attempts" / "attempt-1"
+
+    issued_a = AttemptWorkspace._from_manager(workspace.open_case("case-a"), "attempt-1", root_a)
+    issued_b = AttemptWorkspace._from_manager(workspace.open_case("case-b"), "attempt-1", root_b)
+
+    assert issued_a.root == root_a
+    assert issued_b.root == root_b
+    with pytest.raises(WorkspaceBoundaryError, match="creation identity is required"):
+        AttemptWorkspace._from_manager(case_a, "attempt-1", root_a)
+    with pytest.raises(WorkspaceBoundaryError, match="creation identity is required"):
+        AttemptWorkspace._from_manager(case_b, "attempt-1", root_b)
+
+
+def test_unclaimed_attempt_creation_identities_have_a_bounded_lifetime(tmp_path: Path) -> None:
+    workspace = make_workspace(tmp_path)
+    case = workspace.create_case("case-a")
+    limit = 128
+
+    for index in range(limit + 1):
+        relative = Path("90_Temporary") / "attempts" / f"bounded-{index:03d}"
+        with case._exact_transaction() as exact:
+            exact.make_directory(relative)
+
+    case_stamp = workspace_module._registered_case_stamp(case)
+    registrations = {
+        key
+        for key in workspace_module._ATTEMPT_ROOT_STAMPS
+        if key[0] == case.case_root and key[1] == case_stamp
+    }
+
+    assert len(registrations) <= limit
+    with pytest.raises(WorkspaceBoundaryError, match="creation identity is required"):
+        AttemptWorkspace._from_manager(
+            case,
+            "bounded-000",
+            case.temporary_root / "attempts" / "bounded-000",
+        )
+    newest = AttemptWorkspace._from_manager(
+        case,
+        f"bounded-{limit:03d}",
+        case.temporary_root / "attempts" / f"bounded-{limit:03d}",
+    )
+    assert newest.attempt_id == f"bounded-{limit:03d}"
+
+
+def test_posix_pending_attempt_cleanup_fails_closed_without_namespace_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transaction = object.__new__(workspace_module._ExactCaseTransaction)
+    root = tmp_path / "case-a"
+    root_stamp = (101, 202)
+    parts = ("90_Temporary", "attempts", "attempt-1")
+    current = cast(Any, SimpleNamespace(expected=(303, 404), validate=lambda: None))
+    parent = SimpleNamespace(handle=505)
+    transaction.root = root
+    transaction._root_stamp = root_stamp
+    transaction._directories = {parts: current}
+    claim_key = (root, root_stamp, parts[-1])
+    mutation_calls: list[str] = []
+    claim_owner = SimpleNamespace(close=lambda: mutation_calls.append("release"))
+    claim = (root.joinpath(*parts), current.expected, claim_owner)
+    monkeypatch.setitem(workspace_module._ATTEMPT_ROOT_STAMPS, claim_key, claim)
+
+    def directory(_self: Any, requested: tuple[str, ...]) -> Any:
+        return current if requested == parts else parent
+
+    def rmdir(name: str, *, dir_fd: int) -> None:
+        assert name == parts[-1]
+        assert dir_fd == parent.handle
+        mutation_calls.append("rmdir")
+
+    monkeypatch.setattr(workspace_module._ExactCaseTransaction, "_directory", directory)
+    monkeypatch.setattr(workspace_module, "os", SimpleNamespace(name="posix", rmdir=rmdir))
+
+    with pytest.raises(
+        WorkspaceBoundaryError,
+        match="exact empty directory deletion is unavailable",
+    ):
+        transaction.remove_empty_directory(Path(*parts))
+
+    assert mutation_calls == []
+    assert workspace_module._ATTEMPT_ROOT_STAMPS[claim_key] is claim
+
+
+def test_attempt_write_creates_nested_parents_under_exact_authority(tmp_path: Path) -> None:
+    workspace = make_workspace(tmp_path)
+    case = workspace.create_case("case-a")
+    attempt = case.allocate_attempt("attempt-1")
+
+    written = attempt.write_text("nested/child/model.feb", "owned")
+
+    assert written == attempt.root / "nested" / "child" / "model.feb"
+    assert written.read_text(encoding="utf-8") == "owned"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows rename substitution")
+def test_attempt_nested_write_rejects_substituted_created_parent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = make_workspace(tmp_path)
+    case_a = workspace.create_case("case-a")
+    case_b = workspace.create_case("case-b")
+    attempt_a = case_a.allocate_attempt("attempt-1")
+    attempt_b = case_b.allocate_attempt("attempt-1")
+    foreign = attempt_b.root / "nested"
+    foreign.mkdir()
+    foreign.joinpath("foreign.txt").write_text("foreign", encoding="utf-8")
+    displaced = attempt_a.root / "nested-owned"
+    original_make_directory = workspace_module._ExactCaseTransaction.make_directory
+    substituted = False
+    blocked = False
+
+    def substitute_created_parent(
+        self: Any,
+        relative_path: str | Path,
+    ) -> tuple[int, int]:
+        nonlocal blocked, substituted
+        stamp = original_make_directory(self, relative_path)
+        target = self.root / Path(relative_path)
+        if not substituted and target == attempt_a.root / "nested":
+            try:
+                target.rename(displaced)
+            except OSError:
+                blocked = True
+            else:
+                foreign.rename(target)
+                substituted = True
+        return stamp
+
+    monkeypatch.setattr(
+        workspace_module._ExactCaseTransaction,
+        "make_directory",
+        substitute_created_parent,
+    )
+
+    try:
+        written = attempt_a.write_text("nested/model.feb", "owned")
+    except WorkspaceBoundaryError:
+        written = None
+
+    assert blocked or (substituted and written is None)
+    if blocked:
+        assert written is not None
+        assert written.read_text(encoding="utf-8") == "owned"
+        assert foreign.joinpath("foreign.txt").read_text(encoding="utf-8") == "foreign"
+        assert not displaced.exists()
+    else:
+        assert (attempt_a.root / "nested" / "foreign.txt").read_text(encoding="utf-8") == (
+            "foreign"
+        )
+        assert not (attempt_a.root / "nested" / "model.feb").exists()
+        assert tuple(displaced.iterdir()) == ()
+
+
 def test_case_handle_rejects_reparse_write_alias_inside_owned_tree(tmp_path: Path) -> None:
     workspace = make_workspace(tmp_path)
     case = workspace.create_case("case-a")
@@ -690,7 +881,7 @@ def test_write_rejects_case_substitution_at_temporary_open(
     assert not (case_a.case_root / "90_Temporary" / "open-race.txt").exists()
 
 
-def test_write_rejects_case_substitution_at_atomic_replace(
+def test_write_does_not_reopen_case_path_at_atomic_replace(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -708,11 +899,57 @@ def test_write_rejects_case_substitution_at_atomic_replace(
         original_replace(source, target)
 
     monkeypatch.setattr(os, "replace", swap_before_replace)
-    with pytest.raises(WorkspaceBoundaryError):
-        case_a.write_text(Path("90_Temporary") / "replace-race.txt", "must reject")
+    written = case_a.write_text(Path("90_Temporary") / "replace-race.txt", "owned")
 
-    assert swapped
+    assert not swapped
+    assert written.read_text(encoding="utf-8") == "owned"
     assert not (case_b.case_root / "90_Temporary" / "replace-race.txt").exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows rename substitution")
+def test_replace_rejects_target_substitution_at_exact_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = make_workspace(tmp_path)
+    case = workspace.create_case("case-a")
+    relative = Path("90_Temporary") / "commit-race.txt"
+    target = case.case_root / relative
+    displaced = target.with_name("commit-race-owned.txt")
+    foreign = target.with_name("commit-race-foreign.txt")
+    case.write_text(relative, "authoritative-old")
+    foreign.write_text("foreign", encoding="utf-8")
+    original_replace = workspace_module._replace_exact_entry
+    substituted = False
+    blocked = False
+
+    def substitute_after_validation(*args: Any, **kwargs: Any) -> None:
+        nonlocal blocked, substituted
+        try:
+            target.rename(displaced)
+        except OSError:
+            blocked = True
+            raise
+        foreign.rename(target)
+        substituted = True
+        original_replace(*args, **kwargs)
+
+    monkeypatch.setattr(workspace_module, "_replace_exact_entry", substitute_after_validation)
+
+    with pytest.raises(WorkspaceBoundaryError):
+        case.write_text(relative, "authoritative-new")
+
+    assert blocked or substituted
+    if blocked:
+        assert target.read_text(encoding="utf-8") == "authoritative-old"
+        assert foreign.read_text(encoding="utf-8") == "foreign"
+    else:
+        assert target.read_text(encoding="utf-8") == "foreign"
+    retained = {
+        child.read_text(encoding="utf-8") for child in target.parent.iterdir() if child.is_file()
+    }
+    assert "authoritative-old" in retained
+    assert "authoritative-new" not in retained
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires Windows directory sharing semantics")
@@ -1230,3 +1467,634 @@ def test_failed_case_creation_deletes_authoritative_case_not_foreign_replacement
     assert blocked
     assert not displaced.exists(), "foreign replacement must not be installed"
     assert not case_path.exists(), "authoritative case directory must be deleted"
+
+
+@pytest.mark.parametrize(
+    ("after_close", "released"),
+    [((2,), True), (OSError("probe failed"), False)],
+)
+def test_exact_owner_never_closes_foreign_or_indeterminate_reuse(
+    after_close: tuple[int, ...] | OSError, released: bool
+) -> None:
+    identity: list[tuple[int, ...] | OSError] = [(1,)]
+    close_calls: list[int] = []
+
+    def identity_of(handle: int) -> tuple[int, ...]:
+        if isinstance(identity[0], OSError):
+            raise identity[0]
+        return identity[0]
+
+    def failed_close(handle: int) -> None:
+        close_calls.append(handle)
+        identity[0] = after_close
+        raise OSError("close status lost")
+
+    owner = workspace_module._ExactOwner(17, (1,), identity_of, failed_close, "synthetic owner")
+    with pytest.raises(WorkspaceBoundaryError):
+        owner.close()
+    if released:
+        owner.close()
+    else:
+        with pytest.raises(WorkspaceBoundaryError, match="remains indeterminate"):
+            owner.close()
+    assert owner.released is released
+    assert close_calls == [17]
+
+
+@pytest.mark.parametrize("target_existed", [True, False], ids=["existing", "new"])
+def test_posix_exact_replace_helper_fails_before_namespace_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    target_existed: bool,
+) -> None:
+    mutations: list[str] = []
+
+    def owner(handle: int, label: str) -> Any:
+        return workspace_module._ExactOwner(
+            handle,
+            (handle,),
+            lambda value: (value,),
+            lambda _value: None,
+            label,
+        )
+
+    def reject_mutation(operation: str) -> Callable[..., None]:
+        def reject(*args: object, **kwargs: object) -> None:
+            del args, kwargs
+            mutations.append(operation)
+            raise AssertionError(f"unexpected POSIX namespace {operation}")
+
+        return reject
+
+    parent = owner(17, "synthetic parent")
+    temporary = owner(18, "synthetic temporary")
+    existing = owner(19, "synthetic existing") if target_existed else None
+    state = workspace_module._ExactReplacementState()
+    monkeypatch.setattr(os, "name", "posix")
+    monkeypatch.setattr(os, "replace", reject_mutation("replace"))
+    monkeypatch.setattr(os, "link", reject_mutation("link"))
+    monkeypatch.setattr(os, "unlink", reject_mutation("unlink"))
+
+    with pytest.raises(
+        WorkspaceBoundaryError,
+        match="exact namespace replacement is unavailable on this platform",
+    ):
+        workspace_module._replace_exact_entry(
+            parent=parent,
+            parent_path=tmp_path,
+            temporary_name=".target.txt.owned",
+            target_name="target.txt",
+            temporary=temporary,
+            existing=existing,
+            target_existed=target_existed,
+            state=state,
+        )
+
+    assert mutations == []
+    assert not parent.released
+    assert not temporary.released
+    assert existing is None or not existing.released
+    assert state == workspace_module._ExactReplacementState()
+
+
+def test_posix_discard_retains_exact_owner_without_namespace_unlink(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mutations: list[str] = []
+    parent = workspace_module._ExactOwner(
+        17,
+        (17,),
+        lambda value: (value,),
+        lambda _value: None,
+        "synthetic parent",
+    )
+    discarded = workspace_module._ExactOwner(
+        18,
+        (18,),
+        lambda value: (value,),
+        lambda _value: None,
+        "synthetic temporary",
+    )
+    transaction = object.__new__(workspace_module._ExactCaseTransaction)
+    monkeypatch.setattr(
+        workspace_module._ExactCaseTransaction,
+        "_directory",
+        lambda _self, _parts: parent,
+    )
+    monkeypatch.setattr(
+        workspace_module._ExactCaseTransaction,
+        "_verify_file",
+        lambda _self, _parts, _owner, _label: discarded.expected,
+    )
+
+    def reject_unlink(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        mutations.append("unlink")
+        raise AssertionError("unexpected POSIX namespace unlink")
+
+    monkeypatch.setattr(os, "name", "posix")
+    monkeypatch.setattr(os, "unlink", reject_unlink)
+    primary = RuntimeError("primary failure")
+
+    transaction._discard(("90_Temporary", "owned.tmp"), discarded, primary)
+
+    assert mutations == []
+    assert getattr(primary, "__notes__", ()) == [
+        "synthetic temporary cleanup failed: exact-object cleanup is unavailable on this platform",
+    ]
+    assert not parent.released
+    assert not discarded.released
+
+
+def test_posix_replace_bytes_fails_before_temporary_namespace_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = make_workspace(tmp_path)
+    case = workspace.create_case("case-a")
+    transaction = case._exact_transaction()
+    created: list[tuple[tuple[str, ...], str, int]] = []
+
+    def reject_new_file(
+        _self: Any,
+        parts: tuple[str, ...],
+        label: str,
+        mode: int = 0o666,
+    ) -> Any:
+        created.append((parts, label, mode))
+        raise AssertionError("unexpected POSIX temporary namespace creation")
+
+    transaction.__enter__()
+    try:
+        monkeypatch.setattr(os, "name", "posix")
+        monkeypatch.setattr(
+            workspace_module._ExactCaseTransaction,
+            "_new_file",
+            reject_new_file,
+        )
+        with pytest.raises(
+            WorkspaceBoundaryError,
+            match="exact namespace replacement is unavailable on this platform",
+        ):
+            transaction.replace_bytes("90_Temporary/value.txt", b"new")
+        assert created == []
+    finally:
+        monkeypatch.undo()
+        transaction.close()
+
+
+def test_exact_transaction_preserves_body_exception_and_retains_failed_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = make_workspace(tmp_path)
+    case = workspace.create_case("case-a")
+    transaction = case._exact_transaction()
+
+    def fail_close(_handle: int) -> None:
+        raise OSError("synthetic close failure")
+
+    monkeypatch.setattr(workspace_module, "_close_handle", fail_close)
+    with pytest.raises(RuntimeError, match="primary body failure") as caught, transaction:
+        raise RuntimeError("primary body failure")
+
+    assert any("cleanup" in note for note in getattr(caught.value, "__notes__", ()))
+    assert any(not owner.released for owner in transaction._owners)
+
+    monkeypatch.undo()
+    with pytest.raises(WorkspaceBoundaryError, match="indeterminate"):
+        transaction.close()
+    assert any(owner.indeterminate for owner in transaction._owners)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows exact-handle replacement")
+def test_exact_replacement_never_installs_substituted_source_or_leaks_owned_temporary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = make_workspace(tmp_path)
+    case = workspace.create_case("case-a")
+    outside = tmp_path / "foreign.txt"
+    outside.write_bytes(b"foreign")
+    target = case.temporary_root / "value.txt"
+    attacked = False
+    owned_recovery = case.temporary_root / ".owned-recovery"
+    original_replace = os.replace
+
+    with case._exact_transaction() as exact:
+        exact.replace_bytes("90_Temporary/value.txt", b"before")
+
+    def substitute_source_before_path_replace(
+        source: str | Path,
+        destination: str | Path,
+    ) -> None:
+        nonlocal attacked
+        source_path = Path(source)
+        destination_path = Path(destination)
+        if destination_path == target and source_path.name.startswith(".value.txt."):
+            attacked = True
+            source_path.rename(owned_recovery)
+            os.link(outside, source_path)
+        original_replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", substitute_source_before_path_replace)
+
+    with case._exact_transaction() as exact:
+        exact.replace_bytes("90_Temporary/value.txt", b"after")
+
+    assert not attacked, "the final install must not reopen the temporary by path"
+    assert target.read_bytes() == b"after"
+    assert outside.read_bytes() == b"foreign"
+    assert outside.stat().st_nlink == 1
+    assert not owned_recovery.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows hard-link semantics")
+def test_atomic_replace_never_mutates_a_substituted_foreign_hard_link(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = make_workspace(tmp_path)
+    case = workspace.create_case("case-a")
+    outside = tmp_path / "foreign.txt"
+    outside.write_bytes(b"foreign")
+    target = case.temporary_root / "value.txt"
+    original_chmod = os.chmod
+    attacked = False
+
+    def substitute_before_path_chmod(
+        path: str | Path,
+        mode: int,
+    ) -> None:
+        nonlocal attacked
+        candidate = Path(path)
+        if candidate.name.startswith(".value.txt."):
+            attacked = True
+            candidate.unlink()
+            os.link(outside, candidate)
+        original_chmod(path, mode)
+
+    monkeypatch.setattr(os, "chmod", substitute_before_path_chmod)
+
+    written = case.write_bytes("90_Temporary/value.txt", b"owned")
+
+    assert not attacked, "mode and install effects must remain tied to the open file"
+    assert written == target
+    assert target.read_bytes() == b"owned"
+    assert outside.read_bytes() == b"foreign"
+    assert outside.stat().st_nlink == 1
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows handle-relative rename")
+def test_windows_exact_rename_is_rooted_in_held_parent_not_foreign_path(tmp_path: Path) -> None:
+    owned_parent = tmp_path / "owned"
+    foreign_parent = tmp_path / "foreign"
+    owned_parent.mkdir()
+    foreign_parent.mkdir()
+    foreign_target = foreign_parent / "target.txt"
+    foreign_target.write_bytes(b"foreign")
+    parent_handle = workspace_module._open_directory(owned_parent, "owned parent")
+    descriptor = workspace_module._open_exact_file_descriptor(
+        parent_handle,
+        owned_parent,
+        "temporary.txt",
+        flags=os.O_RDWR | os.O_CREAT | os.O_EXCL,
+        access=0xC0010000,
+        share=0x0001 | 0x0002 | 0x0004,
+        disposition=1,
+    )
+    try:
+        os.write(descriptor, b"owned")
+        os.fsync(descriptor)
+
+        workspace_module._windows_rename_open_file(
+            descriptor,
+            parent_handle,
+            foreign_parent,
+            "target.txt",
+            replace=True,
+            label="exact test file",
+        )
+
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        assert os.read(descriptor, 5) == b"owned"
+        assert foreign_target.read_bytes() == b"foreign"
+    finally:
+        os.close(descriptor)
+        workspace_module._close_handle(parent_handle)
+    assert (owned_parent / "target.txt").read_bytes() == b"owned"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows rename substitution")
+def test_make_directory_rejects_substituted_created_entry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = make_workspace(tmp_path)
+    case_a = workspace.create_case("case-a")
+    case_b = workspace.create_case("case-b")
+    relative = Path("90_Temporary") / "attempts" / "attempt-1"
+    foreign = case_b.case_root / relative
+    foreign.mkdir()
+    foreign.joinpath("foreign.txt").write_text("foreign", encoding="utf-8")
+    displaced = case_a.temporary_root / "attempts" / "attempt-1-owned"
+    original_directory = workspace_module._ExactCaseTransaction._directory
+    substituted = False
+    blocked = False
+
+    def substitute_before_open(
+        self: Any,
+        parts: tuple[str, ...],
+    ) -> Any:
+        nonlocal blocked, substituted
+        target = self.root.joinpath(*parts)
+        if not substituted and target == case_a.case_root / relative and target.exists():
+            try:
+                target.rename(displaced)
+            except OSError:
+                blocked = True
+            else:
+                substituted = True
+                foreign.rename(target)
+        return original_directory(self, parts)
+
+    monkeypatch.setattr(
+        workspace_module._ExactCaseTransaction,
+        "_directory",
+        substitute_before_open,
+    )
+
+    try:
+        with case_a._exact_transaction() as exact:
+            exact.make_directory(relative)
+    except WorkspaceBoundaryError:
+        failed = True
+    else:
+        failed = False
+
+    assert blocked or (substituted and failed)
+    if blocked:
+        assert tuple((case_a.case_root / relative).iterdir()) == ()
+        assert foreign.joinpath("foreign.txt").read_text(encoding="utf-8") == "foreign"
+        assert not displaced.exists()
+    else:
+        assert (case_a.case_root / relative / "foreign.txt").read_text(encoding="utf-8") == (
+            "foreign"
+        )
+        assert tuple(displaced.iterdir()) == ()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows rename substitution")
+def test_allocate_attempt_rejects_substituted_root_before_issuance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = make_workspace(tmp_path)
+    case_a = workspace.create_case("case-a")
+    case_b = workspace.create_case("case-b")
+    foreign = case_b.temporary_root / "attempts" / "attempt-1"
+    foreign.mkdir()
+    foreign.joinpath("foreign.txt").write_text("foreign", encoding="utf-8")
+    displaced = case_a.temporary_root / "attempts" / "attempt-1-owned"
+    original_factory = AttemptWorkspace._from_manager
+    substituted = False
+    blocked = False
+
+    def substitute_before_issue(
+        cls: type[AttemptWorkspace],
+        /,
+        case_workspace: CaseWorkspace,
+        attempt_id: str,
+        root: Path,
+        expected_root_stamp: tuple[int, int] | None = None,
+    ) -> AttemptWorkspace:
+        del cls
+        nonlocal blocked, substituted
+        if not substituted:
+            try:
+                root.rename(displaced)
+            except OSError:
+                blocked = True
+            else:
+                substituted = True
+                foreign.rename(root)
+        return original_factory(case_workspace, attempt_id, root, expected_root_stamp)
+
+    monkeypatch.setattr(AttemptWorkspace, "_from_manager", classmethod(substitute_before_issue))
+
+    try:
+        attempt = case_a.allocate_attempt("attempt-1")
+    except WorkspaceBoundaryError:
+        attempt = None
+
+    assert blocked or (substituted and attempt is None)
+    if blocked:
+        assert attempt is not None
+        assert attempt.root == case_a.temporary_root / "attempts" / "attempt-1"
+        assert not displaced.exists()
+        assert foreign.joinpath("foreign.txt").read_text(encoding="utf-8") == "foreign"
+    else:
+        assert (case_a.temporary_root / "attempts" / "attempt-1" / "foreign.txt").read_text(
+            encoding="utf-8"
+        ) == "foreign"
+        assert tuple(displaced.iterdir()) == ()
+
+
+def test_exact_owner_never_retries_ambiguous_close_with_same_identity() -> None:
+    close_calls: list[int] = []
+
+    def same_identity(_handle: int) -> tuple[int, ...]:
+        return (1,)
+
+    def lost_close_status(handle: int) -> None:
+        close_calls.append(handle)
+        raise OSError("close status lost after value reuse")
+
+    owner = workspace_module._ExactOwner(
+        17,
+        (1,),
+        same_identity,
+        lost_close_status,
+        "synthetic owner",
+    )
+
+    with pytest.raises(WorkspaceBoundaryError, match="indeterminate"):
+        owner.close()
+    with pytest.raises(WorkspaceBoundaryError, match="indeterminate"):
+        owner.close()
+
+    assert owner.indeterminate
+    assert close_calls == [17]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows CloseHandle")
+def test_windows_close_handle_reports_lost_close_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Kernel32:
+        @staticmethod
+        def CloseHandle(_handle: object) -> int:
+            return 0
+
+    monkeypatch.setattr(ctypes, "WinDLL", lambda *args, **kwargs: Kernel32())
+    monkeypatch.setattr(ctypes, "get_last_error", lambda: 6)
+
+    with pytest.raises(OSError, match="CloseHandle"):
+        workspace_module._close_handle(17)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows rename sharing semantics")
+def test_new_replacement_blocks_substitution_after_final_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = make_workspace(tmp_path)
+    case = workspace.create_case("case-a")
+    relative = Path("90_Temporary") / "final-seam.txt"
+    target = case.case_root / relative
+    displaced = target.with_name("final-seam-owned.txt")
+    foreign = target.with_name("final-seam-foreign.txt")
+    foreign.write_bytes(b"foreign")
+    original_validate = workspace_module._ExactCaseTransaction.validate
+    original_windows_create = workspace_module._windows_create
+    blocked = False
+    substituted = False
+    absolute_target_reopens: list[Path] = []
+
+    def reject_absolute_target_reopen(
+        path: Path,
+        access: int,
+        share: int,
+        disposition: int,
+        flags: int,
+        label: str,
+    ) -> int:
+        if path == target:
+            absolute_target_reopens.append(path)
+        return original_windows_create(path, access, share, disposition, flags, label)
+
+    def substitute_after_final_validation(self: Any) -> None:
+        nonlocal blocked, substituted
+        original_validate(self)
+        try:
+            target.rename(displaced)
+        except OSError:
+            blocked = True
+            return
+        foreign.rename(target)
+        substituted = True
+
+    monkeypatch.setattr(
+        workspace_module._ExactCaseTransaction,
+        "validate",
+        substitute_after_final_validation,
+    )
+    monkeypatch.setattr(workspace_module, "_windows_create", reject_absolute_target_reopen)
+
+    with case._exact_transaction() as exact:
+        exact.replace_bytes(relative, b"authoritative-new")
+
+    assert blocked
+    assert not substituted
+    assert target.read_bytes() == b"authoritative-new"
+    assert foreign.read_bytes() == b"foreign"
+    assert not displaced.exists()
+    assert absolute_target_reopens == []
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows exact-handle replacement")
+@pytest.mark.parametrize("failure_seam", ["precommit-restore-retry", "postcommit-old-cleanup"])
+def test_replacement_failure_retains_an_authoritative_version(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_seam: str,
+) -> None:
+    workspace = make_workspace(tmp_path)
+    case = workspace.create_case("case-a")
+    relative = Path("90_Temporary") / "rollback-seam.txt"
+    target = case.case_root / relative
+    case.write_bytes(relative, b"authoritative-old")
+
+    if failure_seam == "precommit-restore-retry":
+        original_rename = workspace_module._windows_rename_open_file
+        restoration_attempts = 0
+
+        def fail_commit_and_first_restore(
+            descriptor: int,
+            parent_handle: int,
+            parent_path: Path,
+            target_name: str,
+            *,
+            replace: bool,
+            label: str,
+        ) -> None:
+            nonlocal restoration_attempts
+            if label == "exact replacement temporary" and target_name == target.name:
+                raise WorkspaceBoundaryError("injected new commit failure")
+            if label == "exact replacement prior target recovery":
+                restoration_attempts += 1
+                if restoration_attempts == 1:
+                    raise WorkspaceBoundaryError("injected first restoration failure")
+            original_rename(
+                descriptor,
+                parent_handle,
+                parent_path,
+                target_name,
+                replace=replace,
+                label=label,
+            )
+
+        monkeypatch.setattr(
+            workspace_module,
+            "_windows_rename_open_file",
+            fail_commit_and_first_restore,
+        )
+
+        with pytest.raises(WorkspaceBoundaryError, match="cannot replace exact file") as caught:
+            case.write_bytes(relative, b"authoritative-new")
+
+        assert restoration_attempts == 2
+        assert target.read_bytes() == b"authoritative-old"
+        assert isinstance(caught.value.__cause__, WorkspaceBoundaryError)
+        assert "injected new commit failure" in str(caught.value.__cause__)
+        assert any(
+            "first restoration failure" in note
+            for note in getattr(caught.value.__cause__, "__notes__", ())
+        )
+    else:
+        original_delete = workspace_module._delete_open_file
+        original_fstat = os.fstat
+        fail_next_identity = False
+        identity_failed = False
+
+        def delete_then_fail_identity(handle: int, label: str) -> None:
+            nonlocal fail_next_identity
+            original_delete(handle, label)
+            if label == "exact replacement prior target":
+                fail_next_identity = True
+
+        def fail_post_delete_identity(descriptor: int) -> os.stat_result:
+            nonlocal fail_next_identity, identity_failed
+            if fail_next_identity:
+                fail_next_identity = False
+                identity_failed = True
+                raise OSError("injected post-delete identity failure")
+            return original_fstat(descriptor)
+
+        monkeypatch.setattr(workspace_module, "_delete_open_file", delete_then_fail_identity)
+        monkeypatch.setattr(os, "fstat", fail_post_delete_identity)
+
+        with pytest.raises(WorkspaceBoundaryError, match="cannot replace exact file") as caught:
+            case.write_bytes(relative, b"authoritative-new")
+
+        assert identity_failed
+        assert target.read_bytes() == b"authoritative-new"
+        assert isinstance(caught.value.__cause__, OSError)
+        assert "post-delete identity failure" in str(caught.value.__cause__)
+
+    retained = {
+        child.read_bytes()
+        for child in target.parent.iterdir()
+        if child.is_file() and "rollback-seam" in child.name
+    }
+    assert b"authoritative-old" in retained or b"authoritative-new" in retained
