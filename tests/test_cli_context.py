@@ -126,6 +126,9 @@ def _fresh_process_open(
 
 def test_case_subcommands_expose_no_free_path_reopen_options(tmp_path: Path) -> None:
     parser = cli_module.build_parser()
+    with pytest.raises(SystemExit) as missing_capability_output:
+        parser.parse_args(("root", "register", "--cae-root", str(tmp_path)))
+    assert missing_capability_output.value.code == 2
     parsed = parser.parse_args(("case", "open", "--case-id", "case-a", "--capability-stdin"))
     assert parsed.command == "case"
     assert parsed.case_command == "open"
@@ -311,24 +314,7 @@ def test_case_cli_emits_canonical_json_and_stable_error_exit(
     monkeypatch.setattr(cli_module, "_case_service", lambda: service)
     cae_root = tmp_path / "02_CAE"
     cae_root.mkdir()
-
-    assert cli_module.main(["root", "register", "--cae-root", str(cae_root)]) == 0
-    registered_output = capsys.readouterr()
-    assert registered_output.err == ""
-    registered = json.loads(registered_output.out)
-    assert registered == {
-        "command": "root.register",
-        "ok": True,
-        "root": {"root_id": registered["root"]["root_id"]},
-        "schema_version": "febio-cae-cli/v1",
-    }
-    assert registered_output.out == json.dumps(registered, sort_keys=True) + "\n"
-
-    case_service = _service(tmp_path / "case-service")
-    monkeypatch.setattr(cli_module, "_case_service", lambda: case_service)
-    case_root = tmp_path / "case-service" / "02_CAE"
-    case_root.mkdir()
-    case_registration = case_service.register_root(case_root)
+    case_registration = service.register_root(cae_root)
     _set_capability_stdin(monkeypatch, case_registration["capability"])
     assert (
         cli_module.main(["case", "open", "--case-id", "missing-case", "--capability-stdin"]) == 22
