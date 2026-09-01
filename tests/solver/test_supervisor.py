@@ -26,6 +26,7 @@ import febio_cae_harness.solver.supervisor as supervisor_module
 from febio_cae_harness.contracts import IntentContract
 from febio_cae_harness.evidence import EvidenceStore
 from febio_cae_harness.solver import headless as headless_module
+from febio_cae_harness.solver.log import LogValidation, LogValidator
 from febio_cae_harness.solver.process_authority import (
     ProcessAuthority,
     ProcessAuthorityError,
@@ -2691,10 +2692,10 @@ def test_normal_exit_drain_failure_precedes_validation_and_cannot_publish(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     events: list[str] = []
-    validator = supervisor_module.LogValidator()
+    validator = LogValidator()
     original_validate = validator.validate
 
-    def track_validation(path: str | Path) -> supervisor_module.LogValidation:
+    def track_validation(path: str | Path) -> LogValidation:
         events.append("validate")
         return original_validate(path)
 
