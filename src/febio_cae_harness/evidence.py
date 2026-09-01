@@ -957,6 +957,76 @@ class EvidenceStore:
             raise EvidenceIntegrityError("intent snapshot is stale")
         return cast(IntentContract, bound_intent)
 
+    def _validate_expected_intent_snapshot(
+        self,
+        authority: IntentSnapshotAuthority,
+    ) -> IntentContract:
+        """Validate one issued snapshot against the locked durable case state."""
+
+        self._exact()
+        if type(authority) is not IntentSnapshotAuthority:
+            raise EvidenceIntegrityError("expected intent snapshot authority is invalid")
+        state = _INTENT_SNAPSHOT_STATES.get(id(authority))
+        if state is None or state[0] is not authority:
+            raise EvidenceIntegrityError("expected intent snapshot authority is invalid")
+        (
+            _,
+            bound_store,
+            bound_binding,
+            bound_case_workspace,
+            bound_case_id,
+            bound_case_sha256,
+            bound_intent_sha256,
+            bound_intent,
+        ) = state
+        if (
+            type(bound_store) is not EvidenceStore
+            or _STORE_BINDINGS.get(id(bound_store)) is not bound_binding
+            or bound_binding[0] is not bound_store
+            or bound_store.case_workspace is not bound_case_workspace
+            or type(bound_intent) is not IntentContract
+        ):
+            raise EvidenceIntegrityError("expected intent snapshot authority is invalid")
+        try:
+            authority_store = object.__getattribute__(authority, "_store")
+            authority_binding = object.__getattribute__(authority, "_store_binding")
+            authority_case_workspace = object.__getattribute__(authority, "_case_workspace")
+            authority_case_id = object.__getattribute__(authority, "_case_id")
+            authority_case_sha256 = object.__getattribute__(authority, "_case_sha256")
+            authority_intent_sha256 = object.__getattribute__(authority, "_intent_sha256")
+            authority_intent = object.__getattribute__(authority, "_intent")
+            bound_root = bound_case_workspace.root
+            current_root = self.case_workspace.root
+        except (AttributeError, WorkspaceBoundaryError) as error:
+            raise EvidenceIntegrityError("expected intent snapshot authority is invalid") from error
+        if (
+            authority_store is not bound_store
+            or authority_binding is not bound_binding
+            or authority_case_workspace is not bound_case_workspace
+            or authority_case_id != bound_case_id
+            or authority_case_sha256 != bound_case_sha256
+            or authority_intent_sha256 != bound_intent_sha256
+            or authority_intent is not bound_intent
+        ):
+            raise EvidenceIntegrityError("expected intent snapshot authority binding changed")
+        if (
+            self.case_workspace.case_id != bound_case_id
+            or type(current_root) is not type(bound_root)
+            or current_root != bound_root
+        ):
+            raise EvidenceIntegrityError("expected intent snapshot is foreign")
+
+        current_intent = self._intent
+        current_intent_sha256 = _digest(current_intent.to_dict())
+        if (
+            self._case_sha256 != bound_case_sha256
+            or current_intent_sha256 != bound_intent_sha256
+            or current_intent.to_dict() != bound_intent.to_dict()
+        ):
+            raise EvidenceIntegrityError("expected intent snapshot is stale")
+        self._exact()
+        return cast(IntentContract, bound_intent)
+
     def append_event(
         self,
         event_type: str,
@@ -983,13 +1053,20 @@ class EvidenceStore:
             self._load_and_validate(None)
             return self._append_event(event_type, payload)
 
-    def revise_intent(self, new_intent: IntentContract) -> dict[str, object]:
+    def revise_intent(
+        self,
+        new_intent: IntentContract,
+        *,
+        expected_snapshot: IntentSnapshotAuthority | None = None,
+    ) -> dict[str, object]:
         """Append a complete intent revision and project its newest contract."""
 
         if not isinstance(new_intent, IntentContract):
             raise TypeError("new_intent must be a complete IntentContract")
         with self._transaction():
             self._load_and_validate(None)
+            if expected_snapshot is not None:
+                self._validate_expected_intent_snapshot(expected_snapshot)
             previous_payload = self._intent.to_dict()
             new_payload = new_intent.to_dict()
             event = self._append_event(
