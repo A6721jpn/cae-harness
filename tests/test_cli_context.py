@@ -454,6 +454,41 @@ def test_forged_registry_root_record_cannot_redirect_case_creation(tmp_path: Pat
     assert tuple(foreign.iterdir()) == ()
 
 
+def test_coherent_forged_registry_root_lacks_os_authority_seal(tmp_path: Path) -> None:
+    module = _context_module()
+    service = _service(tmp_path)
+    cae_root = tmp_path / "02_CAE"
+    cae_root.mkdir()
+    service.register_root(cae_root)
+    foreign = tmp_path / "foreign-location" / "02_CAE"
+    foreign.mkdir(parents=True)
+    foreign_stamp = module._identity_stamp(foreign, "foreign")
+    forged_root_id = module._root_id_for(foreign, foreign_stamp)
+    registry_path = tmp_path / "registry" / "registry.json"
+    document = json.loads(registry_path.read_bytes())
+    document["roots"][0]["path"] = os.fspath(foreign)
+    document["roots"][0]["stamp"] = [*foreign_stamp]
+    document["roots"][0]["root_id"] = forged_root_id
+    body = {name: document[name] for name in ("schema_version", "roots", "cases")}
+    document["sha256"] = module._digest(body)
+    registry_path.write_bytes(module._canonical_bytes(document) + b"\n")
+    source = tmp_path / "synthetic.feb"
+    source.write_text("<febio_spec />", encoding="utf-8")
+
+    with pytest.raises(module.CaseContextError) as raised:
+        service.create_case(
+            root_id=forged_root_id,
+            case_id="case-a",
+            sources=(source,),
+            intent=_complete_intent(),
+        )
+    assert raised.value.code in {
+        "REGISTRY_AUTHORITY_REQUIRED",
+        "EVIDENCE_INTEGRITY_FAILURE",
+    }
+    assert tuple(foreign.iterdir()) == ()
+
+
 def test_failed_case_creation_releases_only_untouched_preparing_reservation(
     tmp_path: Path,
 ) -> None:
