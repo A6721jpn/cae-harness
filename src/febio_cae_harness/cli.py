@@ -7,6 +7,14 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from febio_cae_harness import __version__
+from febio_cae_harness.cli_context import (
+    CaseContextError,
+    CaseContextService,
+    cli_failure,
+    cli_success,
+    load_answer_document,
+    load_intent_document,
+)
 from febio_cae_harness.model.feb import inspect_feb_file
 from febio_cae_harness.model.preflight import PreflightResult, run_preflight
 from febio_cae_harness.model.step import inspect_step_file
@@ -16,6 +24,18 @@ _PREFLIGHT_EXIT_CODES = {
     "INVALID_FEB_ROOT": 2,
     "MISSING_REFERENCE": 3,
     "DUPLICATE_IDENTIFIER": 4,
+}
+
+_CONTEXT_EXIT_CODES = {
+    "INVALID_INPUT": 20,
+    "REGISTRY_AUTHORITY_REQUIRED": 21,
+    "CASE_NOT_REGISTERED": 22,
+    "REGISTRATION_CONFLICT": 23,
+    "BOUNDARY_OR_IDENTITY_VIOLATION": 24,
+    "EVIDENCE_INTEGRITY_FAILURE": 25,
+    "STALE_INTENT_OR_QUESTION": 26,
+    "IO_OR_LOCK_FAILURE": 27,
+    "INTERNAL_ERROR": 70,
 }
 
 
@@ -44,11 +64,44 @@ def build_parser() -> argparse.ArgumentParser:
     )
     probe_febio_command.add_argument("path", type=Path, metavar="PATH")
 
+    root = commands.add_parser("root", help="manage explicitly registered 02_CAE roots")
+    root_commands = root.add_subparsers(dest="root_command", required=True)
+    root_register = root_commands.add_parser(
+        "register", help="register one existing exact 02_CAE root"
+    )
+    root_register.add_argument("--cae-root", required=True, type=Path, metavar="PATH")
+
+    case = commands.add_parser("case", help="operate on registered case contexts")
+    case_commands = case.add_subparsers(dest="case_command", required=True)
+    case_create = case_commands.add_parser("create", help="create one registered case")
+    case_create.add_argument("--root-id", required=True)
+    case_create.add_argument("--case-id", required=True)
+    case_create.add_argument("--intent-file", required=True, type=Path, metavar="PATH")
+    case_create.add_argument("--input", action="append", default=[], type=Path, metavar="PATH")
+    for name in ("open", "show", "reconcile"):
+        case_read = case_commands.add_parser(name, help=f"{name} one registered case")
+        case_read.add_argument("--case-id", required=True)
+    case_revise = case_commands.add_parser("revise", help="append one complete intent revision")
+    case_revise.add_argument("--case-id", required=True)
+    case_revise.add_argument("--if-intent-sha256", required=True)
+    case_revise.add_argument("--intent-file", required=True, type=Path, metavar="PATH")
+    case_answer = case_commands.add_parser(
+        "answer", help="answer the exact current authoritative question"
+    )
+    case_answer.add_argument("--case-id", required=True)
+    case_answer.add_argument("--if-intent-sha256", required=True)
+    case_answer.add_argument("--question-id", required=True)
+    case_answer.add_argument("--answer-file", required=True, type=Path, metavar="PATH")
+
     commands.add_parser(
         "run-febio",
         help="disabled until a safe case-context command can reconstruct authorities",
     )
     return parser
+
+
+def _case_service() -> CaseContextService:
+    return CaseContextService()
 
 
 def _error(message: str) -> int:
@@ -93,6 +146,64 @@ def _emit_probe(path: Path) -> int:
     return 0
 
 
+def _emit_context_json(payload: object, *, error: bool = False) -> None:
+    print(
+        json.dumps(payload, ensure_ascii=False, allow_nan=False, sort_keys=True),
+        file=sys.stderr if error else sys.stdout,
+    )
+
+
+def _context_command_name(arguments: argparse.Namespace) -> str:
+    if arguments.command == "root":
+        return f"root.{arguments.root_command}"
+    return f"case.{arguments.case_command}"
+
+
+def _run_context_command(arguments: argparse.Namespace) -> int:
+    command = _context_command_name(arguments)
+    try:
+        service = _case_service()
+        if command == "root.register":
+            payload = cli_success(command, root=service.register_root(arguments.cae_root))
+        elif command == "case.create":
+            intent = load_intent_document(arguments.intent_file)
+            case = service.create_case(
+                root_id=arguments.root_id,
+                case_id=arguments.case_id,
+                sources=tuple(arguments.input),
+                intent=intent,
+            )
+            payload = cli_success(command, case=case)
+        elif command in {"case.open", "case.show", "case.reconcile"}:
+            payload = cli_success(command, case=service.open_case(arguments.case_id))
+        elif command == "case.revise":
+            intent = load_intent_document(arguments.intent_file)
+            case = service.revise_case(
+                case_id=arguments.case_id,
+                expected_intent_sha256=arguments.if_intent_sha256,
+                intent=intent,
+            )
+            payload = cli_success(command, case=case)
+        elif command == "case.answer":
+            value, source, detail = load_answer_document(arguments.answer_file)
+            case = service.answer_case(
+                case_id=arguments.case_id,
+                expected_intent_sha256=arguments.if_intent_sha256,
+                question_id=arguments.question_id,
+                value=value,
+                source=source,
+                detail=detail,
+            )
+            payload = cli_success(command, case=case)
+        else:  # pragma: no cover - parser owns the command vocabulary
+            raise CaseContextError("INTERNAL_ERROR", "unknown case context command")
+    except CaseContextError as error:
+        _emit_context_json(cli_failure(command, error), error=True)
+        return _CONTEXT_EXIT_CODES.get(error.code, 70)
+    _emit_context_json(payload)
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = build_parser().parse_args(argv)
     if arguments.command in {"inspect-feb", "inspect-step"}:
@@ -101,6 +212,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _emit_preflight(arguments.path)
     if arguments.command == "probe-febio":
         return _emit_probe(arguments.path)
+    if arguments.command in {"root", "case"}:
+        return _run_context_command(arguments)
     if arguments.command == "run-febio":
         return _error("run-febio is disabled until a safe case-context command is available")
     return 0
