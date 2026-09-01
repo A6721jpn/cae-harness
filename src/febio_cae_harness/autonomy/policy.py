@@ -1899,6 +1899,7 @@ _SOLVER_FAILURE_CLASSIFICATIONS: Mapping[SolverClassification, FailureClass] = M
         SolverClassification.MISSING_OUTPUT: FailureClass.MISSING_OUTPUT,
         SolverClassification.FATAL: FailureClass.FATAL,
         SolverClassification.NEGATIVE_JACOBIAN: FailureClass.NEGATIVE_JACOBIAN,
+        SolverClassification.NONLINEAR_CONVERGENCE: FailureClass.NONLINEAR_CONVERGENCE,
         SolverClassification.INVALID_LOG: FailureClass.UNKNOWN,
         SolverClassification.FBS_UNVERIFIED: FailureClass.UNKNOWN,
         SolverClassification.FBS_INVALID: FailureClass.UNKNOWN,

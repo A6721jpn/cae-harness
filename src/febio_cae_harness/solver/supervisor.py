@@ -5326,6 +5326,7 @@ class SolverSupervisor:
             return SolverClassification.CANCELLED
         if log_validation.classification in {
             SolverClassification.NEGATIVE_JACOBIAN,
+            SolverClassification.NONLINEAR_CONVERGENCE,
             SolverClassification.FATAL,
             SolverClassification.INIT_ONLY,
         }:

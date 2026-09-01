@@ -139,6 +139,10 @@ def test_launch_spec_owns_command_and_fresh_attempt_outputs(tmp_path: Path) -> N
         ("initialization only\ninitialization complete", SolverClassification.INIT_ONLY),
         ("FATAL ERROR: cannot continue", SolverClassification.FATAL),
         ("Negative Jacobian determinant at element 4", SolverClassification.NEGATIVE_JACOBIAN),
+        (
+            "Negative Jacobian; nonlinear solver failed to converge",
+            SolverClassification.NEGATIVE_JACOBIAN,
+        ),
     ],
 )
 def test_log_validation_classifies_non_success_logs(
@@ -155,6 +159,27 @@ def test_log_validation_classifies_non_success_logs(
     assert not result.valid
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "FATAL ERROR: nonlinear solver failed to converge",
+        "Maximum number of nonlinear iterations reached",
+    ],
+)
+def test_log_validation_classifies_only_explicit_nonlinear_convergence_failures(
+    tmp_path: Path,
+    text: str,
+) -> None:
+    path = tmp_path / "solver.log"
+    path.write_text(text, encoding="utf-8")
+
+    result = validate_log(path)
+
+    assert result.classification is not None
+    assert result.classification.value == "NONLINEAR_CONVERGENCE"
+    assert not result.valid
+
+
 def test_supervisor_reports_missing_outputs_after_normal_exit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -165,6 +190,27 @@ def test_supervisor_reports_missing_outputs_after_normal_exit(
     assert result.state is SolverState.NORMAL_EXIT
     assert result.return_code == 0
     assert result.classification is SolverClassification.MISSING_OUTPUT
+    assert not result.success
+
+
+def test_supervisor_preserves_explicit_nonlinear_failure_on_nonzero_exit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    code = (
+        "import os; from pathlib import Path; "
+        "Path(os.environ['FEBIO_CAE_HARNESS_LOG']).write_text("
+        "'FATAL ERROR: nonlinear solver failed to converge'); "
+        "Path(os.environ['FEBIO_CAE_HARNESS_XPLT']).write_bytes(b'partial'); "
+        "os._exit(1)"
+    )
+    capability = _capability(tmp_path, monkeypatch, code=code)
+
+    result = SolverSupervisor(capability).run()
+
+    assert result.state is SolverState.FAILED
+    assert result.return_code == 1
+    assert result.classification is SolverClassification.NONLINEAR_CONVERGENCE
     assert not result.success
 
 

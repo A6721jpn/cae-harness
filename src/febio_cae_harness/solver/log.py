@@ -31,6 +31,11 @@ _NEGATIVE_JACOBIAN_PATTERNS = (
     re.compile(r"jacobian(?:\s+determinant)?[^\n]*\bnegative\b", re.IGNORECASE),
     re.compile(r"jacobian(?:\s+determinant)?[^\n]*<\s*0", re.IGNORECASE),
 )
+_NONLINEAR_CONVERGENCE_PATTERNS = (
+    re.compile(r"\bnonlinear(?:\s+solver)?\b[^\n]*\bfailed\s+to\s+converge\b", re.IGNORECASE),
+    re.compile(r"\bfailed\s+to\s+converge\b[^\n]*\bnonlinear\b", re.IGNORECASE),
+    re.compile(r"\bmaximum\s+number\s+of\s+nonlinear\s+iterations\s+reached\b", re.IGNORECASE),
+)
 _FATAL_PATTERNS = (
     re.compile(r"\bfatal(?:\s+error)?\b", re.IGNORECASE),
     re.compile(r"missing\s+(?:a\s+)?(?:reference|attribute|node|element)", re.IGNORECASE),
@@ -148,6 +153,10 @@ def _has_negative_jacobian(text: str) -> bool:
     return any(pattern.search(text) is not None for pattern in _NEGATIVE_JACOBIAN_PATTERNS)
 
 
+def _has_nonlinear_convergence_failure(text: str) -> bool:
+    return any(pattern.search(text) is not None for pattern in _NONLINEAR_CONVERGENCE_PATTERNS)
+
+
 def _has_fatal(text: str) -> bool:
     return any(pattern.search(text) is not None for pattern in _FATAL_PATTERNS)
 
@@ -213,6 +222,9 @@ def validate_log(
     if _has_negative_jacobian(text):
         classification = SolverClassification.NEGATIVE_JACOBIAN
         issues.append("LOG reports a negative Jacobian")
+    elif _has_nonlinear_convergence_failure(text):
+        classification = SolverClassification.NONLINEAR_CONVERGENCE
+        issues.append("LOG explicitly reports nonlinear convergence failure")
     elif _has_fatal(text):
         classification = SolverClassification.FATAL
         issues.append("LOG reports a fatal or missing-reference error")

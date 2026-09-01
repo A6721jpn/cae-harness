@@ -895,6 +895,11 @@ def test_retry_rejects_mutated_capability_inside_accounting_lock(
             FailureClass.TIMEOUT,
             FailureClass.NEGATIVE_JACOBIAN,
         ),
+        (
+            SolverClassification.NONLINEAR_CONVERGENCE,
+            FailureClass.TIMEOUT,
+            FailureClass.NONLINEAR_CONVERGENCE,
+        ),
         (SolverClassification.INVALID_LOG, FailureClass.TIMEOUT, FailureClass.UNKNOWN),
         (SolverClassification.FBS_INVALID, FailureClass.TIMEOUT, FailureClass.UNKNOWN),
         (SolverClassification.TIMEOUT, FailureClass.NEGATIVE_JACOBIAN, FailureClass.TIMEOUT),
