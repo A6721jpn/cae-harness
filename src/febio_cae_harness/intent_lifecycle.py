@@ -372,8 +372,14 @@ class IntentLifecycle:
         self._issued_question = issued_question
         if question is None:
             raise EvidenceIntegrityError("intent has no current authoritative question")
-        if type(question_id) is not IntentQuestion or question_id is not issued_question:
+        if (
+            type(question_id) is not IntentQuestion
+            or issued_question is None
+            or question_id is not issued_question
+        ):
             raise EvidenceIntegrityError("question is not the exact issued current question")
+        if question.to_dict() != issued_question.to_dict():
+            raise EvidenceIntegrityError("current authoritative question changed after issuance")
 
         current_payload = snapshot.intent.to_dict()
         field_by_name = {name: name for name in current_payload if name not in _NON_ANSWER_FIELDS}
