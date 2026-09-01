@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import hashlib
 import importlib
 import inspect
@@ -11,6 +12,7 @@ import stat
 import subprocess
 import sys
 import threading
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 from copy import copy, deepcopy
 from dataclasses import dataclass
@@ -51,6 +53,18 @@ def _execution_module() -> ModuleType:
     }
     missing = sorted(name for name in required if not hasattr(module, name))
     assert not missing, f"execution authority API is incomplete: {missing}"
+    return module
+
+
+def _execution_outputs_module() -> ModuleType:
+    module = _execution_module()
+    required = {
+        "ExecutionOutputsAuthority",
+        "claim_execution_outputs",
+        "validate_execution_outputs",
+    }
+    missing = sorted(name for name in required if not hasattr(module, name))
+    assert not missing, f"execution outputs authority API is incomplete: {missing}"
     return module
 
 
@@ -130,6 +144,36 @@ def _reopen(context: _Context) -> Any:
         context.intent,
         context.runtime,
     )
+
+
+def _write_synthetic_outputs(
+    authority: Any,
+    *,
+    log: bytes = b"synthetic normal termination\n",
+    xplt: bytes = b"synthetic XPLT bytes\n",
+) -> None:
+    authority.log_path.write_bytes(log)
+    authority.xplt_path.write_bytes(xplt)
+
+
+def _make_directory_alias(alias: Path, target: Path) -> None:
+    if os.name != "nt":
+        alias.symlink_to(target, target_is_directory=True)
+        return
+    process = _REAL_POPEN(
+        ["cmd", "/c", "mklink", "/J", str(alias), str(target)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=5.0)
+    finally:
+        if process.stdout is not None:
+            process.stdout.close()
+        if process.stderr is not None:
+            process.stderr.close()
+    assert process.returncode == 0, (stdout, stderr)
 
 
 def test_execution_authority_api_has_no_caller_selected_labels_or_outputs() -> None:
@@ -644,3 +688,235 @@ def test_record_replacement_with_identical_bytes_invalidates_issued_authority(
     reopened = _reopen(context)
     assert reopened.record_sha256 == record_sha256
     assert record_path.read_bytes() == original
+
+
+def test_execution_authority_registry_has_collectible_identity_safe_lifecycle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _context(tmp_path, monkeypatch)
+    module = _execution_module()
+    live = _issue(context)
+    baseline = len(module._AUTHORITY_STATES)
+    reopened = [_reopen(context) for _ in range(32)]
+    references = [weakref.ref(authority) for authority in reopened]
+
+    del reopened
+    gc.collect()
+
+    assert all(reference() is None for reference in references)
+    assert len(module._AUTHORITY_STATES) == baseline
+    assert module.validate_execution_authority(live) is live
+    assert repr(live) == "ExecutionAuthority(<opaque>)"
+
+
+def test_execution_outputs_api_is_derived_opaque_live_and_closeable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _context(tmp_path, monkeypatch)
+    module = _execution_outputs_module()
+    execution = _issue(context)
+    _write_synthetic_outputs(execution)
+
+    claim_parameters = inspect.signature(module.claim_execution_outputs).parameters
+    validate_parameters = inspect.signature(module.validate_execution_outputs).parameters
+    assert tuple(claim_parameters) == ("execution_authority",)
+    assert tuple(validate_parameters) == ("value",)
+    assert not {
+        "attempt",
+        "label",
+        "log_path",
+        "output_path",
+        "xplt_path",
+    }.intersection(claim_parameters)
+
+    outputs = module.claim_execution_outputs(execution)
+    assert type(outputs) is module.ExecutionOutputsAuthority
+    assert repr(outputs) == "ExecutionOutputsAuthority(<opaque>)"
+    assert not hasattr(outputs, "__dict__")
+    assert outputs.log_path == execution.log_path
+    assert outputs.xplt_path == execution.xplt_path
+    assert outputs.log_bytes == b"synthetic normal termination\n"
+    assert outputs.xplt_bytes == b"synthetic XPLT bytes\n"
+    assert outputs.log_sha256 == hashlib.sha256(outputs.log_bytes).hexdigest()
+    assert outputs.xplt_sha256 == hashlib.sha256(outputs.xplt_bytes).hexdigest()
+    assert outputs.log_size == len(outputs.log_bytes)
+    assert outputs.xplt_size == len(outputs.xplt_bytes)
+    assert module.validate_execution_outputs(outputs) is outputs
+    with outputs as entered:
+        assert entered is outputs
+
+    for operation in (copy, deepcopy, pickle.dumps):
+        with pytest.raises(TypeError):
+            operation(outputs)
+    with pytest.raises(AttributeError):
+        outputs.log_sha256 = "0" * 64
+    with pytest.raises(TypeError):
+        module.ExecutionOutputsAuthority()
+    with pytest.raises(TypeError):
+        type("ForgedExecutionOutputsAuthority", (module.ExecutionOutputsAuthority,), {})
+    with pytest.raises(module.ExecutionAuthorityError, match="closed|released"):
+        module.validate_execution_outputs(outputs)
+    with pytest.raises(module.ExecutionAuthorityError, match="closed|released"):
+        _ = outputs.log_bytes
+    outputs.close()
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    ["missing-log", "missing-xplt", "directory", "hardlink", "reparse"],
+)
+def test_execution_outputs_claim_rejects_missing_nonregular_and_aliased_outputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    invalid: str,
+) -> None:
+    context = _context(tmp_path, monkeypatch)
+    module = _execution_outputs_module()
+    execution = _issue(context)
+    if invalid != "missing-log":
+        execution.log_path.write_bytes(b"synthetic LOG")
+    if invalid not in {"missing-xplt", "directory", "hardlink", "reparse"}:
+        execution.xplt_path.write_bytes(b"synthetic XPLT")
+    elif invalid == "directory":
+        execution.xplt_path.mkdir()
+    elif invalid == "hardlink":
+        source = context.attempt.root / "synthetic-output-source"
+        source.write_bytes(b"synthetic XPLT")
+        os.link(source, execution.xplt_path)
+    elif invalid == "reparse":
+        target = tmp_path / "foreign-output-directory"
+        target.mkdir()
+        _make_directory_alias(execution.xplt_path, target)
+
+    with pytest.raises(
+        module.ExecutionAuthorityError,
+        match="output|LOG|XPLT|regular|link|alias|reparse|claim",
+    ):
+        module.claim_execution_outputs(execution)
+
+    assert module.validate_execution_authority(execution) is execution
+
+
+def test_execution_outputs_require_exact_live_authority_and_reject_record_path_escape(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _context(tmp_path, monkeypatch)
+    module = _execution_outputs_module()
+    execution = _issue(context)
+    _write_synthetic_outputs(execution)
+
+    with pytest.raises(module.ExecutionAuthorityError, match="authority|issued|exact"):
+        module.claim_execution_outputs(object())
+
+    record_path = _record_path(context)
+    record = json.loads(record_path.read_bytes())
+    record["outputs"]["log"] = "../escaped.log"
+    payload = dict(record)
+    payload.pop("record_sha256")
+    record["record_sha256"] = hashlib.sha256(_canonical(payload)).hexdigest()
+    record_path.write_bytes(_canonical(record) + b"\n")
+
+    with pytest.raises(
+        module.ExecutionAuthorityError,
+        match="record|authority|output|attempt|outside|changed",
+    ):
+        module.claim_execution_outputs(execution)
+
+
+@pytest.mark.parametrize(
+    ("label", "replacement"),
+    [("log", False), ("xplt", False), ("log", True), ("xplt", True)],
+)
+def test_execution_outputs_validation_rejects_mutation_and_same_bytes_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    label: str,
+    replacement: bool,
+) -> None:
+    context = _context(tmp_path, monkeypatch)
+    module = _execution_outputs_module()
+    execution = _issue(context)
+    _write_synthetic_outputs(execution)
+    outputs = module.claim_execution_outputs(execution)
+    path = execution.log_path if label == "log" else execution.xplt_path
+
+    if replacement:
+        original = path.read_bytes()
+        displaced = path.with_suffix(f"{path.suffix}.displaced")
+        path.replace(displaced)
+        path.write_bytes(original)
+    else:
+        path.write_bytes(b"mutated synthetic output bytes")
+
+    with pytest.raises(
+        module.ExecutionAuthorityError,
+        match="output|LOG|XPLT|identity|changed|digest|state",
+    ):
+        module.validate_execution_outputs(outputs)
+    with pytest.raises(module.ExecutionAuthorityError):
+        _ = outputs.log_bytes
+    outputs.close()
+    outputs.close()
+
+
+def test_execution_outputs_close_is_idempotent_after_foreign_descriptor_reuse(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _context(tmp_path, monkeypatch)
+    module = _execution_outputs_module()
+    execution = _issue(context)
+    _write_synthetic_outputs(execution)
+    outputs = module.claim_execution_outputs(execution)
+    foreign_path = tmp_path / "foreign-descriptor"
+    foreign_path.write_bytes(b"foreign descriptor bytes")
+    original_close = os.close
+    reused: int | None = None
+
+    def close_then_reuse(descriptor: int) -> None:
+        nonlocal reused
+        if reused is None:
+            original_close(descriptor)
+            candidate = os.open(os.fspath(foreign_path), os.O_RDONLY)
+            assert candidate == descriptor
+            reused = candidate
+            raise OSError("synthetic close failure after descriptor reuse")
+        original_close(descriptor)
+
+    monkeypatch.setattr(os, "close", close_then_reuse)
+    try:
+        with pytest.raises(
+            module.ExecutionAuthorityError,
+            match="cleanup|close|ownership|foreign|released",
+        ):
+            outputs.close()
+        assert reused is not None
+        os.fstat(reused)
+        monkeypatch.setattr(os, "close", original_close)
+        outputs.close()
+        os.fstat(reused)
+        with pytest.raises(module.ExecutionAuthorityError, match="closed|released"):
+            module.validate_execution_outputs(outputs)
+    finally:
+        monkeypatch.setattr(os, "close", original_close)
+        if reused is not None:
+            original_close(reused)
+
+
+def test_unclosed_execution_outputs_are_collectible_without_a_strong_registry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _context(tmp_path, monkeypatch)
+    execution = _issue(context)
+    _write_synthetic_outputs(execution)
+    outputs = _execution_outputs_module().claim_execution_outputs(execution)
+    reference = weakref.ref(outputs)
+
+    del outputs
+    gc.collect()
+
+    assert reference() is None
