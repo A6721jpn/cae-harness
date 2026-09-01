@@ -25,6 +25,8 @@ from febio_cae_harness.evidence import EvidenceStore, IntentSnapshotAuthority
 from febio_cae_harness.solver.runtime import FebioRuntimeDiagnostic, probe_febio
 from febio_cae_harness.workspace import AttemptWorkspace, ValidatedCaseWorkspace
 
+_REAL_POPEN = subprocess.Popen
+
 
 @dataclass(frozen=True)
 class _Context:
@@ -549,12 +551,20 @@ def test_issue_rejects_outside_nonregular_hardlinked_and_reparse_inputs(
     (foreign_directory / "aliased.feb").write_bytes(b"foreign synthetic FEB")
     alias = alias_context.attempt.root / "alias"
     if os.name == "nt":
-        subprocess.run(
+        process = _REAL_POPEN(
             ["cmd", "/c", "mklink", "/J", str(alias), str(foreign_directory)],
-            check=True,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
         )
+        try:
+            stdout, stderr = process.communicate(timeout=5.0)
+        finally:
+            if process.stdout is not None:
+                process.stdout.close()
+            if process.stderr is not None:
+                process.stderr.close()
+        assert process.returncode == 0, (stdout, stderr)
     else:
         alias.symlink_to(foreign_directory, target_is_directory=True)
     with pytest.raises(module.ExecutionAuthorityError, match="alias|reparse|directory|input"):
@@ -621,6 +631,7 @@ def test_record_replacement_with_identical_bytes_invalidates_issued_authority(
     context = _context(tmp_path, monkeypatch)
     module = _execution_module()
     authority = _issue(context)
+    record_sha256 = authority.record_sha256
     record_path = _record_path(context)
     original = record_path.read_bytes()
     displaced = record_path.with_suffix(".displaced")
@@ -631,5 +642,5 @@ def test_record_replacement_with_identical_bytes_invalidates_issued_authority(
         module.validate_execution_authority(authority)
 
     reopened = _reopen(context)
-    assert reopened.record_sha256 == authority.record_sha256
+    assert reopened.record_sha256 == record_sha256
     assert record_path.read_bytes() == original
