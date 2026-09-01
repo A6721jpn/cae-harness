@@ -383,7 +383,7 @@ def _single_blocker(
             "source": "synthetic-user",
         },
     )
-    values = {"contact": None, "unresolved": blocker}
+    values: dict[str, object] = {"contact": None, "unresolved": blocker}
     values.update(intent_overrides)
     _, _, store = _make_store(tmp_path, _complete_intent(**values), case_id=case_id)
     lifecycle = module.IntentLifecycle(store)
