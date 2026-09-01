@@ -258,7 +258,10 @@ def _remove_matching_unresolved(value: object, condition: str) -> object:
         if set(value) & set((*_RECORD_NAME_FIELDS, "authoritative", "resolved", "status")):
             return [] if _matches_condition(value, condition) else dict(value)
         return {
-            key: item for key, item in value.items() if key != condition
+            key: item
+            for key, item in value.items()
+            if key != condition
+            and not (isinstance(item, Mapping) and _matches_condition(item, condition))
         }
     if isinstance(value, (list, tuple)):
         return [item for item in value if not _matches_condition(item, condition)]
@@ -373,9 +376,7 @@ class IntentLifecycle:
             raise EvidenceIntegrityError("question is not the exact issued current question")
 
         current_payload = snapshot.intent.to_dict()
-        field_by_name = {
-            name: name for name in current_payload if name not in _NON_ANSWER_FIELDS
-        }
+        field_by_name = {name: name for name in current_payload if name not in _NON_ANSWER_FIELDS}
         condition_field = field_by_name.get(question.condition)
         if condition_field is None:
             raise EvidenceIntegrityError(
