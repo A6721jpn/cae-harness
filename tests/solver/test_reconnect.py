@@ -18,6 +18,8 @@ from febio_cae_harness.contracts import IntentContract
 from febio_cae_harness.evidence import EvidenceStore
 from febio_cae_harness.solver import headless as headless_module
 from febio_cae_harness.solver import types as solver_types
+from febio_cae_harness.solver.log import LogValidation
+from febio_cae_harness.solver.log import validate_log as validate_solver_log
 from febio_cae_harness.solver.runtime import FebioRuntimeDiagnostic, probe_febio
 from febio_cae_harness.solver.supervisor import SolverSupervisor, _process_metadata
 from febio_cae_harness.solver.types import (
@@ -25,6 +27,7 @@ from febio_cae_harness.solver.types import (
     SolverLaunchCapability,
     SolverLaunchSpec,
     SolverOwnershipError,
+    SolverRunResult,
     SolverState,
 )
 from febio_cae_harness.workspace import AttemptWorkspace, ValidatedCaseWorkspace
@@ -100,7 +103,11 @@ def _normal_spec(tmp_path: Path) -> SolverLaunchSpec:
 
 @pytest.mark.parametrize(
     ("terminal", "expected_state"),
-    (("normal", SolverState.NORMAL_EXIT), ("cancel", SolverState.CANCELLED)),
+    (
+        ("normal", SolverState.NORMAL_EXIT),
+        ("failed", SolverState.FAILED),
+        ("cancel", SolverState.CANCELLED),
+    ),
 )
 def test_terminal_completion_releases_parent_process_authority(
     tmp_path: Path,
@@ -108,16 +115,22 @@ def test_terminal_completion_releases_parent_process_authority(
     terminal: str,
     expected_state: SolverState,
 ) -> None:
-    code = "pass" if terminal == "normal" else "import time; time.sleep(30)"
+    code = {
+        "normal": "pass",
+        "failed": "import os; os._exit(7)",
+        "cancel": "import time; time.sleep(30)",
+    }[terminal]
     supervisor = SolverSupervisor(_capability(tmp_path, monkeypatch, code=code)).start()
     authority = supervisor._process_authority
     assert authority is not None
     close = Mock(wraps=authority.close)
     monkeypatch.setattr(authority, "close", close)
 
-    result = supervisor.wait() if terminal == "normal" else supervisor.cancel()
+    result = supervisor.cancel() if terminal == "cancel" else supervisor.wait()
 
     assert result.state is expected_state
+    if terminal == "failed":
+        assert result.return_code == 7
     close.assert_called_once_with()
     assert supervisor._process_authority is None
 
@@ -223,6 +236,169 @@ def test_normal_exit_drains_owned_descendant_before_releasing_authority(
     time.sleep(1.2)
     assert descendant_started.exists()
     assert not descendant_survived.exists()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="requires native Windows Job Objects")
+def test_cancel_after_root_exit_drains_owned_descendant_before_validation(
+    tmp_path: Path,
+) -> None:
+    monkeypatch = pytest.MonkeyPatch()
+    owned_ready = tmp_path / "owned-descendant-ready.txt"
+    owned_release = tmp_path / "owned-descendant-release.txt"
+    owned_late_marker = tmp_path / "owned-descendant-late.txt"
+    unrelated_ready = tmp_path / "unrelated-ready.txt"
+    unrelated_release = tmp_path / "unrelated-release.txt"
+    unrelated_marker = tmp_path / "unrelated-marker.txt"
+
+    def wait_for_path(path: Path, timeout_seconds: float) -> bool:
+        deadline = time.monotonic() + timeout_seconds
+        while not path.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        return path.exists()
+
+    descendant_code = "\n".join(
+        (
+            "from pathlib import Path",
+            "import os",
+            "import time",
+            f"ready = Path({str(owned_ready)!r})",
+            f"release = Path({str(owned_release)!r})",
+            f"marker = Path({str(owned_late_marker)!r})",
+            "ready.write_text(str(os.getpid()), encoding='utf-8')",
+            "deadline = time.monotonic() + 15.0",
+            "while not release.exists() and time.monotonic() < deadline:",
+            "    time.sleep(0.01)",
+            "if release.exists():",
+            "    marker.write_text('survived', encoding='utf-8')",
+        )
+    )
+    root_code = "\n".join(
+        (
+            "from pathlib import Path",
+            "import os",
+            "import subprocess",
+            "import sys",
+            "import time",
+            f"ready = Path({str(owned_ready)!r})",
+            f"descendant_code = {descendant_code!r}",
+            "subprocess.Popen(",
+            "    [sys.executable, '-c', descendant_code],",
+            "    stdin=subprocess.DEVNULL,",
+            "    stdout=subprocess.DEVNULL,",
+            "    stderr=subprocess.DEVNULL,",
+            ")",
+            "deadline = time.monotonic() + 5.0",
+            "while not ready.exists() and time.monotonic() < deadline:",
+            "    time.sleep(0.01)",
+            "os._exit(0 if ready.exists() else 7)",
+        )
+    )
+    unrelated_code = "\n".join(
+        (
+            "from pathlib import Path",
+            "import os",
+            "import time",
+            f"ready = Path({str(unrelated_ready)!r})",
+            f"release = Path({str(unrelated_release)!r})",
+            f"marker = Path({str(unrelated_marker)!r})",
+            "ready.write_text(str(os.getpid()), encoding='utf-8')",
+            "deadline = time.monotonic() + 15.0",
+            "while not release.exists() and time.monotonic() < deadline:",
+            "    time.sleep(0.01)",
+            "if release.exists():",
+            "    marker.write_text('completed', encoding='utf-8')",
+        )
+    )
+
+    supervisor = SolverSupervisor(_capability(tmp_path, monkeypatch, code=root_code)).start()
+    process = supervisor._process
+    assert isinstance(process, subprocess.Popen)
+    unrelated = subprocess.Popen(
+        [sys.executable, "-c", unrelated_code],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        assert wait_for_path(owned_ready, 5.0)
+        owned_pid = int(owned_ready.read_text(encoding="utf-8"))
+        owned_before_root_exit = _process_metadata(owned_pid)
+        assert owned_before_root_exit.alive
+
+        assert process.wait(timeout=5.0) == 0
+        assert process.poll() == 0
+        owned_after_root_exit = _process_metadata(owned_pid)
+        assert owned_after_root_exit.alive
+        assert owned_after_root_exit.creation_identity == owned_before_root_exit.creation_identity
+
+        assert wait_for_path(unrelated_ready, 5.0)
+        assert int(unrelated_ready.read_text(encoding="utf-8")) == unrelated.pid
+        unrelated_before_cancel = _process_metadata(unrelated.pid)
+        assert unrelated_before_cancel.alive
+
+        order: list[str] = []
+        original_validate_log = validate_solver_log
+        original_register_result = supervisor._register_result
+
+        def validate_after_drain(
+            path: str | Path,
+            *,
+            expected_steps: int | None = None,
+            expected_final_time: float | None = None,
+            final_time_tolerance: float = 1e-9,
+        ) -> LogValidation:
+            order.append("validate")
+            owned_release.write_text("validate", encoding="utf-8")
+            assert not wait_for_path(owned_late_marker, 1.0)
+            return original_validate_log(
+                path,
+                expected_steps=expected_steps,
+                expected_final_time=expected_final_time,
+                final_time_tolerance=final_time_tolerance,
+            )
+
+        def publish_after_drain(result: SolverRunResult) -> None:
+            order.append("publish")
+            assert owned_release.exists()
+            assert not owned_late_marker.exists()
+            original_register_result(result)
+
+        monkeypatch.setattr(supervisor_module, "validate_log", validate_after_drain)
+        monkeypatch.setattr(supervisor, "_register_result", publish_after_drain)
+
+        result = supervisor.cancel()
+
+        assert result.state is SolverState.CANCELLED
+        assert order == ["validate", "publish"]
+        assert not wait_for_path(owned_late_marker, 0.5)
+        try:
+            owned_after_cancel = _process_metadata(owned_pid)
+        except ProcessLookupError:
+            pass
+        else:
+            assert (
+                not owned_after_cancel.alive
+                or owned_after_cancel.creation_identity != owned_before_root_exit.creation_identity
+            )
+
+        unrelated_after_cancel = _process_metadata(unrelated.pid)
+        assert unrelated_after_cancel.alive
+        assert unrelated_after_cancel.creation_identity == unrelated_before_cancel.creation_identity
+        unrelated_release.write_text("complete", encoding="utf-8")
+        assert unrelated.wait(timeout=5.0) == 0
+        assert unrelated_marker.read_text(encoding="utf-8") == "completed"
+    finally:
+        monkeypatch.undo()
+        owned_release.touch()
+        unrelated_release.touch()
+        if unrelated.poll() is None:
+            try:
+                unrelated.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                unrelated.kill()
+                unrelated.wait(timeout=5.0)
+        if supervisor._result_latch is None:
+            supervisor.cancel()
 
 
 def test_reconnect_rejects_stale_process_record(tmp_path: Path) -> None:

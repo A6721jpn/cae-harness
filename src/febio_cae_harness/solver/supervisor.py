@@ -3530,7 +3530,15 @@ class SolverSupervisor:
                 self._terminate_owned_process(process)
             except BaseException as error:
                 self._fail_terminal_operation(error)
+            try:
+                self._drain_owned_descendants_after_root_exit(process)
+            except BaseException as error:
+                self._fail_terminal_operation(error)
             return self._complete(SolverState.TIMED_OUT, process.poll())
+        try:
+            self._drain_owned_descendants_after_root_exit(process)
+        except BaseException as error:
+            self._fail_terminal_operation(error)
         return self._complete(
             SolverState.NORMAL_EXIT if return_code == 0 else SolverState.FAILED,
             return_code,
@@ -3563,6 +3571,13 @@ class SolverSupervisor:
             raise SolverLaunchError("solver process ownership was lost")
         try:
             self._terminate_owned_process(process)
+        except BaseException as error:
+            self._fail_terminal_operation(error)
+        try:
+            # Termination is a no-op when the root already exited; in every
+            # case drain the exact held authority before completion validates
+            # outputs or publishes a result.
+            self._drain_owned_descendants_after_root_exit(process)
         except BaseException as error:
             self._fail_terminal_operation(error)
         return self._complete(SolverState.CANCELLED, process.poll())
@@ -4887,6 +4902,30 @@ class SolverSupervisor:
             except ProcessAuthorityError as error:
                 raise SolverOwnershipError("process authority could not be verified") from error
             process.wait(timeout=2.0)
+
+    def _drain_owned_descendants_after_root_exit(
+        self,
+        process: subprocess.Popen[bytes] | _ReconnectedProcess,
+    ) -> None:
+        """Drain the exact owned tree before validating root-exit outputs."""
+
+        with self._lock:
+            if self._result_latch is not None:
+                issuance = self._result_issuance
+                if issuance is None or issuance.result is not self._result_latch:
+                    raise SolverOwnershipError("supervisor result latch is invalid")
+                return
+            if self._process is not process:
+                raise SolverOwnershipError("observed root process is not owned by supervisor")
+            authority = self._process_authority
+            if authority is None:
+                raise SolverOwnershipError("process authority is unavailable")
+            try:
+                authority.drain()
+            except ProcessAuthorityError as error:
+                raise SolverOwnershipError(
+                    "owned process descendants could not be drained"
+                ) from error
 
     def _release_process_authority(self) -> tuple[BaseException, ...]:
         authority = self._process_authority

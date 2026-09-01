@@ -1203,6 +1203,12 @@ def test_late_completion_failure_rolls_back_exact_fbs_and_result_issuance(
     elif failure == "release":
         process_authority = supervisor._process_authority
         assert process_authority is not None
+        validate_requested_fields_call = Mock(wraps=validate_requested_fields)
+        monkeypatch.setattr(
+            supervisor_module,
+            "validate_requested_fields",
+            validate_requested_fields_call,
+        )
         monkeypatch.setattr(
             process_authority,
             "drain",
@@ -1211,6 +1217,15 @@ def test_late_completion_failure_rolls_back_exact_fbs_and_result_issuance(
 
     with pytest.raises((RuntimeError, SolverOwnershipError)):
         supervisor.wait()
+
+    if failure == "release":
+        assert not captured
+        validate_requested_fields_call.assert_not_called()
+        assert supervisor.result is None
+        assert supervisor._result_latch is None
+        assert supervisor._result_issuance is None
+        assert supervisor.state is SolverState.FAILED
+        return
 
     assert captured
     result = captured[0]
