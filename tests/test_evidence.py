@@ -471,6 +471,91 @@ def test_revise_intent_appends_complete_revision_and_reprojects_manifest(
         _ = snapshot.intent
 
 
+def test_revise_intent_expected_snapshot_cas_allows_one_cross_store_race_winner(
+    tmp_path: Path,
+) -> None:
+    assert "expected_snapshot" in inspect.signature(EvidenceStore.revise_intent).parameters
+    _, case, intent = make_case(tmp_path)
+    issuer = EvidenceStore(case, intent)
+    expected_snapshot = issuer.issue_intent_snapshot()
+    writers = (EvidenceStore.open(case), EvidenceStore.open(case))
+    candidates = (
+        IntentContract(engineering_question="CAS writer A", state=IntentState.GATHERING),
+        IntentContract(engineering_question="CAS writer B", state=IntentState.GATHERING),
+    )
+    barrier = threading.Barrier(3)
+    result_lock = threading.Lock()
+    results: list[tuple[str, object]] = []
+
+    def revise(store: EvidenceStore, candidate: IntentContract) -> None:
+        barrier.wait(timeout=5)
+        result: tuple[str, object]
+        try:
+            event = store.revise_intent(candidate, expected_snapshot=expected_snapshot)
+        except BaseException as error:  # pragma: no cover - assertions inspect it
+            result = ("error", error)
+        else:
+            result = ("ok", event)
+        with result_lock:
+            results.append(result)
+
+    threads = [
+        threading.Thread(target=revise, args=(store, candidate), daemon=True)
+        for store, candidate in zip(writers, candidates, strict=True)
+    ]
+    for thread in threads:
+        thread.start()
+    barrier.wait(timeout=5)
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert [kind for kind, _ in results].count("ok") == 1
+    assert [kind for kind, _ in results].count("error") == 1
+    error = next(value for kind, value in results if kind == "error")
+    assert isinstance(error, EvidenceIntegrityError)
+    assert "stale" in str(error).casefold()
+    persisted = EvidenceStore.open(case)
+    assert persisted.intent in candidates
+    assert len(persisted.events_path.read_text(encoding="utf-8").splitlines()) == 1
+    with pytest.raises(EvidenceIntegrityError, match="stale"):
+        persisted.revise_intent(
+            IntentContract(engineering_question="lost update"),
+            expected_snapshot=expected_snapshot,
+        )
+    assert len(persisted.events_path.read_text(encoding="utf-8").splitlines()) == 1
+    with pytest.raises(EvidenceIntegrityError, match="stale"):
+        _ = expected_snapshot.intent
+
+
+def test_revise_intent_expected_snapshot_rejects_foreign_and_fabricated_without_append(
+    tmp_path: Path,
+) -> None:
+    assert "expected_snapshot" in inspect.signature(EvidenceStore.revise_intent).parameters
+    current_root = tmp_path / "current"
+    current_root.mkdir()
+    _, case, intent = make_case(current_root)
+    store = EvidenceStore(case, intent)
+    foreign_tool = tmp_path / "foreign-tool"
+    foreign_tool.mkdir()
+    foreign_workspace = ValidatedCaseWorkspace(
+        foreign_tool,
+        tmp_path / "foreign-02_CAE",
+    )
+    foreign_store = EvidenceStore(foreign_workspace.create_case(case.case_id), intent)
+    foreign_snapshot = foreign_store.issue_intent_snapshot()
+    fabricated = object.__new__(evidence_module.IntentSnapshotAuthority)
+    before = store.events_path.read_bytes()
+
+    for expected_snapshot in (foreign_snapshot, fabricated):
+        with pytest.raises(EvidenceIntegrityError):
+            store.revise_intent(
+                IntentContract(engineering_question="must not append"),
+                expected_snapshot=expected_snapshot,
+            )
+        assert store.events_path.read_bytes() == before
+
+
 def test_revise_intent_survives_spawned_fresh_process_reopen(tmp_path: Path) -> None:
     workspace, case, intent = make_case(tmp_path)
     store = EvidenceStore(case, intent)
