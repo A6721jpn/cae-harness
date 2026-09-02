@@ -25,6 +25,7 @@ END-ISO-10303-21;
 FEB = b"""<?xml version="1.0" encoding="UTF-8"?>
 <febio_spec version="4.0">
   <Module type="solid"/>
+  <Material><material id="1" name="synthetic" type="neo-Hookean"/></Material>
   <Mesh>
     <Nodes name="Object01">
       <node id="1">0,0,0</node><node id="2">1,0,0</node>
@@ -35,6 +36,11 @@ FEB = b"""<?xml version="1.0" encoding="UTF-8"?>
     </Nodes>
     <Elements type="tet10" name="Part1"><elem id="1">1,2,3,4,5,6,7,8,9,10</elem></Elements>
   </Mesh>
+  <Step><step id="1" name="synthetic-step">
+    <Control><time_steps>1</time_steps><step_size>1</step_size></Control>
+    <Boundary><bc name="synthetic-constraint"/></Boundary>
+    <Loads><nodal_load name="synthetic-load"/></Loads>
+  </step></Step>
 </febio_spec>
 """
 PNG_BEFORE = b"\x89PNG\r\n\x1a\nsynthetic-before"

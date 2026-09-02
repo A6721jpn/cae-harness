@@ -25,7 +25,7 @@ DATA;
 ENDSEC;
 END-ISO-10303-21;
 """
-FEB = b"""<?xml version="1.0" encoding="UTF-8"?>
+MESH_ONLY_FEB = b"""<?xml version="1.0" encoding="UTF-8"?>
 <febio_spec version="4.0">
   <Module type="solid"/>
   <Mesh>
@@ -40,6 +40,19 @@ FEB = b"""<?xml version="1.0" encoding="UTF-8"?>
   </Mesh>
 </febio_spec>
 """
+FEB = MESH_ONLY_FEB.replace(
+    b"  <Mesh>",
+    b"""  <Material><material id="1" name="synthetic" type="neo-Hookean"/></Material>
+  <Mesh>""",
+).replace(
+    b"</febio_spec>",
+    b"""  <Step><step id="1" name="synthetic-step">
+    <Control><time_steps>1</time_steps><step_size>1</step_size></Control>
+    <Boundary><bc name="synthetic-constraint"/></Boundary>
+    <Loads><nodal_load name="synthetic-load"/></Loads>
+  </step></Step>
+</febio_spec>""",
+)
 PNG_BEFORE = b"\x89PNG\r\n\x1a\nsynthetic-before"
 PNG_AFTER = b"\x89PNG\r\n\x1a\nsynthetic-after"
 
@@ -70,7 +83,12 @@ def _store(tmp_path: Path, *, state: IntentState = IntentState.BOUND) -> Evidenc
     )
 
 
-def _evidence(handoff: object, executable: Path) -> dict[str, object]:
+def _evidence(
+    handoff: object,
+    executable: Path,
+    *,
+    output_feb: bytes = FEB,
+) -> dict[str, object]:
     request = handoff.to_dict()  # type: ignore[attr-defined]
     return {
         "schema": "studio-fallback-evidence-v1",
@@ -84,7 +102,7 @@ def _evidence(handoff: object, executable: Path) -> dict[str, object]:
             "executable_sha256": hashlib.sha256(executable.read_bytes()).hexdigest(),
         },
         "input_sha256": request["step_sha256"],
-        "output_sha256": hashlib.sha256(FEB).hexdigest(),
+        "output_sha256": hashlib.sha256(output_feb).hexdigest(),
         "before_sha256": hashlib.sha256(PNG_BEFORE).hexdigest(),
         "after_sha256": hashlib.sha256(PNG_AFTER).hexdigest(),
         "actions": [
@@ -264,6 +282,31 @@ def test_rejects_blocked_or_stale_intent_and_wrong_mesh_family(tmp_path: Path) -
             before_png=PNG_BEFORE,
             after_png=PNG_AFTER,
             action_evidence=wrong_evidence,
+        )
+
+
+def test_rejects_mesh_only_feb_without_required_model_sections(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    handoff = issue_step_studio_handoff(
+        inspect_step(STEP),
+        store.issue_intent_snapshot(),
+        input_name="part.step",
+        attempt_id="studio-step-1",
+    )
+    executable = tmp_path / "FEBioStudio.exe"
+    executable.write_bytes(b"synthetic-studio-runtime")
+
+    with pytest.raises(EvidenceIntegrityError, match="model sections"):
+        accept_step_studio_output(
+            handoff,
+            output_feb=MESH_ONLY_FEB,
+            before_png=PNG_BEFORE,
+            after_png=PNG_AFTER,
+            action_evidence=_evidence(
+                handoff,
+                executable,
+                output_feb=MESH_ONLY_FEB,
+            ),
         )
 
 

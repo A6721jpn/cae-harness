@@ -402,6 +402,21 @@ def _validate_output_feb(output_feb: bytes, expected_family: object) -> str:
         raise EvidenceIntegrityError("Studio fallback output FEB inspection failed") from error
     if not preflight.ready:
         raise EvidenceIntegrityError("Studio fallback output FEB preflight failed")
+    tags = {item.tag.casefold() for item in inspection.nodes}
+    required_tags = {
+        "module",
+        "material",
+        "mesh",
+        "nodes",
+        "elements",
+        "elem",
+        "step",
+        "control",
+        "boundary",
+        "loads",
+    }
+    if not required_tags.issubset(tags):
+        raise EvidenceIntegrityError("Studio fallback output FEB lacks required model sections")
     element_nodes = [item for item in inspection.nodes if item.tag.casefold() == "elements"]
     if not element_nodes:
         raise EvidenceIntegrityError("Studio fallback output FEB contains no mesh elements")
