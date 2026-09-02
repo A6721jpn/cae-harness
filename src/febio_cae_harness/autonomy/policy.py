@@ -2355,6 +2355,8 @@ def decide_retry(
         _validated_retry_ledger(ledger, authority)
     except (EvidenceIntegrityError, TypeError):
         return stopped("retry requires a registry-issued ledger bound to the live intent")
+    if any(record.failure is classification for record in ledger.records):
+        return stopped("same failure recurred; retry loop stopped without consuming budget")
     if not _solver_result_is_authoritative(effective_supervisor, effective_result):
         return stopped("retry requires the exact failed result issued by its solver supervisor")
     launch_correlation = _validated_supervisor_correlation(effective_supervisor)

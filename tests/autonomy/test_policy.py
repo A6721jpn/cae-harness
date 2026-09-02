@@ -681,14 +681,18 @@ def test_proposal_authority_rejects_forgery_foreign_and_tampered_state(tmp_path:
         )
 
 
-def test_retry_ledger_accounts_only_allowed_retries(tmp_path: Path) -> None:
+def test_retry_ledger_stops_same_failure_without_improvement(
+    tmp_path: Path,
+    request: pytest.FixtureRequest,
+) -> None:
     intent = bound_intent(retry_budget=2)
-    _workspace_temp, workspace_root = short_workspace_root(tmp_path)
+    workspace_temp, workspace_root = short_workspace_root(tmp_path)
+    request.addfinalizer(workspace_temp.cleanup)
     state, state_snapshot = retry_state_for_case(
         workspace_root,
         "case-ledger",
         intent,
-        attempt_ids=("attempt-a", "attempt-b", "attempt-c"),
+        attempt_ids=("attempt-a", "attempt-b"),
     )
     ledger = RetryLedger.from_authority(state)
     state_case = object.__getattribute__(state_snapshot, "_case_workspace")
@@ -729,26 +733,45 @@ def test_retry_ledger_accounts_only_allowed_retries(tmp_path: Path) -> None:
         supervisor=second_supervisor,
         result=second_result,
     )
-    assert second.decision is RetryDecision.RETRY_REQUIRES_RESERVATION
-    third_supervisor = timeout_supervisor(
-        tmp_path / "third",
-        "attempt-c",
-        case_id="case-ledger",
+    assert second.decision is RetryDecision.STOP
+    assert second.ledger is first.ledger
+    assert second.ledger.used == 1
+    assert "same failure" in second.reason
+
+
+def test_retry_ledger_reports_an_exhausted_zero_budget(
+    tmp_path: Path,
+    request: pytest.FixtureRequest,
+) -> None:
+    intent = bound_intent(retry_budget=0)
+    workspace_temp, workspace_root = short_workspace_root(tmp_path)
+    request.addfinalizer(workspace_temp.cleanup)
+    state, state_snapshot = retry_state_for_case(
+        workspace_root,
+        "case-zero-budget",
+        intent,
+        attempt_ids=("attempt-a",),
+    )
+    state_case = object.__getattribute__(state_snapshot, "_case_workspace")
+    supervisor = timeout_supervisor(
+        tmp_path / "zero-budget",
+        case_id="case-zero-budget",
         intent=intent,
         workspace_root=workspace_root,
         case_workspace=state_case,
         record_attempt=False,
     )
-    third_result = third_supervisor.run(timeout_seconds=0.1)
+    result = supervisor.run(timeout_seconds=0.1)
     exhausted = decide_retry(
         FailureClass.TIMEOUT,
-        second.ledger,
+        RetryLedger.from_authority(state),
         intent=state,
-        supervisor=third_supervisor,
-        result=third_result,
+        supervisor=supervisor,
+        result=result,
     )
+
     assert exhausted.decision is RetryDecision.BUDGET_EXHAUSTED
-    assert exhausted.ledger.used == 2
+    assert exhausted.ledger.used == 0
 
 
 def test_retry_rejects_foreign_case_root_with_same_case_and_intent_digests(
