@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import secrets
@@ -80,6 +81,11 @@ from febio_cae_harness.solver.official_fbs import (
     require_official_fbs_result,
 )
 from febio_cae_harness.solver.runtime import RuntimeProbeError, probe_febio
+from febio_cae_harness.solver.studio_fallback import (
+    accept_step_studio_output,
+    issue_step_studio_handoff,
+    restore_step_studio_handoff,
+)
 from febio_cae_harness.solver.supervisor import SolverSupervisor
 from febio_cae_harness.solver.types import (
     SolverClassification,
@@ -194,6 +200,22 @@ def build_parser() -> argparse.ArgumentParser:
     plan_step_mesh.add_argument("--capability-stdin", required=True, action="store_true")
     plan_step_mesh.add_argument("--case-id", required=True)
     plan_step_mesh.add_argument("--input-name")
+
+    begin_step_studio = commands.add_parser(
+        "begin-step-studio-fallback",
+        help="issue a durable Studio handoff for a registered READY STEP mesh plan",
+    )
+    begin_step_studio.add_argument("--capability-stdin", required=True, action="store_true")
+    begin_step_studio.add_argument("--case-id", required=True)
+    begin_step_studio.add_argument("--input-name")
+
+    accept_step_studio = commands.add_parser(
+        "accept-step-studio-fallback",
+        help="reinspect exact Studio evidence and return a STEP-generated FEB to headless use",
+    )
+    accept_step_studio.add_argument("--capability-stdin", required=True, action="store_true")
+    accept_step_studio.add_argument("--case-id", required=True)
+    accept_step_studio.add_argument("--attempt-id", required=True)
 
     preflight_feb = commands.add_parser(
         "preflight-feb", help="preflight FEB XML structure and explicit references"
@@ -903,6 +925,374 @@ def _plan_step_mesh_command(arguments: argparse.Namespace) -> int:
         failure = CaseContextError(
             "INTERNAL_ERROR",
             "unexpected registered STEP planning failure",
+        )
+        _emit_context_json(cli_failure(command, failure), error=True)
+        return _CONTEXT_EXIT_CODES[failure.code]
+    _emit_context_json(payload)
+    return 0
+
+
+def _canonical_json_document(payload: Mapping[str, object]) -> bytes:
+    return (
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        + b"\n"
+    )
+
+
+def _parse_canonical_json_document(data: bytes, label: str) -> Mapping[str, object]:
+    def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for name, value in pairs:
+            if name in result:
+                raise EvidenceIntegrityError(f"{label} contains a duplicate field")
+            result[name] = value
+        return result
+
+    try:
+        payload = json.loads(
+            data.decode("utf-8"),
+            parse_constant=lambda value: (_ for _ in ()).throw(
+                EvidenceIntegrityError(f"{label} contains non-finite JSON: {value}")
+            ),
+            object_pairs_hook=unique_object,
+        )
+    except EvidenceIntegrityError:
+        raise
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise EvidenceIntegrityError(f"{label} is not valid UTF-8 JSON") from error
+    if not isinstance(payload, Mapping) or data != _canonical_json_document(payload):
+        raise EvidenceIntegrityError(f"{label} is not canonical JSON")
+    return payload
+
+
+def _begin_step_studio_fallback_command(arguments: argparse.Namespace) -> int:
+    command = "begin-step-studio-fallback"
+    try:
+        service = _case_service()
+        root_capability = _read_root_capability_stdin()
+        opened = service._open_context(root_capability, arguments.case_id)
+        snapshot = opened.result.snapshot
+        if opened.result.state is not IntentState.BOUND or opened.result.question is not None:
+            raise _RunCommandError("ASK_AND_BLOCK", "case intent is not authoritatively bound")
+        completeness = assess_authoritative_completeness(snapshot)
+        if completeness.state != IntentState.BOUND.value:
+            raise _RunCommandError(
+                "ASK_AND_BLOCK",
+                "required physical conditions are not authoritatively bound",
+            )
+        source_relative, input_name, expected_sha256 = _select_step_input(
+            opened.store.manifest.get("inputs"),
+            arguments.input_name,
+        )
+        with opened.case._exact_transaction() as exact:
+            source = exact.read_bytes(source_relative)
+        inspection = inspect_step(source, source_name=input_name)
+        if inspection.sha256 != expected_sha256:
+            raise CaseContextError(
+                "EVIDENCE_INTEGRITY_FAILURE",
+                "registered STEP input does not match its manifest digest",
+            )
+        attempt_id = f"studio-step-{secrets.token_hex(16)}"
+        handoff = issue_step_studio_handoff(
+            inspection,
+            snapshot,
+            input_name=input_name,
+            attempt_id=attempt_id,
+        )
+        request = handoff.to_dict()
+        request_id = handoff.request_id
+        intent_sha256 = snapshot.intent_sha256
+        case_id = snapshot.case_id
+        opened.store.record_attempt(
+            attempt_id,
+            {"status": "studio_fallback_pending", "studio_fallback": request},
+        )
+        attempt = AttemptWorkspace._from_manager(
+            opened.case,
+            attempt_id,
+            opened.case.temporary_root / "attempts" / attempt_id,
+        )
+        request_path = attempt.write_bytes(
+            "studio-request.json",
+            _canonical_json_document(request),
+        )
+        request_artifact = opened.store.record_artifact(
+            request_path,
+            attempt_id=attempt_id,
+        )
+        opened.store.append_event(
+            "studio_fallback_requested",
+            {
+                "attempt_id": attempt_id,
+                "intent_sha256": intent_sha256,
+                "request_id": request_id,
+                "request_sha256": request_artifact["sha256"],
+            },
+        )
+        payload = cli_success(
+            command,
+            case={
+                "case_id": case_id,
+                "intent": {"sha256": intent_sha256},
+                "state": IntentState.BOUND.value,
+            },
+        )
+        payload["input"] = {"name": input_name, "sha256": expected_sha256}
+        payload["status"] = "PENDING_EXTERNAL_STUDIO"
+        payload["attempt"] = {
+            "attempt_id": attempt_id,
+            "request_id": request_id,
+            "workspace": f"90_Temporary/attempts/{attempt_id}",
+            "required_files": {
+                "action_evidence": "actions.json",
+                "after_screenshot": "after.png",
+                "before_screenshot": "before.png",
+                "output_feb": "studio-output.feb",
+            },
+        }
+    except _RunCommandError as error:
+        if error.code == "ASK_AND_BLOCK":
+            _emit_context_json(
+                {
+                    "command": command,
+                    "ok": False,
+                    "error": {
+                        "code": error.code,
+                        "message": str(error),
+                        "retryable": False,
+                    },
+                },
+                error=True,
+            )
+            return _RUN_FAILURE_EXIT
+        context_error = CaseContextError(error.code, str(error))
+        _emit_context_json(cli_failure(command, context_error), error=True)
+        return _CONTEXT_EXIT_CODES.get(error.code, _CONTEXT_EXIT_CODES["INVALID_INPUT"])
+    except CaseContextError as error:
+        _emit_context_json(cli_failure(command, error), error=True)
+        return _CONTEXT_EXIT_CODES.get(error.code, _CONTEXT_EXIT_CODES["INTERNAL_ERROR"])
+    except (EvidenceIntegrityError, WorkspaceBoundaryError):
+        failure = CaseContextError(
+            "EVIDENCE_INTEGRITY_FAILURE",
+            "Studio fallback request evidence is invalid",
+        )
+        _emit_context_json(cli_failure(command, failure), error=True)
+        return _CONTEXT_EXIT_CODES[failure.code]
+    except (TypeError, ValueError):
+        failure = CaseContextError("INVALID_INPUT", "Studio fallback request is invalid")
+        _emit_context_json(cli_failure(command, failure), error=True)
+        return _CONTEXT_EXIT_CODES[failure.code]
+    except OSError:
+        failure = CaseContextError("IO_OR_LOCK_FAILURE", "Studio fallback request I/O failed")
+        _emit_context_json(cli_failure(command, failure), error=True)
+        return _CONTEXT_EXIT_CODES[failure.code]
+    except Exception:
+        failure = CaseContextError("INTERNAL_ERROR", "unexpected Studio fallback request failure")
+        _emit_context_json(cli_failure(command, failure), error=True)
+        return _CONTEXT_EXIT_CODES[failure.code]
+    _emit_context_json(payload)
+    return 0
+
+
+def _accept_step_studio_fallback_command(arguments: argparse.Namespace) -> int:
+    command = "accept-step-studio-fallback"
+    try:
+        service = _case_service()
+        root_capability = _read_root_capability_stdin()
+        opened = service._open_context(root_capability, arguments.case_id)
+        snapshot = opened.store.issue_intent_snapshot()
+        if opened.result.state is not IntentState.BOUND or opened.result.question is not None:
+            raise _RunCommandError("ASK_AND_BLOCK", "case intent is not authoritatively bound")
+        completeness = assess_authoritative_completeness(snapshot)
+        if completeness.state != IntentState.BOUND.value:
+            raise _RunCommandError(
+                "ASK_AND_BLOCK",
+                "required physical conditions are not authoritatively bound",
+            )
+        attempt = _open_recorded_attempt(opened.case, arguments.attempt_id)
+        prefix = Path("90_Temporary") / "attempts" / attempt.attempt_id
+        paths = {
+            "attempt": prefix / "ATTEMPT.json",
+            "request": prefix / "studio-request.json",
+            "output": prefix / "studio-output.feb",
+            "before": prefix / "before.png",
+            "after": prefix / "after.png",
+            "actions": prefix / "actions.json",
+        }
+        with opened.case._exact_transaction() as exact:
+            attempt_document = _parse_canonical_json_document(
+                exact.read_bytes(paths["attempt"]),
+                "Studio fallback attempt record",
+            )
+            request_bytes = exact.read_bytes(paths["request"])
+            request_document = _parse_canonical_json_document(
+                request_bytes,
+                "Studio fallback request",
+            )
+            output_feb = exact.read_bytes(paths["output"])
+            before_png = exact.read_bytes(paths["before"])
+            after_png = exact.read_bytes(paths["after"])
+            actions_bytes = exact.read_bytes(paths["actions"])
+            identities = {
+                name: exact.identity(path)
+                for name, path in paths.items()
+                if name not in {"attempt", "request"}
+            }
+        if (
+            attempt_document.get("case_id") != arguments.case_id
+            or attempt_document.get("attempt_id") != attempt.attempt_id
+            or not isinstance(attempt_document.get("payload"), Mapping)
+        ):
+            raise EvidenceIntegrityError("Studio fallback attempt record is invalid")
+        attempt_payload = cast(Mapping[str, object], attempt_document["payload"])
+        persisted = attempt_payload.get("studio_fallback")
+        if (
+            set(attempt_payload) != {"status", "studio_fallback"}
+            or attempt_payload.get("status") != "studio_fallback_pending"
+            or not isinstance(persisted, Mapping)
+            or dict(persisted) != dict(request_document)
+        ):
+            raise EvidenceIntegrityError("Studio fallback pending attempt differs")
+        input_name = request_document.get("input_name")
+        source_relative, selected_name, expected_sha256 = _select_step_input(
+            opened.store.manifest.get("inputs"),
+            input_name,
+        )
+        with opened.case._exact_transaction() as exact:
+            step_source = exact.read_bytes(source_relative)
+        inspection = inspect_step(step_source, source_name=selected_name)
+        if inspection.sha256 != expected_sha256:
+            raise EvidenceIntegrityError("Studio fallback STEP input digest changed")
+        handoff = restore_step_studio_handoff(request_document, inspection, snapshot)
+        action_evidence = _parse_canonical_json_document(
+            actions_bytes,
+            "Studio fallback action evidence",
+        )
+        receipt = accept_step_studio_output(
+            handoff,
+            output_feb=output_feb,
+            before_png=before_png,
+            after_png=after_png,
+            action_evidence=action_evidence,
+        )
+        receipt_payload = receipt.to_dict()
+        intent_sha256 = receipt.intent_sha256
+        case_id = receipt.case_id
+        request_id = receipt.request_id
+        expected_digests = {
+            "output": receipt.output_sha256,
+            "before": receipt.before_sha256,
+            "after": receipt.after_sha256,
+            "actions": hashlib.sha256(actions_bytes).hexdigest(),
+        }
+        recorded_artifacts: dict[str, str] = {}
+        request_artifact = opened.store.record_artifact(
+            opened.case.case_root / paths["request"],
+            attempt_id=attempt.attempt_id,
+            expected_sha256=hashlib.sha256(request_bytes).hexdigest(),
+        )
+        recorded_artifacts["studio-request.json"] = cast(str, request_artifact["sha256"])
+        artifact_names = {
+            "output": "studio-output.feb",
+            "before": "before.png",
+            "after": "after.png",
+            "actions": "actions.json",
+        }
+        for name, artifact_name in artifact_names.items():
+            record = opened.store.record_artifact(
+                opened.case.case_root / paths[name],
+                attempt_id=attempt.attempt_id,
+                expected_sha256=expected_digests[name],
+                expected_identity=identities[name],
+            )
+            recorded_artifacts[artifact_name] = cast(str, record["sha256"])
+        receipt_path = attempt.write_bytes(
+            "studio-receipt.json",
+            _canonical_json_document(receipt_payload),
+        )
+        receipt_artifact = opened.store.record_artifact(
+            receipt_path,
+            attempt_id=attempt.attempt_id,
+        )
+        recorded_artifacts["studio-receipt.json"] = cast(
+            str,
+            receipt_artifact["sha256"],
+        )
+        refreshed = opened.store.issue_intent_snapshot()
+        if refreshed.intent_sha256 != intent_sha256:
+            raise EvidenceIntegrityError("Studio fallback intent changed before completion")
+        opened.store.record_studio_fallback_completion(
+            refreshed,
+            attempt.attempt_id,
+            {
+                "artifacts": recorded_artifacts,
+                "attempt_id": attempt.attempt_id,
+                "intent_sha256": intent_sha256,
+                "receipt": receipt_payload,
+                "request_id": request_id,
+            },
+        )
+        payload = cli_success(
+            command,
+            case={
+                "case_id": case_id,
+                "intent": {"sha256": intent_sha256},
+                "state": IntentState.BOUND.value,
+            },
+        )
+        payload["status"] = "HEADLESS_READY"
+        payload["attempt"] = {
+            "attempt_id": attempt.attempt_id,
+            "request_id": request_id,
+            "output_feb": "studio-output.feb",
+            "output_sha256": receipt.output_sha256,
+        }
+    except _RunCommandError as error:
+        if error.code == "ASK_AND_BLOCK":
+            _emit_context_json(
+                {
+                    "command": command,
+                    "ok": False,
+                    "error": {
+                        "code": error.code,
+                        "message": str(error),
+                        "retryable": False,
+                    },
+                },
+                error=True,
+            )
+            return _RUN_FAILURE_EXIT
+        context_error = CaseContextError(error.code, str(error))
+        _emit_context_json(cli_failure(command, context_error), error=True)
+        return _CONTEXT_EXIT_CODES.get(error.code, _CONTEXT_EXIT_CODES["INVALID_INPUT"])
+    except CaseContextError as error:
+        _emit_context_json(cli_failure(command, error), error=True)
+        return _CONTEXT_EXIT_CODES.get(error.code, _CONTEXT_EXIT_CODES["INTERNAL_ERROR"])
+    except (EvidenceIntegrityError, WorkspaceBoundaryError):
+        failure = CaseContextError(
+            "EVIDENCE_INTEGRITY_FAILURE",
+            "Studio fallback completion evidence is invalid",
+        )
+        _emit_context_json(cli_failure(command, failure), error=True)
+        return _CONTEXT_EXIT_CODES[failure.code]
+    except (TypeError, ValueError):
+        failure = CaseContextError("INVALID_INPUT", "Studio fallback completion is invalid")
+        _emit_context_json(cli_failure(command, failure), error=True)
+        return _CONTEXT_EXIT_CODES[failure.code]
+    except OSError:
+        failure = CaseContextError("IO_OR_LOCK_FAILURE", "Studio fallback completion I/O failed")
+        _emit_context_json(cli_failure(command, failure), error=True)
+        return _CONTEXT_EXIT_CODES[failure.code]
+    except Exception:
+        failure = CaseContextError(
+            "INTERNAL_ERROR",
+            "unexpected Studio fallback completion failure",
         )
         _emit_context_json(cli_failure(command, failure), error=True)
         return _CONTEXT_EXIT_CODES[failure.code]
@@ -2245,6 +2635,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _inspect_incomplete_feb_command(arguments)
     if arguments.command == "plan-step-mesh":
         return _plan_step_mesh_command(arguments)
+    if arguments.command == "begin-step-studio-fallback":
+        return _begin_step_studio_fallback_command(arguments)
+    if arguments.command == "accept-step-studio-fallback":
+        return _accept_step_studio_fallback_command(arguments)
     if arguments.command in {"root", "case"}:
         return _run_context_command(arguments)
     if arguments.command == "run-febio":

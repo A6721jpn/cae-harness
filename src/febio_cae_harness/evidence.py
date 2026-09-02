@@ -66,6 +66,7 @@ _DIAGNOSTIC_EVENT = "artifact_validation_diagnostic"
 _PROMOTION_CONSUMED_EVENT = "artifact_promotion_consumed"
 _INTENT_REVISED_EVENT = "intent_revised"
 _RETRY_SETUP_STARTED_EVENT = "retry_setup_started"
+_STUDIO_FALLBACK_COMPLETED_EVENT = "studio_fallback_completed"
 _INTENT_REVISION_FIELDS = frozenset(
     {
         "previous_intent",
@@ -1051,6 +1052,7 @@ class EvidenceStore:
             _DIAGNOSTIC_EVENT,
             _PROMOTION_CONSUMED_EVENT,
             _RETRY_SETUP_STARTED_EVENT,
+            _STUDIO_FALLBACK_COMPLETED_EVENT,
         }:
             raise EvidenceIntegrityError(
                 "verification events must be recorded through their dedicated API"
@@ -1092,6 +1094,138 @@ class EvidenceStore:
                     raise EvidenceIntegrityError("attempt terminal event conflicts")
                 return dict(existing[0])
             return self._append_event("run_febio_terminal", normalised)
+
+    def record_studio_fallback_completion(
+        self,
+        expected_snapshot: IntentSnapshotAuthority,
+        attempt_id: str,
+        payload: Mapping[str, Any],
+    ) -> dict[str, object]:
+        """Atomically record one exact, idempotent Studio fallback completion."""
+
+        _validate_segment(attempt_id, "attempt_id")
+        normalised = self._normalise_payload(payload)
+        if set(normalised) != {
+            "artifacts",
+            "attempt_id",
+            "intent_sha256",
+            "receipt",
+            "request_id",
+        }:
+            raise EvidenceIntegrityError("Studio fallback completion payload is invalid")
+        if normalised.get("attempt_id") != attempt_id:
+            raise EvidenceIntegrityError("Studio fallback completion attempt differs")
+        intent_sha256 = _validate_digest(
+            normalised.get("intent_sha256"),
+            "Studio fallback intent",
+        )
+        request_id = _validate_digest(
+            normalised.get("request_id"),
+            "Studio fallback request",
+        )
+        artifacts = normalised.get("artifacts")
+        required_artifacts = {
+            "actions.json",
+            "after.png",
+            "before.png",
+            "studio-output.feb",
+            "studio-receipt.json",
+            "studio-request.json",
+        }
+        if not isinstance(artifacts, dict) or set(artifacts) != required_artifacts:
+            raise EvidenceIntegrityError("Studio fallback completion artifacts are invalid")
+        artifact_digests = {
+            name: _validate_digest(value, f"Studio fallback artifact {name}")
+            for name, value in artifacts.items()
+        }
+        receipt = normalised.get("receipt")
+        if not isinstance(receipt, dict) or set(receipt) != {
+            "after_sha256",
+            "attempt_id",
+            "before_sha256",
+            "case_id",
+            "headless_ready",
+            "intent_sha256",
+            "official_computer_use",
+            "operation",
+            "output_sha256",
+            "request_id",
+            "runtime_executable_sha256",
+            "schema",
+        }:
+            raise EvidenceIntegrityError("Studio fallback completion receipt is invalid")
+        if (
+            receipt.get("schema") != "studio-fallback-receipt-v1"
+            or receipt.get("operation") != "STEP_IMPORT_MESH_FEB"
+            or receipt.get("case_id") != self.case_workspace.case_id
+            or receipt.get("attempt_id") != attempt_id
+            or receipt.get("intent_sha256") != intent_sha256
+            or receipt.get("request_id") != request_id
+            or receipt.get("headless_ready") is not True
+            or receipt.get("official_computer_use") is not True
+            or receipt.get("output_sha256") != artifact_digests["studio-output.feb"]
+            or receipt.get("before_sha256") != artifact_digests["before.png"]
+            or receipt.get("after_sha256") != artifact_digests["after.png"]
+            or hashlib.sha256(_json_text(receipt).encode("utf-8")).hexdigest()
+            != artifact_digests["studio-receipt.json"]
+        ):
+            raise EvidenceIntegrityError("Studio fallback completion receipt differs")
+
+        with self._transaction():
+            self._load_and_validate(None)
+            current_intent = self._validate_expected_intent_snapshot(expected_snapshot)
+            if _digest(current_intent.to_dict()) != intent_sha256:
+                raise EvidenceIntegrityError("Studio fallback completion intent differs")
+            attempts = self._read_attempts()
+            matching_attempts = [item for item in attempts if item.get("attempt_id") == attempt_id]
+            if len(matching_attempts) != 1:
+                raise EvidenceIntegrityError("Studio fallback pending attempt is invalid")
+            attempt_path = matching_attempts[0].get("path")
+            if not isinstance(attempt_path, str):
+                raise EvidenceIntegrityError("Studio fallback pending attempt is invalid")
+            attempt_record = self._read_json(self._safe_case_file(attempt_path))
+            attempt_payload = attempt_record.get("payload")
+            if not isinstance(attempt_payload, dict) or set(attempt_payload) != {
+                "status",
+                "studio_fallback",
+            }:
+                raise EvidenceIntegrityError("Studio fallback pending attempt is invalid")
+            request = attempt_payload.get("studio_fallback")
+            if (
+                attempt_payload.get("status") != "studio_fallback_pending"
+                or not isinstance(request, dict)
+                or request.get("schema") != "studio-fallback-request-v1"
+                or request.get("request_id") != request_id
+                or request.get("intent_sha256") != intent_sha256
+                or request.get("case_id") != self.case_workspace.case_id
+                or request.get("attempt_id") != attempt_id
+            ):
+                raise EvidenceIntegrityError("Studio fallback pending request differs")
+            prefix = f"90_Temporary/attempts/{attempt_id}/"
+            for name, digest in artifact_digests.items():
+                path = prefix + name
+                record = self._artifacts.get(path)
+                if record != {"path": path, "sha256": digest, "attempt_id": attempt_id}:
+                    raise EvidenceIntegrityError(
+                        "Studio fallback completion artifact is not recorded"
+                    )
+            events, _ = self._read_events()
+            existing = [
+                event
+                for event in events
+                if event.get("event_type") == _STUDIO_FALLBACK_COMPLETED_EVENT
+                and isinstance(event.get("payload"), dict)
+                and (
+                    event["payload"].get("attempt_id") == attempt_id
+                    or event["payload"].get("request_id") == request_id
+                )
+            ]
+            if existing:
+                if len(existing) != 1 or existing[0]["payload"] != normalised:
+                    raise EvidenceIntegrityError("Studio fallback completion event conflicts")
+                return dict(existing[0])
+            self._validate_expected_intent_snapshot(expected_snapshot)
+            return self._append_event(_STUDIO_FALLBACK_COMPLETED_EVENT, normalised)
 
     def _record_retry_terminal(
         self,
