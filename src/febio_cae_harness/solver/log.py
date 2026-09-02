@@ -26,6 +26,7 @@ _TIME_PATTERN = re.compile(
     rf"\b(?:current\s+|final\s+|at\s+)?time\s*(?:[=:])\s*({_NUMBER})\b",
     re.IGNORECASE,
 )
+_ELAPSED_TIME_PATTERN = re.compile(r"\belapsed\s+time\b", re.IGNORECASE)
 _NEGATIVE_JACOBIAN_PATTERNS = (
     re.compile(r"negative\s+jacobian", re.IGNORECASE),
     re.compile(r"jacobian(?:\s+determinant)?[^\n]*\bnegative\b", re.IGNORECASE),
@@ -133,13 +134,16 @@ def _observed_steps(text: str) -> int | None:
 
 def _observed_final_time(text: str) -> float | None:
     values: list[float] = []
-    for match in _TIME_PATTERN.finditer(text):
-        try:
-            value = float(match.group(1))
-        except ValueError:
+    for line in text.splitlines():
+        if _ELAPSED_TIME_PATTERN.search(line) is not None:
             continue
-        if math.isfinite(value):
-            values.append(value)
+        for match in _TIME_PATTERN.finditer(line):
+            try:
+                value = float(match.group(1))
+            except ValueError:
+                continue
+            if math.isfinite(value):
+                values.append(value)
     return values[-1] if values else None
 
 

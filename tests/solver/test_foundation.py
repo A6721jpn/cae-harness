@@ -180,6 +180,28 @@ def test_log_validation_classifies_only_explicit_nonlinear_convergence_failures(
     assert not result.valid
 
 
+def test_log_validation_ignores_wall_clock_timing_after_final_analysis_time(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "solver.log"
+    path.write_text(
+        """
+===== beginning time step 1 : 1 =====
+Nonlinear solution status: time= 1
+------- converged at time : 1
+Elapsed time : 0:00:00
+N O R M A L   T E R M I N A T I O N
+""",
+        encoding="utf-8",
+    )
+
+    result = validate_log(path, expected_steps=1, expected_final_time=1.0)
+
+    assert result.valid
+    assert result.observed_steps == 1
+    assert result.observed_final_time == 1.0
+
+
 def test_supervisor_reports_missing_outputs_after_normal_exit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
