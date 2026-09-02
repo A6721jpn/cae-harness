@@ -242,6 +242,56 @@ def test_preflight_feb_missing_input_is_concise_stderr(tmp_path: Path) -> None:
     assert "Traceback" not in completed.stderr
 
 
+def test_preflight_step_uses_only_structural_and_explicit_unit_evidence(
+    tmp_path: Path,
+) -> None:
+    ready = tmp_path / "ready.step"
+    ready.write_text(
+        "ISO-10303-21;\nHEADER;\nENDSEC;\nDATA;\n"
+        "#1 = SI_UNIT(.MILLI., .METRE.);\nENDSEC;\nEND-ISO-10303-21;\n",
+        encoding="utf-8",
+    )
+    unresolved = tmp_path / "unresolved.step"
+    unresolved.write_text(
+        "ISO-10303-21;\nHEADER;\nENDSEC;\nDATA;\n"
+        "#1 = CARTESIAN_POINT('', (0., 0., 0.));\nENDSEC;\nEND-ISO-10303-21;\n",
+        encoding="utf-8",
+    )
+
+    completed = _run_cli("preflight-step", str(ready))
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stderr == ""
+    ready_payload = json.loads(completed.stdout)
+    assert ready_payload == {
+        "completeness": None,
+        "diagnostics": [],
+        "ready": True,
+        "status": "READY",
+    }
+
+    blocked = _run_cli("preflight-step", str(unresolved))
+
+    assert blocked.returncode == 1
+    assert blocked.stderr == ""
+    blocked_payload = json.loads(blocked.stdout)
+    assert blocked_payload["ready"] is False
+    assert blocked_payload["status"] == "BLOCKED"
+    assert blocked_payload["diagnostics"] == [
+        {
+            "blocking": True,
+            "code": "UNRESOLVED_UNITS",
+            "evidence": [],
+            "location": unresolved.name,
+            "message": "STEP contains no explicit unit declaration; units must be supplied",
+            "severity": "BLOCKING",
+        }
+    ]
+    assert "material" not in blocked.stdout.casefold()
+    assert "load" not in blocked.stdout.casefold()
+    assert "constraint" not in blocked.stdout.casefold()
+
+
 def test_probe_febio_emits_identity_json(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

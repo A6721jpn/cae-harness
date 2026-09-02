@@ -117,6 +117,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     preflight_feb.add_argument("path", type=Path, metavar="PATH")
 
+    preflight_step = commands.add_parser(
+        "preflight-step", help="preflight STEP structure and explicit unit evidence"
+    )
+    preflight_step.add_argument("path", type=Path, metavar="PATH")
+
     inspect_step = commands.add_parser(
         "inspect-step", help="inspect STEP structure and explicit unit evidence"
     )
@@ -225,12 +230,14 @@ def _preflight_exit_code(result: PreflightResult) -> int:
     return 0 if result.ready else 1
 
 
-def _emit_preflight(path: Path) -> int:
+def _emit_preflight(path: Path, command: str) -> int:
     try:
-        inspection = inspect_feb_file(path)
+        if command == "preflight-feb":
+            result = run_preflight(feb=inspect_feb_file(path))
+        else:
+            result = run_preflight(step=inspect_step_file(path))
     except (OSError, ValueError) as error:
         return _error(str(error))
-    result = run_preflight(feb=inspection)
     print(json.dumps(result.to_dict(), sort_keys=True))
     return _preflight_exit_code(result)
 
@@ -1268,8 +1275,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = build_parser().parse_args(argv)
     if arguments.command in {"inspect-feb", "inspect-step"}:
         return _emit_inspection(arguments.path, arguments.command)
-    if arguments.command == "preflight-feb":
-        return _emit_preflight(arguments.path)
+    if arguments.command in {"preflight-feb", "preflight-step"}:
+        return _emit_preflight(arguments.path, arguments.command)
     if arguments.command == "probe-febio":
         return _emit_probe(arguments.path)
     if arguments.command in {"root", "case"}:
