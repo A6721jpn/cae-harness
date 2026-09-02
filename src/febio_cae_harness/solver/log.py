@@ -14,7 +14,13 @@ from pathlib import Path
 
 from .types import SolverClassification
 
-__all__ = ["LogValidation", "LogValidator", "validate_log", "validate_solver_log"]
+__all__ = [
+    "LogValidation",
+    "LogValidator",
+    "NegativeJacobianLogEvidence",
+    "validate_log",
+    "validate_solver_log",
+]
 
 
 _NUMBER = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
@@ -32,6 +38,18 @@ _NEGATIVE_JACOBIAN_PATTERNS = (
     re.compile(r"jacobian(?:\s+determinant)?[^\n]*\bnegative\b", re.IGNORECASE),
     re.compile(r"jacobian(?:\s+determinant)?[^\n]*<\s*0", re.IGNORECASE),
 )
+_ELEMENT_PATTERN = re.compile(
+    r"\belem(?:ent)?\s*(?:(?:id|no\.?|number)\s*)?(?:[=:#]\s*)?(\d+)\b",
+    re.IGNORECASE,
+)
+_INTEGRATION_POINT_PATTERN = re.compile(
+    r"\bintegration\s+point\s*(?:(?:id|no\.?|number)\s*)?(?:[=:#]\s*)?(\d+)\b",
+    re.IGNORECASE,
+)
+_JACOBIAN_VALUE_PATTERN = re.compile(
+    rf"\b(?:jacobian(?:\s+determinant)?|detj)\s*(?:[=:])\s*({_NUMBER})\b",
+    re.IGNORECASE,
+)
 _NONLINEAR_CONVERGENCE_PATTERNS = (
     re.compile(r"\bnonlinear(?:\s+solver)?\b[^\n]*\bfailed\s+to\s+converge\b", re.IGNORECASE),
     re.compile(r"\bfailed\s+to\s+converge\b[^\n]*\bnonlinear\b", re.IGNORECASE),
@@ -47,6 +65,28 @@ _FATAL_PATTERNS = (
 
 
 @dataclass(frozen=True, slots=True)
+class NegativeJacobianLogEvidence:
+    """Details stated on one explicit negative-Jacobian LOG line."""
+
+    line_number: int
+    element_id: int | None
+    integration_point: int | None
+    determinant: float | None
+
+    def __post_init__(self) -> None:
+        if isinstance(self.line_number, bool) or self.line_number <= 0:
+            raise ValueError("line_number must be positive")
+        for name in ("element_id", "integration_point"):
+            value = getattr(self, name)
+            if value is not None and (isinstance(value, bool) or value <= 0):
+                raise ValueError(f"{name} must be positive or None")
+        if self.determinant is not None and (
+            not math.isfinite(self.determinant) or self.determinant >= 0
+        ):
+            raise ValueError("determinant must be finite and negative or None")
+
+
+@dataclass(frozen=True, slots=True)
 class LogValidation:
     """Evidence extracted from one solver LOG file."""
 
@@ -58,6 +98,7 @@ class LogValidation:
     expected_steps: int | None
     expected_final_time: float | None
     classification: SolverClassification | None
+    negative_jacobian_evidence: tuple[NegativeJacobianLogEvidence, ...] = ()
     issues: tuple[str, ...] = ()
 
     @property
@@ -157,6 +198,39 @@ def _has_negative_jacobian(text: str) -> bool:
     return any(pattern.search(text) is not None for pattern in _NEGATIVE_JACOBIAN_PATTERNS)
 
 
+def _positive_match(pattern: re.Pattern[str], line: str) -> int | None:
+    match = pattern.search(line)
+    if match is None:
+        return None
+    value = int(match.group(1))
+    return value if value > 0 else None
+
+
+def _negative_jacobian_evidence(text: str) -> tuple[NegativeJacobianLogEvidence, ...]:
+    evidence: list[NegativeJacobianLogEvidence] = []
+    for line_number, line in enumerate(text.splitlines(), start=1):
+        if not _has_negative_jacobian(line):
+            continue
+        determinant: float | None = None
+        value_match = _JACOBIAN_VALUE_PATTERN.search(line)
+        if value_match is not None:
+            try:
+                candidate = float(value_match.group(1))
+            except ValueError:  # pragma: no cover - numeric regex is closed
+                candidate = math.nan
+            if math.isfinite(candidate) and candidate < 0:
+                determinant = candidate
+        evidence.append(
+            NegativeJacobianLogEvidence(
+                line_number=line_number,
+                element_id=_positive_match(_ELEMENT_PATTERN, line),
+                integration_point=_positive_match(_INTEGRATION_POINT_PATTERN, line),
+                determinant=determinant,
+            )
+        )
+    return tuple(evidence)
+
+
 def _has_nonlinear_convergence_failure(text: str) -> bool:
     return any(pattern.search(text) is not None for pattern in _NONLINEAR_CONVERGENCE_PATTERNS)
 
@@ -220,6 +294,7 @@ def validate_log(
     observed_steps = _observed_steps(text)
     observed_final_time = _observed_final_time(text)
     normal_termination = _has_normal_termination(text)
+    negative_jacobian_evidence = _negative_jacobian_evidence(text)
     issues: list[str] = []
     classification: SolverClassification | None = None
 
@@ -266,6 +341,7 @@ def validate_log(
         expected_steps=expected_steps,
         expected_final_time=expected_final_time,
         classification=classification,
+        negative_jacobian_evidence=negative_jacobian_evidence,
         issues=tuple(issues),
     )
 

@@ -161,6 +161,47 @@ def test_log_validation_classifies_non_success_logs(
     assert not result.valid
 
 
+def test_log_validation_retains_explicit_negative_jacobian_location(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "solver.log"
+    path.write_text(
+        "time step = 2\n"
+        "time = 0.25\n"
+        "ERROR: Negative Jacobian determinant = -0.125 at element 17, integration point 3\n",
+        encoding="utf-8",
+    )
+
+    result = validate_log(path)
+
+    assert result.classification is SolverClassification.NEGATIVE_JACOBIAN
+    assert len(result.negative_jacobian_evidence) == 1
+    evidence = result.negative_jacobian_evidence[0]
+    assert evidence.line_number == 3
+    assert evidence.element_id == 17
+    assert evidence.integration_point == 3
+    assert evidence.determinant == -0.125
+
+
+def test_log_validation_does_not_infer_missing_negative_jacobian_details(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "solver.log"
+    path.write_text(
+        "time step = 9\nNegative Jacobian determinant at element four\n",
+        encoding="utf-8",
+    )
+
+    result = validate_log(path)
+
+    assert len(result.negative_jacobian_evidence) == 1
+    evidence = result.negative_jacobian_evidence[0]
+    assert evidence.line_number == 2
+    assert evidence.element_id is None
+    assert evidence.integration_point is None
+    assert evidence.determinant is None
+
+
 @pytest.mark.parametrize(
     "text",
     [

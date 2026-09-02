@@ -19,7 +19,13 @@ from .headless import (
     run_headless_febio,
     run_headless_febio_session,
 )
-from .log import LogValidation, LogValidator, validate_log, validate_solver_log
+from .log import (
+    LogValidation,
+    LogValidator,
+    NegativeJacobianLogEvidence,
+    validate_log,
+    validate_solver_log,
+)
 from .official_fbs import (
     OfficialFbsResultReceipt,
     OfficialFbsRuntime,
@@ -69,6 +75,7 @@ __all__ = [
     "headless_exit_code",
     "LogValidation",
     "LogValidator",
+    "NegativeJacobianLogEvidence",
     "FebioRuntimeDiagnostic",
     "OutputExpectation",
     "OutputFreshnessError",
