@@ -22,13 +22,25 @@ from febio_cae_harness.cli_context import (
     load_root_capability,
 )
 from febio_cae_harness.contracts import IntentState
-from febio_cae_harness.evidence import EvidenceIntegrityError, EvidenceStore
+from febio_cae_harness.evidence import (
+    EvidenceIntegrityError,
+    EvidenceStore,
+    IntentSnapshotAuthority,
+)
 from febio_cae_harness.model.completeness import assess_authoritative_completeness
 from febio_cae_harness.model.feb import inspect_feb_file, inspect_feb_xml
 from febio_cae_harness.model.incomplete import inspect_incomplete_feb
 from febio_cae_harness.model.preflight import PreflightResult, run_preflight
 from febio_cae_harness.model.step import inspect_step_file
+from febio_cae_harness.reporting import (
+    AttemptIdentity,
+    EvidenceKind,
+    ReportAuthorityManager,
+    ResultReport,
+    assemble_report,
+)
 from febio_cae_harness.solver.execution import (
+    ExecutionAuthority,
     ExecutionAuthorityError,
     claim_execution_outputs,
     issue_execution_authority,
@@ -37,14 +49,25 @@ from febio_cae_harness.solver.execution import (
 )
 from febio_cae_harness.solver.headless import (
     HeadlessConfigurationError,
+    HeadlessReconnectSession,
+    HeadlessRunSession,
     recover_headless_febio,
     run_headless_febio_session,
 )
+from febio_cae_harness.solver.official_fbs import (
+    OfficialFbsResultReceipt,
+    OfficialFbsRuntimeError,
+    open_official_fbs_manager,
+    probe_official_fbs_runtime,
+    require_official_fbs_result,
+)
 from febio_cae_harness.solver.runtime import RuntimeProbeError, probe_febio
+from febio_cae_harness.solver.supervisor import SolverSupervisor
 from febio_cae_harness.solver.types import (
     SolverClassification,
     SolverConfigurationError,
     SolverOwnershipError,
+    SolverRunResult,
     SolverState,
 )
 from febio_cae_harness.workspace import (
@@ -74,6 +97,7 @@ _CONTEXT_EXIT_CODES = {
 
 _RUN_FAILURE_EXIT = 4
 _FBS_UNAVAILABLE_EXIT = 5
+_REPORT_BLOCKED_EXIT = 6
 
 
 class _RunCommandError(RuntimeError):
@@ -101,6 +125,28 @@ def _positive_float(value: str) -> float:
     if not math.isfinite(parsed) or parsed <= 0:
         raise argparse.ArgumentTypeError("value must be a positive finite number")
     return parsed
+
+
+def _official_fbs_paths(arguments: argparse.Namespace) -> tuple[Path, Path, Path] | None:
+    paths = (
+        getattr(arguments, "fbs_python", None),
+        getattr(arguments, "fbs_module", None),
+        getattr(arguments, "fbs_zlib", None),
+    )
+    if any(path is not None for path in paths) and not all(path is not None for path in paths):
+        raise _RunCommandError(
+            "INVALID_INPUT",
+            "fbs_python, fbs_module, and fbs_zlib must be supplied together",
+        )
+    if not all(path is not None for path in paths):
+        return None
+    checked = cast(tuple[Path, Path, Path], paths)
+    if any(not path.is_absolute() for path in checked):
+        raise _RunCommandError(
+            "INVALID_INPUT",
+            "official FBS paths must be absolute",
+        )
+    return checked
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -193,6 +239,9 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="FIELD",
     )
     run_febio.add_argument("--timeout-seconds", type=_positive_float)
+    run_febio.add_argument("--fbs-python", type=Path, metavar="PATH")
+    run_febio.add_argument("--fbs-module", type=Path, metavar="PATH")
+    run_febio.add_argument("--fbs-zlib", type=Path, metavar="PATH")
 
     reconnect_febio = commands.add_parser(
         "reconnect-febio",
@@ -202,6 +251,9 @@ def build_parser() -> argparse.ArgumentParser:
     reconnect_febio.add_argument("--case-id", required=True)
     reconnect_febio.add_argument("--attempt-id", required=True)
     reconnect_febio.add_argument("--runtime-probe", required=True, type=Path, metavar="PATH")
+    reconnect_febio.add_argument("--fbs-python", type=Path, metavar="PATH")
+    reconnect_febio.add_argument("--fbs-module", type=Path, metavar="PATH")
+    reconnect_febio.add_argument("--fbs-zlib", type=Path, metavar="PATH")
 
     retry_febio = commands.add_parser(
         "retry-febio",
@@ -211,6 +263,9 @@ def build_parser() -> argparse.ArgumentParser:
     retry_febio.add_argument("--case-id", required=True)
     retry_febio.add_argument("--reservation-id", required=True)
     retry_febio.add_argument("--runtime-probe", required=True, type=Path, metavar="PATH")
+    retry_febio.add_argument("--fbs-python", type=Path, metavar="PATH")
+    retry_febio.add_argument("--fbs-module", type=Path, metavar="PATH")
+    retry_febio.add_argument("--fbs-zlib", type=Path, metavar="PATH")
     return parser
 
 
@@ -357,6 +412,7 @@ def _run_failure(
     retryable: bool = False,
     attempt: Mapping[str, object] | None = None,
     solver: Mapping[str, object] | None = None,
+    report: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     payload = cli_failure(
         command,
@@ -366,6 +422,8 @@ def _run_failure(
         payload["attempt"] = dict(attempt)
     if solver is not None:
         payload["solver"] = dict(solver)
+    if report is not None:
+        payload["report"] = dict(report)
     return payload
 
 
@@ -388,10 +446,11 @@ def _append_run_terminal(
     status: str,
     *,
     solver: Mapping[str, object] | None = None,
+    official_fbs: bool = False,
 ) -> bool:
     payload: dict[str, object] = {
         "attempt_id": attempt_id,
-        "official_fbs": False,
+        "official_fbs": official_fbs,
         "status": status,
     }
     if solver is not None:
@@ -407,6 +466,158 @@ def _append_run_terminal(
     except (EvidenceIntegrityError, OSError, ValueError, WorkspaceBoundaryError):
         return False
     return True
+
+
+def _official_report_evidence(
+    attempt: AttemptWorkspace,
+    receipt: OfficialFbsResultReceipt,
+) -> dict[EvidenceKind, Path]:
+    """Write explicit diagnostic-only physical-evidence placeholders."""
+
+    binding = {
+        "element_count": receipt.element_count,
+        "model_manifest_sha256": receipt.model_manifest_sha256,
+        "node_count": receipt.node_count,
+        "requested_fields": list(receipt.requested_fields),
+        "state_count": receipt.state_count,
+        "state_times": list(receipt.state_times),
+        "xplt_sha256": receipt.xplt_sha256,
+    }
+    paths: dict[EvidenceKind, Path] = {}
+    for kind in EvidenceKind:
+        payload = {
+            "authority": "unverified",
+            "fbs_binding": binding,
+            "kind": kind.value,
+            "reason": (
+                "official FBS field validation does not establish this physical intent condition"
+            ),
+            "satisfies_intent": False,
+            "schema_version": "febio-cae-report-evidence/v1",
+            "verified": False,
+        }
+        paths[kind] = attempt.write_text(
+            Path("report-evidence") / f"{kind.value}.json",
+            json.dumps(
+                payload,
+                allow_nan=False,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n",
+        )
+    return paths
+
+
+def _complete_official_report_blocked(
+    *,
+    command: str,
+    store: EvidenceStore,
+    attempt: AttemptWorkspace,
+    snapshot: IntentSnapshotAuthority,
+    execution: ExecutionAuthority,
+    supervisor: SolverSupervisor,
+    result: SolverRunResult,
+    staged_input: Path,
+    attempt_payload: dict[str, object],
+    solver: Mapping[str, object],
+) -> int:
+    """Persist an official-FBS diagnostic report without manufacturing success."""
+
+    if (
+        type(execution) is not ExecutionAuthority
+        or type(supervisor) is not SolverSupervisor
+        or type(result) is not SolverRunResult
+    ):
+        raise _RunCommandError(
+            "EVIDENCE_INTEGRITY_FAILURE",
+            "official result requires exact execution and solver authorities",
+        )
+    try:
+        validation = result.fbs_validation
+        if validation is None:
+            raise TypeError("official solver result has no FBS validation")
+        receipt = require_official_fbs_result(validation)
+        identity = AttemptIdentity(
+            attempt.case_id,
+            snapshot.intent_sha256,
+            attempt.attempt_id,
+        )
+        evidence_paths = _official_report_evidence(attempt, receipt)
+        authority = ReportAuthorityManager(
+            supervisor,
+            result,
+            identity,
+            official_fbs_result=receipt,
+        ).issue(evidence_paths)
+        report = assemble_report(authority)
+        if type(report) is not ResultReport or report.success or report.verified:
+            raise TypeError("unverified physical evidence unexpectedly passed report gates")
+        report_path = attempt.write_text(
+            "report.json",
+            json.dumps(
+                report.to_dict(),
+                allow_nan=False,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n",
+        )
+        execution_input_sha256 = execution.input_sha256
+        execution_record = execution.record_path
+        with claim_execution_outputs(execution) as outputs:
+            record_execution_output_artifacts(outputs, store)
+        store.record_artifact(
+            staged_input,
+            attempt_id=attempt.attempt_id,
+            expected_sha256=execution_input_sha256,
+        )
+        store.record_artifact(execution_record, attempt_id=attempt.attempt_id)
+        for path in evidence_paths.values():
+            store.record_artifact(path, attempt_id=attempt.attempt_id)
+        store.record_artifact(report_path, attempt_id=attempt.attempt_id)
+        attempt_payload["official_fbs"] = True
+        attempt_payload["status"] = "REPORT_BLOCKED"
+        if not _append_run_terminal(
+            store,
+            attempt.attempt_id,
+            "REPORT_BLOCKED",
+            solver=solver,
+            official_fbs=True,
+        ):
+            raise _RunCommandError(
+                "EVIDENCE_INTEGRITY_FAILURE",
+                f"{command} terminal evidence could not be recorded",
+            )
+        report_summary = {
+            "failed_checks": list(report.gates.failed_checks),
+            "provenance": report.provenance.value,
+            "success": False,
+            "verified": False,
+        }
+    except _RunCommandError:
+        raise
+    except (AttributeError, TypeError, ValueError, RuntimeError) as error:
+        raise _RunCommandError(
+            "EVIDENCE_INTEGRITY_FAILURE",
+            "official result report authority is invalid",
+        ) from error
+
+    _emit_context_json(
+        _run_failure(
+            "REPORT_BLOCKED",
+            "official FBS passed, but mesh, all-integration-point Jacobian, ROI, "
+            "and evaluation evidence remain unverified",
+            command=command,
+            attempt=attempt_payload,
+            solver=solver,
+            report=report_summary,
+        ),
+        error=True,
+    )
+    return _REPORT_BLOCKED_EXIT
 
 
 def _fail_run_after_terminal(
@@ -607,6 +818,7 @@ def _run_febio_command(arguments: argparse.Namespace) -> int:
                 "INVALID_INPUT",
                 "requested fields must be non-empty and unique",
             )
+        fbs_paths = _official_fbs_paths(arguments)
 
         attempt_id = f"run-{secrets.token_hex(16)}"
         opened.store.record_attempt(attempt_id, {"status": "started"})
@@ -651,6 +863,10 @@ def _run_febio_command(arguments: argparse.Namespace) -> int:
             )
 
         runtime = probe_febio(arguments.runtime_probe)
+        official_runtime = None
+        if fbs_paths is not None:
+            fbs_python, fbs_module, fbs_zlib = fbs_paths
+            official_runtime = probe_official_fbs_runtime(fbs_python, fbs_module, fbs_zlib)
         execution = issue_execution_authority(
             attempt,
             snapshot,
@@ -660,22 +876,72 @@ def _run_febio_command(arguments: argparse.Namespace) -> int:
             expected_steps=arguments.expected_steps,
             expected_final_time=arguments.expected_final_time,
             timeout_seconds=arguments.timeout_seconds,
+            official_fbs_runtime=official_runtime,
         )
         if execution.input_sha256 != inspection.sha256:
             raise _RunCommandError(
                 "EVIDENCE_INTEGRITY_FAILURE",
                 "execution input changed after preflight",
             )
-        session = run_headless_febio_session(
-            attempt,
-            snapshot,
-            runtime,
-            staged_input,
-            expected_steps=arguments.expected_steps,
-            expected_final_time=arguments.expected_final_time,
-            timeout_seconds=arguments.timeout_seconds,
-            requested_fields=requested_fields,
-        )
+        if official_runtime is None:
+            session = run_headless_febio_session(
+                attempt,
+                snapshot,
+                runtime,
+                staged_input,
+                expected_steps=arguments.expected_steps,
+                expected_final_time=arguments.expected_final_time,
+                timeout_seconds=arguments.timeout_seconds,
+                requested_fields=requested_fields,
+            )
+        else:
+            with open_official_fbs_manager(official_runtime, attempt.root) as fbs_manager:
+                session = run_headless_febio_session(
+                    attempt,
+                    snapshot,
+                    runtime,
+                    staged_input,
+                    expected_steps=arguments.expected_steps,
+                    expected_final_time=arguments.expected_final_time,
+                    timeout_seconds=arguments.timeout_seconds,
+                    requested_fields=requested_fields,
+                    fbs_adapter=fbs_manager.issue_authority(),
+                )
+                diagnostic = session.diagnostic
+                solver = {
+                    "classification": diagnostic.classification.value,
+                    "return_code": diagnostic.return_code,
+                    "state": diagnostic.state.value,
+                }
+                official_attempt_payload = {
+                    "attempt_id": attempt_id,
+                    "official_fbs": False,
+                    "status": diagnostic.classification.value,
+                }
+                if (
+                    diagnostic.state is SolverState.NORMAL_EXIT
+                    and diagnostic.classification is SolverClassification.SUCCESS
+                    and diagnostic.return_code == 0
+                    and diagnostic.log_path == execution.log_path
+                    and diagnostic.xplt_path == execution.xplt_path
+                ):
+                    if type(session) is not HeadlessRunSession:
+                        raise _RunCommandError(
+                            "EVIDENCE_INTEGRITY_FAILURE",
+                            "official result requires an exact headless run session",
+                        )
+                    return _complete_official_report_blocked(
+                        command="run-febio",
+                        store=opened.store,
+                        attempt=attempt,
+                        snapshot=snapshot,
+                        execution=execution,
+                        supervisor=session.supervisor,
+                        result=session.result,
+                        staged_input=staged_input,
+                        attempt_payload=official_attempt_payload,
+                        solver=solver,
+                    )
         diagnostic = session.diagnostic
         solver = {
             "classification": diagnostic.classification.value,
@@ -684,12 +950,16 @@ def _run_febio_command(arguments: argparse.Namespace) -> int:
         }
         attempt_payload = {
             "attempt_id": attempt_id,
-            "official_fbs": False,
+            "official_fbs": diagnostic.official_fbs,
             "status": diagnostic.classification.value,
         }
+        accepted_classification = (
+            diagnostic.classification is SolverClassification.FBS_UNVERIFIED
+            and diagnostic.official_fbs is False
+        )
         if (
             diagnostic.state is not SolverState.NORMAL_EXIT
-            or diagnostic.classification is not SolverClassification.FBS_UNVERIFIED
+            or not accepted_classification
             or diagnostic.return_code != 0
             or diagnostic.log_path != execution.log_path
             or diagnostic.xplt_path != execution.xplt_path
@@ -789,6 +1059,13 @@ def _run_febio_command(arguments: argparse.Namespace) -> int:
             "RUNTIME_PROBE_FAILED",
             _RunCommandError("RUNTIME_PROBE_FAILED", "FEBio runtime probe failed"),
         )
+    except OfficialFbsRuntimeError:
+        return _fail_run_after_terminal(
+            terminal_store,
+            attempt_id,
+            "FBS_RUNTIME_FAILED",
+            _RunCommandError("FBS_RUNTIME_FAILED", "official FBS runtime validation failed"),
+        )
     except (
         EvidenceIntegrityError,
         ExecutionAuthorityError,
@@ -844,7 +1121,9 @@ def _retry_febio_command(arguments: argparse.Namespace) -> int:
                 "INVALID_INPUT",
                 "runtime_probe must be one absolute executable path",
             )
+        fbs_paths = _official_fbs_paths(arguments)
         runtime = probe_febio(arguments.runtime_probe)
+        official_runtime = None if fbs_paths is None else probe_official_fbs_runtime(*fbs_paths)
         state_authority = transition_intent(snapshot)
         ledger = RetryLedger.from_store(state_authority, opened.store)
         matching_records = [
@@ -880,6 +1159,7 @@ def _retry_febio_command(arguments: argparse.Namespace) -> int:
             parent_attempt,
             snapshot,
             runtime,
+            official_fbs_runtime=official_runtime,
         )
         parent_input = parent_execution.input_path
         input_name = parent_input.name
@@ -896,7 +1176,12 @@ def _retry_febio_command(arguments: argparse.Namespace) -> int:
         with opened.case._exact_transaction() as exact:
             execution_exists = exact.exists(execution_relative)
         if execution_exists:
-            reopen_execution_authority(attempt, snapshot, runtime)
+            reopen_execution_authority(
+                attempt,
+                snapshot,
+                runtime,
+                official_fbs_runtime=official_runtime,
+            )
             return _retry_already_started(attempt_id)
 
         source_relative = parent_input.relative_to(opened.case.root)
@@ -957,6 +1242,7 @@ def _retry_febio_command(arguments: argparse.Namespace) -> int:
             parent_attempt,
             snapshot,
             runtime,
+            official_fbs_runtime=official_runtime,
         )
         if (
             refreshed_parent_execution.input_path.name != input_name
@@ -1011,12 +1297,18 @@ def _retry_febio_command(arguments: argparse.Namespace) -> int:
                 expected_steps=expected_steps,
                 expected_final_time=expected_final_time,
                 timeout_seconds=timeout_seconds,
+                official_fbs_runtime=official_runtime,
             )
         except ExecutionAuthorityError:
             with opened.case._exact_transaction() as exact:
                 execution_exists = exact.exists(execution_relative)
             if execution_exists:
-                reopen_execution_authority(attempt, snapshot, runtime)
+                reopen_execution_authority(
+                    attempt,
+                    snapshot,
+                    runtime,
+                    official_fbs_runtime=official_runtime,
+                )
                 return _retry_already_started(attempt_id)
             raise
         if execution.input_sha256 != expected_sha256:
@@ -1024,16 +1316,65 @@ def _retry_febio_command(arguments: argparse.Namespace) -> int:
                 "EVIDENCE_INTEGRITY_FAILURE",
                 "retry execution input differs from its parent",
             )
-        session = run_headless_febio_session(
-            attempt,
-            snapshot,
-            runtime,
-            staged_input,
-            expected_steps=expected_steps,
-            expected_final_time=expected_final_time,
-            timeout_seconds=timeout_seconds,
-            requested_fields=requested_fields,
-        )
+        if official_runtime is None:
+            session = run_headless_febio_session(
+                attempt,
+                snapshot,
+                runtime,
+                staged_input,
+                expected_steps=expected_steps,
+                expected_final_time=expected_final_time,
+                timeout_seconds=timeout_seconds,
+                requested_fields=requested_fields,
+            )
+        else:
+            with open_official_fbs_manager(official_runtime, attempt.root) as fbs_manager:
+                session = run_headless_febio_session(
+                    attempt,
+                    snapshot,
+                    runtime,
+                    staged_input,
+                    expected_steps=expected_steps,
+                    expected_final_time=expected_final_time,
+                    timeout_seconds=timeout_seconds,
+                    requested_fields=requested_fields,
+                    fbs_adapter=fbs_manager.issue_authority(),
+                )
+                diagnostic = session.diagnostic
+                solver = {
+                    "classification": diagnostic.classification.value,
+                    "return_code": diagnostic.return_code,
+                    "state": diagnostic.state.value,
+                }
+                official_attempt_payload = {
+                    "attempt_id": attempt_id,
+                    "official_fbs": False,
+                    "status": diagnostic.classification.value,
+                }
+                if (
+                    diagnostic.state is SolverState.NORMAL_EXIT
+                    and diagnostic.classification is SolverClassification.SUCCESS
+                    and diagnostic.return_code == 0
+                    and diagnostic.log_path == execution.log_path
+                    and diagnostic.xplt_path == execution.xplt_path
+                ):
+                    if type(session) is not HeadlessRunSession:
+                        raise _RunCommandError(
+                            "EVIDENCE_INTEGRITY_FAILURE",
+                            "official result requires an exact headless run session",
+                        )
+                    return _complete_official_report_blocked(
+                        command=command,
+                        store=opened.store,
+                        attempt=attempt,
+                        snapshot=snapshot,
+                        execution=execution,
+                        supervisor=session.supervisor,
+                        result=session.result,
+                        staged_input=staged_input,
+                        attempt_payload=official_attempt_payload,
+                        solver=solver,
+                    )
         diagnostic = session.diagnostic
         solver = {
             "classification": diagnostic.classification.value,
@@ -1042,12 +1383,16 @@ def _retry_febio_command(arguments: argparse.Namespace) -> int:
         }
         attempt_payload: dict[str, object] = {
             "attempt_id": attempt_id,
-            "official_fbs": False,
+            "official_fbs": diagnostic.official_fbs,
             "status": diagnostic.classification.value,
         }
+        accepted_classification = (
+            diagnostic.classification is SolverClassification.FBS_UNVERIFIED
+            and diagnostic.official_fbs is False
+        )
         if (
             diagnostic.state is not SolverState.NORMAL_EXIT
-            or diagnostic.classification is not SolverClassification.FBS_UNVERIFIED
+            or not accepted_classification
             or diagnostic.return_code != 0
             or diagnostic.log_path != execution.log_path
             or diagnostic.xplt_path != execution.xplt_path
@@ -1151,6 +1496,14 @@ def _retry_febio_command(arguments: argparse.Namespace) -> int:
             _RunCommandError("RUNTIME_PROBE_FAILED", "FEBio runtime probe failed"),
             command=command,
         )
+    except OfficialFbsRuntimeError:
+        return _fail_run_after_terminal(
+            terminal_store,
+            attempt_id,
+            "FBS_RUNTIME_FAILED",
+            _RunCommandError("FBS_RUNTIME_FAILED", "official FBS runtime validation failed"),
+            command=command,
+        )
     except (
         EvidenceIntegrityError,
         ExecutionAuthorityError,
@@ -1198,15 +1551,74 @@ def _reconnect_febio_command(arguments: argparse.Namespace) -> int:
                 "INVALID_INPUT",
                 "runtime_probe must be one absolute executable path",
             )
+        fbs_paths = _official_fbs_paths(arguments)
         runtime = probe_febio(arguments.runtime_probe)
-        session = recover_headless_febio(
-            opened.store,
-            snapshot,
-            runtime,
-            attempt_id,
-        )
-        terminal_store = opened.store
-        result = session.supervisor.wait()
+        official_runtime = None if fbs_paths is None else probe_official_fbs_runtime(*fbs_paths)
+        if official_runtime is None:
+            session = recover_headless_febio(
+                opened.store,
+                snapshot,
+                runtime,
+                attempt_id,
+            )
+            terminal_store = opened.store
+            result = session.supervisor.wait()
+            official_fbs = False
+        else:
+            attempt_root = opened.case.temporary_root / "attempts" / attempt_id
+            with open_official_fbs_manager(official_runtime, attempt_root) as fbs_manager:
+                session = recover_headless_febio(
+                    opened.store,
+                    snapshot,
+                    runtime,
+                    attempt_id,
+                    official_fbs_runtime=official_runtime,
+                    fbs_adapter=fbs_manager.issue_authority(),
+                )
+                terminal_store = opened.store
+                result = session.supervisor.wait()
+                solver = {
+                    "classification": result.classification.value,
+                    "return_code": result.return_code,
+                    "state": result.state.value,
+                }
+                official_attempt_payload = {
+                    "attempt_id": attempt_id,
+                    "official_fbs": False,
+                    "status": result.classification.value,
+                }
+                if (
+                    result.state is SolverState.NORMAL_EXIT
+                    and result.classification is SolverClassification.SUCCESS
+                    and result.return_code == 0
+                ):
+                    if type(session) is not HeadlessReconnectSession:
+                        raise _RunCommandError(
+                            "EVIDENCE_INTEGRITY_FAILURE",
+                            "official result requires an exact headless reconnect session",
+                        )
+                    execution = session.execution
+                    if (
+                        result.log_path != execution.log_path
+                        or result.xplt_path != execution.xplt_path
+                    ):
+                        raise _RunCommandError(
+                            "EVIDENCE_INTEGRITY_FAILURE",
+                            "official result paths differ from the recorded execution",
+                        )
+                    return _complete_official_report_blocked(
+                        command=command,
+                        store=opened.store,
+                        attempt=session.attempt,
+                        snapshot=snapshot,
+                        execution=execution,
+                        supervisor=session.supervisor,
+                        result=result,
+                        staged_input=execution.input_path,
+                        attempt_payload=official_attempt_payload,
+                        solver=solver,
+                    )
+                official_fbs = False
         solver = {
             "classification": result.classification.value,
             "return_code": result.return_code,
@@ -1214,13 +1626,16 @@ def _reconnect_febio_command(arguments: argparse.Namespace) -> int:
         }
         attempt_payload = {
             "attempt_id": attempt_id,
-            "official_fbs": False,
+            "official_fbs": official_fbs,
             "status": result.classification.value,
         }
         execution = session.execution
+        accepted_classification = (
+            result.classification is SolverClassification.FBS_UNVERIFIED and official_fbs is False
+        )
         if (
             result.state is not SolverState.NORMAL_EXIT
-            or result.classification is not SolverClassification.FBS_UNVERIFIED
+            or not accepted_classification
             or result.return_code != 0
             or result.log_path != execution.log_path
             or result.xplt_path != execution.xplt_path
@@ -1324,6 +1739,14 @@ def _reconnect_febio_command(arguments: argparse.Namespace) -> int:
             attempt_id,
             "RUNTIME_PROBE_FAILED",
             _RunCommandError("RUNTIME_PROBE_FAILED", "FEBio runtime probe failed"),
+            command=command,
+        )
+    except OfficialFbsRuntimeError:
+        return _fail_run_after_terminal(
+            terminal_store,
+            attempt_id,
+            "FBS_RUNTIME_FAILED",
+            _RunCommandError("FBS_RUNTIME_FAILED", "official FBS runtime validation failed"),
             command=command,
         )
     except (

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import hashlib
+import importlib
 import io
 import json
 import stat
 import sys
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import Any
 
 import pytest
@@ -20,6 +22,7 @@ from febio_cae_harness.solver.execution import (
     reopen_execution_authority,
 )
 from febio_cae_harness.solver.headless import HeadlessRunDiagnostic
+from febio_cae_harness.solver.official_fbs import OfficialFbsRuntime
 from febio_cae_harness.solver.runtime import (
     FebioRuntimeDiagnostic,
     RuntimeProbeError,
@@ -117,6 +120,62 @@ def _issued_runtime(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FebioRun
         lambda command, **kwargs: CompletedProcess(),
     )
     return probe_febio(executable)
+
+
+def _issued_official_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[ModuleType, OfficialFbsRuntime]:
+    module = importlib.import_module("febio_cae_harness.solver.official_fbs")
+    python_dir = tmp_path / "python313"
+    module_dir = tmp_path / "module"
+    runtime_dir = tmp_path / "runtime"
+    for directory in (python_dir, module_dir, runtime_dir):
+        directory.mkdir(parents=True)
+    payloads = {
+        "python_executable": b"fixture-python-executable",
+        "python_dll": b"fixture-python-dll",
+        "python_stdlib": b"fixture-python-stdlib",
+        "python_path_config": b"fixture-python-path-config",
+        "fbs_module": b"fixture-official-fbs-module",
+        "zlib": b"fixture-zlib",
+    }
+    paths = {
+        "python_executable": python_dir / "python.exe",
+        "python_dll": python_dir / "python313.dll",
+        "python_stdlib": python_dir / "python313.zip",
+        "python_path_config": python_dir / "python313._pth",
+        "fbs_module": module_dir / "fbs.cp313-win_amd64.pyd",
+        "zlib": runtime_dir / "zlib1.dll",
+    }
+    for name, path in paths.items():
+        path.write_bytes(payloads[name])
+    hashes = {name: hashlib.sha256(payload).hexdigest() for name, payload in payloads.items()}
+    monkeypatch.setattr(module, "_APPROVED_SHA256", hashes)
+    monkeypatch.setattr(
+        module,
+        "_APPROVED_PYTHON_TREE",
+        {path.name: hashes[name] for name, path in paths.items() if name.startswith("python_")},
+    )
+    monkeypatch.setattr(
+        module,
+        "_probe_helper",
+        lambda held, timeout_seconds: module._ProbeHelperResult(
+            {
+                "protocol": 1,
+                "python": "3.13",
+                "module": "fbs",
+                "api": ["ReadPlotFile", "vtkExport"],
+            },
+            "a" * 64,
+        ),
+    )
+    runtime = module.probe_official_fbs_runtime(
+        paths["python_executable"],
+        paths["fbs_module"],
+        paths["zlib"],
+    )
+    return module, runtime
 
 
 def _run_arguments(runtime: Path, *extra: str) -> list[str]:
@@ -236,6 +295,32 @@ def test_retry_febio_parser_accepts_only_durable_reservation_and_runtime(
         "timeout_seconds",
         "arguments",
     }.intersection(vars(parsed))
+
+
+@pytest.mark.parametrize("command", ["reconnect-febio", "retry-febio"])
+def test_reconnect_and_retry_accept_current_official_fbs_profile_paths(
+    tmp_path: Path,
+    command: str,
+) -> None:
+    extra = (
+        "--fbs-python",
+        str((tmp_path / "python.exe").resolve()),
+        "--fbs-module",
+        str((tmp_path / "fbs.pyd").resolve()),
+        "--fbs-zlib",
+        str((tmp_path / "zlib1.dll").resolve()),
+    )
+    arguments = (
+        _reconnect_arguments(tmp_path / "febio.exe", *extra)
+        if command == "reconnect-febio"
+        else _retry_arguments(tmp_path / "febio.exe", "a" * 64, *extra)
+    )
+
+    parsed = cli_module.build_parser().parse_args(arguments)
+
+    assert parsed.fbs_python == (tmp_path / "python.exe").resolve()
+    assert parsed.fbs_module == (tmp_path / "fbs.pyd").resolve()
+    assert parsed.fbs_zlib == (tmp_path / "zlib1.dll").resolve()
 
 
 def test_reconnect_runtime_probe_failure_does_not_append_orphan_terminal(
@@ -496,6 +581,101 @@ def test_reconnect_febio_claims_exact_outputs_but_remains_fbs_unverified(
     assert not (case_root / "50_Reports").exists()
 
 
+def test_reconnect_febio_never_promotes_caller_asserted_official_fbs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    service, capability, _ = _register_case(tmp_path, intent=_complete_intent())
+    opened = service._open_context(capability, "case-a")
+    opened.store.record_attempt("run-existing", {"status": "started"})
+    attempt = AttemptWorkspace._from_manager(
+        opened.case,
+        "run-existing",
+        opened.case.temporary_root / "attempts" / "run-existing",
+    )
+    input_path = attempt.write_text("model.feb", "<febio_spec version='4.0' />")
+    runtime = _issued_runtime(tmp_path, monkeypatch)
+    execution = issue_execution_authority(
+        attempt,
+        opened.store.issue_intent_snapshot(),
+        runtime,
+        input_path,
+        requested_fields=("displacement",),
+    )
+    execution.log_path.write_bytes(b"synthetic normal termination\n")
+    execution.xplt_path.write_bytes(b"synthetic XPLT\n")
+    result = SimpleNamespace(
+        state=SolverState.NORMAL_EXIT,
+        classification=SolverClassification.SUCCESS,
+        return_code=0,
+        pid=123,
+        log_path=execution.log_path,
+        xplt_path=execution.xplt_path,
+        fbs_validation=SimpleNamespace(valid=True, official=True, provenance="official"),
+    )
+    session = SimpleNamespace(
+        supervisor=SimpleNamespace(wait=lambda: result),
+        execution=execution,
+    )
+    issued_authority = object()
+    captured: list[tuple[object, object]] = []
+
+    class Manager:
+        def __enter__(self) -> Manager:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def issue_authority(self) -> object:
+            return issued_authority
+
+    def recover(
+        store: object,
+        snapshot: object,
+        runtime_diagnostic: object,
+        attempt_id: str,
+        **kwargs: object,
+    ) -> object:
+        del store, snapshot, runtime_diagnostic
+        assert attempt_id == "run-existing"
+        captured.append((kwargs["official_fbs_runtime"], kwargs["fbs_adapter"]))
+        return session
+
+    _set_capability_stdin(monkeypatch, capability)
+    monkeypatch.setattr(cli_module, "_case_service", lambda: service)
+    monkeypatch.setattr(cli_module, "probe_febio", lambda path: runtime)
+    monkeypatch.setattr(
+        cli_module,
+        "probe_official_fbs_runtime",
+        lambda python, module, zlib: "probe-issued-receipt",
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "open_official_fbs_manager",
+        lambda receipt, root: Manager(),
+    )
+    monkeypatch.setattr(cli_module, "recover_headless_febio", recover)
+    fbs_args = (
+        "--fbs-python",
+        str((tmp_path / "python.exe").resolve()),
+        "--fbs-module",
+        str((tmp_path / "fbs.pyd").resolve()),
+        "--fbs-zlib",
+        str((tmp_path / "zlib1.dll").resolve()),
+    )
+
+    assert cli_module.main(_reconnect_arguments(runtime.path, *fbs_args)) == 4
+
+    captured_output = capsys.readouterr()
+    assert captured_output.out == ""
+    payload = json.loads(captured_output.err)
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "EVIDENCE_INTEGRITY_FAILURE"
+    assert captured == [("probe-issued-receipt", issued_authority)]
+
+
 def test_run_febio_solves_but_fails_closed_without_official_fbs(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -572,6 +752,295 @@ def test_run_febio_solves_but_fails_closed_without_official_fbs(
     }
     reports = case_root / "50_Reports"
     assert not reports.exists() or not any(reports.iterdir())
+
+
+def test_run_febio_never_promotes_diagnostic_boolean_as_official_fbs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    service, capability, case_root = _register_case(tmp_path, intent=_complete_intent())
+    runtime = _issued_runtime(tmp_path, monkeypatch)
+    fbs_paths = [
+        (tmp_path / "python313" / "python.exe").resolve(),
+        (tmp_path / "fbs.cp313-win_amd64.pyd").resolve(),
+        (tmp_path / "zlib1.dll").resolve(),
+    ]
+    issued_authority = object()
+    manager_root: Path | None = None
+    issued_profiles: list[object] = []
+    issue_execution = issue_execution_authority
+
+    class Manager:
+        def __enter__(self) -> Manager:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def issue_authority(self) -> object:
+            return issued_authority
+
+    def open_manager(receipt: object, attempt_root: Path) -> Manager:
+        nonlocal manager_root
+        assert receipt == "probe-issued-receipt"
+        manager_root = attempt_root
+        return Manager()
+
+    def run_official(
+        attempt: Any,
+        snapshot: Any,
+        runtime_diagnostic: FebioRuntimeDiagnostic,
+        input_path: Path,
+        **kwargs: object,
+    ) -> Any:
+        del attempt, snapshot
+        assert kwargs["fbs_adapter"] is issued_authority
+        log_path = input_path.with_suffix(".log")
+        xplt_path = input_path.with_suffix(".xplt")
+        log_path.write_bytes(b"synthetic normal termination\n")
+        xplt_path.write_bytes(b"synthetic XPLT\n")
+        return SimpleNamespace(
+            diagnostic=HeadlessRunDiagnostic(
+                runtime_identity=runtime_diagnostic,
+                state=SolverState.NORMAL_EXIT,
+                classification=SolverClassification.SUCCESS,
+                return_code=0,
+                pid=123,
+                log_path=log_path,
+                xplt_path=xplt_path,
+            ),
+            supervisor=None,
+            result=None,
+        )
+
+    def issue_with_profile(*args: object, **kwargs: object) -> object:
+        issued_profiles.append(kwargs.pop("official_fbs_runtime"))
+        return issue_execution(*args, **kwargs)  # type: ignore[arg-type]
+
+    _set_capability_stdin(monkeypatch, capability)
+    monkeypatch.setattr(cli_module, "_case_service", lambda: service)
+    monkeypatch.setattr(cli_module, "probe_febio", lambda path: runtime)
+    monkeypatch.setattr(
+        cli_module,
+        "probe_official_fbs_runtime",
+        lambda python, module, zlib: "probe-issued-receipt",
+        raising=False,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "open_official_fbs_manager",
+        open_manager,
+        raising=False,
+    )
+    monkeypatch.setattr(cli_module, "run_headless_febio_session", run_official)
+    monkeypatch.setattr(cli_module, "issue_execution_authority", issue_with_profile)
+
+    arguments = _run_arguments(
+        runtime.path,
+        "--fbs-python",
+        str(fbs_paths[0]),
+        "--fbs-module",
+        str(fbs_paths[1]),
+        "--fbs-zlib",
+        str(fbs_paths[2]),
+    )
+    assert cli_module.main(arguments) == 4
+
+    captured_output = capsys.readouterr()
+    assert captured_output.out == ""
+    payload = json.loads(captured_output.err)
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "EVIDENCE_INTEGRITY_FAILURE"
+    assert issued_profiles == ["probe-issued-receipt"]
+    assert manager_root is not None and manager_root.is_relative_to(case_root)
+    events = [
+        json.loads(line)
+        for line in (case_root / "90_Temporary" / "events.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert events[-1]["payload"]["official_fbs"] is False
+    assert events[-1]["payload"]["status"] == "EVIDENCE_INTEGRITY_FAILURE"
+
+
+def test_exact_official_result_writes_only_a_blocked_diagnostic_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    service, capability, case_root = _register_case(tmp_path, intent=_complete_intent())
+    opened = service._open_context(capability, "case-a")
+    attempt_id = "run-official"
+    opened.store.record_attempt(attempt_id, {"status": "started"})
+    attempt = AttemptWorkspace._from_manager(
+        opened.case,
+        attempt_id,
+        opened.case.temporary_root / "attempts" / attempt_id,
+    )
+    log = "time step 1\ntime = 1.0\nnormal termination\n"
+    xplt_payload = b"synthetic-xplt"
+    code = (
+        "import os; from pathlib import Path; "
+        f"Path(os.environ['FEBIO_CAE_HARNESS_LOG']).write_text({log!r}); "
+        f"Path(os.environ['FEBIO_CAE_HARNESS_XPLT']).write_bytes({xplt_payload!r})"
+    )
+    staged_input = attempt.write_text("solver.py", code)
+
+    class ProbeProcess:
+        returncode = 0
+
+        def communicate(self, input: bytes, timeout: float) -> tuple[bytes, bytes]:
+            del timeout
+            assert input == b"quit\n"
+            return b"version 4.12.0\n", b""
+
+    with monkeypatch.context() as probe_patch:
+        probe_patch.setattr(
+            "febio_cae_harness.solver.runtime.subprocess.Popen",
+            lambda command, **kwargs: ProbeProcess(),
+        )
+        runtime = probe_febio(Path(sys.executable))
+
+    official_module, official_runtime = _issued_official_runtime(
+        tmp_path / "official-runtime",
+        monkeypatch,
+    )
+    model_manifest = {
+        "available_fields": [{"index": 0, "name": "stress"}],
+        "element_count": 1,
+        "node_count": 4,
+        "requested_fields": {
+            "stress": {
+                "association": "CELL_DATA",
+                "component_index": 0,
+                "component_name": "stress",
+                "components": 9,
+                "field_index": 0,
+                "tensor_type": "DATA_TENSOR2",
+                "vtk_name": "stress",
+            }
+        },
+        "state_count": 1,
+        "state_times": [0.0],
+    }
+    monkeypatch.setattr(
+        official_module,
+        "_invoke_helper",
+        lambda checked, path, fields, root: {
+            "protocol": 1,
+            "available_fields": ["stress"],
+            "model_manifest": model_manifest,
+            "model_sha256": official_module._model_manifest_sha256(model_manifest),
+            "values": {
+                "stress": {
+                    "components": 9,
+                    "count": 9,
+                    "entity_count": 1,
+                    "field_index": 0,
+                    "minimum": 0.0,
+                    "maximum": 1.0,
+                    "state_count": 1,
+                }
+            },
+            "non_finite_fields": [],
+            "xplt_sha256": hashlib.sha256(xplt_payload).hexdigest(),
+        },
+    )
+    snapshot = opened.store.issue_intent_snapshot()
+    execution = issue_execution_authority(
+        attempt,
+        snapshot,
+        runtime,
+        staged_input,
+        requested_fields=("stress",),
+        expected_steps=1,
+        expected_final_time=1.0,
+        timeout_seconds=None,
+        official_fbs_runtime=official_runtime,
+    )
+
+    with official_module.open_official_fbs_manager(
+        official_runtime,
+        attempt.root,
+    ) as fbs_manager:
+        session = headless_module.run_headless_febio_session(
+            attempt,
+            snapshot,
+            runtime,
+            staged_input,
+            requested_fields=("stress",),
+            expected_steps=1,
+            expected_final_time=1.0,
+            fbs_adapter=fbs_manager.issue_authority(),
+        )
+        solver = {
+            "classification": session.result.classification.value,
+            "return_code": session.result.return_code,
+            "state": session.result.state.value,
+        }
+        assert (
+            cli_module._complete_official_report_blocked(
+                command="run-febio",
+                store=opened.store,
+                attempt=attempt,
+                snapshot=snapshot,
+                execution=execution,
+                supervisor=session.supervisor,
+                result=session.result,
+                staged_input=staged_input,
+                attempt_payload={
+                    "attempt_id": attempt_id,
+                    "official_fbs": False,
+                    "status": "SUCCESS",
+                },
+                solver=solver,
+            )
+            == 6
+        )
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    response = json.loads(captured.err)
+    assert response["error"]["code"] == "REPORT_BLOCKED"
+    assert response["attempt"] == {
+        "attempt_id": attempt_id,
+        "official_fbs": True,
+        "status": "REPORT_BLOCKED",
+    }
+    assert response["report"]["success"] is False
+    assert response["report"]["verified"] is False
+    assert response["report"]["provenance"] == "official"
+    assert set(response["report"]["failed_checks"]) >= {
+        "mesh_evidence",
+        "jacobian_evidence",
+        "roi_evidence",
+        "evaluation_evidence",
+    }
+    assert not _contains_path_key(response)
+    assert str(tmp_path) not in captured.err
+
+    attempt_root = case_root / "90_Temporary" / "attempts" / attempt_id
+    report = json.loads((attempt_root / "report.json").read_text(encoding="utf-8"))
+    assert report["success"] is False
+    assert report["verified"] is False
+    assert report["provenance"] == "official"
+    for kind in ("mesh", "jacobian", "roi", "evaluation"):
+        evidence = json.loads(
+            (attempt_root / "report-evidence" / f"{kind}.json").read_text(encoding="utf-8")
+        )
+        assert evidence["kind"] == kind
+        assert evidence["verified"] is False
+        assert evidence["satisfies_intent"] is False
+    events = [
+        json.loads(line)
+        for line in (case_root / "90_Temporary" / "events.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert events[-1]["event_type"] == "run_febio_terminal"
+    assert events[-1]["payload"]["official_fbs"] is True
+    assert events[-1]["payload"]["status"] == "REPORT_BLOCKED"
 
 
 def test_run_febio_ask_and_block_does_not_probe_or_create_attempt(
