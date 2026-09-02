@@ -509,6 +509,139 @@ def test_run_febio_routes_exact_negative_jacobian_repair_into_retry_policy(
     assert captured_policy["proposal_authority"] is not None
 
 
+def test_retry_febio_applies_its_exact_reserved_negative_jacobian_repair(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    change = {
+        "target": "/febio_spec",
+        "mode": "ATTRIBUTE",
+        "attribute_name": "version",
+        "value": "4.1",
+    }
+    intent = _complete_intent(
+        retry_budget=1,
+        allowed_mesh_changes={
+            "mesh": {
+                "patches": (change,),
+                "negative_jacobian_evidence": {
+                    "initial_mesh_valid": True,
+                    "surrounding_mesh_metrics": {"scaled_jacobian": 0.61},
+                    "roi_relation_evidence": {"relation": "outside ROI"},
+                    "contact_relation_evidence": {"relation": "outside contact"},
+                    "constraint_relation_evidence": {"relation": "outside constraint"},
+                },
+            }
+        },
+    )
+    service, capability, case_root = _register_case(tmp_path, intent=intent)
+
+    class CompletedProbe:
+        returncode = 0
+
+        def communicate(self, input: bytes, timeout: float) -> tuple[bytes, bytes]:
+            assert input == b"quit\n"
+            assert timeout > 0
+            return b"version 4.12.0\n", b""
+
+    with monkeypatch.context() as probe_patch:
+        probe_patch.setattr(
+            "febio_cae_harness.solver.runtime.subprocess.Popen",
+            lambda command, **kwargs: CompletedProbe(),
+        )
+        runtime = probe_febio(Path(sys.executable))
+
+    launches = 0
+    repaired_inputs: list[bytes] = []
+
+    def run_synthetic(
+        attempt: AttemptWorkspace,
+        snapshot: Any,
+        runtime_diagnostic: FebioRuntimeDiagnostic,
+        input_path: Path,
+        **kwargs: object,
+    ) -> Any:
+        nonlocal launches
+        launches += 1
+        if launches == 1:
+            script = attempt.write_text(
+                "negative.py",
+                "import os\n"
+                "from pathlib import Path\n"
+                "Path(os.environ['FEBIO_CAE_HARNESS_LOG']).write_text("
+                "'time step = 1\\ntime = 1.0\\nNegative Jacobian determinant = -0.125 "
+                "at element 17, integration point 3\\n')\n"
+                "Path(os.environ['FEBIO_CAE_HARNESS_XPLT']).write_bytes(b'synthetic XPLT')\n",
+            )
+            session = headless_module.run_headless_febio_session(
+                attempt,
+                snapshot,
+                runtime_diagnostic,
+                script,
+                expected_steps=1,
+                expected_final_time=1.0,
+            )
+            model_log = input_path.with_suffix(".log")
+            model_xplt = input_path.with_suffix(".xplt")
+            model_log.write_bytes(session.result.log_path.read_bytes())
+            model_xplt.write_bytes(session.result.xplt_path.read_bytes())
+            return HeadlessRunSession(
+                supervisor=session.supervisor,
+                result=session.result,
+                diagnostic=HeadlessRunDiagnostic(
+                    runtime_identity=runtime_diagnostic,
+                    state=session.result.state,
+                    classification=session.result.classification,
+                    return_code=session.result.return_code,
+                    pid=session.result.pid,
+                    log_path=model_log,
+                    xplt_path=model_xplt,
+                ),
+            )
+
+        repaired_inputs.append(input_path.read_bytes())
+        log_path = input_path.with_suffix(".log")
+        xplt_path = input_path.with_suffix(".xplt")
+        log_path.write_text(
+            "normal termination\ntime step = 1\ntime = 1.0\n",
+            encoding="utf-8",
+        )
+        xplt_path.write_bytes(b"synthetic XPLT")
+        return SimpleNamespace(
+            diagnostic=HeadlessRunDiagnostic(
+                runtime_identity=runtime_diagnostic,
+                state=SolverState.NORMAL_EXIT,
+                classification=SolverClassification.FBS_UNVERIFIED,
+                return_code=0,
+                pid=456,
+                log_path=log_path,
+                xplt_path=xplt_path,
+            ),
+            supervisor=None,
+            result=None,
+        )
+
+    monkeypatch.setattr(cli_module, "_case_service", lambda: service)
+    monkeypatch.setattr(cli_module, "probe_febio", lambda path: runtime)
+    monkeypatch.setattr(cli_module, "run_headless_febio_session", run_synthetic)
+
+    _set_capability_stdin(monkeypatch, capability)
+    assert cli_module.main(_run_arguments(runtime.path)) == 4
+    first = json.loads(capsys.readouterr().err)
+    reservation_id = first["attempt"]["retry_reservation_id"]
+    assert isinstance(reservation_id, str)
+
+    _set_capability_stdin(monkeypatch, capability)
+    assert cli_module.main(_retry_arguments(runtime.path, reservation_id)) == 5
+
+    second = json.loads(capsys.readouterr().err)
+    assert second["error"]["code"] == "FBS_UNAVAILABLE"
+    assert len(repaired_inputs) == 1
+    assert b'version="4.1"' in repaired_inputs[0]
+    assert b"version='4.0'" in (case_root / "01_Input" / "model.feb").read_bytes()
+
+
 def test_reconnect_febio_parser_cannot_redefine_recorded_launch_context(
     tmp_path: Path,
 ) -> None:

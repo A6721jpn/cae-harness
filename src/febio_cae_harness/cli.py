@@ -11,7 +11,9 @@ from typing import cast
 
 from febio_cae_harness import __version__
 from febio_cae_harness.autonomy import (
+    IntentStateAuthority,
     Proposal,
+    ProposalAuthority,
     ProposalAuthorityManager,
     ProposalClass,
     RetryLedger,
@@ -69,7 +71,7 @@ from febio_cae_harness.solver.headless import (
     recover_headless_febio,
     run_headless_febio_session,
 )
-from febio_cae_harness.solver.log import LogValidation
+from febio_cae_harness.solver.log import LogValidation, validate_log
 from febio_cae_harness.solver.official_fbs import (
     OfficialFbsResultReceipt,
     OfficialFbsRuntimeError,
@@ -932,6 +934,9 @@ def _write_declared_mesh_input(
     expected_sha256: str,
     input_name: str,
     attempt: AttemptWorkspace,
+    proposal: Proposal | None = None,
+    state_authority: IntentStateAuthority | None = None,
+    proposal_authority: ProposalAuthority | None = None,
 ) -> tuple[Path, str]:
     original = OriginalModel.from_bytes(source_payload, source_name=input_name)
     if original.sha256 != expected_sha256:
@@ -953,18 +958,22 @@ def _write_declared_mesh_input(
             )
         )
 
-    state_authority = transition_intent(snapshot)
-    proposal = Proposal(
-        proposal_id=f"declared-mesh-{snapshot.intent_sha256}",
-        proposal_class=ProposalClass.INTENT_PRESERVING,
-        rationale="apply the exact current intent mesh patch declaration",
-        evidence_ids=(snapshot.intent_sha256,),
-        changes={"mesh": {"patches": raw_patches}},
-        authorized=True,
-        within_contract=True,
-    )
-    manager = ProposalAuthorityManager(state_authority)
-    authority = manager.issue(proposal)
+    if proposal is None:
+        if state_authority is not None or proposal_authority is not None:
+            raise TypeError("partial proposal authority is not allowed")
+        state_authority = transition_intent(snapshot)
+        proposal = Proposal(
+            proposal_id=f"declared-mesh-{snapshot.intent_sha256}",
+            proposal_class=ProposalClass.INTENT_PRESERVING,
+            rationale="apply the exact current intent mesh patch declaration",
+            evidence_ids=(snapshot.intent_sha256,),
+            changes={"mesh": {"patches": raw_patches}},
+            authorized=True,
+            within_contract=True,
+        )
+        proposal_authority = ProposalAuthorityManager(state_authority).issue(proposal)
+    if state_authority is None or proposal_authority is None:
+        raise TypeError("derived retry requires exact proposal authorities")
     receipt = write_derived_feb(
         original,
         patches,
@@ -972,7 +981,7 @@ def _write_declared_mesh_input(
         attempt,
         state_authority=state_authority,
         proposal=proposal,
-        proposal_authority=authority,
+        proposal_authority=proposal_authority,
     )
     return receipt.destination, receipt.derived_sha256
 
@@ -1101,6 +1110,31 @@ def _negative_jacobian_repair_proposal(
         within_contract=True,
     )
     return bind_retry_proposal(proposal)
+
+
+def _reopen_negative_jacobian_repair_proposal(
+    snapshot: IntentSnapshotAuthority,
+    *,
+    parent_attempt_id: str,
+    parent_execution: ExecutionAuthority,
+    expected_proposal_id: str,
+) -> Proposal:
+    validation = validate_log(
+        parent_execution.log_path,
+        expected_steps=parent_execution.expected_steps,
+        expected_final_time=parent_execution.expected_final_time,
+    )
+    proposal = _negative_jacobian_repair_proposal(
+        snapshot,
+        attempt_id=parent_attempt_id,
+        validation=validation,
+    )
+    if proposal is None or proposal.proposal_id != expected_proposal_id:
+        raise _RunCommandError(
+            "EVIDENCE_INTEGRITY_FAILURE",
+            "retry repair proposal differs from its durable reservation",
+        )
+    return proposal
 
 
 def _run_febio_command(arguments: argparse.Namespace) -> int:
@@ -1481,18 +1515,43 @@ def _retry_febio_command(arguments: argparse.Namespace) -> int:
         matching_records = [
             record for record in ledger.records if record.reservation_id == reservation_id
         ]
-        if len(matching_records) != 1 or matching_records[0].attempt_id is None:
+        if len(matching_records) != 1:
             raise _RunCommandError(
                 "RETRY_RESERVATION_INVALID",
                 "retry reservation is absent or has no exact parent attempt",
             )
-        parent_attempt_id = matching_records[0].attempt_id
+        retry_record = matching_records[0]
+        parent_attempt_id = retry_record.attempt_id
+        if not isinstance(parent_attempt_id, str):
+            raise _RunCommandError(
+                "RETRY_RESERVATION_INVALID",
+                "retry reservation is absent or has no exact parent attempt",
+            )
+        parent_attempt = _open_recorded_attempt(opened.case, parent_attempt_id)
+        parent_execution = reopen_execution_authority(
+            parent_attempt,
+            snapshot,
+            runtime,
+            official_fbs_runtime=official_runtime,
+        )
+        repair_proposal = None
+        repair_authority = None
+        if retry_record.proposal_id is not None:
+            repair_proposal = _reopen_negative_jacobian_repair_proposal(
+                snapshot,
+                parent_attempt_id=parent_attempt_id,
+                parent_execution=parent_execution,
+                expected_proposal_id=retry_record.proposal_id,
+            )
+            repair_authority = ProposalAuthorityManager(state_authority).issue(repair_proposal)
         attempt_id = f"retry-{reservation_id}"
         claim = ledger.claim_attempt(
             opened.store,
             state_authority,
             reservation_id,
             attempt_id,
+            proposal=repair_proposal,
+            proposal_authority=repair_authority,
         )
         if claim.get("attempt_id") != attempt_id:
             raise _RunCommandError(
@@ -1521,6 +1580,17 @@ def _retry_febio_command(arguments: argparse.Namespace) -> int:
         timeout_seconds = parent_execution.timeout_seconds
         requested_fields = parent_execution.requested_fields
         execution_name = parent_execution.record_path.name
+        stage_state: IntentStateAuthority | None = None
+        repair_authority = None
+        if retry_record.proposal_id is not None:
+            repair_proposal = _reopen_negative_jacobian_repair_proposal(
+                snapshot,
+                parent_attempt_id=parent_attempt_id,
+                parent_execution=parent_execution,
+                expected_proposal_id=retry_record.proposal_id,
+            )
+            stage_state = transition_intent(snapshot)
+            repair_authority = ProposalAuthorityManager(stage_state).issue(repair_proposal)
 
         attempt = _open_recorded_attempt(opened.case, attempt_id)
         attempt_relative = Path("90_Temporary") / "attempts" / attempt_id
@@ -1538,26 +1608,48 @@ def _retry_febio_command(arguments: argparse.Namespace) -> int:
 
         source_relative = parent_input.relative_to(opened.case.root)
         destination_relative = attempt_relative / input_name
-        with opened.case._exact_transaction() as exact:
-            if exact.exists(destination_relative):
-                if exact.digest(destination_relative) != expected_sha256:
-                    raise _RunCommandError(
-                        "EVIDENCE_INTEGRITY_FAILURE",
-                        "retry input differs from its parent execution",
+        if repair_proposal is None:
+            with opened.case._exact_transaction() as exact:
+                if exact.exists(destination_relative):
+                    if exact.digest(destination_relative) != expected_sha256:
+                        raise _RunCommandError(
+                            "EVIDENCE_INTEGRITY_FAILURE",
+                            "retry input differs from its parent execution",
+                        )
+                    staged_input = opened.case.root / destination_relative
+                else:
+                    staged_input = exact.copy_create_new(
+                        source_relative,
+                        destination_relative,
+                        expected_sha256,
                     )
-                staged_input = opened.case.root / destination_relative
-            else:
-                staged_input = exact.copy_create_new(
-                    source_relative,
-                    destination_relative,
-                    expected_sha256,
+            staged_sha256 = expected_sha256
+        else:
+            with opened.case._exact_transaction() as exact:
+                if exact.exists(destination_relative):
+                    return _retry_already_started(attempt_id)
+                source_payload = exact.read_bytes(source_relative)
+            if stage_state is None or repair_authority is None:
+                raise _RunCommandError(
+                    "EVIDENCE_INTEGRITY_FAILURE",
+                    "retry repair proposal authority is incomplete",
                 )
+            staged_input, staged_sha256 = _write_declared_mesh_input(
+                snapshot=snapshot,
+                source_payload=source_payload,
+                expected_sha256=expected_sha256,
+                input_name=input_name,
+                attempt=attempt,
+                proposal=repair_proposal,
+                state_authority=stage_state,
+                proposal_authority=repair_authority,
+            )
 
         inspection = inspect_feb_file(staged_input)
-        if inspection.sha256 != expected_sha256:
+        if inspection.sha256 != staged_sha256:
             raise _RunCommandError(
                 "EVIDENCE_INTEGRITY_FAILURE",
-                "retry input changed after exact copy",
+                "retry input changed after staging",
             )
         preflight = run_preflight(
             feb=inspection,
@@ -1572,13 +1664,15 @@ def _retry_febio_command(arguments: argparse.Namespace) -> int:
                 f"retry FEB preflight is blocked: {detail}",
             )
 
-        setup_state = transition_intent(snapshot)
+        setup_state = stage_state or transition_intent(snapshot)
         setup_ledger = RetryLedger.from_store(setup_state, opened.store)
         if not setup_ledger.begin_attempt_setup(
             opened.store,
             setup_state,
             reservation_id,
             attempt_id,
+            proposal=repair_proposal,
+            proposal_authority=repair_authority,
         ):
             return _retry_already_started(attempt_id)
 
@@ -1609,11 +1703,18 @@ def _retry_febio_command(arguments: argparse.Namespace) -> int:
                 "EVIDENCE_INTEGRITY_FAILURE",
                 "parent execution contract changed during retry setup",
             )
+        if retry_record.proposal_id is not None:
+            _reopen_negative_jacobian_repair_proposal(
+                snapshot,
+                parent_attempt_id=parent_attempt_id,
+                parent_execution=refreshed_parent_execution,
+                expected_proposal_id=retry_record.proposal_id,
+            )
         attempt = _open_recorded_attempt(opened.case, attempt_id)
         with opened.case._exact_transaction() as exact:
             if (
                 not exact.exists(destination_relative)
-                or exact.digest(destination_relative) != expected_sha256
+                or exact.digest(destination_relative) != staged_sha256
             ):
                 raise _RunCommandError(
                     "EVIDENCE_INTEGRITY_FAILURE",
@@ -1621,7 +1722,7 @@ def _retry_febio_command(arguments: argparse.Namespace) -> int:
                 )
         staged_input = opened.case.root / destination_relative
         inspection = inspect_feb_file(staged_input)
-        if inspection.sha256 != expected_sha256:
+        if inspection.sha256 != staged_sha256:
             raise _RunCommandError(
                 "EVIDENCE_INTEGRITY_FAILURE",
                 "retry input changed after setup began",
@@ -1663,10 +1764,10 @@ def _retry_febio_command(arguments: argparse.Namespace) -> int:
                 )
                 return _retry_already_started(attempt_id)
             raise
-        if execution.input_sha256 != expected_sha256:
+        if execution.input_sha256 != staged_sha256:
             raise _RunCommandError(
                 "EVIDENCE_INTEGRITY_FAILURE",
-                "retry execution input differs from its parent",
+                "retry execution input differs from its staged contract",
             )
         if official_runtime is None:
             session = run_headless_febio_session(
