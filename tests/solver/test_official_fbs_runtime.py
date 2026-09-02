@@ -65,6 +65,34 @@ def _normalized_pressure_result(module: ModuleType, xplt_sha256: str) -> dict[st
     }
 
 
+def _tet4_geometry_summary() -> dict[str, object]:
+    return {
+        "topology_sha256": "f" * 64,
+        "node_count": 4,
+        "element_count": 1,
+        "cell_types": [
+            {
+                "vtk_id": 10,
+                "name": "tet4",
+                "nodes": 4,
+                "elements": 1,
+                "integration_points": 1,
+            }
+        ],
+        "states": [
+            {
+                "index": 0,
+                "time": 0.0,
+                "integration_point_count": 1,
+                "minimum_jacobian": 1.0,
+                "maximum_jacobian": 1.0,
+                "minimum_element_index": 0,
+                "minimum_integration_point_index": 0,
+            }
+        ],
+    }
+
+
 def _runtime_files(tmp_path: Path) -> tuple[dict[str, Path], dict[str, str]]:
     tmp_path.mkdir(parents=True, exist_ok=True)
     python_dir = tmp_path / "python313"
@@ -334,6 +362,68 @@ def test_official_fbs_receipt_retains_model_manifest_and_private_pipe_provenance
 
     with pytest.raises(TypeError, match="closed|authority|unavailable"):
         _ = receipt.node_count
+
+
+def test_official_fbs_receipt_retains_validated_geometry_summary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, runtime, _ = _probe(tmp_path / "runtime-fixture", monkeypatch)
+    attempt = tmp_path / "attempt"
+    attempt.mkdir()
+    xplt = attempt / "result.xplt"
+    xplt.write_bytes(b"synthetic-xplt")
+    response = _normalized_pressure_result(module, _sha256(b"synthetic-xplt"))
+    response["geometry"] = _tet4_geometry_summary()
+    monkeypatch.setattr(
+        module,
+        "_invoke_helper",
+        lambda checked, path, fields, root: response,
+    )
+
+    with module.open_official_fbs_manager(runtime, attempt) as manager:
+        validation = validate_requested_fields(manager.issue_authority(), xplt, ("pressure",))
+        receipt = module.require_official_fbs_result(validation)
+        geometry = receipt.geometry_summary
+
+        assert geometry is not None
+        assert geometry["topology_sha256"] == "f" * 64
+        assert geometry["node_count"] == 4
+        assert geometry["element_count"] == 1
+        assert geometry["cell_types"][0]["name"] == "tet4"
+        assert geometry["states"][0]["minimum_jacobian"] == 1.0
+
+
+@pytest.mark.parametrize(
+    ("target", "value"),
+    [
+        ("node_count", 5),
+        ("vtk_id", 12),
+        ("time", 1.0),
+        ("integration_point_count", 2),
+        ("minimum_jacobian", float("nan")),
+        ("maximum_jacobian", 0.5),
+    ],
+)
+def test_official_fbs_geometry_summary_rejects_unbound_or_invalid_values(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    target: str,
+    value: object,
+) -> None:
+    module, _, _ = _probe(tmp_path / "runtime-fixture", monkeypatch)
+    response = _normalized_pressure_result(module, "a" * 64)
+    geometry = _tet4_geometry_summary()
+    if target in geometry:
+        geometry[target] = value
+    elif target == "vtk_id":
+        cast(list[dict[str, object]], geometry["cell_types"])[0][target] = value
+    else:
+        cast(list[dict[str, object]], geometry["states"])[0][target] = value
+    response["geometry"] = geometry
+
+    with pytest.raises(module.OfficialFbsRuntimeError):
+        module._validate_normalized_result(response, ("pressure",))
 
 
 @pytest.mark.parametrize("replacement", [False, True], ids=["mutate", "replace"])

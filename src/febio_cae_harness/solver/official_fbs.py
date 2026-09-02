@@ -247,6 +247,7 @@ class _OfficialFbsResultRecord:
     xplt_sha256: str
     model_manifest: Mapping[str, object]
     model_manifest_sha256: str
+    geometry_summary: Mapping[str, object] | None
     requested_fields: tuple[str, ...]
     values: Mapping[str, object]
     transport: str
@@ -304,6 +305,10 @@ class OfficialFbsResultReceipt:
     @property
     def model_manifest_sha256(self) -> str:
         return _official_result_record(self).model_manifest_sha256
+
+    @property
+    def geometry_summary(self) -> Mapping[str, object] | None:
+        return _official_result_record(self).geometry_summary
 
     @property
     def node_count(self) -> int:
@@ -1419,6 +1424,126 @@ def _validate_model_manifest(
     return value
 
 
+def _validate_geometry_summary(
+    value: object,
+    model: Mapping[str, object],
+) -> Mapping[str, object]:
+    if not isinstance(value, dict):
+        raise OfficialFbsRuntimeError("official FBS geometry summary is invalid")
+    _exact_keys(
+        value,
+        {
+            "topology_sha256",
+            "node_count",
+            "element_count",
+            "cell_types",
+            "states",
+        },
+        "geometry summary",
+    )
+    if not _valid_sha256(value["topology_sha256"]):
+        raise OfficialFbsRuntimeError("geometry topology digest is invalid")
+    node_count = _positive_count(value["node_count"], "geometry node count", maximum=100000000)
+    element_count = _positive_count(
+        value["element_count"], "geometry element count", maximum=100000000
+    )
+    if node_count != model["node_count"] or element_count != model["element_count"]:
+        raise OfficialFbsRuntimeError("geometry cardinality changed")
+
+    cell_types = value["cell_types"]
+    if not isinstance(cell_types, list) or not cell_types or len(cell_types) > 256:
+        raise OfficialFbsRuntimeError("geometry cell types are invalid")
+    supported = {
+        10: ("tet4", 4, 1),
+        24: ("tet10", 10, 4),
+    }
+    seen: set[int] = set()
+    total_elements = 0
+    total_integration_points = 0
+    maximum_integration_points = 0
+    for item in cell_types:
+        if not isinstance(item, dict):
+            raise OfficialFbsRuntimeError("geometry cell type is invalid")
+        _exact_keys(
+            item,
+            {"vtk_id", "name", "nodes", "elements", "integration_points"},
+            "geometry cell type",
+        )
+        vtk_id = item["vtk_id"]
+        if isinstance(vtk_id, bool) or not isinstance(vtk_id, int) or vtk_id in seen:
+            raise OfficialFbsRuntimeError("geometry cell type identity is invalid")
+        profile = supported.get(vtk_id)
+        if profile is None:
+            raise OfficialFbsRuntimeError("geometry cell type is unsupported")
+        name, nodes, integration_points = profile
+        elements = _positive_count(item["elements"], "geometry cell count", maximum=element_count)
+        if (
+            item["name"] != name
+            or item["nodes"] != nodes
+            or item["integration_points"] != integration_points
+        ):
+            raise OfficialFbsRuntimeError("geometry cell type identity is invalid")
+        seen.add(vtk_id)
+        total_elements += elements
+        total_integration_points += elements * integration_points
+        maximum_integration_points = max(maximum_integration_points, integration_points)
+    if total_elements != element_count:
+        raise OfficialFbsRuntimeError("geometry element cardinality is invalid")
+
+    states = value["states"]
+    state_count = model["state_count"]
+    state_times = model["state_times"]
+    if (
+        not isinstance(state_count, int)
+        or not isinstance(state_times, list)
+        or not isinstance(states, list)
+        or len(states) != state_count
+    ):  # pragma: no cover - model is validated by the caller
+        raise OfficialFbsRuntimeError("geometry states are invalid")
+    for expected_index, state in enumerate(states):
+        if not isinstance(state, dict):
+            raise OfficialFbsRuntimeError("geometry state is invalid")
+        _exact_keys(
+            state,
+            {
+                "index",
+                "time",
+                "integration_point_count",
+                "minimum_jacobian",
+                "maximum_jacobian",
+                "minimum_element_index",
+                "minimum_integration_point_index",
+            },
+            "geometry state",
+        )
+        index = state["index"]
+        integration_point_count = state["integration_point_count"]
+        minimum_element_index = state["minimum_element_index"]
+        minimum_integration_point_index = state["minimum_integration_point_index"]
+        if (
+            isinstance(index, bool)
+            or not isinstance(index, int)
+            or index != expected_index
+            or isinstance(integration_point_count, bool)
+            or not isinstance(integration_point_count, int)
+            or integration_point_count != total_integration_points
+            or isinstance(minimum_element_index, bool)
+            or not isinstance(minimum_element_index, int)
+            or not 0 <= minimum_element_index < element_count
+            or isinstance(minimum_integration_point_index, bool)
+            or not isinstance(minimum_integration_point_index, int)
+            or not 0 <= minimum_integration_point_index < maximum_integration_points
+            or _number(state["time"], "geometry state time")
+            != _number(state_times[expected_index], "model state time")
+        ):
+            raise OfficialFbsRuntimeError("geometry state cardinality is invalid")
+        minimum = _number(state["minimum_jacobian"], "minimum Jacobian")
+        maximum = _number(state["maximum_jacobian"], "maximum Jacobian")
+        if minimum > maximum:
+            raise OfficialFbsRuntimeError("geometry Jacobian range is invalid")
+    return value
+
+
 def _validate_inspect_response(
     response: Mapping[str, object],
     requested_fields: Sequence[str],
@@ -2239,19 +2364,17 @@ def _validate_normalized_result(
     response: Mapping[str, object],
     requested_fields: Sequence[str],
 ) -> Mapping[str, object]:
-    _exact_keys(
-        response,
-        {
-            "available_fields",
-            "model_manifest",
-            "model_sha256",
-            "non_finite_fields",
-            "protocol",
-            "values",
-            "xplt_sha256",
-        },
-        "normalized official FBS result",
-    )
+    expected_keys = {
+        "available_fields",
+        "model_manifest",
+        "model_sha256",
+        "non_finite_fields",
+        "protocol",
+        "values",
+        "xplt_sha256",
+    }
+    if set(response) not in (expected_keys, expected_keys | {"geometry"}):
+        raise OfficialFbsRuntimeError("normalized official FBS result has an invalid schema")
     if response["protocol"] != _PROTOCOL:
         raise OfficialFbsRuntimeError("official FBS result protocol mismatch")
     if not _valid_sha256(response["xplt_sha256"]) or not _valid_sha256(response["model_sha256"]):
@@ -2259,6 +2382,8 @@ def _validate_normalized_result(
     model = _validate_model_manifest(response["model_manifest"], requested_fields)
     if _model_manifest_sha256(model) != response["model_sha256"]:
         raise OfficialFbsRuntimeError("official FBS result model binding is invalid")
+    if "geometry" in response:
+        _validate_geometry_summary(response["geometry"], model)
     available = response["available_fields"]
     raw_model_available = model["available_fields"]
     if not isinstance(available, list) or not isinstance(raw_model_available, list):
@@ -2404,6 +2529,10 @@ def _adopt_official_fbs_result(
     frozen_model = _fbs._freeze_value(model)
     if not isinstance(frozen_model, Mapping):  # pragma: no cover - schema guard
         raise TypeError("official FBS model receipt is invalid")
+    raw_geometry = response.get("geometry")
+    frozen_geometry = None if raw_geometry is None else _fbs._freeze_value(raw_geometry)
+    if frozen_geometry is not None and not isinstance(frozen_geometry, Mapping):
+        raise TypeError("official FBS geometry receipt is invalid")
     receipt = OfficialFbsResultReceipt(_RESULT_TOKEN)
     result_record = _OfficialFbsResultRecord(
         receipt=receipt,
@@ -2414,6 +2543,7 @@ def _adopt_official_fbs_result(
         xplt_sha256=validation_record.digest_before,
         model_manifest=frozen_model,
         model_manifest_sha256=str(response["model_sha256"]),
+        geometry_summary=frozen_geometry,
         requested_fields=validation_record.requested_fields,
         values=validation_record.values,
         transport="private-named-pipe",
