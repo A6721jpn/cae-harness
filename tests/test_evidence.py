@@ -458,6 +458,34 @@ def test_attempt_terminal_is_recorded_once_and_rejects_conflicting_replay(
         store.append_event("run_febio_terminal", payload)
 
 
+def test_attempt_terminal_rejects_caller_supplied_autonomy_evidence(tmp_path: Path) -> None:
+    _, case, intent = make_case(tmp_path)
+    store = EvidenceStore(case, intent)
+    store.record_attempt("attempt-1", {"status": "started"})
+
+    with pytest.raises(EvidenceIntegrityError, match="policy-issued"):
+        store.record_attempt_terminal(
+            "attempt-1",
+            {
+                "attempt_id": "attempt-1",
+                "autonomy": {
+                    "decision": "RETRY",
+                    "failure": "TIMEOUT",
+                    "retry_budget": 99,
+                    "retry_used": 1,
+                },
+                "classification": "TIMEOUT",
+                "official_fbs": False,
+                "status": "SOLVER_FAILED",
+            },
+        )
+
+    events = [
+        json.loads(line) for line in store.events_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert not any(event["event_type"] == "run_febio_terminal" for event in events)
+
+
 @pytest.mark.parametrize("mode", ["before_append", "partial_append"])
 def test_reopen_recovers_one_interrupted_attempt_terminal_event(
     tmp_path: Path,

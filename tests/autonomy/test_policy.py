@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import gc
 import inspect
 import json
+import multiprocessing
 import pickle
 import sys
 import tempfile
@@ -9,10 +11,12 @@ from concurrent.futures import ThreadPoolExecutor
 from copy import copy, deepcopy
 from dataclasses import is_dataclass, replace
 from pathlib import Path
+from typing import Any, cast
 from unittest.mock import patch
 
 import pytest
 
+import febio_cae_harness.workspace as workspace_module
 from febio_cae_harness.autonomy import (
     ExecutionAction,
     ExecutionContext,
@@ -214,6 +218,33 @@ def short_workspace_root(
 ) -> tuple[tempfile.TemporaryDirectory[str], Path]:
     workspace_temp = tempfile.TemporaryDirectory(prefix="h4b-", dir=tmp_path.parent.parent)
     return workspace_temp, Path(workspace_temp.name)
+
+
+def _restore_retry_ledger_from_fresh_process(
+    tool_root: str,
+    cae_root: str,
+    case_id: str,
+    results: Any,
+) -> None:
+    """Restore the durable retry projection in a spawned interpreter."""
+
+    try:
+        manager = ValidatedCaseWorkspace(Path(tool_root), Path(cae_root))
+        store = EvidenceStore.open(manager.open_case(case_id))
+        state = run_transition(store.issue_intent_snapshot())
+        ledger = RetryLedger.from_store(state, store)
+        records = tuple(
+            (
+                record.failure.value,
+                record.attempt_id,
+                record.proposal_id,
+                record.reservation_id,
+            )
+            for record in ledger.records
+        )
+        results.put(("ok", ledger.budget, ledger.used, ledger.remaining, records))
+    except BaseException as error:  # pragma: no cover - assertion reports details
+        results.put(("error", type(error).__name__, str(error)))
 
 
 def test_transition_binds_only_when_complete_and_blocks_authoritative_unknowns(
@@ -648,7 +679,7 @@ def test_retry_ledger_accounts_only_allowed_retries(tmp_path: Path) -> None:
         solver_supervisor=first_supervisor,
         solver_result=first_result,
     )
-    assert first.decision is RetryDecision.RETRY
+    assert first.decision is RetryDecision.RETRY_REQUIRES_RESERVATION
     assert first.ledger.used == 1
 
     second_supervisor = timeout_supervisor(
@@ -668,7 +699,7 @@ def test_retry_ledger_accounts_only_allowed_retries(tmp_path: Path) -> None:
         supervisor=second_supervisor,
         result=second_result,
     )
-    assert second.decision is RetryDecision.RETRY
+    assert second.decision is RetryDecision.RETRY_REQUIRES_RESERVATION
     third_supervisor = timeout_supervisor(
         tmp_path / "third",
         "attempt-c",
@@ -935,7 +966,10 @@ def test_mismatched_failure_cannot_promote_an_issued_solver_result(
         supervisor=supervisor,
         result=result,
     )
-    assert decision.decision is not RetryDecision.RETRY
+    assert decision.decision not in {
+        RetryDecision.RETRY,
+        RetryDecision.RETRY_REQUIRES_RESERVATION,
+    }
     assert decision.failure is expected_failure
 
 
@@ -954,7 +988,10 @@ def test_mismatched_failure_evidence_cannot_promote_same_supervisor_result(
         supervisor=supervisor,
         result=result,
     )
-    assert decision.decision is not RetryDecision.RETRY
+    assert decision.decision not in {
+        RetryDecision.RETRY,
+        RetryDecision.RETRY_REQUIRES_RESERVATION,
+    }
     assert decision.failure is FailureClass.TIMEOUT
 
 
@@ -989,7 +1026,7 @@ def test_retry_does_not_turn_unresolved_non_authoritative_data_into_a_question(
         supervisor=supervisor,
         result=result,
     )
-    assert decision.decision is RetryDecision.RETRY
+    assert decision.decision is RetryDecision.RETRY_REQUIRES_RESERVATION
 
 
 def test_sensitive_proposal_validation_is_required_before_retry_accounting() -> None:
@@ -1152,7 +1189,10 @@ def test_raw_retry_inputs_never_authorize_retry(tmp_path: Path) -> None:
         (FailureClass.TIMEOUT, RetryLedger(budget=1), state),
     ):
         decision = decide_retry(failure, ledger, intent=supplied_intent)
-        assert decision.decision is not RetryDecision.RETRY
+        assert decision.decision not in {
+            RetryDecision.RETRY,
+            RetryDecision.RETRY_REQUIRES_RESERVATION,
+        }
 
 
 def test_execution_actions_require_live_correlated_supervisor() -> None:
@@ -1199,7 +1239,7 @@ def test_retry_authority_rejects_forged_ledger_and_result(tmp_path: Path) -> Non
             supervisor=supervisor,
             result=result,
         )
-        assert accepted.decision is RetryDecision.RETRY
+        assert accepted.decision is RetryDecision.RETRY_REQUIRES_RESERVATION
 
         for diagnostic in (
             RetryLedger(budget=1),
@@ -1310,7 +1350,7 @@ def test_retry_replay_of_parent_ledger_and_failed_result_stops_without_minting(
         result=result,
     )
 
-    assert first.decision is RetryDecision.RETRY
+    assert first.decision is RetryDecision.RETRY_REQUIRES_RESERVATION
     assert first.ledger.budget == state.intent.execution_budget.retry_budget == 3
     assert first.ledger.used == 1
     assert len(first.ledger.records) == 1
@@ -1367,7 +1407,7 @@ def test_retry_replay_parent_ledger_cannot_mint_with_a_different_failed_result(
         result=second_result,
     )
 
-    assert first.decision is RetryDecision.RETRY
+    assert first.decision is RetryDecision.RETRY_REQUIRES_RESERVATION
     assert replay.decision is RetryDecision.STOP
     assert replay.ledger is ledger
 
@@ -1410,7 +1450,7 @@ def test_retry_replay_of_consumed_result_with_successor_ledger_stops(
         result=result,
     )
 
-    assert first.decision is RetryDecision.RETRY
+    assert first.decision is RetryDecision.RETRY_REQUIRES_RESERVATION
     assert first.ledger.budget == 3
     assert first.ledger.used == 1
     assert len(first.ledger.records) == 1
@@ -1453,8 +1493,226 @@ def test_retry_replay_consumption_is_atomic_under_concurrent_calls(
     with ThreadPoolExecutor(max_workers=2) as executor:
         decisions = tuple(executor.map(lambda _: consume(), range(2)))
 
-    assert decisions.count(RetryDecision.RETRY) == 1
+    assert decisions.count(RetryDecision.RETRY_REQUIRES_RESERVATION) == 1
     assert decisions.count(RetryDecision.STOP) == 1
+
+
+@pytest.mark.parametrize("append_mode", ["normal", "before_append", "partial_append"])
+def test_retry_ledger_survives_fresh_process_and_interrupted_append(
+    tmp_path: Path,
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+    append_mode: str,
+) -> None:
+    intent = bound_intent(retry_budget=2)
+    _workspace_temp, workspace_root = short_workspace_root(tmp_path)
+    request.addfinalizer(_workspace_temp.cleanup)
+    state, snapshot = retry_state_for_case(
+        workspace_root,
+        "case-durable-retry",
+        intent,
+        attempt_ids=("attempt-a",),
+    )
+    intent_sha256 = snapshot.intent_sha256
+    case = object.__getattribute__(snapshot, "_case_workspace")
+    store = object.__getattribute__(snapshot, "_store")
+    supervisor = timeout_supervisor(
+        tmp_path / "durable-retry-solver",
+        case_id="case-durable-retry",
+        intent=intent,
+        workspace_root=workspace_root,
+        case_workspace=case,
+        record_attempt=False,
+    )
+    result = supervisor.run(timeout_seconds=0.1)
+    initial = RetryLedger.from_authority(state)
+    retry = decide_retry(
+        FailureClass.TIMEOUT,
+        initial,
+        intent=state,
+        supervisor=supervisor,
+        result=result,
+    )
+    assert retry.decision is RetryDecision.RETRY_REQUIRES_RESERVATION
+    assert retry.retry_allowed is False
+    assert replace(retry, decision=RetryDecision.RETRY).retry_allowed is False
+    assert retry.reservation_required is True
+    assert tuple(inspect.signature(retry.persist).parameters) == ("store", "authority")
+    reservation_id = retry.reservation_id
+    assert isinstance(reservation_id, str)
+    assert len(reservation_id) == 64
+
+    forged = replace(retry)
+    with pytest.raises(EvidenceIntegrityError, match="not policy-issued"):
+        forged.persist(store, state)
+    with pytest.raises(TypeError):
+        cast(Any, retry.persist)(store, state, {"official_fbs": True, "secret": "forged"})
+    assert not any(
+        json.loads(line)["event_type"] == "run_febio_terminal"
+        for line in store.events_path.read_text(encoding="utf-8").splitlines()
+    )
+
+    original_append = workspace_module._ExactCaseTransaction.append_bytes
+    interrupted = False
+
+    def interrupt_terminal_once(
+        self: Any,
+        relative_path: str | Path,
+        data: bytes,
+    ) -> None:
+        nonlocal interrupted
+        if not interrupted and b'"event_type":"run_febio_terminal"' in data:
+            interrupted = True
+            if append_mode == "partial_append":
+                original_append(self, relative_path, data[: len(data) // 2])
+            raise OSError("simulated retry terminal append interruption")
+        original_append(self, relative_path, data)
+
+    if append_mode == "normal":
+        persisted = retry.persist(store, state)
+        assert persisted["event_type"] == "run_febio_terminal"
+    else:
+        with monkeypatch.context() as patch_context:
+            patch_context.setattr(
+                workspace_module._ExactCaseTransaction,
+                "append_bytes",
+                interrupt_terminal_once,
+            )
+            with pytest.raises(EvidenceIntegrityError):
+                retry.persist(store, state)
+        assert interrupted
+
+    reopened = EvidenceStore.open(case)
+    terminal_events = [
+        json.loads(line)
+        for line in reopened.events_path.read_text(encoding="utf-8").splitlines()
+        if json.loads(line)["event_type"] == "run_febio_terminal"
+    ]
+    assert len(terminal_events) == 1
+    persisted_payload = terminal_events[0]["payload"]
+    assert isinstance(persisted_payload, dict)
+    assert {key: value for key, value in persisted_payload.items() if key != "autonomy"} == {
+        "attempt_id": "attempt-a",
+        "classification": "TIMEOUT",
+        "official_fbs": False,
+        "return_code": result.return_code,
+        "solver_state": "TIMED_OUT",
+        "status": "SOLVER_FAILED",
+    }
+    assert persisted_payload["autonomy"] == {
+        "decision": "RETRY",
+        "failure": "TIMEOUT",
+        "intent_sha256": intent_sha256,
+        "proposal_id": None,
+        "reservation_id": reservation_id,
+        "retry_budget": 2,
+        "retry_used": 1,
+        "route": "RETRY",
+    }
+    reopened_state = run_transition(reopened.issue_intent_snapshot())
+    restored = RetryLedger.from_store(reopened_state, reopened)
+    assert restored.budget == 2
+    assert restored.used == 1
+    assert restored.remaining == 1
+    assert restored.records == (retry.ledger.records[0],)
+    with pytest.raises(EvidenceIntegrityError, match="stale"):
+        retry.persist(store, state)
+    assert (
+        sum(
+            json.loads(line)["event_type"] == "run_febio_terminal"
+            for line in store.events_path.read_text(encoding="utf-8").splitlines()
+        )
+        == 1
+    )
+
+    context = multiprocessing.get_context("spawn")
+    results = context.Queue()
+    child = context.Process(
+        target=_restore_retry_ledger_from_fresh_process,
+        args=(
+            str(workspace_root / "t"),
+            str(workspace_root / "c"),
+            "case-durable-retry",
+            results,
+        ),
+    )
+    child.start()
+    child.join(timeout=15)
+
+    assert not child.is_alive()
+    child_exitcode = child.exitcode
+    child_result = results.get(timeout=5)
+    results.close()
+    results.join_thread()
+    child.close()
+    del results
+    gc.collect()
+    assert child_exitcode == 0
+    assert child_result == (
+        "ok",
+        2,
+        1,
+        1,
+        (("TIMEOUT", "attempt-a", None, reservation_id),),
+    )
+
+
+@pytest.mark.parametrize("malformation", ["autonomy_null", "solver_state_mismatch"])
+def test_retry_restore_rejects_malformed_terminal_semantics(
+    tmp_path: Path,
+    request: pytest.FixtureRequest,
+    malformation: str,
+) -> None:
+    intent = bound_intent(retry_budget=2)
+    _workspace_temp, workspace_root = short_workspace_root(tmp_path)
+    request.addfinalizer(_workspace_temp.cleanup)
+    _, snapshot = retry_state_for_case(
+        workspace_root,
+        f"case-retry-malformed-{malformation}",
+        intent,
+        attempt_ids=("attempt-a",),
+    )
+    case = object.__getattribute__(snapshot, "_case_workspace")
+    store = object.__getattribute__(snapshot, "_store")
+    AttemptWorkspace._from_manager(
+        case,
+        "attempt-a",
+        case.temporary_root / "attempts" / "attempt-a",
+    )
+    terminal = {
+        "attempt_id": "attempt-a",
+        "classification": "TIMEOUT",
+        "official_fbs": False,
+        "return_code": None,
+        "solver_state": "FAILED",
+        "status": "SOLVER_FAILED",
+    }
+    if malformation == "autonomy_null":
+        with store._transaction():
+            store._load_and_validate(None)
+            store._append_event(
+                "run_febio_terminal",
+                {**terminal, "autonomy": None},
+            )
+    else:
+        store._record_retry_terminal(
+            snapshot,
+            terminal,
+            {
+                "attempt_id": "attempt-a",
+                "failure": "TIMEOUT",
+                "proposal_id": None,
+                "reservation_id": "a" * 64,
+                "retry_budget": 2,
+                "retry_used": 1,
+                "solver_classification": "TIMEOUT",
+            },
+        )
+
+    reopened = EvidenceStore.open(case)
+    reopened_state = run_transition(reopened.issue_intent_snapshot())
+    with pytest.raises(EvidenceIntegrityError):
+        RetryLedger.from_store(reopened_state, reopened)
 
 
 def test_execution_authority_rejects_mismatched_context_and_tampered_supervisor(

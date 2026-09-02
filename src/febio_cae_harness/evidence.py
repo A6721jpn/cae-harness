@@ -1068,6 +1068,10 @@ class EvidenceStore:
         normalised = self._normalise_payload(payload)
         if normalised.get("attempt_id") != attempt_id:
             raise EvidenceIntegrityError("attempt terminal identity mismatch")
+        if "autonomy" in normalised:
+            raise EvidenceIntegrityError(
+                "autonomy terminal evidence requires a policy-issued retry result"
+            )
         with self._transaction():
             self._load_and_validate(None)
             attempts = self._read_attempts()
@@ -1086,6 +1090,297 @@ class EvidenceStore:
                     raise EvidenceIntegrityError("attempt terminal event conflicts")
                 return dict(existing[0])
             return self._append_event("run_febio_terminal", normalised)
+
+    def _record_retry_terminal(
+        self,
+        expected_snapshot: IntentSnapshotAuthority,
+        terminal_payload: Mapping[str, Any],
+        autonomy_payload: Mapping[str, Any],
+    ) -> dict[str, object]:
+        """Atomically record a terminal event with one authorized retry reservation."""
+
+        normalised_terminal = self._normalise_payload(terminal_payload)
+        normalised = self._normalise_payload(autonomy_payload)
+        required = {
+            "attempt_id",
+            "failure",
+            "proposal_id",
+            "reservation_id",
+            "retry_budget",
+            "retry_used",
+            "solver_classification",
+        }
+        if set(normalised) != required:
+            raise EvidenceIntegrityError("retry consumption payload is invalid")
+        attempt_id = normalised["attempt_id"]
+        if not isinstance(attempt_id, str):
+            raise EvidenceIntegrityError("retry consumption attempt is invalid")
+        _validate_segment(attempt_id, "retry consumption attempt")
+        for field_name in ("failure", "solver_classification"):
+            value = normalised[field_name]
+            if not isinstance(value, str) or not value.strip():
+                raise EvidenceIntegrityError(f"retry consumption {field_name} is invalid")
+        proposal_id = normalised["proposal_id"]
+        if proposal_id is not None and (
+            not isinstance(proposal_id, str)
+            or not proposal_id.strip()
+            or proposal_id != proposal_id.strip()
+        ):
+            raise EvidenceIntegrityError("retry consumption proposal is invalid")
+        reservation_id = normalised["reservation_id"]
+        if (
+            not isinstance(reservation_id, str)
+            or len(reservation_id) != 64
+            or any(character not in "0123456789abcdef" for character in reservation_id)
+        ):
+            raise EvidenceIntegrityError("retry consumption reservation is invalid")
+        retry_budget = normalised["retry_budget"]
+        if retry_budget is not None and (
+            isinstance(retry_budget, bool) or not isinstance(retry_budget, int) or retry_budget < 0
+        ):
+            raise EvidenceIntegrityError("retry consumption budget is invalid")
+        retry_used = normalised["retry_used"]
+        if isinstance(retry_used, bool) or not isinstance(retry_used, int) or retry_used <= 0:
+            raise EvidenceIntegrityError("retry consumption used count is invalid")
+        if retry_budget is not None and retry_used > retry_budget:
+            raise EvidenceIntegrityError("retry consumption exceeds its budget")
+        if set(normalised_terminal) != {
+            "attempt_id",
+            "classification",
+            "official_fbs",
+            "return_code",
+            "solver_state",
+            "status",
+        }:
+            raise EvidenceIntegrityError("retry terminal projection is invalid")
+        return_code = normalised_terminal.get("return_code")
+        if normalised_terminal.get("attempt_id") != attempt_id:
+            raise EvidenceIntegrityError("retry terminal identity mismatch")
+        if (
+            normalised_terminal.get("status") != "SOLVER_FAILED"
+            or normalised_terminal.get("classification") != normalised["solver_classification"]
+            or normalised_terminal.get("official_fbs") is not False
+            or not isinstance(normalised_terminal.get("solver_state"), str)
+            or not cast(str, normalised_terminal["solver_state"]).strip()
+            or return_code is not None
+            and (isinstance(return_code, bool) or not isinstance(return_code, int))
+        ):
+            raise EvidenceIntegrityError("retry terminal classification differs")
+        if "autonomy" in normalised_terminal:
+            raise EvidenceIntegrityError("retry terminal payload already contains autonomy")
+
+        with self._transaction():
+            self._load_and_validate(None)
+            intent = self._validate_expected_intent_snapshot(expected_snapshot)
+            intent_sha256 = _digest(intent.to_dict())
+            attempts = self._read_attempts()
+            if sum(item.get("attempt_id") == attempt_id for item in attempts) != 1:
+                raise EvidenceIntegrityError("retry consumption attempt is not recorded")
+            events, _ = self._read_events()
+            existing = [
+                event
+                for event in events
+                if event.get("event_type") == "run_febio_terminal"
+                and isinstance(event.get("payload"), dict)
+                and event["payload"].get("attempt_id") == attempt_id
+            ]
+            autonomy = {
+                "decision": "RETRY",
+                "failure": normalised["failure"],
+                "intent_sha256": intent_sha256,
+                "proposal_id": proposal_id,
+                "reservation_id": reservation_id,
+                "retry_budget": retry_budget,
+                "retry_used": retry_used,
+                "route": "RETRY",
+            }
+            persisted_payload = dict(normalised_terminal)
+            persisted_payload["autonomy"] = autonomy
+            if existing:
+                if len(existing) != 1 or existing[0]["payload"] != persisted_payload:
+                    raise EvidenceIntegrityError("attempt terminal event conflicts")
+                return dict(existing[0])
+            current = [
+                cast(dict[str, Any], event["payload"])["autonomy"]
+                for event in events
+                if event.get("event_type") == "run_febio_terminal"
+                and isinstance(event.get("payload"), dict)
+                and isinstance(event["payload"].get("autonomy"), dict)
+                and event["payload"]["autonomy"].get("intent_sha256") == intent_sha256
+            ]
+            if retry_used != len(current) + 1:
+                raise EvidenceIntegrityError("retry consumption is not the next ledger entry")
+            for previous_autonomy in current:
+                if previous_autonomy.get("retry_budget") != retry_budget:
+                    raise EvidenceIntegrityError("retry consumption budget changed")
+            return self._append_event("run_febio_terminal", persisted_payload)
+
+    def _read_retry_consumptions(
+        self,
+        expected_snapshot: IntentSnapshotAuthority,
+    ) -> tuple[dict[str, object], ...]:
+        """Read and validate the durable retry ledger for one live intent."""
+
+        with self._transaction():
+            self._load_and_validate(None)
+            intent = self._validate_expected_intent_snapshot(expected_snapshot)
+            intent_sha256 = _digest(intent.to_dict())
+            attempts = self._read_attempts()
+            attempt_ids = [item.get("attempt_id") for item in attempts]
+            events, _ = self._read_events()
+            terminal_payloads = [
+                cast(dict[str, Any], event["payload"])
+                for event in events
+                if event.get("event_type") == "run_febio_terminal"
+                and isinstance(event.get("payload"), dict)
+            ]
+            autonomy_terminals: list[dict[str, Any]] = []
+            all_reservations: set[str] = set()
+            for terminal in terminal_payloads:
+                if "autonomy" not in terminal:
+                    continue
+                autonomy_value = terminal["autonomy"]
+                if not isinstance(autonomy_value, dict) or set(autonomy_value) != {
+                    "decision",
+                    "failure",
+                    "intent_sha256",
+                    "proposal_id",
+                    "reservation_id",
+                    "retry_budget",
+                    "retry_used",
+                    "route",
+                }:
+                    raise EvidenceIntegrityError("durable retry consumption is invalid")
+                autonomy = cast(dict[str, Any], autonomy_value)
+                if set(terminal) != {
+                    "attempt_id",
+                    "autonomy",
+                    "classification",
+                    "official_fbs",
+                    "return_code",
+                    "solver_state",
+                    "status",
+                }:
+                    raise EvidenceIntegrityError("durable retry terminal projection is invalid")
+                attempt_id = terminal.get("attempt_id")
+                classification = terminal.get("classification")
+                solver_state = terminal.get("solver_state")
+                return_code = terminal.get("return_code")
+                if (
+                    not isinstance(attempt_id, str)
+                    or not attempt_id.strip()
+                    or terminal.get("status") != "SOLVER_FAILED"
+                    or terminal.get("official_fbs") is not False
+                    or not isinstance(classification, str)
+                    or not classification.strip()
+                    or not isinstance(solver_state, str)
+                    or not solver_state.strip()
+                    or (
+                        return_code is not None
+                        and (isinstance(return_code, bool) or not isinstance(return_code, int))
+                    )
+                ):
+                    raise EvidenceIntegrityError("durable retry terminal projection is invalid")
+                intent_value = autonomy.get("intent_sha256")
+                reservation_value = autonomy.get("reservation_id")
+                proposal_value = autonomy.get("proposal_id")
+                retry_budget_value = autonomy.get("retry_budget")
+                retry_used_value = autonomy.get("retry_used")
+                if (
+                    autonomy.get("decision") != "RETRY"
+                    or autonomy.get("route") != "RETRY"
+                    or not isinstance(autonomy.get("failure"), str)
+                    or not cast(str, autonomy["failure"]).strip()
+                    or not isinstance(intent_value, str)
+                    or len(intent_value) != 64
+                    or any(character not in "0123456789abcdef" for character in intent_value)
+                    or proposal_value is not None
+                    and (not isinstance(proposal_value, str) or not proposal_value.strip())
+                    or not isinstance(reservation_value, str)
+                    or len(reservation_value) != 64
+                    or any(character not in "0123456789abcdef" for character in reservation_value)
+                    or reservation_value in all_reservations
+                    or retry_budget_value is not None
+                    and (
+                        isinstance(retry_budget_value, bool)
+                        or not isinstance(retry_budget_value, int)
+                        or retry_budget_value < 0
+                    )
+                    or isinstance(retry_used_value, bool)
+                    or not isinstance(retry_used_value, int)
+                    or retry_used_value <= 0
+                    or (retry_budget_value is not None and retry_used_value > retry_budget_value)
+                ):
+                    raise EvidenceIntegrityError("durable retry consumption is invalid")
+                all_reservations.add(reservation_value)
+                autonomy_terminals.append(terminal)
+            consumptions = [
+                terminal
+                for terminal in autonomy_terminals
+                if terminal["autonomy"].get("intent_sha256") == intent_sha256
+            ]
+            seen_attempts: set[str] = set()
+            seen_reservations: set[str] = set()
+            budget: object = None
+            result: list[dict[str, object]] = []
+            terminal_attempt_ids = [item.get("attempt_id") for item in terminal_payloads]
+            for expected_used, terminal in enumerate(consumptions, start=1):
+                autonomy = terminal["autonomy"]
+                assert isinstance(autonomy, dict)
+                attempt_id = terminal.get("attempt_id")
+                if (
+                    not isinstance(attempt_id, str)
+                    or attempt_ids.count(attempt_id) != 1
+                    or terminal_attempt_ids.count(attempt_id) != 1
+                ):
+                    raise EvidenceIntegrityError("durable retry attempt binding is invalid")
+                if attempt_id in seen_attempts:
+                    raise EvidenceIntegrityError("durable retry attempt was consumed twice")
+                seen_attempts.add(attempt_id)
+                if (
+                    terminal.get("status") != "SOLVER_FAILED"
+                    or not isinstance(terminal.get("classification"), str)
+                    or autonomy.get("decision") != "RETRY"
+                    or autonomy.get("route") != "RETRY"
+                ):
+                    raise EvidenceIntegrityError("durable retry terminal binding is invalid")
+                retry_used = autonomy.get("retry_used")
+                if (
+                    isinstance(retry_used, bool)
+                    or not isinstance(retry_used, int)
+                    or retry_used != expected_used
+                ):
+                    raise EvidenceIntegrityError("durable retry sequence is invalid")
+                retry_budget = autonomy.get("retry_budget")
+                if retry_budget is not None and (
+                    isinstance(retry_budget, bool)
+                    or not isinstance(retry_budget, int)
+                    or retry_budget < 0
+                    or retry_used > retry_budget
+                ):
+                    raise EvidenceIntegrityError("durable retry budget is invalid")
+                if expected_used == 1:
+                    budget = retry_budget
+                elif retry_budget != budget:
+                    raise EvidenceIntegrityError("durable retry budget changed")
+                reservation_id = autonomy.get("reservation_id")
+                if (
+                    not isinstance(reservation_id, str)
+                    or len(reservation_id) != 64
+                    or any(character not in "0123456789abcdef" for character in reservation_id)
+                    or reservation_id in seen_reservations
+                ):
+                    raise EvidenceIntegrityError("durable retry reservation is invalid")
+                seen_reservations.add(reservation_id)
+                result.append(
+                    {
+                        **autonomy,
+                        "attempt_id": attempt_id,
+                        "solver_classification": terminal["classification"],
+                        "solver_state": terminal["solver_state"],
+                    }
+                )
+            return tuple(result)
 
     def revise_intent(
         self,

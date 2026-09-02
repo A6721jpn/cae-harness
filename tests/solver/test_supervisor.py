@@ -585,6 +585,10 @@ def test_windows_reconnect_rejects_forged_inherited_event_after_supervisor_loss(
         os.replace(os.fspath(replacement_record_path), os.fspath(record_path))
         os.replace(os.fspath(replacement_journal_path), os.fspath(transaction_path))
 
+        # Settle unrelated unreachable process/queue finalizers before the
+        # exact reconnect delta is measured.  The equality assertion below
+        # still rejects every handle opened or closed by reconnect itself.
+        gc.collect()
         handles_before_reconnect = _windows_process_handle_count()
         with pytest.raises(SolverOwnershipError, match="event|authority|identity|transaction"):
             reconnected = SolverSupervisor.reconnect(capability)

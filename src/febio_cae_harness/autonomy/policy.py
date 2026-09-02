@@ -10,6 +10,7 @@ in the solver and workspace phases.
 from __future__ import annotations
 
 import os
+import secrets
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
@@ -20,7 +21,7 @@ from types import MappingProxyType
 from typing import Any, NoReturn, Self, cast
 
 from ..contracts import IntentContract, IntentState, JSONValue
-from ..evidence import EvidenceIntegrityError, IntentSnapshotAuthority
+from ..evidence import EvidenceIntegrityError, EvidenceStore, IntentSnapshotAuthority
 from ..solver.supervisor import SolverSupervisor
 from ..solver.types import SolverClassification, SolverRunResult, SolverState
 from ..workspace import AttemptWorkspace, CaseWorkspace
@@ -178,6 +179,7 @@ class RetryDecision(StrEnum):
     """Result of applying failure routing and retry-budget policy."""
 
     RETRY = "RETRY"
+    RETRY_REQUIRES_RESERVATION = "RETRY_REQUIRES_RESERVATION"
     BUDGET_EXHAUSTED = "BUDGET_EXHAUSTED"
     WAIT_FOR_RECONNECT = "WAIT_FOR_RECONNECT"
     ASK_AND_BLOCK = "ASK_AND_BLOCK"
@@ -1495,6 +1497,7 @@ class RetryRecord:
     attempt_id: str | None = None
     proposal_id: str | None = None
     evidence_ids: tuple[str, ...] = ()
+    reservation_id: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "failure", FailureClass(self.failure))
@@ -1548,6 +1551,18 @@ class RetryLedger:
         if type(authority) is not IntentStateAuthority:
             raise TypeError("authority must be an exact IntentStateAuthority")
         return cast(Self, _issue_retry_ledger(authority))
+
+    @classmethod
+    def from_store(
+        cls,
+        authority: IntentStateAuthority,
+        store: EvidenceStore,
+    ) -> Self:
+        """Restore a registry-issued ledger from a validated append-only chain."""
+
+        if cls is not RetryLedger:
+            raise TypeError("retry ledger subclasses are not supported")
+        return cast(Self, _restore_retry_ledger(authority, store))
 
     @classmethod
     def from_intent(cls, intent: IntentContract) -> Self:
@@ -1642,7 +1657,14 @@ def _retry_record_projection(record: RetryRecord) -> tuple[object, ...]:
     evidence_ids = tuple(record.evidence_ids)
     if any(not isinstance(value, str) or not value.strip() for value in evidence_ids):
         raise EvidenceIntegrityError("retry ledger evidence identifiers are invalid")
-    return (failure, record.attempt_id, record.proposal_id, evidence_ids)
+    reservation_id = record.reservation_id
+    if reservation_id is not None and (
+        not isinstance(reservation_id, str)
+        or len(reservation_id) != 64
+        or any(character not in "0123456789abcdef" for character in reservation_id)
+    ):
+        raise EvidenceIntegrityError("retry ledger reservation identifier is invalid")
+    return (failure, record.attempt_id, record.proposal_id, evidence_ids, reservation_id)
 
 
 def _retry_ledger_projection(ledger: RetryLedger) -> tuple[object, ...]:
@@ -1666,6 +1688,8 @@ def _issue_retry_ledger(
     budget = intent.execution_budget.retry_budget
     ledger = RetryLedger(budget=budget, used=used, records=tuple(records))
     projection = _retry_ledger_projection(ledger)
+    if any(record.reservation_id is None for record in ledger.records):
+        raise EvidenceIntegrityError("authority retry ledger requires durable reservations")
     _RETRY_LEDGER_RECORDS[id(ledger)] = (
         ledger,
         state_authority,
@@ -1713,6 +1737,7 @@ class RetryResult:
     failure: FailureClass
     reason: str
     route: FailureRoute
+    reservation_id: str | None = None
 
     @property
     def action(self) -> RetryDecision:
@@ -1724,7 +1749,197 @@ class RetryResult:
 
     @property
     def retry_allowed(self) -> bool:
-        return self.decision is RetryDecision.RETRY
+        record = _RETRY_RESULT_RECORDS.get(id(self))
+        return (
+            self.decision is RetryDecision.RETRY
+            and record is not None
+            and record[0] is self
+            and _retry_result_projection(self) == record[7]
+        )
+
+    @property
+    def reservation_required(self) -> bool:
+        return self.decision is RetryDecision.RETRY_REQUIRES_RESERVATION
+
+    def persist(
+        self,
+        store: EvidenceStore,
+        authority: IntentStateAuthority,
+    ) -> dict[str, object]:
+        """Atomically reserve this pending retry and its exact solver terminal evidence."""
+
+        return _persist_retry_result(self, store, authority)
+
+
+type _RetryResultRecord = tuple[
+    RetryResult,
+    IntentStateAuthority,
+    IntentSnapshotAuthority,
+    RetryLedger,
+    SolverSupervisor,
+    SolverRunResult,
+    str,
+    tuple[object, ...],
+]
+_RETRY_RESULT_RECORDS: dict[int, _RetryResultRecord] = {}
+
+
+def _retry_result_projection(result: RetryResult) -> tuple[object, ...]:
+    if type(result) is not RetryResult:
+        raise EvidenceIntegrityError("retry result must be an exact RetryResult")
+    return (
+        result.decision,
+        result.ledger,
+        result.failure,
+        result.reason,
+        result.route,
+        result.reservation_id,
+        _retry_ledger_projection(result.ledger),
+    )
+
+
+def _restore_retry_ledger(
+    authority: IntentStateAuthority,
+    store: EvidenceStore,
+) -> RetryLedger:
+    if type(store) is not EvidenceStore:
+        raise TypeError("store must be an exact EvidenceStore")
+    state_record = _state_authority_record(authority, bound=True)
+    snapshot = state_record[1]
+    consumptions = store._read_retry_consumptions(snapshot)
+    canonical_budget = state_record[3].execution_budget.retry_budget
+    records: list[RetryRecord] = []
+    for expected_used, payload in enumerate(consumptions, start=1):
+        if payload.get("retry_budget") != canonical_budget:
+            raise EvidenceIntegrityError("durable retry budget differs from the live intent")
+        if payload.get("retry_used") != expected_used:
+            raise EvidenceIntegrityError("durable retry ledger sequence is invalid")
+        attempt_id = payload.get("attempt_id")
+        proposal_id = payload.get("proposal_id")
+        reservation_id = payload.get("reservation_id")
+        failure_value = payload.get("failure")
+        solver_classification_value = payload.get("solver_classification")
+        solver_state_value = payload.get("solver_state")
+        if not isinstance(attempt_id, str):
+            raise EvidenceIntegrityError("durable retry attempt is invalid")
+        if proposal_id is not None and not isinstance(proposal_id, str):
+            raise EvidenceIntegrityError("durable retry proposal is invalid")
+        if (
+            not isinstance(reservation_id, str)
+            or len(reservation_id) != 64
+            or any(character not in "0123456789abcdef" for character in reservation_id)
+        ):
+            raise EvidenceIntegrityError("durable retry reservation is invalid")
+        if not isinstance(failure_value, str):
+            raise EvidenceIntegrityError("durable retry failure is invalid")
+        if not isinstance(solver_classification_value, str):
+            raise EvidenceIntegrityError("durable solver classification is invalid")
+        if not isinstance(solver_state_value, str):
+            raise EvidenceIntegrityError("durable solver state is invalid")
+        try:
+            failure = FailureClass(failure_value)
+        except (TypeError, ValueError) as error:
+            raise EvidenceIntegrityError("durable retry failure is invalid") from error
+        try:
+            solver_classification = SolverClassification(solver_classification_value)
+        except (TypeError, ValueError) as error:
+            raise EvidenceIntegrityError("durable solver classification is invalid") from error
+        try:
+            solver_state = SolverState(solver_state_value)
+        except (TypeError, ValueError) as error:
+            raise EvidenceIntegrityError("durable solver state is invalid") from error
+        if (
+            solver_classification is SolverClassification.TIMEOUT
+            and solver_state is not SolverState.TIMED_OUT
+        ) or (
+            solver_classification is SolverClassification.CANCELLED
+            and solver_state is not SolverState.CANCELLED
+        ):
+            raise EvidenceIntegrityError("durable solver state differs from its classification")
+        if solver_classification not in {
+            SolverClassification.TIMEOUT,
+            SolverClassification.CANCELLED,
+        } and solver_state not in {SolverState.FAILED, SolverState.NORMAL_EXIT}:
+            raise EvidenceIntegrityError("durable solver state differs from its classification")
+        if _SOLVER_FAILURE_CLASSIFICATIONS.get(solver_classification) is not failure:
+            raise EvidenceIntegrityError("durable retry failure differs from solver evidence")
+        records.append(
+            RetryRecord(
+                failure=failure,
+                attempt_id=attempt_id,
+                proposal_id=proposal_id,
+                reservation_id=reservation_id,
+            )
+        )
+    return _issue_retry_ledger(
+        authority,
+        used=len(records),
+        records=records,
+    )
+
+
+def _persist_retry_result(
+    result: RetryResult,
+    store: EvidenceStore,
+    authority: IntentStateAuthority,
+) -> dict[str, object]:
+    if type(store) is not EvidenceStore:
+        raise TypeError("store must be an exact EvidenceStore")
+    if type(authority) is not IntentStateAuthority:
+        raise TypeError("authority must be an exact IntentStateAuthority")
+    record = _RETRY_RESULT_RECORDS.get(id(result))
+    if record is None or record[0] is not result:
+        raise EvidenceIntegrityError("retry result is not policy-issued")
+    if (
+        result.decision is not RetryDecision.RETRY_REQUIRES_RESERVATION
+        or result.reservation_id is None
+    ):
+        raise EvidenceIntegrityError("retry result does not carry a pending reservation")
+    state_record = _state_authority_record(authority, bound=True)
+    if (
+        record[1] is not authority
+        or record[2] is not state_record[1]
+        or record[3] is not result.ledger
+        or _retry_result_projection(result) != record[7]
+    ):
+        raise EvidenceIntegrityError("retry result authority or projection changed")
+    _validated_retry_ledger(result.ledger, authority)
+    supervisor = record[4]
+    solver_result = record[5]
+    if not _solver_result_is_authoritative(supervisor, solver_result):
+        raise EvidenceIntegrityError("retry solver result authority is stale")
+    launch_correlation = _validated_supervisor_correlation(supervisor)
+    if launch_correlation is None or not _retry_authority_matches(launch_correlation, state_record):
+        raise EvidenceIntegrityError("retry solver launch authority is stale")
+    attempt_id = record[6]
+    if launch_correlation[9] != attempt_id:
+        raise EvidenceIntegrityError("retry attempt authority changed")
+    retry_record = result.ledger.records[-1]
+    if (
+        retry_record.attempt_id != attempt_id
+        or retry_record.reservation_id != result.reservation_id
+    ):
+        raise EvidenceIntegrityError("retry ledger attempt binding changed")
+    return store._record_retry_terminal(
+        state_record[1],
+        {
+            "attempt_id": attempt_id,
+            "classification": solver_result.classification.value,
+            "official_fbs": False,
+            "return_code": solver_result.return_code,
+            "solver_state": solver_result.state.value,
+            "status": "SOLVER_FAILED",
+        },
+        {
+            "attempt_id": attempt_id,
+            "failure": result.failure.value,
+            "proposal_id": retry_record.proposal_id,
+            "reservation_id": result.reservation_id,
+            "retry_budget": result.ledger.budget,
+            "retry_used": result.ledger.used,
+            "solver_classification": solver_result.classification.value,
+        },
+    )
 
 
 def _solver_result_is_authoritative(
@@ -2133,11 +2348,15 @@ def decide_retry(
         attempt_id_value = refreshed_launch_correlation[9]
         if not isinstance(attempt_id_value, str) or not attempt_id_value.strip():
             return stopped("solver launch authority attempt identity is invalid")
+        if any(record.attempt_id == attempt_id_value for record in ledger.records):
+            return stopped("solver attempt already has a durable retry reservation")
+        reservation_id = secrets.token_hex(32)
         record = RetryRecord(
             failure=classification,
             attempt_id=attempt_id_value,
             proposal_id=proposal.proposal_id if proposal is not None else None,
             evidence_ids=evidence_ids,
+            reservation_id=reservation_id,
         )
         next_ledger = _issue_retry_ledger(
             authority,
@@ -2147,13 +2366,25 @@ def decide_retry(
         _RETRY_CONSUMED_LEDGERS[id(ledger)] = ledger
         _RETRY_CONSUMED_RESULTS[id(issued_result)] = issued_result
         _RETRY_CONSUMED_PAIRS[pair_key] = (ledger, issued_result)
-    return RetryResult(
-        decision=RetryDecision.RETRY,
+    retry_result = RetryResult(
+        decision=RetryDecision.RETRY_REQUIRES_RESERVATION,
         ledger=next_ledger,
         failure=classification,
         reason=routing.rationale,
         route=routing.route,
+        reservation_id=reservation_id,
     )
+    _RETRY_RESULT_RECORDS[id(retry_result)] = (
+        retry_result,
+        authority,
+        authority_record[1],
+        next_ledger,
+        cast(SolverSupervisor, effective_supervisor),
+        issued_result,
+        attempt_id_value,
+        _retry_result_projection(retry_result),
+    )
+    return retry_result
 
 
 @dataclass(frozen=True, slots=True)
