@@ -27,6 +27,11 @@ from ..workspace import (
     _registered_attempt_stamp,
     _stable_file_state,
 )
+from .official_fbs import (
+    OfficialFbsRuntime,
+    OfficialFbsRuntimeError,
+    validate_official_fbs_runtime,
+)
 from .runtime import (
     FebioRuntimeDiagnostic,
     RuntimeProbeError,
@@ -46,7 +51,7 @@ __all__ = [
 ]
 
 _SCHEMA = "febio-cae-execution"
-_VERSION = 2
+_VERSION = 3
 _RECORD_NAME = "execution.json"
 _RECORD_FACTORY = object()
 _OUTPUT_FACTORY = object()
@@ -70,6 +75,14 @@ class _LiveContext:
     case_root: Path
     attempt_root: Path
     attempt_relative: Path
+    official_fbs_runtime: OfficialFbsRuntime | None
+
+
+@dataclass(frozen=True, slots=True)
+class _OfficialFbsData:
+    profile: str
+    runtime_identity: str
+    module_sha256: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,6 +106,7 @@ class _RecordData:
     expected_steps: int | None
     expected_final_time: float | None
     timeout_seconds: float | None
+    official_fbs: _OfficialFbsData | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,6 +115,7 @@ class _AuthorityBinding:
     attempt: AttemptWorkspace
     intent: IntentSnapshotAuthority
     runtime: FebioRuntimeDiagnostic
+    official_fbs_runtime: OfficialFbsRuntime | None
     data: _RecordData
     record_bytes: bytes
     record_identity: _FileIdentity
@@ -209,6 +224,11 @@ class ExecutionAuthority:
     @property
     def timeout_seconds(self) -> float | None:
         return _validated_binding(self).data.timeout_seconds
+
+    @property
+    def official_fbs_runtime_identity(self) -> str | None:
+        profile = _validated_binding(self).data.official_fbs
+        return None if profile is None else profile.runtime_identity
 
 
 @dataclass(slots=True)
@@ -413,6 +433,7 @@ def _validate_live_context(
     attempt_workspace: AttemptWorkspace,
     intent_snapshot: IntentSnapshotAuthority,
     runtime_diagnostic: FebioRuntimeDiagnostic,
+    official_fbs_runtime: OfficialFbsRuntime | None = None,
 ) -> _LiveContext:
     if type(attempt_workspace) is not AttemptWorkspace:
         raise ExecutionAuthorityError("execution requires an exact live AttemptWorkspace authority")
@@ -449,6 +470,13 @@ def _validate_live_context(
         raise ExecutionAuthorityError(
             "runtime authority is not a current probe-issued identity"
         ) from error
+    if official_fbs_runtime is not None:
+        try:
+            official_fbs_runtime = validate_official_fbs_runtime(official_fbs_runtime)
+        except (OfficialFbsRuntimeError, TypeError, ValueError) as error:
+            raise ExecutionAuthorityError(
+                "official FBS runtime is not a current probe-issued identity"
+            ) from error
     return _LiveContext(
         attempt_workspace,
         intent_snapshot,
@@ -460,6 +488,7 @@ def _validate_live_context(
         case_root,
         attempt_root,
         attempt_relative,
+        official_fbs_runtime,
     )
 
 
@@ -619,6 +648,7 @@ def _payload(
     expected_steps: int | None,
     expected_final_time: float | None,
     timeout_seconds: float | None,
+    official_fbs: _OfficialFbsData | None,
 ) -> dict[str, object]:
     return {
         "case": {
@@ -643,6 +673,15 @@ def _payload(
             "size": input_identity[3],
         },
         "intent_sha256": context.intent_sha256,
+        "official_fbs": (
+            None
+            if official_fbs is None
+            else {
+                "module_sha256": official_fbs.module_sha256,
+                "profile": official_fbs.profile,
+                "runtime_identity": official_fbs.runtime_identity,
+            }
+        ),
         "outputs": {
             "log": log_relative.as_posix(),
             "xplt": xplt_relative.as_posix(),
@@ -715,6 +754,7 @@ def _decode_record(raw: bytes) -> _RecordData:
             "expectations",
             "input",
             "intent_sha256",
+            "official_fbs",
             "outputs",
             "record_sha256",
             "requested_fields",
@@ -755,6 +795,26 @@ def _decode_record(raw: bytes) -> _RecordData:
         "expectations",
         {"expected_final_time", "expected_steps", "timeout_seconds"},
     )
+    official_fbs_value = record["official_fbs"]
+    if official_fbs_value is None:
+        official_fbs = None
+    else:
+        official_fbs_record = _require_mapping(
+            official_fbs_value,
+            "official FBS",
+            {"module_sha256", "profile", "runtime_identity"},
+        )
+        official_fbs = _OfficialFbsData(
+            _require_string(official_fbs_record["profile"], "official FBS profile"),
+            _require_string(
+                official_fbs_record["runtime_identity"],
+                "official FBS runtime identity",
+            ),
+            _require_digest(
+                official_fbs_record["module_sha256"],
+                "official FBS module SHA-256",
+            ),
+        )
 
     fields_value = record["requested_fields"]
     if not isinstance(fields_value, list):
@@ -814,6 +874,7 @@ def _decode_record(raw: bytes) -> _RecordData:
         expected_steps,
         expected_final_time,
         timeout_seconds,
+        official_fbs,
     )
 
 
@@ -833,6 +894,18 @@ def _validate_record_context(data: _RecordData, context: _LiveContext) -> Path:
         or data.runtime_version != context.runtime.version
     ):
         raise ExecutionAuthorityError("execution record runtime identity differs")
+    runtime = context.official_fbs_runtime
+    if data.official_fbs is None:
+        if runtime is not None:
+            raise ExecutionAuthorityError("execution record has no official FBS profile")
+    elif runtime is None:
+        raise ExecutionAuthorityError("execution record requires an official FBS runtime")
+    elif (
+        data.official_fbs.profile != runtime.profile
+        or data.official_fbs.runtime_identity != runtime.runtime_identity
+        or data.official_fbs.module_sha256 != runtime.fbs_module_sha256
+    ):
+        raise ExecutionAuthorityError("execution record official FBS identity differs")
     input_relative = _record_relative(data.input_relative, "input path")
     log_relative, xplt_relative = _derived_outputs(input_relative)
     if (
@@ -889,6 +962,7 @@ def _bind_authority(
         context.attempt,
         context.intent,
         context.runtime,
+        context.official_fbs_runtime,
         data,
         record_raw,
         record_identity,
@@ -907,13 +981,28 @@ def issue_execution_authority(
     expected_steps: int | None = None,
     expected_final_time: float | None = None,
     timeout_seconds: float | None = None,
+    official_fbs_runtime: OfficialFbsRuntime | None = None,
 ) -> ExecutionAuthority:
     """Create exactly one durable record and issue its sole in-process capability."""
 
-    context = _validate_live_context(attempt_workspace, intent_snapshot, runtime_diagnostic)
+    context = _validate_live_context(
+        attempt_workspace,
+        intent_snapshot,
+        runtime_diagnostic,
+        official_fbs_runtime,
+    )
     fields = _normalise_fields(requested_fields)
     steps, final_time = _normalise_expectations(expected_steps, expected_final_time)
     timeout = _normalise_timeout(timeout_seconds)
+    official_fbs = (
+        None
+        if context.official_fbs_runtime is None
+        else _OfficialFbsData(
+            context.official_fbs_runtime.profile,
+            context.official_fbs_runtime.runtime_identity,
+            context.official_fbs_runtime.fbs_module_sha256,
+        )
+    )
     input_relative = _input_relative(input_path, context)
     log_relative, xplt_relative = _derived_outputs(input_relative)
     record_relative = context.attempt_relative / _RECORD_NAME
@@ -939,6 +1028,7 @@ def issue_execution_authority(
                 steps,
                 final_time,
                 timeout,
+                official_fbs,
             )
             try:
                 record_raw, record_sha256 = _record_bytes(payload)
@@ -973,10 +1063,17 @@ def reopen_execution_authority(
     attempt_workspace: AttemptWorkspace,
     intent_snapshot: IntentSnapshotAuthority,
     runtime_diagnostic: FebioRuntimeDiagnostic,
+    *,
+    official_fbs_runtime: OfficialFbsRuntime | None = None,
 ) -> ExecutionAuthority:
     """Revalidate one durable record through current capabilities and issue fresh authority."""
 
-    context = _validate_live_context(attempt_workspace, intent_snapshot, runtime_diagnostic)
+    context = _validate_live_context(
+        attempt_workspace,
+        intent_snapshot,
+        runtime_diagnostic,
+        official_fbs_runtime,
+    )
     data, record_raw, record_identity = _load_existing(context)
     return _bind_authority(context, data, record_raw, record_identity)
 
@@ -998,7 +1095,12 @@ def _binding(value: object) -> _AuthorityBinding:
 
 def _validated_binding(value: object) -> _AuthorityBinding:
     binding = _binding(value)
-    context = _validate_live_context(binding.attempt, binding.intent, binding.runtime)
+    context = _validate_live_context(
+        binding.attempt,
+        binding.intent,
+        binding.runtime,
+        binding.official_fbs_runtime,
+    )
     if (
         context.attempt is not binding.attempt
         or context.intent is not binding.intent

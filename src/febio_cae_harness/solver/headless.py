@@ -5,13 +5,19 @@ from __future__ import annotations
 import os
 import stat
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Final
 
 from ..evidence import EvidenceStore, IntentSnapshotAuthority
 from ..workspace import AttemptWorkspace, _identity_stamp
 from .execution import ExecutionAuthority, reopen_execution_authority
+from .fbs import FbsAdapterAuthority
+from .official_fbs import (
+    OfficialFbsRuntime,
+    OfficialFbsRuntimeError,
+    _validate_official_fbs_authority,
+)
 from .runtime import (
     FebioRuntimeDiagnostic,
     validate_runtime_diagnostic,
@@ -114,8 +120,15 @@ class HeadlessRunDiagnostic:
     pid: int | None
     log_path: Path
     xplt_path: Path
-    official_fbs: bool = False
-    success: bool = False
+    official_fbs: bool = field(init=False)
+    success: bool = field(init=False)
+
+    def __post_init__(self) -> None:
+        # A diagnostic is deliberately not an authority.  In particular it
+        # must not preserve an official-success claim after the live FBS
+        # manager that issued the underlying validation has closed.
+        object.__setattr__(self, "official_fbs", False)
+        object.__setattr__(self, "success", False)
 
     @property
     def runtime(self) -> FebioRuntimeDiagnostic:
@@ -125,7 +138,7 @@ class HeadlessRunDiagnostic:
         return {
             "classification": self.classification.value,
             "log": os.fspath(self.log_path),
-            "official_fbs": False,
+            "official_fbs": self.official_fbs,
             "pid": self.pid,
             "return_code": self.return_code,
             "runtime": self.runtime_identity.to_dict(),
@@ -163,6 +176,7 @@ def run_headless_febio(
     expected_final_time: float | None = None,
     timeout_seconds: float | None = None,
     requested_fields: Sequence[str] = (),
+    fbs_adapter: FbsAdapterAuthority | None = None,
 ) -> HeadlessRunDiagnostic:
     """Run one attempt using only live, manager-issued context capabilities."""
 
@@ -175,6 +189,7 @@ def run_headless_febio(
         expected_final_time=expected_final_time,
         timeout_seconds=timeout_seconds,
         requested_fields=requested_fields,
+        fbs_adapter=fbs_adapter,
     ).diagnostic
 
 
@@ -188,6 +203,7 @@ def run_headless_febio_session(
     expected_final_time: float | None = None,
     timeout_seconds: float | None = None,
     requested_fields: Sequence[str] = (),
+    fbs_adapter: FbsAdapterAuthority | None = None,
 ) -> HeadlessRunSession:
     """Run one attempt while retaining exact retry-policy authorities."""
 
@@ -206,6 +222,7 @@ def run_headless_febio_session(
         expected_final_time=expected_final_time,
         timeout_seconds=timeout_seconds,
         requested_fields=requested_fields,
+        fbs_adapter=fbs_adapter,
     )
     supervisor = SolverSupervisor(capability)
     result = supervisor.run()
@@ -217,7 +234,6 @@ def run_headless_febio_session(
         pid=result.pid,
         log_path=result.log_path,
         xplt_path=result.xplt_path,
-        success=result.success is True,
     )
     return HeadlessRunSession(
         supervisor=supervisor,
@@ -236,6 +252,8 @@ def reconnect_headless_febio(
     expected_final_time: float | None = None,
     timeout_seconds: float | None = None,
     requested_fields: Sequence[str] = (),
+    official_fbs_runtime: OfficialFbsRuntime | None = None,
+    fbs_adapter: FbsAdapterAuthority | None = None,
 ) -> SolverSupervisor:
     """Reconnect to one attempt using the same authority-bound launch contract."""
 
@@ -245,6 +263,22 @@ def reconnect_headless_febio(
     )
     runtime = validate_runtime_diagnostic(runtime_diagnostic)
     input_file = _validate_input(input_path, root)
+    if official_fbs_runtime is None:
+        if fbs_adapter is not None:
+            raise HeadlessConfigurationError(
+                "FBS authority requires the recorded official runtime profile"
+            )
+    elif fbs_adapter is None:
+        raise HeadlessConfigurationError(
+            "recorded official FBS runtime requires a live manager authority"
+        )
+    else:
+        try:
+            _validate_official_fbs_authority(official_fbs_runtime, fbs_adapter, root)
+        except (OfficialFbsRuntimeError, TypeError, ValueError) as error:
+            raise HeadlessConfigurationError(
+                "official FBS authority does not match the recorded runtime profile"
+            ) from error
     capability = _issue_launch_capability(
         attempt_workspace,
         intent_snapshot,
@@ -254,6 +288,7 @@ def reconnect_headless_febio(
         expected_final_time=expected_final_time,
         timeout_seconds=timeout_seconds,
         requested_fields=requested_fields,
+        fbs_adapter=fbs_adapter,
     )
     return SolverSupervisor.reconnect(capability)
 
@@ -263,6 +298,9 @@ def recover_headless_febio(
     intent_snapshot: IntentSnapshotAuthority,
     runtime_diagnostic: FebioRuntimeDiagnostic,
     attempt_id: str,
+    *,
+    official_fbs_runtime: OfficialFbsRuntime | None = None,
+    fbs_adapter: FbsAdapterAuthority | None = None,
 ) -> HeadlessReconnectSession:
     """Rebuild recorded launch context, then authenticate its live process.
 
@@ -298,6 +336,7 @@ def recover_headless_febio(
             attempt,
             intent_snapshot,
             runtime_diagnostic,
+            official_fbs_runtime=official_fbs_runtime,
         )
         supervisor = reconnect_headless_febio(
             attempt,
@@ -308,6 +347,8 @@ def recover_headless_febio(
             expected_final_time=execution.expected_final_time,
             timeout_seconds=execution.timeout_seconds,
             requested_fields=execution.requested_fields,
+            official_fbs_runtime=official_fbs_runtime,
+            fbs_adapter=fbs_adapter,
         )
     except HeadlessConfigurationError:
         raise
@@ -353,6 +394,7 @@ def _issue_launch_capability(
     expected_final_time: float | None,
     timeout_seconds: float | None,
     requested_fields: Sequence[str] = (),
+    fbs_adapter: FbsAdapterAuthority | None = None,
 ) -> SolverLaunchCapability:
     """Build the sole supervisor input after the public boundary checks."""
 
@@ -377,6 +419,7 @@ def _issue_launch_capability(
         intent_snapshot,
         runtime,
         spec,
+        fbs_adapter,
     )
 
 

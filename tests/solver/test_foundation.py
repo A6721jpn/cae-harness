@@ -96,6 +96,7 @@ def _capability(
     expected_steps: int | None = None,
     expected_final_time: float | None = None,
     timeout_seconds: float | None = None,
+    requested_fields: Sequence[str] = (),
 ) -> SolverLaunchCapability:
     manager = ValidatedCaseWorkspace(tmp_path / "tool", tmp_path / "cae")
     case = manager.create_case("case-a")
@@ -117,6 +118,7 @@ def _capability(
         expected_steps=expected_steps,
         expected_final_time=expected_final_time,
         timeout_seconds=timeout_seconds,
+        requested_fields=requested_fields,
     )
 
 
@@ -249,6 +251,7 @@ def test_supervisor_validates_log_xplt_and_synthetic_fbs_fields(tmp_path: Path) 
         code=code,
         expected_steps=2,
         expected_final_time=1.0,
+        requested_fields=("displacement",),
     )
     authority = FbsAdapterManager(
         SyntheticVectorFixtureAdapter(), "synthetic-fixture", capability.spec.attempt_root
@@ -282,6 +285,7 @@ def test_synthetic_fbs_adapter_is_not_reported_as_official(tmp_path: Path) -> No
         code=code,
         expected_steps=2,
         expected_final_time=1.0,
+        requested_fields=("displacement",),
     )
     authority = FbsAdapterManager(
         SyntheticFixtureAdapter(), "synthetic-fixture", capability.spec.attempt_root
@@ -297,6 +301,43 @@ def test_synthetic_fbs_adapter_is_not_reported_as_official(tmp_path: Path) -> No
     assert result.fbs_validation.provenance == "synthetic-unverified"
     assert result.classification is SolverClassification.FBS_UNVERIFIED
     assert not result.success
+
+
+def test_supervisor_does_not_promote_an_official_runtime_label(
+    tmp_path: Path,
+) -> None:
+    code = (
+        "import os; from pathlib import Path; "
+        f"Path(os.environ['FEBIO_CAE_HARNESS_LOG']).write_text({NORMAL_LOG!r}); "
+        "Path(os.environ['FEBIO_CAE_HARNESS_XPLT']).write_bytes(b'xplt')"
+    )
+    monkeypatch = pytest.MonkeyPatch()
+    capability = _capability(
+        tmp_path,
+        monkeypatch,
+        code=code,
+        expected_steps=2,
+        expected_final_time=1.0,
+        requested_fields=("displacement",),
+    )
+    manager = FbsAdapterManager(
+        SyntheticFixtureAdapter(),
+        "official-fbs-3.1-cp313:forged",
+        capability.spec.attempt_root,
+    )
+    with manager:
+        authority = manager.issue_authority()
+        result = SolverSupervisor(
+            capability,
+            fbs_adapter=authority,
+            requested_fields=("displacement",),
+        ).run()
+
+        assert result.fbs_validation is not None
+        assert result.fbs_validation.official is False
+        assert result.fbs_validation.provenance == "synthetic-unverified"
+        assert result.classification is SolverClassification.FBS_UNVERIFIED
+        assert not result.success
 
 
 def test_fbs_boundary_rejects_non_finite_requested_field(tmp_path: Path) -> None:

@@ -24,6 +24,7 @@ import pytest
 
 from febio_cae_harness.contracts import IntentContract
 from febio_cae_harness.evidence import EvidenceStore, IntentSnapshotAuthority
+from febio_cae_harness.solver import official_fbs as official_fbs_module
 from febio_cae_harness.solver.runtime import FebioRuntimeDiagnostic, probe_febio
 from febio_cae_harness.workspace import AttemptWorkspace, ValidatedCaseWorkspace
 
@@ -147,6 +148,51 @@ def _reopen(context: _Context) -> Any:
     )
 
 
+def _official_runtime(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
+    root = tmp_path / "official-fbs"
+    python_root = root / "python313"
+    python_root.mkdir(parents=True)
+    payloads = {
+        "python_executable": (python_root / "python.exe", b"fixture-python"),
+        "python_dll": (python_root / "python313.dll", b"fixture-python-dll"),
+        "python_stdlib": (python_root / "python313.zip", b"fixture-stdlib"),
+        "python_path_config": (python_root / "python313._pth", b"fixture-path"),
+        "fbs_module": (root / "fbs.cp313-win_amd64.pyd", b"fixture-fbs"),
+        "zlib": (root / "zlib1.dll", b"fixture-zlib"),
+    }
+    for path, payload in payloads.values():
+        path.write_bytes(payload)
+    hashes = {name: hashlib.sha256(payload).hexdigest() for name, (_, payload) in payloads.items()}
+    monkeypatch.setattr(official_fbs_module, "_APPROVED_SHA256", hashes)
+    monkeypatch.setattr(
+        official_fbs_module,
+        "_APPROVED_PYTHON_TREE",
+        {
+            path.name: hashes[name]
+            for name, (path, _) in payloads.items()
+            if name.startswith("python_")
+        },
+    )
+    monkeypatch.setattr(
+        official_fbs_module,
+        "_probe_helper",
+        lambda held, timeout: official_fbs_module._ProbeHelperResult(
+            {
+                "protocol": 1,
+                "python": "3.13",
+                "module": "fbs",
+                "api": ["ReadPlotFile", "vtkExport"],
+            },
+            "a" * 64,
+        ),
+    )
+    return official_fbs_module.probe_official_fbs_runtime(
+        payloads["python_executable"][0],
+        payloads["fbs_module"][0],
+        payloads["zlib"][0],
+    )
+
+
 def _write_synthetic_outputs(
     authority: Any,
     *,
@@ -191,11 +237,13 @@ def test_execution_authority_api_has_no_caller_selected_labels_or_outputs() -> N
         "expected_steps",
         "expected_final_time",
         "timeout_seconds",
+        "official_fbs_runtime",
     )
     assert tuple(reopen_parameters) == (
         "attempt_workspace",
         "intent_snapshot",
         "runtime_diagnostic",
+        "official_fbs_runtime",
     )
     forbidden = {
         "case_id",
@@ -256,6 +304,7 @@ def test_issue_writes_one_canonical_deterministic_record_and_reopen_is_fresh(
             "size": context.input_path.stat().st_size,
         },
         "intent_sha256": context.intent.intent_sha256,
+        "official_fbs": None,
         "outputs": {"log": "model.log", "xplt": "model.xplt"},
         "requested_fields": ["displacement", "stress"],
         "runtime": {
@@ -265,7 +314,7 @@ def test_issue_writes_one_canonical_deterministic_record_and_reopen_is_fresh(
             "version": context.runtime.version,
         },
         "schema": "febio-cae-execution",
-        "version": 2,
+        "version": 3,
     }
     assert type(authority) is module.ExecutionAuthority
     assert authority.record_path == record_path
@@ -287,6 +336,43 @@ def test_issue_writes_one_canonical_deterministic_record_and_reopen_is_fresh(
     assert reopened.record_sha256 == authority.record_sha256
     assert reopened.input_sha256 == authority.input_sha256
     assert record_path.read_bytes() == original
+
+
+def test_execution_record_requires_same_live_official_fbs_profile_on_reopen(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _context(tmp_path, monkeypatch)
+    module = _execution_module()
+    runtime = _official_runtime(tmp_path, monkeypatch)
+
+    authority = _issue(
+        context,
+        requested_fields=("stress",),
+        official_fbs_runtime=runtime,
+    )
+    record = json.loads(_record_path(context).read_bytes())
+
+    assert record["official_fbs"] == {
+        "module_sha256": runtime.fbs_module_sha256,
+        "profile": "official-fbs-3.1-cp313",
+        "runtime_identity": runtime.runtime_identity,
+    }
+    assert authority.official_fbs_runtime_identity == runtime.runtime_identity
+    with pytest.raises(module.ExecutionAuthorityError, match="official FBS"):
+        module.reopen_execution_authority(context.attempt, context.intent, context.runtime)
+
+    reopened = module.reopen_execution_authority(
+        context.attempt,
+        context.intent,
+        context.runtime,
+        official_fbs_runtime=runtime,
+    )
+    assert reopened.official_fbs_runtime_identity == runtime.runtime_identity
+
+    runtime.fbs_module.write_bytes(b"replacement")
+    with pytest.raises(module.ExecutionAuthorityError, match="official FBS"):
+        module.validate_execution_authority(reopened)
 
 
 def test_issue_rejects_duplicate_and_differing_replay_without_overwrite(

@@ -1,20 +1,29 @@
 from __future__ import annotations
 
+import hashlib
 import inspect
 import os
 import stat
 import sys
 from copy import copy, deepcopy
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
 from febio_cae_harness.contracts import IntentContract
 from febio_cae_harness.evidence import EvidenceStore, IntentSnapshotAuthority
 from febio_cae_harness.solver import headless as headless_module
+from febio_cae_harness.solver import official_fbs as official_fbs_module
 from febio_cae_harness.solver.execution import issue_execution_authority
+from febio_cae_harness.solver.fbs import (
+    FbsAdapterAuthority,
+    FbsAdapterManager,
+    validate_requested_fields,
+)
 from febio_cae_harness.solver.headless import (
     HeadlessConfigurationError,
+    HeadlessRunDiagnostic,
     headless_exit_code,
     run_headless_febio,
 )
@@ -31,6 +40,8 @@ from febio_cae_harness.solver.types import (
     SolverLaunchSpec,
     SolverRunResult,
     SolverState,
+    _require_issued_launch_capability,
+    _validate_launch_capability,
 )
 from febio_cae_harness.workspace import AttemptWorkspace, ValidatedCaseWorkspace
 
@@ -56,6 +67,34 @@ def _forged_runtime() -> FebioRuntimeDiagnostic:
     return FebioRuntimeDiagnostic(Path(sys.executable).absolute(), "a" * 64, 1, "4.12.0")
 
 
+def test_headless_diagnostic_derives_official_without_caller_boolean(tmp_path: Path) -> None:
+    diagnostic = HeadlessRunDiagnostic(
+        runtime_identity=_forged_runtime(),
+        state=SolverState.NORMAL_EXIT,
+        classification=SolverClassification.SUCCESS,
+        return_code=0,
+        pid=123,
+        log_path=tmp_path / "model.log",
+        xplt_path=tmp_path / "model.xplt",
+    )
+
+    assert diagnostic.classification is SolverClassification.SUCCESS
+    assert diagnostic.official_fbs is False
+    assert diagnostic.success is False
+    assert headless_exit_code(diagnostic) == 4
+    with pytest.raises(TypeError):
+        cast(Any, HeadlessRunDiagnostic)(
+            runtime_identity=_forged_runtime(),
+            state=SolverState.NORMAL_EXIT,
+            classification=SolverClassification.SUCCESS,
+            return_code=0,
+            pid=123,
+            log_path=tmp_path / "model.log",
+            xplt_path=tmp_path / "model.xplt",
+            official_fbs=False,
+        )
+
+
 def _issued_runtime(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FebioRuntimeDiagnostic:
     executable = tmp_path / "fake-febio"
     executable.write_bytes(b"synthetic FEBio executable")
@@ -73,6 +112,66 @@ def _issued_runtime(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FebioRun
         lambda command, **kwargs: CompletedProcess(),
     )
     return probe_febio(executable)
+
+
+def _issued_official_manager(
+    attempt: AttemptWorkspace,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[official_fbs_module.OfficialFbsRuntime, FbsAdapterManager]:
+    root = tmp_path / "official-fbs"
+    python_root = root / "python313"
+    python_root.mkdir(parents=True)
+    payloads = {
+        "python_executable": (python_root / "python.exe", b"fixture-python"),
+        "python_dll": (python_root / "python313.dll", b"fixture-python-dll"),
+        "python_stdlib": (python_root / "python313.zip", b"fixture-stdlib"),
+        "python_path_config": (python_root / "python313._pth", b"fixture-path"),
+        "fbs_module": (root / "fbs.cp313-win_amd64.pyd", b"fixture-fbs"),
+        "zlib": (root / "zlib1.dll", b"fixture-zlib"),
+    }
+    for path, payload in payloads.values():
+        path.write_bytes(payload)
+    hashes = {name: hashlib.sha256(payload).hexdigest() for name, (_, payload) in payloads.items()}
+    monkeypatch.setattr(official_fbs_module, "_APPROVED_SHA256", hashes)
+    monkeypatch.setattr(
+        official_fbs_module,
+        "_APPROVED_PYTHON_TREE",
+        {
+            path.name: hashes[name]
+            for name, (path, _) in payloads.items()
+            if name.startswith("python_")
+        },
+    )
+    monkeypatch.setattr(
+        official_fbs_module,
+        "_probe_helper",
+        lambda held, timeout: official_fbs_module._ProbeHelperResult(
+            {
+                "protocol": 1,
+                "python": "3.13",
+                "module": "fbs",
+                "api": ["ReadPlotFile", "vtkExport"],
+            },
+            "a" * 64,
+        ),
+    )
+    monkeypatch.setattr(
+        official_fbs_module,
+        "_invoke_helper",
+        lambda checked, path, fields, attempt_root: {
+            "protocol": 1,
+            "available_fields": list(fields),
+            "values": {field: {"count": 2, "minimum": 0.0, "maximum": 1.0} for field in fields},
+            "non_finite_fields": [],
+        },
+    )
+    receipt = official_fbs_module.probe_official_fbs_runtime(
+        payloads["python_executable"][0],
+        payloads["fbs_module"][0],
+        payloads["zlib"][0],
+    )
+    return receipt, official_fbs_module.open_official_fbs_manager(receipt, attempt.root)
 
 
 def test_headless_rejects_forged_runtime_diagnostic(tmp_path: Path) -> None:
@@ -209,6 +308,116 @@ def test_headless_derives_context_and_preserves_fbs_unverified(
     assert diagnostic.classification is SolverClassification.FBS_UNVERIFIED
     assert diagnostic.success is False
     assert headless_exit_code(diagnostic) == 5
+
+
+def test_headless_diagnostic_does_not_preserve_official_fbs_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    attempt, intent, input_path = _authority_context(tmp_path, case_id="case-a")
+    runtime = _issued_runtime(tmp_path, monkeypatch)
+    captured_authority: FbsAdapterAuthority | None = None
+    captured_capability: SolverLaunchCapability | None = None
+
+    class FakeSupervisor:
+        def __init__(self, capability: SolverLaunchCapability) -> None:
+            nonlocal captured_authority, captured_capability
+            self.capability = capability
+            captured_capability = capability
+            record = _require_issued_launch_capability(capability)
+            captured_authority = cast(FbsAdapterAuthority | None, record.fbs_adapter)
+
+        def run(self) -> SolverRunResult:
+            assert captured_authority is not None
+            outputs = self.capability.spec.expected_outputs
+            outputs.xplt_path.write_bytes(b"synthetic-xplt")
+            validation = validate_requested_fields(
+                captured_authority,
+                outputs.xplt_path,
+                self.capability.spec.requested_fields,
+            )
+            return SolverRunResult(
+                state=SolverState.NORMAL_EXIT,
+                classification=SolverClassification.SUCCESS,
+                return_code=0,
+                pid=123,
+                command=self.capability.spec.command,
+                log_path=outputs.log_path,
+                xplt_path=outputs.xplt_path,
+                fbs_validation=validation,
+            )
+
+    monkeypatch.setattr(headless_module, "SolverSupervisor", FakeSupervisor)
+    official_runtime, manager = _issued_official_manager(attempt, tmp_path, monkeypatch)
+    with manager:
+        authority = manager.issue_authority()
+        diagnostic = run_headless_febio(
+            attempt,
+            intent,
+            runtime,
+            input_path,
+            requested_fields=("stress",),
+            fbs_adapter=authority,
+        )
+
+        assert captured_authority is authority
+        assert diagnostic.success is False
+        assert diagnostic.official_fbs is False
+        assert diagnostic.to_dict()["official_fbs"] is False
+        assert headless_exit_code(diagnostic) == 4
+        assert captured_capability is not None
+        *_, launch_context, _ = _validate_launch_capability(captured_capability)
+        assert launch_context["fbs"] == {
+            "official": True,
+            "profile": official_fbs_module._PROFILE,
+            "provenance": "official",
+            "runtime_identity": official_runtime.runtime_identity,
+        }
+
+    assert diagnostic.official_fbs is False
+
+
+def test_recover_headless_rebinds_only_recorded_official_fbs_profile(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempt, intent, input_path = _authority_context(tmp_path, case_id="case-a")
+    runtime = _issued_runtime(tmp_path, monkeypatch)
+    official_runtime, manager = _issued_official_manager(attempt, tmp_path, monkeypatch)
+    execution = issue_execution_authority(
+        attempt,
+        intent,
+        runtime,
+        input_path,
+        requested_fields=("stress",),
+        official_fbs_runtime=official_runtime,
+    )
+    store = object.__getattribute__(intent, "_store")
+    reopened_store = EvidenceStore.open(store.case_workspace)
+    reopened_intent = reopened_store.issue_intent_snapshot()
+    captured: SolverLaunchCapability | None = None
+
+    class FakeSupervisor:
+        @classmethod
+        def reconnect(cls, capability: SolverLaunchCapability) -> object:
+            nonlocal captured
+            captured = capability
+            return object()
+
+    monkeypatch.setattr(headless_module, "SolverSupervisor", FakeSupervisor)
+    with manager:
+        authority = manager.issue_authority()
+        session = headless_module.recover_headless_febio(
+            reopened_store,
+            reopened_intent,
+            runtime,
+            "attempt-a",
+            official_fbs_runtime=official_runtime,
+            fbs_adapter=authority,
+        )
+
+        assert captured is not None
+        assert _require_issued_launch_capability(captured).fbs_adapter is authority
+        assert session.execution.record_sha256 == execution.record_sha256
 
 
 def test_recover_headless_uses_only_recorded_execution_context(

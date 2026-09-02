@@ -411,6 +411,7 @@ class SolverLaunchCapability:
         intent_snapshot: object,
         runtime_diagnostic: object,
         spec: SolverLaunchSpec,
+        fbs_adapter: object | None = None,
     ) -> SolverLaunchCapability:
         """Create a capability for the private headless boundary only."""
 
@@ -430,6 +431,7 @@ class SolverLaunchCapability:
             attempt_workspace=attempt_workspace,
             intent_snapshot=intent_snapshot,
             runtime_diagnostic=runtime_diagnostic,
+            fbs_adapter=fbs_adapter,
             attempt_root=spec.attempt_root,
             input_path=spec.input_path,
             input_snapshot=_input_snapshot(spec.input_path),
@@ -449,6 +451,7 @@ class _LaunchCapabilityRecord:
     attempt_workspace: object
     intent_snapshot: object
     runtime_diagnostic: object
+    fbs_adapter: object | None
     attempt_root: Path
     input_path: Path
     input_snapshot: tuple[object, ...]
@@ -504,6 +507,7 @@ def _launch_context_projection(
     spec: SolverLaunchSpec,
     input_snapshot: tuple[object, ...],
     runtime_diagnostic: object,
+    fbs_adapter: object | None,
 ) -> tuple[dict[str, object], str]:
     """Build the exact, secret-free projection persisted for one launch."""
 
@@ -533,6 +537,18 @@ def _launch_context_projection(
         "mtime_ns": input_snapshot[4],
     }
     outputs = spec.expected_outputs
+    if fbs_adapter is None:
+        fbs_context = None
+    else:
+        from .fbs import _authority_record
+
+        fbs_record = _authority_record(fbs_adapter)
+        fbs_context = {
+            "official": fbs_record.official,
+            "profile": fbs_record.profile,
+            "provenance": fbs_record.provenance,
+            "runtime_identity": fbs_record.runtime_identity,
+        }
     context: dict[str, object] = {
         "input_path": _canonical_path(spec.input_path),
         "input_sha256": input_sha256,
@@ -550,6 +566,7 @@ def _launch_context_projection(
         "expected_steps": spec.expected_steps,
         "expected_final_time": spec.expected_final_time,
         "requested_fields": list(spec.requested_fields),
+        "fbs": fbs_context,
         "environment_digest": _environment_digest(spec.environment),
     }
     return context, _json_digest(context)
@@ -753,7 +770,12 @@ def _validate_launch_capability(
         raise SolverConfigurationError(
             "solver launch capability authorities are not live"
         ) from error
-    context, context_digest = _launch_context_projection(spec, current_input, validated_runtime)
+    context, context_digest = _launch_context_projection(
+        spec,
+        current_input,
+        validated_runtime,
+        record.fbs_adapter,
+    )
     return record, case_id, intent_id, attempt_id, root, context, context_digest
 
 

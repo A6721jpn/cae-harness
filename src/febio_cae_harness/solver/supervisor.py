@@ -2173,17 +2173,26 @@ class SolverSupervisor:
         self._attempt_id = attempt_id
         self._launch_context = launch_context
         self._launch_context_digest = launch_context_digest
+        bound_fbs_adapter = _capability_record.fbs_adapter
+        if bound_fbs_adapter is not None:
+            if fbs_adapter is not None and fbs_adapter is not bound_fbs_adapter:
+                raise SolverConfigurationError("fbs adapter does not match launch capability")
+            fbs_adapter = cast(FbsAdapterAuthority, bound_fbs_adapter)
         if fbs_adapter is not None:
             try:
-                _authority_record(fbs_adapter)
+                fbs_record = _authority_record(fbs_adapter)
             except TypeError as error:
                 raise SolverConfigurationError(
                     "fbs_adapter must be issued by FbsAdapterManager"
                 ) from error
+            if bound_fbs_adapter is None and fbs_record.official:
+                raise SolverConfigurationError(
+                    "official fbs adapter must be bound into the launch capability"
+                )
         self._fbs_adapter = fbs_adapter
-        self._requested_fields = (
-            tuple(requested_fields) if requested_fields is not None else self.spec.requested_fields
-        )
+        if requested_fields is not None and tuple(requested_fields) != self.spec.requested_fields:
+            raise SolverConfigurationError("requested fields do not match launch capability")
+        self._requested_fields = self.spec.requested_fields
         self._log_validator = log_validator
         self._owner_token = uuid.uuid4().hex
         self._lock = threading.RLock()
@@ -5248,6 +5257,11 @@ class SolverSupervisor:
                             )
                         if not fbs_validation.valid:
                             classification = SolverClassification.FBS_INVALID
+                        elif (
+                            fbs_validation.official is True
+                            and fbs_validation.provenance == "official"
+                        ):
+                            classification = SolverClassification.SUCCESS
                         else:
                             classification = SolverClassification.FBS_UNVERIFIED
 
