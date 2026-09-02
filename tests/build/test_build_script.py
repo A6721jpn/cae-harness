@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import pickle
 import subprocess
 import sys
+import zipfile
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -39,6 +41,42 @@ def fake_runner(
         return completed(normalised)
 
     return run
+
+
+def _write_minimal_wheel(path: Path) -> None:
+    metadata = """Metadata-Version: 2.1
+Name: febio-cae-harness
+Version: 0.1.0
+"""
+    wheel = """Wheel-Version: 1.0
+Generator: febio-cae-harness-test
+Root-Is-Purelib: true
+Tag: py3-none-any
+"""
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("febio_cae_harness/__init__.py", "")
+        archive.writestr(
+            "febio_cae_harness/cli.py",
+            'def main():\n    print("febio-cae 0.1.0")\n',
+        )
+        archive.writestr("febio_cae_harness-0.1.0.dist-info/METADATA", metadata)
+        archive.writestr("febio_cae_harness-0.1.0.dist-info/WHEEL", wheel)
+        archive.writestr(
+            "febio_cae_harness-0.1.0.dist-info/entry_points.txt",
+            "[console_scripts]\nfebio-cae = febio_cae_harness.cli:main\n",
+        )
+        archive.writestr("febio_cae_harness-0.1.0.dist-info/RECORD", "")
+
+
+def _git(repo: Path, *arguments: str) -> str:
+    completed_process = subprocess.run(
+        ("git", *arguments),
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return completed_process.stdout.strip()
 
 
 def test_command_plan_runs_gates_with_bound_environment_but_no_authority(
@@ -135,8 +173,73 @@ def test_receipt_is_exact_opaque_authority_and_staging_is_fail_closed() -> None:
         class ReceiptChild(CleanBuildReceipt):
             pass
 
-    with pytest.raises(BuildFailure, match="staging is unavailable"):
-        build_script.stage_clean_build(forged, Path("arbitrary-source"), Path("arbitrary-app"))
+    with pytest.raises(TypeError, match="run_clean_build-issued"):
+        build_script.stage_clean_build(forged)
+    with pytest.raises(TypeError):
+        build_script.stage_clean_build(forged, Path("arbitrary-source"))  # type: ignore[call-arg]
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="fixed launcher contract is Windows-only")
+def test_stage_clean_build_installs_wheel_at_fixed_atomic_location(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".gitignore").write_text("dist/\n", encoding="utf-8")
+    _git(repo, "init", "--initial-branch=main")
+    _git(repo, "config", "user.email", "test@example.invalid")
+    _git(repo, "config", "user.name", "Test")
+    _git(repo, "add", ".gitignore")
+    _git(repo, "commit", "-m", "base")
+    commit_sha = _git(repo, "rev-parse", "HEAD")
+
+    dist = repo / "dist"
+    dist.mkdir()
+    wheel = dist / "febio_cae_harness-0.1.0-py3-none-any.whl"
+    _write_minimal_wheel(wheel)
+    wheel_sha256 = hashlib.sha256(wheel.read_bytes()).hexdigest()
+    evidence = tuple(
+        (step, ("test", step), 0, "", "")
+        for step in ("pytest", "format", "lint", "mypy", "boundary", "package")
+    ) + (
+        ("smoke-venv", ("test", "smoke-venv"), 0, "", ""),
+        ("smoke-install", ("test", "smoke-install"), 0, "", ""),
+        ("smoke-version", ("test", "smoke-version"), 0, "febio-cae 0.1.0\n", ""),
+    )
+    receipt = object.__new__(CleanBuildReceipt)
+    monkeypatch.setitem(
+        build_script._RECEIPTS,
+        id(receipt),
+        (
+            receipt,
+            repo,
+            commit_sha,
+            commit_sha,
+            wheel,
+            wheel_sha256,
+            build_script._MANDATORY_STEPS,
+            evidence,
+            f"0.1.0-{commit_sha[:12]}-{wheel_sha256[:16]}",
+        ),
+    )
+    local_app_data = tmp_path / "local-app-data"
+    monkeypatch.setenv("LOCALAPPDATA", str(local_app_data))
+
+    deployment = build_script.stage_clean_build(receipt)
+
+    assert deployment.latest == (local_app_data / "FEBioCaeWorkbench" / "latest-development")
+    assert deployment.build_identity.commit_sha == commit_sha
+    assert deployment.build_identity.artifact_sha256 == wheel_sha256
+    completed_process = subprocess.run(
+        (str(deployment.latest / "febio-cae.exe"), "--version"),
+        cwd=deployment.latest,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed_process.returncode == 0
+    assert completed_process.stdout == "febio-cae 0.1.0\n"
+    assert completed_process.stderr == ""
 
 
 def test_windows_console_launcher_retarget_is_exact_and_single_use(tmp_path: Path) -> None:

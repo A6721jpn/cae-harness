@@ -11,9 +11,11 @@ from __future__ import annotations
 import argparse
 import hashlib
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
+import uuid
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
@@ -28,7 +30,14 @@ if str(SOURCE_ROOT) not in sys.path:
     sys.path.insert(0, str(SOURCE_ROOT))
 
 from febio_cae_harness import __version__  # noqa: E402
-from febio_cae_harness.launch import BuildIdentity  # noqa: E402
+from febio_cae_harness.launch import (  # noqa: E402
+    LAUNCHER_NAME,
+    BuildIdentity,
+    DeploymentError,
+    DeploymentLayout,
+    DeploymentReceipt,
+    stage_latest_development,
+)
 
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
 _REAL_RUN = subprocess.run
@@ -421,11 +430,194 @@ def _require_receipt(value: object) -> tuple[object, ...]:
     return record
 
 
-def stage_clean_build(*args: object, **kwargs: object) -> NoReturn:
-    """Staging is unavailable until a trusted wheel-derived runtime exists."""
+def _validated_stage_record(receipt: CleanBuildReceipt) -> tuple[object, ...]:
+    record = _require_receipt(receipt)
+    _require_current_python()
+    repo_root = cast(Path, record[1])
+    start_commit = cast(str, record[2])
+    end_commit = cast(str, record[3])
+    wheel = cast(Path, record[4])
+    wheel_sha256 = cast(str, record[5])
+    mandatory_steps = cast(tuple[str, ...], record[6])
+    evidence = cast(tuple[_StepEvidence, ...], record[7])
 
-    del args, kwargs
-    raise BuildFailure("clean-build staging is unavailable")
+    require_clean_repository(repo_root)
+    if start_commit != end_commit or current_commit(repo_root) != start_commit:
+        raise BuildFailure("clean-build receipt no longer matches repository HEAD")
+    current_wheel = _wheel_path(repo_root)
+    try:
+        if current_wheel.resolve(strict=True) != wheel.resolve(strict=True):
+            raise BuildFailure("clean-build receipt no longer identifies the fresh wheel")
+    except OSError as error:
+        raise BuildFailure("cannot resolve clean-build receipt wheel") from error
+    if _wheel_digest(current_wheel) != wheel_sha256:
+        raise BuildFailure("clean-build receipt wheel digest changed")
+    if mandatory_steps != _MANDATORY_STEPS:
+        raise BuildFailure("clean-build receipt is missing mandatory gates")
+    expected_evidence = (
+        "pytest",
+        "format",
+        "lint",
+        "mypy",
+        "boundary",
+        "package",
+        "smoke-venv",
+        "smoke-install",
+        "smoke-version",
+    )
+    if tuple(item[0] for item in evidence) != expected_evidence or any(
+        item[2] != 0 for item in evidence
+    ):
+        raise BuildFailure("clean-build receipt gate evidence is incomplete")
+    if evidence[-1][3] != f"febio-cae {__version__}\n" or evidence[-1][4]:
+        raise BuildFailure("clean-build receipt installed smoke evidence is invalid")
+    return record
+
+
+_RUNTIME_SOURCE_PREFIX = ".febio-runtime-"
+_REPARSE_POINT = 0x400
+
+
+def _runtime_source_name_length(layout: DeploymentLayout) -> int:
+    return len(os.fspath(layout.latest.relative_to(layout.local_app_data)).encode("utf-8"))
+
+
+def _new_runtime_source(layout: DeploymentLayout) -> Path:
+    name_length = _runtime_source_name_length(layout)
+    if name_length <= len(_RUNTIME_SOURCE_PREFIX):
+        raise BuildFailure("fixed deployment path is too short for private runtime staging")
+    try:
+        layout.local_app_data.mkdir(parents=True, exist_ok=True)
+        local_app_data = layout.local_app_data.resolve(strict=True)
+    except OSError as error:
+        raise BuildFailure("cannot create private runtime staging parent") from error
+    for _ in range(32):
+        suffix_length = name_length - len(_RUNTIME_SOURCE_PREFIX)
+        suffix = uuid.uuid4().hex[:suffix_length]
+        candidate = local_app_data / f"{_RUNTIME_SOURCE_PREFIX}{suffix}"
+        try:
+            candidate.mkdir()
+        except FileExistsError:
+            continue
+        except OSError as error:
+            raise BuildFailure("cannot create private runtime staging directory") from error
+        if len(os.fspath(candidate).encode("utf-8")) != len(
+            os.fspath(layout.latest).encode("utf-8")
+        ):
+            _remove_runtime_source(candidate, layout)
+            raise BuildFailure("private runtime and fixed deployment paths are not equal-length")
+        return candidate
+    raise BuildFailure("cannot allocate a unique private runtime staging directory")
+
+
+def _remove_runtime_source(source: Path, layout: DeploymentLayout) -> None:
+    try:
+        local_app_data = layout.local_app_data.resolve(strict=True)
+        source_absolute = Path(os.path.abspath(os.fspath(source)))
+        metadata = source_absolute.lstat()
+        is_reparse = bool(getattr(metadata, "st_file_attributes", 0) & _REPARSE_POINT)
+        if (
+            source_absolute.parent != local_app_data
+            or not source_absolute.name.startswith(_RUNTIME_SOURCE_PREFIX)
+            or len(source_absolute.name.encode("utf-8")) != _runtime_source_name_length(layout)
+            or source_absolute.is_symlink()
+            or is_reparse
+            or not source_absolute.is_dir()
+        ):
+            raise BuildFailure("refusing to remove unowned private runtime staging path")
+        shutil.rmtree(source_absolute)
+    except BuildFailure:
+        raise
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise BuildFailure("cannot remove private runtime staging directory") from error
+
+
+def _materialise_runtime_source(
+    receipt: CleanBuildReceipt,
+    source: Path,
+    layout: DeploymentLayout,
+) -> None:
+    record = _require_receipt(receipt)
+    repo_root = cast(Path, record[1])
+    wheel = cast(Path, record[4])
+    request = BuildRequest(repo_root)
+    _run_step(
+        "stage-venv",
+        (_CURRENT_PYTHON, "-m", "venv", "--without-pip", os.fspath(source)),
+        request=request,
+        runner=_REAL_RUN,
+        use_source_path=False,
+    )
+    venv_python = source / "Scripts" / "python.exe"
+    installed_launcher = source / "Scripts" / LAUNCHER_NAME
+    _run_step(
+        "stage-install",
+        (
+            _CURRENT_PYTHON,
+            "-m",
+            "pip",
+            "--python",
+            os.fspath(source),
+            "install",
+            "--no-deps",
+            os.fspath(wheel),
+        ),
+        request=request,
+        runner=_REAL_RUN,
+        use_source_path=False,
+    )
+    smoke = _run_step(
+        "stage-source-version",
+        (os.fspath(installed_launcher), "--version"),
+        request=request,
+        runner=_REAL_RUN,
+        use_source_path=False,
+    )
+    if smoke[3] != f"febio-cae {__version__}\n" or smoke[4]:
+        raise BuildFailure("staged wheel launcher returned unexpected version output")
+    target_python = layout.latest / "Scripts" / "python.exe"
+    _retarget_windows_console_launcher(installed_launcher, venv_python, target_python)
+    try:
+        shutil.copy2(installed_launcher, source / LAUNCHER_NAME)
+        artifact_directory = source / "artifact"
+        artifact_directory.mkdir()
+        shutil.copy2(wheel, artifact_directory / wheel.name)
+    except OSError as error:
+        raise BuildFailure("cannot complete wheel-derived runtime payload") from error
+
+
+def stage_clean_build(receipt: CleanBuildReceipt) -> DeploymentReceipt:
+    """Atomically stage one exact clean-build wheel at the fixed Windows location."""
+
+    _validated_stage_record(receipt)
+    if os.name != "nt":
+        raise BuildFailure("fixed clean-build staging requires Windows")
+    layout = DeploymentLayout.from_environment()
+    source = _new_runtime_source(layout)
+    try:
+        _materialise_runtime_source(receipt, source, layout)
+        deployment = stage_latest_development(
+            source,
+            identity=receipt.build_identity,
+            layout=layout,
+        )
+    except DeploymentError as error:
+        failure = BuildFailure("cannot atomically stage clean build")
+        try:
+            _remove_runtime_source(source, layout)
+        except BaseException as cleanup_error:
+            failure.add_note(f"private runtime cleanup failed: {cleanup_error}")
+        raise failure from error
+    except BaseException as primary_error:
+        try:
+            _remove_runtime_source(source, layout)
+        except BaseException as cleanup_error:
+            primary_error.add_note(f"private runtime cleanup failed: {cleanup_error}")
+        raise
+    _remove_runtime_source(source, layout)
+    return deployment
 
 
 def run_clean_build(request: BuildRequest) -> CleanBuildReceipt:
