@@ -313,8 +313,9 @@ def test_cancel_after_root_exit_drains_owned_descendant_before_validation(
     supervisor = SolverSupervisor(_capability(tmp_path, monkeypatch, code=root_code)).start()
     process = supervisor._process
     assert isinstance(process, subprocess.Popen)
+    unrelated_executable = getattr(sys, "_base_executable", sys.executable)
     unrelated = subprocess.Popen(
-        [sys.executable, "-c", unrelated_code],
+        [unrelated_executable, "-c", unrelated_code],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
