@@ -1090,6 +1090,66 @@ def test_negative_jacobian_result_cannot_reserve_an_unchanged_blind_retry(
     assert "proposal" in decision.reason
 
 
+def test_negative_jacobian_retry_requires_live_authority_for_declared_repair(
+    tmp_path: Path,
+    request: pytest.FixtureRequest,
+) -> None:
+    change = {
+        "target": "/febio_spec/Mesh[1]/Elements[1]",
+        "mode": "ATTRIBUTE",
+        "attribute_name": "type",
+        "value": "tet10",
+    }
+    intent = bound_intent(
+        retry_budget=1,
+        allowed_mesh_changes={"mesh": {"patches": (change,)}},
+    )
+    workspace_temp, workspace_root = short_workspace_root(tmp_path)
+    request.addfinalizer(workspace_temp.cleanup)
+    state, state_snapshot = retry_state_for_case(
+        workspace_root,
+        "case-negative-repair",
+        intent,
+        attempt_ids=("attempt-a",),
+    )
+    state_case = object.__getattribute__(state_snapshot, "_case_workspace")
+    supervisor = timeout_supervisor(
+        tmp_path / "solver-negative-repair",
+        case_id="case-negative-repair",
+        classification=SolverClassification.NEGATIVE_JACOBIAN,
+        intent=intent,
+        workspace_root=workspace_root,
+        case_workspace=state_case,
+        record_attempt=False,
+    )
+    result = supervisor.run()
+    proposal = Proposal(
+        proposal_id="negative-jacobian-repair-a",
+        proposal_class=ProposalClass.INTENT_PRESERVING,
+        rationale="synthetic completed mesh diagnostic repair",
+        evidence_ids=("synthetic-negative-jacobian-diagnostic",),
+        changes={"mesh": {"patches": (change,)}},
+        authorized=True,
+        within_contract=True,
+    )
+    proposal_authority = ProposalAuthorityManager(state).issue(proposal)
+
+    decision = decide_retry(
+        FailureClass.NEGATIVE_JACOBIAN,
+        RetryLedger.from_authority(state),
+        intent=state,
+        proposal=proposal,
+        proposal_authority=proposal_authority,
+        supervisor=supervisor,
+        result=result,
+    )
+
+    assert decision.decision is RetryDecision.RETRY_REQUIRES_RESERVATION
+    assert decision.failure is FailureClass.NEGATIVE_JACOBIAN
+    assert decision.ledger.used == 1
+    assert decision.ledger.records[0].proposal_id == proposal.proposal_id
+
+
 def test_retry_does_not_turn_unresolved_non_authoritative_data_into_a_question(
     tmp_path: Path,
 ) -> None:

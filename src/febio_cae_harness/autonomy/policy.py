@@ -2249,6 +2249,7 @@ def decide_retry(
     intent: IntentStateAuthority | IntentContract | None = None,
     state_authority: IntentStateAuthority | None = None,
     proposal: Proposal | None = None,
+    proposal_authority: ProposalAuthority | ProposalValidationReceipt | None = None,
     validation_passed: bool = False,
     result: SolverRunResult | None = None,
     solver_result: SolverRunResult | None = None,
@@ -2283,6 +2284,8 @@ def decide_retry(
         raise TypeError("intent and state_authority must identify the same authority")
     if type(intent) is IntentContract and state_authority is not None:
         raise TypeError("raw IntentContract cannot be combined with a state authority")
+    if proposal is None and proposal_authority is not None:
+        raise TypeError("proposal_authority requires an exact proposal")
 
     authority = state_authority
     raw_intent_supplied = type(intent) is IntentContract
@@ -2383,6 +2386,7 @@ def decide_retry(
         proposal_decision = decide_proposal(
             authority,
             proposal,
+            proposal_authority,
             validation_passed=validation_passed,
         )
         if proposal_decision.action is ProposalAction.ASK_AND_BLOCK:
