@@ -75,7 +75,6 @@ def test_missing_or_non_authoritative_settings_ask_without_geometry_inference() 
     assert absent.status == ASK_AND_BLOCK
     assert absent.questions == (
         "Which element family should be used for meshing?",
-        "Which length unit should target_size use?",
         "What target element size should be used?",
         "Which mesh quality criteria must be enforced?",
     )
@@ -175,3 +174,19 @@ def test_step_unit_mismatch_is_rejected_without_overriding_request() -> None:
     )
     with pytest.raises(STEPInspectionError, match="conflicting"):
         plan_step_meshing(inspection, request)
+
+
+def test_explicit_step_length_unit_satisfies_missing_request_unit() -> None:
+    inspection = inspect_step(STEP)
+    request = StepMeshingRequest(
+        element_family="tet10",
+        target_size=1.0,
+        quality_criteria={"min_jacobian": 0.1, "max_aspect_ratio": 4.0},
+        evidence=(AUTH,),
+    )
+
+    plan = plan_step_meshing(inspection, request)
+
+    assert plan.status == "READY"
+    assert plan.length_unit == "mm"
+    assert plan.questions == ()

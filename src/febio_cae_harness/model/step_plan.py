@@ -118,10 +118,14 @@ def _step_length_units(step: STEPInspection) -> tuple[str, ...]:
     return tuple(units)
 
 
-def _questions(request: StepMeshingRequest) -> tuple[str, ...]:
+def _questions(
+    request: StepMeshingRequest,
+    *,
+    resolved_length_unit: str | None,
+) -> tuple[str, ...]:
     missing: tuple[bool, ...] = (
         request.element_family is None,
-        request.length_unit is None,
+        resolved_length_unit is None,
         request.target_size is None,
         request.quality_criteria is None or not request.quality_criteria,
     )
@@ -224,12 +228,13 @@ def plan_step_meshing(
         and _canonical_unit(request.length_unit) != step_units[0]
     ):
         raise STEPInspectionError("conflicting explicit units: request disagrees with STEP")
-    questions = _questions(request)
+    resolved_length_unit = request.length_unit or (step_units[0] if step_units else None)
+    questions = _questions(request, resolved_length_unit=resolved_length_unit)
     return StepMeshingPlan(
         step_sha256=step.sha256,
         status=_READY if not questions else ASK_AND_BLOCK,
         element_family=request.element_family,
-        length_unit=request.length_unit,
+        length_unit=resolved_length_unit,
         target_size=request.target_size,
         quality_criteria=request.quality_criteria,
         evidence=request.evidence,
