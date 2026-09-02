@@ -32,10 +32,12 @@ if str(SOURCE_ROOT) not in sys.path:
 from febio_cae_harness import __version__  # noqa: E402
 from febio_cae_harness.launch import (  # noqa: E402
     LAUNCHER_NAME,
+    SHORTCUT_LINK_NAME,
     BuildIdentity,
     DeploymentError,
     DeploymentLayout,
     DeploymentReceipt,
+    ShortcutManager,
     stage_latest_development,
 )
 
@@ -620,6 +622,19 @@ def stage_clean_build(receipt: CleanBuildReceipt) -> DeploymentReceipt:
     return deployment
 
 
+def _install_fixed_shortcut(deployment: DeploymentReceipt) -> Path:
+    if type(deployment) is not DeploymentReceipt:
+        raise TypeError("deployment must be an exact DeploymentReceipt")
+    manager = ShortcutManager(deployment.layout)
+    descriptor = manager.issue_descriptor()
+    descriptor_path = manager.write(descriptor)
+    manager.verify(descriptor)
+    link_path = descriptor_path.parent / SHORTCUT_LINK_NAME
+    if not link_path.is_file() or link_path.is_symlink():
+        raise BuildFailure("verified Start Menu shortcut is missing")
+    return link_path
+
+
 def run_clean_build(request: BuildRequest) -> CleanBuildReceipt:
     """Run every mandatory gate and return receipt evidence for one fresh wheel."""
 
@@ -664,8 +679,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = build_parser().parse_args(argv)
     result = run_clean_build(BuildRequest(repo_root=arguments.repo_root))
     deployment = stage_clean_build(result)
+    shortcut = _install_fixed_shortcut(deployment)
     print(f"built {result.wheel.name} from {result.commit_sha}")
     print(f"staged {deployment.latest}")
+    print(f"shortcut {shortcut}")
     return 0
 
 

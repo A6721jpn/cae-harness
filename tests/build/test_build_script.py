@@ -163,6 +163,7 @@ def test_build_cli_stages_only_the_issued_clean_build(
     wheel = tmp_path / "dist" / "fresh.whl"
     receipt = SimpleNamespace(wheel=wheel, commit_sha="a" * 40)
     deployment = SimpleNamespace(latest=tmp_path / "fixed" / "latest-development")
+    shortcut = tmp_path / "start-menu" / "FEBio CAE Workbench.lnk"
     calls: list[object] = []
 
     def run(request: BuildRequest) -> object:
@@ -173,14 +174,19 @@ def test_build_cli_stages_only_the_issued_clean_build(
         calls.append(value)
         return deployment
 
+    def install(value: object) -> Path:
+        calls.append(value)
+        return shortcut
+
     monkeypatch.setattr(build_script, "run_clean_build", run)
     monkeypatch.setattr(build_script, "stage_clean_build", stage)
+    monkeypatch.setattr(build_script, "_install_fixed_shortcut", install, raising=False)
 
     assert build_script.main(["--repo-root", str(tmp_path)]) == 0
 
-    assert calls == [BuildRequest(tmp_path), receipt]
+    assert calls == [BuildRequest(tmp_path), receipt, deployment]
     assert capsys.readouterr().out == (
-        f"built fresh.whl from {'a' * 40}\nstaged {deployment.latest}\n"
+        f"built fresh.whl from {'a' * 40}\nstaged {deployment.latest}\nshortcut {shortcut}\n"
     )
 
 
