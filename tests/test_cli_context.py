@@ -371,6 +371,29 @@ def test_root_register_emits_capability_only_when_explicit(
     assert captured.out.encode("utf-8") == module.dump_root_capability(capability)
 
 
+def test_root_register_preserves_canonical_capability_bytes_on_windows_stdout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _context_module()
+    service = _service(tmp_path)
+    monkeypatch.setattr(cli_module, "_case_service", lambda: service)
+    cae_root = tmp_path / "02_CAE"
+    cae_root.mkdir()
+    raw_stdout = io.BytesIO()
+    windows_stdout = io.TextIOWrapper(raw_stdout, encoding="utf-8", newline="\r\n")
+    monkeypatch.setattr(sys, "stdout", windows_stdout)
+
+    assert (
+        cli_module.main(["root", "register", "--cae-root", str(cae_root), "--emit-capability"]) == 0
+    )
+
+    windows_stdout.flush()
+    emitted = raw_stdout.getvalue()
+    capability = module.load_root_capability(emitted)
+    assert emitted == module.dump_root_capability(capability)
+
+
 def test_registered_root_identity_replacement_is_rejected(tmp_path: Path) -> None:
     module = _context_module()
     service = _service(tmp_path)

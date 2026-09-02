@@ -292,7 +292,7 @@ def _run_context_command(arguments: argparse.Namespace) -> int:
         if command == "root.register":
             registered = service.register_root(arguments.cae_root)
             if arguments.emit_capability:
-                sys.stdout.write(dump_root_capability(registered["capability"]).decode("utf-8"))
+                sys.stdout.buffer.write(dump_root_capability(registered["capability"]))
                 return 0
             payload = cli_success(command, root={"root_id": registered["root_id"]})
         elif command == "case.create":
