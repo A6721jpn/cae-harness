@@ -24,7 +24,8 @@ from febio_cae_harness.cli_context import (
 from febio_cae_harness.contracts import IntentState
 from febio_cae_harness.evidence import EvidenceIntegrityError, EvidenceStore
 from febio_cae_harness.model.completeness import assess_authoritative_completeness
-from febio_cae_harness.model.feb import inspect_feb_file
+from febio_cae_harness.model.feb import inspect_feb_file, inspect_feb_xml
+from febio_cae_harness.model.incomplete import inspect_incomplete_feb
 from febio_cae_harness.model.preflight import PreflightResult, run_preflight
 from febio_cae_harness.model.step import inspect_step_file
 from febio_cae_harness.solver.execution import (
@@ -111,6 +112,16 @@ def build_parser() -> argparse.ArgumentParser:
         "inspect-feb", help="inspect FEB XML structure and explicit references"
     )
     inspect_feb.add_argument("path", type=Path, metavar="PATH")
+
+    inspect_incomplete_feb_command = commands.add_parser(
+        "inspect-incomplete-feb",
+        help="inspect one registered FEB against its current authoritative case intent",
+    )
+    inspect_incomplete_feb_command.add_argument(
+        "--capability-stdin", required=True, action="store_true"
+    )
+    inspect_incomplete_feb_command.add_argument("--case-id", required=True)
+    inspect_incomplete_feb_command.add_argument("--input-name")
 
     preflight_feb = commands.add_parser(
         "preflight-feb", help="preflight FEB XML structure and explicit references"
@@ -466,6 +477,80 @@ def _open_recorded_attempt(case: CaseWorkspace, attempt_id: str) -> AttemptWorks
         attempt_root,
         expected_root_stamp=attempt_stamp,
     )
+
+
+def _inspect_incomplete_feb_command(arguments: argparse.Namespace) -> int:
+    command = "inspect-incomplete-feb"
+    try:
+        service = _case_service()
+        root_capability = _read_root_capability_stdin()
+        opened = service._open_context(root_capability, arguments.case_id)
+        snapshot = opened.result.snapshot
+        completeness = assess_authoritative_completeness(snapshot)
+        source_relative, input_name, expected_sha256 = _select_feb_input(
+            opened.store.manifest.get("inputs"),
+            arguments.input_name,
+        )
+        with opened.case._exact_transaction() as exact:
+            source = exact.read_bytes(source_relative)
+        inspection = inspect_feb_xml(source, source_name=input_name)
+        if inspection.sha256 != expected_sha256:
+            raise CaseContextError(
+                "EVIDENCE_INTEGRITY_FAILURE",
+                "registered FEB input does not match its manifest digest",
+            )
+        inventory = inspect_incomplete_feb(
+            inspection,
+            completeness,
+            snapshot=snapshot,
+        )
+        inventory_payload = inventory.to_dict()
+        # Revalidate the live snapshot after consuming every action field.
+        assess_authoritative_completeness(snapshot)
+        payload = cli_success(
+            command,
+            case={
+                "case_id": snapshot.case_id,
+                "intent": {"sha256": snapshot.intent_sha256},
+                "state": opened.result.state.value,
+            },
+        )
+        payload["input"] = {"name": input_name, "sha256": expected_sha256}
+        payload["inventory"] = inventory_payload
+        payload["status"] = "READY" if inventory_payload["ready"] is True else "ASK_AND_BLOCK"
+    except _RunCommandError as error:
+        context_error = CaseContextError(error.code, str(error))
+        _emit_context_json(cli_failure(command, context_error), error=True)
+        if error.code == "EVIDENCE_INTEGRITY_FAILURE":
+            return _CONTEXT_EXIT_CODES[error.code]
+        return _CONTEXT_EXIT_CODES["INVALID_INPUT"]
+    except CaseContextError as error:
+        _emit_context_json(cli_failure(command, error), error=True)
+        return _CONTEXT_EXIT_CODES.get(error.code, _CONTEXT_EXIT_CODES["INTERNAL_ERROR"])
+    except (EvidenceIntegrityError, WorkspaceBoundaryError):
+        failure = CaseContextError(
+            "EVIDENCE_INTEGRITY_FAILURE",
+            "registered FEB or intent evidence is invalid",
+        )
+        _emit_context_json(cli_failure(command, failure), error=True)
+        return _CONTEXT_EXIT_CODES[failure.code]
+    except ValueError:
+        failure = CaseContextError("INVALID_INPUT", "registered FEB inspection failed")
+        _emit_context_json(cli_failure(command, failure), error=True)
+        return _CONTEXT_EXIT_CODES[failure.code]
+    except OSError:
+        failure = CaseContextError("IO_OR_LOCK_FAILURE", "registered FEB inspection I/O failed")
+        _emit_context_json(cli_failure(command, failure), error=True)
+        return _CONTEXT_EXIT_CODES[failure.code]
+    except Exception:
+        failure = CaseContextError(
+            "INTERNAL_ERROR",
+            "unexpected registered FEB inspection failure",
+        )
+        _emit_context_json(cli_failure(command, failure), error=True)
+        return _CONTEXT_EXIT_CODES[failure.code]
+    _emit_context_json(payload)
+    return 0
 
 
 def _retry_already_started(attempt_id: str) -> int:
@@ -1279,6 +1364,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _emit_preflight(arguments.path, arguments.command)
     if arguments.command == "probe-febio":
         return _emit_probe(arguments.path)
+    if arguments.command == "inspect-incomplete-feb":
+        return _inspect_incomplete_feb_command(arguments)
     if arguments.command in {"root", "case"}:
         return _run_context_command(arguments)
     if arguments.command == "run-febio":

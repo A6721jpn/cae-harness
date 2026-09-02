@@ -607,6 +607,98 @@ def test_cli_case_projection_omits_intent_values_and_absolute_paths(
     assert "attempt" not in payload["case"]
 
 
+def test_cli_inspect_incomplete_feb_uses_current_case_authority_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    service, _, _, capability = _registered_case(tmp_path, IntentContract())
+    monkeypatch.setattr(cli_module, "_case_service", lambda: service)
+    _set_capability_stdin(monkeypatch, capability)
+
+    assert (
+        cli_module.main(
+            [
+                "inspect-incomplete-feb",
+                "--case-id",
+                "case-a",
+                "--capability-stdin",
+                "--input-name",
+                "synthetic.feb",
+            ]
+        )
+        == 0
+    )
+
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    payload = json.loads(captured.out)
+    assert payload["command"] == "inspect-incomplete-feb"
+    assert payload["ok"] is True
+    assert payload["status"] == "ASK_AND_BLOCK"
+    assert payload["case"]["case_id"] == "case-a"
+    assert len(payload["case"]["intent"]["sha256"]) == 64
+    assert payload["input"]["name"] == "synthetic.feb"
+    assert len(payload["input"]["sha256"]) == 64
+    assert payload["inventory"]["structural_diagnostics"] == []
+    assert payload["inventory"]["ready"] is False
+    assert [item["condition"] for item in payload["inventory"]["questions"]] == [
+        "engineering_question",
+        "units",
+        "material",
+        "loads",
+        "constraints",
+        "contact",
+        "analysis_step",
+        "roi",
+        "evaluation_quantities",
+    ]
+    assert all(item["action"] == "ASK_AND_BLOCK" for item in payload["inventory"]["questions"])
+    assert str(tmp_path) not in captured.out
+
+
+def test_cli_inspect_incomplete_feb_redacts_unexpected_internal_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    service, _, _, capability = _registered_case(tmp_path, IntentContract())
+    monkeypatch.setattr(cli_module, "_case_service", lambda: service)
+
+    def fail_inspection(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise RuntimeError(f"synthetic internal failure at {tmp_path}")
+
+    monkeypatch.setattr(cli_module, "inspect_incomplete_feb", fail_inspection)
+    _set_capability_stdin(monkeypatch, capability)
+
+    assert (
+        cli_module.main(
+            [
+                "inspect-incomplete-feb",
+                "--case-id",
+                "case-a",
+                "--capability-stdin",
+                "--input-name",
+                "synthetic.feb",
+            ]
+        )
+        == 70
+    )
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    payload = json.loads(captured.err)
+    assert payload["command"] == "inspect-incomplete-feb"
+    assert payload["error"] == {
+        "code": "INTERNAL_ERROR",
+        "message": "unexpected registered FEB inspection failure",
+        "retryable": False,
+    }
+    assert str(tmp_path) not in captured.err
+    assert "Traceback" not in captured.err
+
+
 def test_production_registry_ignores_environment_override(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
