@@ -8,6 +8,7 @@ import sys
 import zipfile
 from collections.abc import Sequence
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -152,6 +153,35 @@ def test_cli_has_no_untrusted_authority_arguments() -> None:
         parser.parse_args(["--stage-source", "arbitrary-source"])
     with pytest.raises(SystemExit):
         parser.parse_args(["--build-id", "forged-build-id"])
+
+
+def test_build_cli_stages_only_the_issued_clean_build(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    wheel = tmp_path / "dist" / "fresh.whl"
+    receipt = SimpleNamespace(wheel=wheel, commit_sha="a" * 40)
+    deployment = SimpleNamespace(latest=tmp_path / "fixed" / "latest-development")
+    calls: list[object] = []
+
+    def run(request: BuildRequest) -> object:
+        calls.append(request)
+        return receipt
+
+    def stage(value: object) -> object:
+        calls.append(value)
+        return deployment
+
+    monkeypatch.setattr(build_script, "run_clean_build", run)
+    monkeypatch.setattr(build_script, "stage_clean_build", stage)
+
+    assert build_script.main(["--repo-root", str(tmp_path)]) == 0
+
+    assert calls == [BuildRequest(tmp_path), receipt]
+    assert capsys.readouterr().out == (
+        f"built fresh.whl from {'a' * 40}\nstaged {deployment.latest}\n"
+    )
 
 
 def test_receipt_is_exact_opaque_authority_and_staging_is_fail_closed() -> None:

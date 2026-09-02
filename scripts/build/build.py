@@ -663,7 +663,9 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = build_parser().parse_args(argv)
     result = run_clean_build(BuildRequest(repo_root=arguments.repo_root))
+    deployment = stage_clean_build(result)
     print(f"built {result.wheel.name} from {result.commit_sha}")
+    print(f"staged {deployment.latest}")
     return 0
 
 
