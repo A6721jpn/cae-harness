@@ -18,6 +18,11 @@ from .gates import (
     evaluate_success_gate,
     evaluate_success_gates,
 )
+from .physical import (
+    PhysicalEvidenceAuthority,
+    PhysicalEvidenceEvaluation,
+    issue_physical_evidence,
+)
 from .report import (
     ReportAssembler,
     ReportBuilder,
@@ -72,6 +77,8 @@ __all__ = [
     "MeshEvidence",
     "OutputFreshValidation",
     "OutputFreshness",
+    "PhysicalEvidenceAuthority",
+    "PhysicalEvidenceEvaluation",
     "Report",
     "ReportAuthority",
     "ReportAuthorityManager",
@@ -98,4 +105,5 @@ __all__ = [
     "evaluate_success",
     "evaluate_success_gate",
     "evaluate_success_gates",
+    "issue_physical_evidence",
 ]

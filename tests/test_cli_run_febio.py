@@ -864,10 +864,12 @@ def test_run_febio_never_promotes_diagnostic_boolean_as_official_fbs(
     assert events[-1]["payload"]["status"] == "EVIDENCE_INTEGRITY_FAILURE"
 
 
-def test_exact_official_result_writes_only_a_blocked_diagnostic_report(
+@pytest.mark.parametrize("physical_success", [False, True], ids=["blocked", "verified"])
+def test_exact_official_result_writes_bound_report(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    physical_success: bool,
 ) -> None:
     service, capability, case_root = _register_case(tmp_path, intent=_complete_intent())
     opened = service._open_context(capability, "case-a")
@@ -959,6 +961,21 @@ def test_exact_official_result_writes_only_a_blocked_diagnostic_report(
         timeout_seconds=None,
         official_fbs_runtime=official_runtime,
     )
+    if physical_success:
+        physical_module = importlib.import_module("febio_cae_harness.reporting.physical")
+        synthetic_evaluation = physical_module.PhysicalEvidenceEvaluation(
+            {kind: True for kind in ("mesh", "jacobian", "roi", "evaluation")},
+            {
+                kind: {"synthetic_plumbing": True}
+                for kind in ("mesh", "jacobian", "roi", "evaluation")
+            },
+            {kind: () for kind in ("mesh", "jacobian", "roi", "evaluation")},
+        )
+        monkeypatch.setattr(
+            physical_module,
+            "_evaluate_physical_payload",
+            lambda **kwargs: synthetic_evaluation,
+        )
 
     with official_module.open_official_fbs_manager(
         official_runtime,
@@ -979,59 +996,62 @@ def test_exact_official_result_writes_only_a_blocked_diagnostic_report(
             "return_code": session.result.return_code,
             "state": session.result.state.value,
         }
-        assert (
-            cli_module._complete_official_report_blocked(
-                command="run-febio",
-                store=opened.store,
-                attempt=attempt,
-                snapshot=snapshot,
-                execution=execution,
-                supervisor=session.supervisor,
-                result=session.result,
-                staged_input=staged_input,
-                attempt_payload={
-                    "attempt_id": attempt_id,
-                    "official_fbs": False,
-                    "status": "SUCCESS",
-                },
-                solver=solver,
-            )
-            == 6
-        )
+        assert cli_module._complete_official_report(
+            command="run-febio",
+            store=opened.store,
+            attempt=attempt,
+            snapshot=snapshot,
+            execution=execution,
+            supervisor=session.supervisor,
+            result=session.result,
+            staged_input=staged_input,
+            attempt_payload={
+                "attempt_id": attempt_id,
+                "official_fbs": False,
+                "status": "SUCCESS",
+            },
+            solver=solver,
+        ) == (0 if physical_success else 6)
 
     captured = capsys.readouterr()
-    assert captured.out == ""
-    response = json.loads(captured.err)
-    assert response["error"]["code"] == "REPORT_BLOCKED"
+    assert (captured.err == "") is physical_success
+    assert (captured.out == "") is not physical_success
+    response = json.loads(captured.out if physical_success else captured.err)
+    assert response["ok"] is physical_success
+    if not physical_success:
+        assert response["error"]["code"] == "REPORT_BLOCKED"
     assert response["attempt"] == {
         "attempt_id": attempt_id,
         "official_fbs": True,
-        "status": "REPORT_BLOCKED",
+        "status": "SUCCESS" if physical_success else "REPORT_BLOCKED",
     }
-    assert response["report"]["success"] is False
-    assert response["report"]["verified"] is False
+    assert response["report"]["success"] is physical_success
+    assert response["report"]["verified"] is physical_success
     assert response["report"]["provenance"] == "official"
-    assert set(response["report"]["failed_checks"]) >= {
-        "mesh_evidence",
-        "jacobian_evidence",
-        "roi_evidence",
-        "evaluation_evidence",
-    }
+    if physical_success:
+        assert response["report"]["failed_checks"] == []
+    else:
+        assert set(response["report"]["failed_checks"]) >= {
+            "mesh_evidence",
+            "jacobian_evidence",
+            "roi_evidence",
+            "evaluation_evidence",
+        }
     assert not _contains_path_key(response)
-    assert str(tmp_path) not in captured.err
+    assert str(tmp_path) not in (captured.out + captured.err)
 
     attempt_root = case_root / "90_Temporary" / "attempts" / attempt_id
     report = json.loads((attempt_root / "report.json").read_text(encoding="utf-8"))
-    assert report["success"] is False
-    assert report["verified"] is False
+    assert report["success"] is physical_success
+    assert report["verified"] is physical_success
     assert report["provenance"] == "official"
     for kind in ("mesh", "jacobian", "roi", "evaluation"):
         evidence = json.loads(
             (attempt_root / "report-evidence" / f"{kind}.json").read_text(encoding="utf-8")
         )
         assert evidence["kind"] == kind
-        assert evidence["verified"] is False
-        assert evidence["satisfies_intent"] is False
+        assert evidence["verified"] is physical_success
+        assert evidence["satisfies_intent"] is physical_success
     events = [
         json.loads(line)
         for line in (case_root / "90_Temporary" / "events.jsonl")
@@ -1040,7 +1060,7 @@ def test_exact_official_result_writes_only_a_blocked_diagnostic_report(
     ]
     assert events[-1]["event_type"] == "run_febio_terminal"
     assert events[-1]["payload"]["official_fbs"] is True
-    assert events[-1]["payload"]["status"] == "REPORT_BLOCKED"
+    assert events[-1]["payload"]["status"] == ("SUCCESS" if physical_success else "REPORT_BLOCKED")
 
 
 def test_run_febio_ask_and_block_does_not_probe_or_create_attempt(

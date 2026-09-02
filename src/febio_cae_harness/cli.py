@@ -35,9 +35,11 @@ from febio_cae_harness.model.step import inspect_step_file
 from febio_cae_harness.reporting import (
     AttemptIdentity,
     EvidenceKind,
+    PhysicalEvidenceAuthority,
     ReportAuthorityManager,
     ResultReport,
     assemble_report,
+    issue_physical_evidence,
 )
 from febio_cae_harness.solver.execution import (
     ExecutionAuthority,
@@ -471,8 +473,9 @@ def _append_run_terminal(
 def _official_report_evidence(
     attempt: AttemptWorkspace,
     receipt: OfficialFbsResultReceipt,
+    physical_evidence: PhysicalEvidenceAuthority,
 ) -> dict[EvidenceKind, Path]:
-    """Write explicit diagnostic-only physical-evidence placeholders."""
+    """Write physical evidence documents from one live issued authority."""
 
     binding = {
         "element_count": receipt.element_count,
@@ -485,17 +488,8 @@ def _official_report_evidence(
     }
     paths: dict[EvidenceKind, Path] = {}
     for kind in EvidenceKind:
-        payload = {
-            "authority": "unverified",
-            "fbs_binding": binding,
-            "kind": kind.value,
-            "reason": (
-                "official FBS field validation does not establish this physical intent condition"
-            ),
-            "satisfies_intent": False,
-            "schema_version": "febio-cae-report-evidence/v1",
-            "verified": False,
-        }
+        payload = physical_evidence.document(kind.value)
+        payload["fbs_binding"] = binding
         paths[kind] = attempt.write_text(
             Path("report-evidence") / f"{kind.value}.json",
             json.dumps(
@@ -510,7 +504,7 @@ def _official_report_evidence(
     return paths
 
 
-def _complete_official_report_blocked(
+def _complete_official_report(
     *,
     command: str,
     store: EvidenceStore,
@@ -523,7 +517,7 @@ def _complete_official_report_blocked(
     attempt_payload: dict[str, object],
     solver: Mapping[str, object],
 ) -> int:
-    """Persist an official-FBS diagnostic report without manufacturing success."""
+    """Persist a verified or fail-closed report from one official FBS result."""
 
     if (
         type(execution) is not ExecutionAuthority
@@ -544,16 +538,23 @@ def _complete_official_report_blocked(
             snapshot.intent_sha256,
             attempt.attempt_id,
         )
-        evidence_paths = _official_report_evidence(attempt, receipt)
+        physical_evidence = issue_physical_evidence(supervisor, result, receipt)
+        evidence_paths = _official_report_evidence(attempt, receipt, physical_evidence)
         authority = ReportAuthorityManager(
             supervisor,
             result,
             identity,
             official_fbs_result=receipt,
+            physical_evidence=physical_evidence,
         ).issue(evidence_paths)
         report = assemble_report(authority)
-        if type(report) is not ResultReport or report.success or report.verified:
-            raise TypeError("unverified physical evidence unexpectedly passed report gates")
+        physical_passed = all(physical_evidence.passed.values())
+        if (
+            type(report) is not ResultReport
+            or report.success is not physical_passed
+            or report.verified is not physical_passed
+        ):
+            raise TypeError("physical evidence and report gate decisions differ")
         report_path = attempt.write_text(
             "report.json",
             json.dumps(
@@ -579,11 +580,11 @@ def _complete_official_report_blocked(
             store.record_artifact(path, attempt_id=attempt.attempt_id)
         store.record_artifact(report_path, attempt_id=attempt.attempt_id)
         attempt_payload["official_fbs"] = True
-        attempt_payload["status"] = "REPORT_BLOCKED"
+        attempt_payload["status"] = "SUCCESS" if report.success else "REPORT_BLOCKED"
         if not _append_run_terminal(
             store,
             attempt.attempt_id,
-            "REPORT_BLOCKED",
+            str(attempt_payload["status"]),
             solver=solver,
             official_fbs=True,
         ):
@@ -594,8 +595,8 @@ def _complete_official_report_blocked(
         report_summary = {
             "failed_checks": list(report.gates.failed_checks),
             "provenance": report.provenance.value,
-            "success": False,
-            "verified": False,
+            "success": report.success,
+            "verified": report.verified,
         }
     except _RunCommandError:
         raise
@@ -605,11 +606,21 @@ def _complete_official_report_blocked(
             "official result report authority is invalid",
         ) from error
 
+    if report_summary["success"] is True:
+        payload = cli_success(command)
+        payload.update(
+            {
+                "attempt": dict(attempt_payload),
+                "solver": dict(solver),
+                "report": report_summary,
+            }
+        )
+        _emit_context_json(payload)
+        return 0
     _emit_context_json(
         _run_failure(
             "REPORT_BLOCKED",
-            "official FBS passed, but mesh, all-integration-point Jacobian, ROI, "
-            "and evaluation evidence remain unverified",
+            "official FBS passed, but physical evidence does not satisfy the exact approved intent",
             command=command,
             attempt=attempt_payload,
             solver=solver,
@@ -930,7 +941,7 @@ def _run_febio_command(arguments: argparse.Namespace) -> int:
                             "EVIDENCE_INTEGRITY_FAILURE",
                             "official result requires an exact headless run session",
                         )
-                    return _complete_official_report_blocked(
+                    return _complete_official_report(
                         command="run-febio",
                         store=opened.store,
                         attempt=attempt,
@@ -1363,7 +1374,7 @@ def _retry_febio_command(arguments: argparse.Namespace) -> int:
                             "EVIDENCE_INTEGRITY_FAILURE",
                             "official result requires an exact headless run session",
                         )
-                    return _complete_official_report_blocked(
+                    return _complete_official_report(
                         command=command,
                         store=opened.store,
                         attempt=attempt,
@@ -1606,7 +1617,7 @@ def _reconnect_febio_command(arguments: argparse.Namespace) -> int:
                             "EVIDENCE_INTEGRITY_FAILURE",
                             "official result paths differ from the recorded execution",
                         )
-                    return _complete_official_report_blocked(
+                    return _complete_official_report(
                         command=command,
                         store=opened.store,
                         attempt=session.attempt,
