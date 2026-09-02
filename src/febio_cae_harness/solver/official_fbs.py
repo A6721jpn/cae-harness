@@ -1460,7 +1460,6 @@ def _validate_geometry_summary(
     seen: set[int] = set()
     total_elements = 0
     total_integration_points = 0
-    maximum_integration_points = 0
     for item in cell_types:
         if not isinstance(item, dict):
             raise OfficialFbsRuntimeError("geometry cell type is invalid")
@@ -1494,7 +1493,6 @@ def _validate_geometry_summary(
         seen.add(vtk_id)
         total_elements += elements
         total_integration_points += elements * integration_points
-        maximum_integration_points = max(maximum_integration_points, integration_points)
     if total_elements != element_count:
         raise OfficialFbsRuntimeError("geometry element cardinality is invalid")
 
@@ -1520,6 +1518,7 @@ def _validate_geometry_summary(
                 "minimum_jacobian",
                 "maximum_jacobian",
                 "minimum_element_index",
+                "minimum_vtk_id",
                 "minimum_integration_point_index",
             },
             "geometry state",
@@ -1527,6 +1526,7 @@ def _validate_geometry_summary(
         index = state["index"]
         integration_point_count = state["integration_point_count"]
         minimum_element_index = state["minimum_element_index"]
+        minimum_vtk_id = state["minimum_vtk_id"]
         minimum_integration_point_index = state["minimum_integration_point_index"]
         if (
             isinstance(index, bool)
@@ -1538,9 +1538,12 @@ def _validate_geometry_summary(
             or isinstance(minimum_element_index, bool)
             or not isinstance(minimum_element_index, int)
             or not 0 <= minimum_element_index < element_count
+            or isinstance(minimum_vtk_id, bool)
+            or not isinstance(minimum_vtk_id, int)
+            or minimum_vtk_id not in seen
             or isinstance(minimum_integration_point_index, bool)
             or not isinstance(minimum_integration_point_index, int)
-            or not 0 <= minimum_integration_point_index < maximum_integration_points
+            or not 0 <= minimum_integration_point_index < supported[minimum_vtk_id][3]
             or _number(state["time"], "geometry state time")
             != _number(state_times[expected_index], "model state time")
         ):
@@ -1596,20 +1599,18 @@ def _validate_field_response(
     requested_fields: Sequence[str],
     binding: _RequestBinding,
 ) -> Mapping[str, object]:
-    _exact_keys(
-        response,
-        {
-            "available_fields",
-            "field_data",
-            "model_sha256",
-            "nonce",
-            "profile",
-            "protocol",
-            "request_sha256",
-            "xplt_sha256",
-        },
-        "field response",
-    )
+    expected_keys = {
+        "available_fields",
+        "field_data",
+        "model_sha256",
+        "nonce",
+        "profile",
+        "protocol",
+        "request_sha256",
+        "xplt_sha256",
+    }
+    if set(response) not in (expected_keys, expected_keys | {"geometry"}):
+        raise OfficialFbsRuntimeError("field response has an invalid schema")
     if response["protocol"] != _PROTOCOL:
         raise OfficialFbsRuntimeError("official FBS helper protocol mismatch")
     if (
@@ -1625,6 +1626,9 @@ def _validate_field_response(
     model = _validate_model_manifest(binding.model_manifest, requested_fields)
     if _model_manifest_sha256(model) != binding.model_sha256:
         raise OfficialFbsRuntimeError("official FBS model binding changed")
+    geometry = None
+    if "geometry" in response:
+        geometry = _validate_geometry_summary(response["geometry"], model)
     available, field_data = response["available_fields"], response["field_data"]
     raw_available = model["available_fields"]
     if not isinstance(raw_available, list):  # pragma: no cover - validated above
@@ -1726,7 +1730,7 @@ def _validate_field_response(
             }
         else:
             raise OfficialFbsRuntimeError(f"{field} has no component values")
-    return {
+    normalized = {
         "protocol": _PROTOCOL,
         "available_fields": list(available),
         "model_manifest": model,
@@ -1735,6 +1739,9 @@ def _validate_field_response(
         "non_finite_fields": non_finite,
         "xplt_sha256": binding.xplt_sha256,
     }
+    if geometry is not None:
+        normalized["geometry"] = geometry
+    return normalized
 
 
 class _WindowsBasicLimitInformation(ctypes.Structure):
@@ -2726,6 +2733,20 @@ def consume(lines, index, count):
         fail("VTK array truncated")
     return values, index
 
+def consume_ints(lines, index, count):
+    values = []
+    while len(values) < count and index < len(lines):
+        tokens = lines[index].split()
+        index += 1
+        if not tokens:
+            continue
+        if len(values) + len(tokens) > count:
+            fail("VTK integer array cardinality")
+        values.extend(int(token) for token in tokens)
+    if len(values) != count:
+        fail("VTK integer array truncated")
+    return values, index
+
 def store_array(arrays, name, value):
     if name in arrays:
         fail("duplicate VTK array")
@@ -2739,11 +2760,60 @@ def parse_vtk(payload):
     association = None
     association_count = 0
     arrays = {}
+    points = None
+    cells = None
+    cell_types = None
     index = 0
     while index < len(lines):
         parts = lines[index].split()
         index += 1
         if not parts:
+            continue
+        if parts[0] == "POINTS":
+            if len(parts) != 3 or points is not None:
+                fail("VTK points")
+            point_count = int(parts[1])
+            if point_count <= 0 or point_count > 100000000:
+                fail("VTK point count")
+            values, index = consume(lines, index, point_count * 3)
+            if any(not math.isfinite(value) for value in values):
+                fail("VTK point value")
+            points = [values[offset : offset + 3] for offset in range(0, len(values), 3)]
+            continue
+        if parts[0] == "CELLS":
+            if len(parts) != 3 or cells is not None:
+                fail("VTK cells")
+            cell_count = int(parts[1])
+            integer_count = int(parts[2])
+            if (
+                cell_count <= 0
+                or cell_count > 100000000
+                or integer_count <= cell_count
+                or integer_count > cell_count * 128
+            ):
+                fail("VTK cell count")
+            values, index = consume_ints(lines, index, integer_count)
+            cells = []
+            offset = 0
+            for _ in range(cell_count):
+                if offset >= len(values):
+                    fail("VTK cell cardinality")
+                node_count = values[offset]
+                offset += 1
+                if node_count <= 0 or offset + node_count > len(values):
+                    fail("VTK cell cardinality")
+                cells.append(values[offset : offset + node_count])
+                offset += node_count
+            if offset != len(values):
+                fail("VTK cell cardinality")
+            continue
+        if parts[0] == "CELL_TYPES":
+            if len(parts) != 2 or cell_types is not None:
+                fail("VTK cell types")
+            cell_type_count = int(parts[1])
+            if cell_type_count <= 0 or cell_type_count > 100000000:
+                fail("VTK cell type count")
+            cell_types, index = consume_ints(lines, index, cell_type_count)
             continue
         if parts[0] in {"POINT_DATA", "CELL_DATA"}:
             if len(parts) != 2:
@@ -2780,7 +2850,168 @@ def parse_vtk(payload):
                 parts[1],
                 (association, components, association_count, values),
             )
-    return arrays
+    if points is None or cells is None or cell_types is None:
+        fail("VTK geometry missing")
+    if len(cells) != len(cell_types):
+        fail("VTK geometry cardinality")
+    if any(node < 0 or node >= len(points) for cell in cells for node in cell):
+        fail("VTK node reference")
+    return {
+        "arrays": arrays,
+        "points": points,
+        "cells": cells,
+        "cell_types": cell_types,
+    }
+
+def tet_gradients(vtk_id, natural):
+    r, s, t = natural
+    barycentric = (1.0 - r - s - t, r, s, t)
+    gradients = (
+        (-1.0, -1.0, -1.0),
+        (1.0, 0.0, 0.0),
+        (0.0, 1.0, 0.0),
+        (0.0, 0.0, 1.0),
+    )
+    if vtk_id == 10:
+        return list(gradients)
+    if vtk_id != 24:
+        fail("VTK cell type")
+    result = [
+        tuple((4.0 * barycentric[index] - 1.0) * value for value in gradients[index])
+        for index in range(4)
+    ]
+    for first, second in ((0, 1), (1, 2), (2, 0), (0, 3), (1, 3), (2, 3)):
+        result.append(
+            tuple(
+                4.0
+                * (
+                    barycentric[second] * gradients[first][axis]
+                    + barycentric[first] * gradients[second][axis]
+                )
+                for axis in range(3)
+            )
+        )
+    return result
+
+def jacobian_determinant(points, cell, vtk_id, natural):
+    gradients = tet_gradients(vtk_id, natural)
+    matrix = [
+        [
+            sum(
+                points[node][coordinate] * gradients[local][parameter]
+                for local, node in enumerate(cell)
+            )
+            for parameter in range(3)
+        ]
+        for coordinate in range(3)
+    ]
+    determinant = (
+        matrix[0][0] * (matrix[1][1] * matrix[2][2] - matrix[1][2] * matrix[2][1])
+        - matrix[0][1] * (matrix[1][0] * matrix[2][2] - matrix[1][2] * matrix[2][0])
+        + matrix[0][2] * (matrix[1][0] * matrix[2][1] - matrix[1][1] * matrix[2][0])
+    )
+    if not math.isfinite(determinant):
+        fail("VTK Jacobian")
+    return determinant
+
+def summarize_geometry(parsed_states, state_times):
+    if not parsed_states or len(parsed_states) != len(state_times):
+        fail("VTK geometry states")
+    first = parsed_states[0]
+    cells = first["cells"]
+    cell_types = first["cell_types"]
+    profiles = {
+        10: ("tet4", 4, "gauss1", [(0.25, 0.25, 0.25)]),
+        24: (
+            "tet10",
+            10,
+            "gauss4",
+            [
+                (0.1381966011250105, 0.1381966011250105, 0.1381966011250105),
+                (0.5854101966249685, 0.1381966011250105, 0.1381966011250105),
+                (0.1381966011250105, 0.5854101966249685, 0.1381966011250105),
+                (0.1381966011250105, 0.1381966011250105, 0.5854101966249685),
+            ],
+        ),
+    }
+    counts = {}
+    for cell, vtk_id in zip(cells, cell_types, strict=True):
+        profile = profiles.get(vtk_id)
+        if profile is None or len(cell) != profile[1]:
+            fail("unsupported VTK solid cell")
+        counts[vtk_id] = counts.get(vtk_id, 0) + 1
+    topology = {"cells": cells, "cell_types": cell_types}
+    topology_sha256 = hashlib.sha256(
+        json.dumps(topology, sort_keys=True, separators=(",", ":")).encode("ascii")
+    ).hexdigest()
+    summaries = []
+    expected_topology = (cells, cell_types)
+    total_integration_points = sum(
+        len(profiles[vtk_id][3]) for vtk_id in cell_types
+    )
+    for state_index, (parsed, state_time) in enumerate(
+        zip(parsed_states, state_times, strict=True)
+    ):
+        if (parsed["cells"], parsed["cell_types"]) != expected_topology:
+            fail("VTK topology changed")
+        points = parsed["points"]
+        if len(points) != len(first["points"]):
+            fail("VTK point cardinality changed")
+        minimum = None
+        maximum = None
+        minimum_element_index = None
+        minimum_vtk_id = None
+        minimum_integration_point_index = None
+        for element_index, (cell, vtk_id) in enumerate(
+            zip(cells, cell_types, strict=True)
+        ):
+            for integration_point_index, natural in enumerate(profiles[vtk_id][3]):
+                determinant = jacobian_determinant(points, cell, vtk_id, natural)
+                if minimum is None or determinant < minimum:
+                    minimum = determinant
+                    minimum_element_index = element_index
+                    minimum_vtk_id = vtk_id
+                    minimum_integration_point_index = integration_point_index
+                if maximum is None or determinant > maximum:
+                    maximum = determinant
+        if (
+            minimum is None
+            or maximum is None
+            or minimum_element_index is None
+            or minimum_vtk_id is None
+            or minimum_integration_point_index is None
+            or not math.isfinite(float(state_time))
+        ):
+            fail("VTK Jacobian summary")
+        summaries.append(
+            {
+                "index": state_index,
+                "time": float(state_time),
+                "integration_point_count": total_integration_points,
+                "minimum_jacobian": minimum,
+                "maximum_jacobian": maximum,
+                "minimum_element_index": minimum_element_index,
+                "minimum_vtk_id": minimum_vtk_id,
+                "minimum_integration_point_index": minimum_integration_point_index,
+            }
+        )
+    return {
+        "topology_sha256": topology_sha256,
+        "node_count": len(first["points"]),
+        "element_count": len(cells),
+        "cell_types": [
+            {
+                "vtk_id": vtk_id,
+                "name": profiles[vtk_id][0],
+                "nodes": profiles[vtk_id][1],
+                "elements": counts[vtk_id],
+                "integration_rule": profiles[vtk_id][2],
+                "integration_points": len(profiles[vtk_id][3]),
+            }
+            for vtk_id in sorted(counts)
+        ],
+        "states": summaries,
+    }
 
 def prime_private_pipe_api():
     thread = threading.Thread(target=lambda: None)
@@ -3098,6 +3329,7 @@ def read_fields(fbs, request, stage):
         parse_vtk(payload)
         for payload in export_vtk_to_private_pipes(fbs, model, state_count)
     ]
+    geometry = summarize_geometry(parsed, expected_model["state_times"])
     field_data = {}
     available = [item["name"] for item in expected_model["available_fields"]]
     for field in fields:
@@ -3105,7 +3337,8 @@ def read_fields(fbs, request, stage):
         if field not in available:
             continue
         states = []
-        for state_index, arrays in enumerate(parsed):
+        for state_index, parsed_state in enumerate(parsed):
+            arrays = parsed_state["arrays"]
             raw = arrays.get(source_name)
             if raw is None:
                 fail("missing VTK field")
@@ -3145,6 +3378,7 @@ def read_fields(fbs, request, stage):
         "xplt_sha256": xplt_sha256,
         "available_fields": available,
         "field_data": field_data,
+        "geometry": geometry,
         "model_sha256": model_sha256,
     }
 

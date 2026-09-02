@@ -21,6 +21,13 @@ def _module() -> ModuleType:
     return importlib.import_module("febio_cae_harness.solver.official_fbs")
 
 
+def _embedded_helper_namespace() -> dict[str, Any]:
+    source = _module()._HELPER_SOURCE
+    namespace: dict[str, Any] = {"__name__": "official_fbs_helper_test"}
+    exec(compile(source.rsplit("\nmain()\n", 1)[0], "<official-fbs-helper>", "exec"), namespace)
+    return namespace
+
+
 def _sha256(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
 
@@ -88,6 +95,7 @@ def _tet4_geometry_summary() -> dict[str, object]:
                 "minimum_jacobian": 1.0,
                 "maximum_jacobian": 1.0,
                 "minimum_element_index": 0,
+                "minimum_vtk_id": 10,
                 "minimum_integration_point_index": 0,
             }
         ],
@@ -401,8 +409,10 @@ def test_official_fbs_receipt_retains_validated_geometry_summary(
     [
         ("node_count", 5),
         ("vtk_id", 12),
+        ("integration_rule", "gauss4"),
         ("time", 1.0),
         ("integration_point_count", 2),
+        ("minimum_vtk_id", 24),
         ("minimum_jacobian", float("nan")),
         ("maximum_jacobian", 0.5),
     ],
@@ -418,7 +428,7 @@ def test_official_fbs_geometry_summary_rejects_unbound_or_invalid_values(
     geometry = _tet4_geometry_summary()
     if target in geometry:
         geometry[target] = value
-    elif target == "vtk_id":
+    elif target in {"vtk_id", "integration_rule"}:
         cast(list[dict[str, object]], geometry["cell_types"])[0][target] = value
     else:
         cast(list[dict[str, object]], geometry["states"])[0][target] = value
@@ -611,9 +621,16 @@ def test_field_response_binds_fbs_field_id_and_model_derived_cardinality() -> No
             }
         },
     }
+    geometry = _tet4_geometry_summary()
+    second_state = copy.deepcopy(cast(list[dict[str, object]], geometry["states"])[0])
+    second_state["index"] = 1
+    second_state["time"] = 1.0
+    cast(list[dict[str, object]], geometry["states"]).append(second_state)
+    response["geometry"] = geometry
 
     validated = module._validate_field_response(response, ("stress",), binding)
     assert validated["values"]["stress"]["entity_count"] == 1
+    assert validated["geometry"] == geometry
     response["field_data"]["stress"]["states"][1]["entity_count"] = 2
     response["field_data"]["stress"]["states"][1]["values"] = [1.0] * 18
     with pytest.raises(module.OfficialFbsRuntimeError, match="cardinality"):
@@ -737,6 +754,139 @@ def test_embedded_helper_bounds_total_vtk_payload_across_all_states() -> None:
 
     assert "MAX_TOTAL_VTK_BYTES = 512 * 1024 * 1024" in source
     assert "remaining = MAX_TOTAL_VTK_BYTES - total_bytes" in source
+
+
+def test_embedded_helper_summarizes_all_default_tet4_integration_points() -> None:
+    namespace = _embedded_helper_namespace()
+    vtk = b"""# vtk DataFile Version 3.0
+synthetic tet4
+ASCII
+DATASET UNSTRUCTURED_GRID
+POINTS 4 float
+0 0 0
+1 0 0
+0 1 0
+0 0 1
+CELLS 1 5
+4 0 1 2 3
+CELL_TYPES 1
+10
+CELL_DATA 1
+SCALARS pressure float
+LOOKUP_TABLE default
+0
+"""
+
+    parsed = namespace["parse_vtk"](vtk)
+    geometry = namespace["summarize_geometry"]([parsed], [0.0])
+
+    assert parsed["arrays"]["pressure"][:3] == ("CELL_DATA", 1, 1)
+    assert geometry["node_count"] == 4
+    assert geometry["element_count"] == 1
+    assert geometry["cell_types"] == [
+        {
+            "vtk_id": 10,
+            "name": "tet4",
+            "nodes": 4,
+            "elements": 1,
+            "integration_rule": "gauss1",
+            "integration_points": 1,
+        }
+    ]
+    assert geometry["states"] == [
+        {
+            "index": 0,
+            "time": 0.0,
+            "integration_point_count": 1,
+            "minimum_jacobian": 1.0,
+            "maximum_jacobian": 1.0,
+            "minimum_element_index": 0,
+            "minimum_vtk_id": 10,
+            "minimum_integration_point_index": 0,
+        }
+    ]
+    assert len(geometry["topology_sha256"]) == 64
+
+
+def test_embedded_helper_summarizes_all_default_tet10_integration_points() -> None:
+    namespace = _embedded_helper_namespace()
+    vtk = b"""# vtk DataFile Version 3.0
+synthetic tet10
+ASCII
+DATASET UNSTRUCTURED_GRID
+POINTS 10 float
+0 0 0
+1 0 0
+0 1 0
+0 0 1
+0.5 0 0
+0.5 0.5 0
+0 0.5 0
+0 0 0.5
+0.5 0 0.5
+0 0.5 0.5
+CELLS 1 11
+10 0 1 2 3 4 5 6 7 8 9
+CELL_TYPES 1
+24
+CELL_DATA 1
+SCALARS pressure float
+LOOKUP_TABLE default
+0
+"""
+
+    geometry = namespace["summarize_geometry"]([namespace["parse_vtk"](vtk)], [0.0])
+
+    assert geometry["cell_types"][0] == {
+        "vtk_id": 24,
+        "name": "tet10",
+        "nodes": 10,
+        "elements": 1,
+        "integration_rule": "gauss4",
+        "integration_points": 4,
+    }
+    assert geometry["states"][0]["integration_point_count"] == 4
+    assert geometry["states"][0]["minimum_jacobian"] == pytest.approx(1.0)
+    assert geometry["states"][0]["maximum_jacobian"] == pytest.approx(1.0)
+
+
+def test_embedded_helper_reports_negative_jacobian_and_rejects_topology_change() -> None:
+    namespace = _embedded_helper_namespace()
+    vtk = b"""# vtk DataFile Version 3.0
+synthetic tet4
+ASCII
+DATASET UNSTRUCTURED_GRID
+POINTS 4 float
+0 0 0
+1 0 0
+0 1 0
+0 0 1
+CELLS 1 5
+4 0 1 2 3
+CELL_TYPES 1
+10
+CELL_DATA 1
+SCALARS pressure float
+LOOKUP_TABLE default
+0
+"""
+    initial = namespace["parse_vtk"](vtk)
+    inverted = copy.deepcopy(initial)
+    inverted["points"][1], inverted["points"][2] = (
+        inverted["points"][2],
+        inverted["points"][1],
+    )
+
+    geometry = namespace["summarize_geometry"]([initial, inverted], [0.0, 1.0])
+
+    assert geometry["states"][0]["minimum_jacobian"] == 1.0
+    assert geometry["states"][1]["minimum_jacobian"] == -1.0
+    assert geometry["states"][1]["minimum_vtk_id"] == 10
+
+    changed = copy.deepcopy(inverted)
+    changed["cells"][0] = [0, 2, 1, 3]
+    with pytest.raises(RuntimeError, match="topology changed"):
+        namespace["summarize_geometry"]([initial, changed], [0.0, 1.0])
 
 
 def test_helper_holds_staged_runtime_against_replacement(
