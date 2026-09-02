@@ -35,6 +35,7 @@ __all__ = [
 
 _AdapterReader = Callable[[Path, Sequence[str]], object]
 _PROVENANCE = "synthetic-unverified"
+_OFFICIAL_PROVENANCE = "official"
 _AUTHORITY_TOKEN = object()
 
 
@@ -150,6 +151,9 @@ class _ManagerRecord:
     adapter: object
     reader: _AdapterReader
     runtime_identity: str
+    official: bool
+    profile: str | None
+    provenance: str
     attempt_root: Path | None
     root_binding: _RootBinding | None
     authority: FbsAdapterAuthority | None = None
@@ -163,6 +167,9 @@ class _AuthorityRecord:
     adapter: object
     reader: _AdapterReader
     runtime_identity: str
+    official: bool
+    profile: str | None
+    provenance: str
     attempt_root: Path | None
     root_binding: _RootBinding | None
 
@@ -458,10 +465,18 @@ def _windows_open_relative(
     share_mode: int,
     create_options: int,
     path: Path,
+    *,
+    create_disposition: int = 1,
 ) -> _OwnedHandle:
     with _HANDLE_LOCK:
         return _windows_open_relative_locked(
-            parent, name, desired_access, share_mode, create_options, path
+            parent,
+            name,
+            desired_access,
+            share_mode,
+            create_options,
+            path,
+            create_disposition=create_disposition,
         )
 
 
@@ -472,6 +487,8 @@ def _windows_open_relative_locked(
     share_mode: int,
     create_options: int,
     path: Path,
+    *,
+    create_disposition: int = 1,
 ) -> _OwnedHandle:
     parent_value = _owned_value(parent)
     name_buffer = ctypes.create_unicode_buffer(name)
@@ -515,7 +532,7 @@ def _windows_open_relative_locked(
             None,
             wintypes.ULONG(0),
             wintypes.ULONG(share_mode),
-            wintypes.ULONG(1),
+            wintypes.ULONG(create_disposition),
             wintypes.ULONG(create_options),
             None,
             wintypes.ULONG(0),
@@ -1018,6 +1035,11 @@ class FbsAdapterManager:
         reader = _adapter_reader(adapter)
         _drain_pending_cleanup()
         root = _normalise_root(attempt_root) if attempt_root is not None else None
+        from .official_fbs import _official_adapter_identity
+
+        official_profile = _official_adapter_identity(adapter, runtime_identity.strip(), root)
+        official = official_profile is not None
+        provenance = _OFFICIAL_PROVENANCE if official else _PROVENANCE
         root_binding = _hold_root(root) if root is not None else None
         object.__setattr__(self, "_finalizer", None)
         object.__setattr__(
@@ -1028,6 +1050,9 @@ class FbsAdapterManager:
                 adapter=adapter,
                 reader=reader,
                 runtime_identity=runtime_identity.strip(),
+                official=official,
+                profile=official_profile,
+                provenance=provenance,
                 attempt_root=root,
                 root_binding=root_binding,
             ),
@@ -1108,6 +1133,9 @@ class FbsAdapterManager:
                 adapter=record.adapter,
                 reader=record.reader,
                 runtime_identity=record.runtime_identity,
+                official=record.official,
+                profile=record.profile,
+                provenance=record.provenance,
                 attempt_root=record.attempt_root,
                 root_binding=record.root_binding,
             )
@@ -1514,7 +1542,7 @@ def _freeze_value(value: object) -> object:
 
 @dataclass(frozen=True, slots=True)
 class FbsValidation:
-    """Immutable, synthetic validation bound to one issued authority."""
+    """Immutable validation bound to one issued synthetic or official authority."""
 
     xplt_path: Path
     requested_fields: tuple[str, ...]
@@ -1537,8 +1565,8 @@ class FbsValidation:
             record = _authority_record(self.authority)
             if self.runtime_identity != record.runtime_identity:
                 raise ValueError("validation runtime identity does not match authority")
-            if self.official or self.provenance != _PROVENANCE:
-                raise ValueError("issued validation cannot claim unverified provenance")
+            if self.official is not record.official or self.provenance != record.provenance:
+                raise ValueError("validation provenance does not match authority")
         values = dict(self.values)
         object.__setattr__(
             self,
@@ -1730,7 +1758,8 @@ def _invalid_validation(
         missing_fields=fields,
         non_finite_fields=(),
         valid=False,
-        provenance=_PROVENANCE,
+        official=record.official,
+        provenance=record.provenance,
         digest_before=digest_before,
         digest_after=digest_after,
         issues=(issue,),
@@ -1768,7 +1797,8 @@ def _build_validation(
         missing_fields=missing,
         non_finite_fields=non_finite,
         valid=not issues and digest_before == digest_after,
-        provenance=_PROVENANCE,
+        official=record.official,
+        provenance=record.provenance,
         digest_before=digest_before,
         digest_after=digest_after,
         issues=tuple(issues),

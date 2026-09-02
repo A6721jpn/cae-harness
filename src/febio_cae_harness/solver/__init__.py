@@ -20,6 +20,13 @@ from .headless import (
     run_headless_febio_session,
 )
 from .log import LogValidation, LogValidator, validate_log, validate_solver_log
+from .official_fbs import (
+    OfficialFbsRuntime,
+    OfficialFbsRuntimeError,
+    open_official_fbs_manager,
+    probe_official_fbs_runtime,
+    validate_official_fbs_runtime,
+)
 from .runtime import (
     FebioRuntimeDiagnostic,
     RuntimeDiagnostic,
@@ -63,6 +70,8 @@ __all__ = [
     "FebioRuntimeDiagnostic",
     "OutputExpectation",
     "OutputFreshnessError",
+    "OfficialFbsRuntime",
+    "OfficialFbsRuntimeError",
     "ProcessState",
     "RunState",
     "SolverClassification",
@@ -79,13 +88,16 @@ __all__ = [
     "RuntimeProbeDiagnostic",
     "RuntimeProbeError",
     "probe_febio",
+    "probe_official_fbs_runtime",
     "probe_runtime",
+    "open_official_fbs_manager",
     "record_execution_output_artifacts",
     "recover_headless_febio",
     "reconnect_headless_febio",
     "run_headless_febio",
     "run_headless_febio_session",
     "validate_log",
+    "validate_official_fbs_runtime",
     "validate_requested_fields",
     "validate_runtime_diagnostic",
     "validate_solver_log",

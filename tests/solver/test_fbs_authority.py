@@ -1171,6 +1171,7 @@ def _supervisor_with_fbs(
         expected_steps=2,
         expected_final_time=1.0,
         timeout_seconds=None,
+        requested_fields=("stress",),
     )
     fbs_manager = FbsAdapterManager(MappingAdapter(), "synthetic-runtime", attempt.root)
     authority = fbs_manager.issue_authority()
