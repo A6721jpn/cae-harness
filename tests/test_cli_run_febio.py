@@ -13,6 +13,7 @@ import pytest
 from febio_cae_harness import cli as cli_module
 from febio_cae_harness.cli_context import CaseContextService, dump_root_capability
 from febio_cae_harness.contracts import IntentContract, IntentState
+from febio_cae_harness.solver import headless as headless_module
 from febio_cae_harness.solver.execution import issue_execution_authority
 from febio_cae_harness.solver.headless import HeadlessRunDiagnostic
 from febio_cae_harness.solver.runtime import (
@@ -20,11 +21,12 @@ from febio_cae_harness.solver.runtime import (
     RuntimeProbeError,
     probe_febio,
 )
+from febio_cae_harness.solver.supervisor import SolverSupervisor
 from febio_cae_harness.solver.types import SolverClassification, SolverState
 from febio_cae_harness.workspace import AttemptWorkspace
 
 
-def _complete_intent() -> IntentContract:
+def _complete_intent(*, retry_budget: int | None = None) -> IntentContract:
     names = (
         "engineering_question",
         "units",
@@ -50,6 +52,7 @@ def _complete_intent() -> IntentContract:
             name: {"authoritative": True, "current": True, "source": "synthetic-user"}
             for name in names
         },
+        retry_budget=retry_budget,
         state=IntentState.GATHERING,
     )
 
@@ -278,6 +281,111 @@ def test_reconnect_febio_reports_authenticated_solver_failure_without_new_attemp
     ]
     assert events[-1]["event_type"] == "run_febio_terminal"
     assert events[-1]["payload"]["status"] == "SOLVER_FAILED"
+
+
+def test_reconnect_febio_persists_retry_reservation_before_terminal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    service, capability, case_root = _register_case(
+        tmp_path,
+        intent=_complete_intent(retry_budget=1),
+    )
+    opened = service._open_context(capability, "case-a")
+    opened.store.record_attempt("run-existing", {"status": "started"})
+
+    class CompletedProbe:
+        returncode = 0
+
+        def communicate(self, input: bytes, timeout: float) -> tuple[bytes, bytes]:
+            assert input == b"quit\n"
+            assert timeout > 0
+            return b"version 4.12.0\n", b""
+
+    with monkeypatch.context() as probe_patch:
+        probe_patch.setattr(
+            "febio_cae_harness.solver.runtime.subprocess.Popen",
+            lambda command, **kwargs: CompletedProbe(),
+        )
+        runtime = probe_febio(Path(sys.executable))
+
+    def recover_timeout(
+        store: Any,
+        snapshot: Any,
+        runtime_diagnostic: FebioRuntimeDiagnostic,
+        attempt_id: str,
+    ) -> Any:
+        case = store.case_workspace
+        attempt = AttemptWorkspace._from_manager(
+            case,
+            attempt_id,
+            case.temporary_root / "attempts" / attempt_id,
+        )
+        input_path = attempt.write_text(
+            "retry-timeout.feb",
+            "import time; time.sleep(30)",
+        )
+        supervisor = SolverSupervisor(
+            headless_module._issue_launch_capability(
+                attempt,
+                snapshot,
+                runtime_diagnostic,
+                input_path,
+                expected_steps=None,
+                expected_final_time=None,
+                timeout_seconds=0.1,
+            )
+        )
+        result = supervisor.run()
+        assert result.state is SolverState.TIMED_OUT
+        assert result.classification is SolverClassification.TIMEOUT
+        return SimpleNamespace(
+            supervisor=supervisor,
+            execution=SimpleNamespace(
+                log_path=result.log_path,
+                xplt_path=result.xplt_path,
+            ),
+        )
+
+    _set_capability_stdin(monkeypatch, capability)
+    monkeypatch.setattr(cli_module, "_case_service", lambda: service)
+    monkeypatch.setattr(cli_module, "probe_febio", lambda path: runtime)
+    monkeypatch.setattr(cli_module, "recover_headless_febio", recover_timeout)
+
+    assert cli_module.main(_reconnect_arguments(runtime.path)) == 4
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    response = json.loads(captured.err)
+    assert response["error"]["code"] == "SOLVER_FAILED"
+    terminal_events = [
+        event
+        for event in (
+            json.loads(line)
+            for line in (case_root / "90_Temporary" / "events.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        )
+        if event["event_type"] == "run_febio_terminal"
+    ]
+    assert len(terminal_events) == 1
+    terminal = terminal_events[0]["payload"]
+    assert {
+        key: value for key, value in terminal.items() if key not in {"autonomy", "return_code"}
+    } == {
+        "attempt_id": "run-existing",
+        "classification": "TIMEOUT",
+        "official_fbs": False,
+        "solver_state": "TIMED_OUT",
+        "status": "SOLVER_FAILED",
+    }
+    assert terminal["return_code"] is None or isinstance(terminal["return_code"], int)
+    assert terminal["autonomy"]["decision"] == "RETRY"
+    assert terminal["autonomy"]["failure"] == "TIMEOUT"
+    assert terminal["autonomy"]["retry_budget"] == 1
+    assert terminal["autonomy"]["retry_used"] == 1
+    assert len(terminal["autonomy"]["reservation_id"]) == 64
 
 
 def test_reconnect_febio_claims_exact_outputs_but_remains_fbs_unverified(

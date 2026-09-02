@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import cast
 
 from febio_cae_harness import __version__
+from febio_cae_harness.autonomy import RetryLedger, decide_retry, transition_intent
 from febio_cae_harness.cli_context import (
     CaseContextError,
     CaseContextService,
@@ -715,11 +716,19 @@ def _reconnect_febio_command(arguments: argparse.Namespace) -> int:
             or result.log_path != execution.log_path
             or result.xplt_path != execution.xplt_path
         ):
-            if not _append_run_terminal(
-                opened.store,
-                attempt_id,
-                "SOLVER_FAILED",
-                solver=solver,
+            state_authority = transition_intent(snapshot)
+            retry = decide_retry(
+                result.classification.value,
+                RetryLedger.from_store(state_authority, opened.store),
+                intent=state_authority,
+                supervisor=session.supervisor,
+                result=result,
+            )
+            retry_reserved = retry.reservation_required
+            if retry_reserved:
+                retry.persist(opened.store, state_authority)
+            if not retry_reserved and not _append_run_terminal(
+                opened.store, attempt_id, "SOLVER_FAILED", solver=solver
             ):
                 return _fail_run(
                     _RunCommandError(
