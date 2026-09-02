@@ -1430,30 +1430,206 @@ class EvidenceStore:
         """Create a new attempt record and link it into the event chain."""
 
         _validate_segment(attempt_id, "attempt_id")
+        normalised_payload = self._normalise_payload(payload)
+        if "retry_claim" in normalised_payload:
+            raise EvidenceIntegrityError("retry claim payloads are reserved")
         with self._transaction():
             self._load_and_validate(None)
-            normalised_payload = self._normalise_payload(payload)
-            body: dict[str, object] = {
-                "schema_version": SCHEMA_VERSION,
-                "case_id": self.case_workspace.case_id,
-                "attempt_id": attempt_id,
-                "payload": normalised_payload,
-            }
-            record = dict(body)
-            record["sha256"] = _digest(body)
+            return self._record_attempt_locked(attempt_id, normalised_payload)
 
-            attempt_root = f"90_Temporary/attempts/{attempt_id}"
-            event = self._prepare_event(
-                "attempt_recorded", {"attempt_id": attempt_id, "sha256": record["sha256"]}
+    def _claim_retry_attempt(
+        self,
+        expected_snapshot: IntentSnapshotAuthority,
+        attempt_id: str,
+        claim_payload: Mapping[str, Any],
+    ) -> dict[str, object]:
+        """Atomically bind one durable retry reservation to one fresh attempt."""
+
+        _validate_segment(attempt_id, "attempt_id")
+        claim = self._normalise_payload(claim_payload)
+        expected_fields = {
+            "failure",
+            "intent_sha256",
+            "parent_attempt_id",
+            "proposal_id",
+            "reservation_id",
+            "retry_budget",
+            "retry_used",
+        }
+        if set(claim) != expected_fields:
+            raise EvidenceIntegrityError("retry claim payload is invalid")
+        parent_attempt_id = claim.get("parent_attempt_id")
+        failure = claim.get("failure")
+        intent_sha256 = claim.get("intent_sha256")
+        proposal_id = claim.get("proposal_id")
+        reservation_id = claim.get("reservation_id")
+        retry_budget = claim.get("retry_budget")
+        retry_used = claim.get("retry_used")
+        if not isinstance(parent_attempt_id, str):
+            raise EvidenceIntegrityError("retry claim parent attempt is invalid")
+        try:
+            _validate_segment(parent_attempt_id, "parent_attempt_id")
+        except (TypeError, ValueError) as error:
+            raise EvidenceIntegrityError("retry claim parent attempt is invalid") from error
+        if (
+            failure != "TIMEOUT"
+            or proposal_id is not None
+            or not isinstance(intent_sha256, str)
+            or len(intent_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in intent_sha256)
+            or not isinstance(reservation_id, str)
+            or len(reservation_id) != 64
+            or any(character not in "0123456789abcdef" for character in reservation_id)
+            or retry_budget is not None
+            and (
+                isinstance(retry_budget, bool)
+                or not isinstance(retry_budget, int)
+                or retry_budget < 0
             )
-            self._publish_event_recovery(event)
-            self._exact().make_directory(attempt_root)
-            self._exact().replace_bytes(
-                f"{attempt_root}/{ATTEMPT_FILE}",
-                _json_text(record).encode("utf-8"),
-            )
-            self._append_prepared_event(event)
-            return record
+            or isinstance(retry_used, bool)
+            or not isinstance(retry_used, int)
+            or retry_used <= 0
+            or retry_budget is not None
+            and retry_used > retry_budget
+        ):
+            raise EvidenceIntegrityError("retry claim payload is invalid")
+
+        attempt_payload = {
+            "retry_claim": claim,
+            "status": "retry_claimed",
+        }
+        with self._transaction():
+            self._load_and_validate(None)
+            if _digest(self._intent.to_dict()) != intent_sha256:
+                raise EvidenceIntegrityError("retry claim intent is stale")
+
+            attempts = self._read_attempts()
+            attempt_ids = [item.get("attempt_id") for item in attempts]
+            if attempt_ids.count(parent_attempt_id) != 1:
+                raise EvidenceIntegrityError("retry claim parent attempt is invalid")
+
+            events, _ = self._read_events()
+            matching_terminals = [
+                cast(dict[str, Any], event["payload"])
+                for event in events
+                if event.get("event_type") == "run_febio_terminal"
+                and isinstance(event.get("payload"), dict)
+                and isinstance(event["payload"].get("autonomy"), dict)
+                and event["payload"]["autonomy"].get("reservation_id") == reservation_id
+            ]
+            if len(matching_terminals) != 1:
+                raise EvidenceIntegrityError("retry claim reservation is not durable")
+            terminal = matching_terminals[0]
+            autonomy = cast(dict[str, Any], terminal["autonomy"])
+            if (
+                terminal.get("attempt_id") != parent_attempt_id
+                or terminal.get("classification") != "TIMEOUT"
+                or terminal.get("official_fbs") is not False
+                or terminal.get("solver_state") != "TIMED_OUT"
+                or terminal.get("status") != "SOLVER_FAILED"
+                or autonomy.get("decision") != "RETRY"
+                or autonomy.get("route") != "RETRY"
+                or autonomy.get("failure") != failure
+                or autonomy.get("intent_sha256") != intent_sha256
+                or autonomy.get("proposal_id") != proposal_id
+                or autonomy.get("reservation_id") != reservation_id
+                or autonomy.get("retry_budget") != retry_budget
+                or autonomy.get("retry_used") != retry_used
+            ):
+                raise EvidenceIntegrityError("retry claim differs from durable reservation")
+
+            claims = self._read_retry_attempt_claims_locked()
+            existing_claims = [
+                item
+                for item in claims
+                if cast(dict[str, object], item["payload"])["retry_claim"] == claim
+                or cast(dict[str, Any], item["payload"])["retry_claim"].get("reservation_id")
+                == reservation_id
+            ]
+            if existing_claims:
+                if (
+                    len(existing_claims) == 1
+                    and existing_claims[0]["attempt_id"] == attempt_id
+                    and existing_claims[0]["payload"] == attempt_payload
+                ):
+                    return existing_claims[0]
+                raise EvidenceIntegrityError("retry reservation is already claimed")
+            self._validate_expected_intent_snapshot(expected_snapshot)
+            if attempt_id in attempt_ids:
+                raise EvidenceIntegrityError("retry claim attempt already exists")
+            return self._record_attempt_locked(attempt_id, attempt_payload)
+
+    def _read_retry_attempt_claims_locked(self) -> list[dict[str, object]]:
+        """Read every canonical retry-claim attempt while holding the case lock."""
+
+        claims: list[dict[str, object]] = []
+        for attempt in self._read_attempts():
+            path = attempt.get("path")
+            if not isinstance(path, str):  # pragma: no cover - validated by reader
+                raise EvidenceIntegrityError("retry claim attempt path is invalid")
+            record = self._read_json(self._safe_case_file(path))
+            payload = record.get("payload")
+            if not isinstance(payload, dict) or "retry_claim" not in payload:
+                continue
+            if (
+                set(payload) != {"retry_claim", "status"}
+                or payload.get("status") != "retry_claimed"
+            ):
+                raise EvidenceIntegrityError("durable retry claim is invalid")
+            claim = payload.get("retry_claim")
+            if not isinstance(claim, dict) or set(claim) != {
+                "failure",
+                "intent_sha256",
+                "parent_attempt_id",
+                "proposal_id",
+                "reservation_id",
+                "retry_budget",
+                "retry_used",
+            }:
+                raise EvidenceIntegrityError("durable retry claim is invalid")
+            reservation_id = claim.get("reservation_id")
+            if (
+                not isinstance(reservation_id, str)
+                or len(reservation_id) != 64
+                or any(character not in "0123456789abcdef" for character in reservation_id)
+            ):
+                raise EvidenceIntegrityError("durable retry claim is invalid")
+            claims.append(record)
+        reservation_ids = [
+            cast(dict[str, Any], item["payload"])["retry_claim"]["reservation_id"]
+            for item in claims
+        ]
+        if len(reservation_ids) != len(set(reservation_ids)):
+            raise EvidenceIntegrityError("retry reservation was claimed more than once")
+        return claims
+
+    def _record_attempt_locked(
+        self,
+        attempt_id: str,
+        normalised_payload: Mapping[str, Any],
+    ) -> dict[str, object]:
+        """Create one attempt record while holding the exact evidence transaction."""
+
+        body: dict[str, object] = {
+            "schema_version": SCHEMA_VERSION,
+            "case_id": self.case_workspace.case_id,
+            "attempt_id": attempt_id,
+            "payload": dict(normalised_payload),
+        }
+        record = dict(body)
+        record["sha256"] = _digest(body)
+        attempt_root = f"90_Temporary/attempts/{attempt_id}"
+        event = self._prepare_event(
+            "attempt_recorded", {"attempt_id": attempt_id, "sha256": record["sha256"]}
+        )
+        self._publish_event_recovery(event)
+        self._exact().make_directory(attempt_root)
+        self._exact().replace_bytes(
+            f"{attempt_root}/{ATTEMPT_FILE}",
+            _json_text(record).encode("utf-8"),
+        )
+        self._append_prepared_event(event)
+        return record
 
     def record_artifact(
         self,

@@ -1641,6 +1641,23 @@ class RetryLedger:
             evidence_ids=evidence_ids,
         )
 
+    def claim_attempt(
+        self,
+        store: EvidenceStore,
+        authority: IntentStateAuthority,
+        reservation_id: str,
+        attempt_id: str,
+    ) -> dict[str, object]:
+        """Atomically bind one durable no-change reservation to a fresh attempt."""
+
+        return _claim_retry_attempt(
+            self,
+            store,
+            authority,
+            reservation_id,
+            attempt_id,
+        )
+
 
 def _retry_record_projection(record: RetryRecord) -> tuple[object, ...]:
     if type(record) is not RetryRecord:
@@ -1726,6 +1743,51 @@ def _validated_retry_ledger(
     if _retry_ledger_projection(ledger) != record[7]:
         raise EvidenceIntegrityError("retry ledger projection was modified")
     return record
+
+
+def _claim_retry_attempt(
+    ledger: RetryLedger,
+    store: EvidenceStore,
+    authority: IntentStateAuthority,
+    reservation_id: str,
+    attempt_id: str,
+) -> dict[str, object]:
+    """Validate policy authority before the evidence layer consumes a reservation."""
+
+    if type(store) is not EvidenceStore:
+        raise TypeError("store must be an exact EvidenceStore")
+    if type(authority) is not IntentStateAuthority:
+        raise TypeError("authority must be an exact IntentStateAuthority")
+    if not isinstance(reservation_id, str):
+        raise TypeError("reservation_id must be a string")
+    if not isinstance(attempt_id, str):
+        raise TypeError("attempt_id must be a string")
+    ledger_record = _validated_retry_ledger(ledger, authority)
+    matches = [record for record in ledger.records if record.reservation_id == reservation_id]
+    if len(matches) != 1:
+        raise EvidenceIntegrityError("retry reservation is not present in the authorized ledger")
+    retry_record = matches[0]
+    if retry_record.failure is not FailureClass.TIMEOUT or retry_record.proposal_id is not None:
+        raise EvidenceIntegrityError(
+            "retry reservation requires live proposal authority and cannot be claimed"
+        )
+    if retry_record.attempt_id is None:
+        raise EvidenceIntegrityError("retry reservation parent attempt is missing")
+    snapshot = ledger_record[2]
+    record_index = ledger.records.index(retry_record)
+    return store._claim_retry_attempt(
+        snapshot,
+        attempt_id,
+        {
+            "failure": retry_record.failure.value,
+            "intent_sha256": snapshot.intent_sha256,
+            "parent_attempt_id": retry_record.attempt_id,
+            "proposal_id": retry_record.proposal_id,
+            "reservation_id": reservation_id,
+            "retry_budget": ledger.budget,
+            "retry_used": record_index + 1,
+        },
+    )
 
 
 @dataclass(frozen=True, slots=True)

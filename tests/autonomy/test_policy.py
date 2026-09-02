@@ -247,6 +247,36 @@ def _restore_retry_ledger_from_fresh_process(
         results.put(("error", type(error).__name__, str(error)))
 
 
+def _claim_retry_from_fresh_process(
+    tool_root: str,
+    cae_root: str,
+    case_id: str,
+    reservation_id: str,
+    attempt_id: str,
+    start_gate: Any,
+    results: Any,
+) -> None:
+    """Race one durable retry claim from a spawned interpreter."""
+
+    try:
+        manager = ValidatedCaseWorkspace(Path(tool_root), Path(cae_root))
+        case = manager.open_case(case_id)
+        store = EvidenceStore.open(case)
+        state = run_transition(store.issue_intent_snapshot())
+        ledger = RetryLedger.from_store(state, store)
+        if not start_gate.wait(timeout=10):
+            raise TimeoutError("retry claim start gate timed out")
+        record = ledger.claim_attempt(store, state, reservation_id, attempt_id)
+        attempt = AttemptWorkspace._from_manager(
+            case,
+            attempt_id,
+            case.temporary_root / "attempts" / attempt_id,
+        )
+        results.put(("ok", attempt.attempt_id, record["sha256"]))
+    except BaseException as error:  # pragma: no cover - assertion reports details
+        results.put(("error", attempt_id, type(error).__name__, str(error)))
+
+
 def test_transition_binds_only_when_complete_and_blocks_authoritative_unknowns(
     tmp_path: Path,
 ) -> None:
@@ -1655,6 +1685,196 @@ def test_retry_ledger_survives_fresh_process_and_interrupted_append(
         1,
         (("TIMEOUT", "attempt-a", None, reservation_id),),
     )
+
+
+def test_retry_reservation_claim_is_atomic_and_single_use(
+    tmp_path: Path,
+    request: pytest.FixtureRequest,
+) -> None:
+    intent = bound_intent(retry_budget=2)
+    workspace_temp, workspace_root = short_workspace_root(tmp_path)
+    request.addfinalizer(workspace_temp.cleanup)
+    state, snapshot = retry_state_for_case(
+        workspace_root,
+        "case-retry-claim",
+        intent,
+        attempt_ids=("attempt-a",),
+    )
+    intent_sha256 = snapshot.intent_sha256
+    case = object.__getattribute__(snapshot, "_case_workspace")
+    store = object.__getattribute__(snapshot, "_store")
+    supervisor = timeout_supervisor(
+        tmp_path / "retry-claim-solver",
+        case_id="case-retry-claim",
+        intent=intent,
+        workspace_root=workspace_root,
+        case_workspace=case,
+        record_attempt=False,
+    )
+    result = supervisor.run(timeout_seconds=0.1)
+    retry = decide_retry(
+        FailureClass.TIMEOUT,
+        RetryLedger.from_authority(state),
+        intent=state,
+        supervisor=supervisor,
+        result=result,
+    )
+    retry.persist(store, state)
+    reservation_id = retry.reservation_id
+    assert isinstance(reservation_id, str)
+
+    reopened = EvidenceStore.open(case)
+    reopened_state = run_transition(reopened.issue_intent_snapshot())
+    ledger = RetryLedger.from_store(reopened_state, reopened)
+
+    with pytest.raises(EvidenceIntegrityError, match="reserved"):
+        reopened.record_attempt(
+            "attempt-raw",
+            {"retry_claim": {"reservation_id": reservation_id}},
+        )
+
+    def claim(attempt_id: str) -> tuple[str, str, object]:
+        try:
+            record = ledger.claim_attempt(
+                reopened,
+                reopened_state,
+                reservation_id,
+                attempt_id,
+            )
+        except EvidenceIntegrityError as error:
+            return ("error", attempt_id, str(error))
+        return ("ok", attempt_id, record)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = tuple(executor.map(claim, ("attempt-b", "attempt-c")))
+
+    successes = tuple(outcome for outcome in outcomes if outcome[0] == "ok")
+    failures = tuple(outcome for outcome in outcomes if outcome[0] == "error")
+    assert len(successes) == 1
+    assert len(failures) == 1
+    assert "already claimed" in cast(str, failures[0][2])
+
+    winning_attempt_id = successes[0][1]
+    winning_record = cast(dict[str, object], successes[0][2])
+    assert winning_record["attempt_id"] == winning_attempt_id
+    assert winning_record["payload"] == {
+        "retry_claim": {
+            "failure": "TIMEOUT",
+            "intent_sha256": intent_sha256,
+            "parent_attempt_id": "attempt-a",
+            "proposal_id": None,
+            "reservation_id": reservation_id,
+            "retry_budget": 2,
+            "retry_used": 1,
+        },
+        "status": "retry_claimed",
+    }
+    claimed_attempt = AttemptWorkspace._from_manager(
+        case,
+        winning_attempt_id,
+        case.temporary_root / "attempts" / winning_attempt_id,
+    )
+    assert claimed_attempt.attempt_id == winning_attempt_id
+    replay_store = EvidenceStore.open(case)
+    replay_state = run_transition(replay_store.issue_intent_snapshot())
+    replay_ledger = RetryLedger.from_store(replay_state, replay_store)
+    replay = replay_ledger.claim_attempt(
+        replay_store,
+        replay_state,
+        reservation_id,
+        winning_attempt_id,
+    )
+    assert replay == winning_record
+
+    attempt_records = sorted(case.temporary_root.joinpath("attempts").iterdir())
+    assert [path.name for path in attempt_records] == ["attempt-a", winning_attempt_id]
+    attempt_events = [
+        json.loads(line)
+        for line in reopened.events_path.read_text(encoding="utf-8").splitlines()
+        if json.loads(line)["event_type"] == "attempt_recorded"
+    ]
+    assert len(attempt_events) == 2
+
+
+def test_retry_reservation_claim_is_single_use_across_processes(
+    tmp_path: Path,
+    request: pytest.FixtureRequest,
+) -> None:
+    intent = bound_intent(retry_budget=2)
+    workspace_temp, workspace_root = short_workspace_root(tmp_path)
+    request.addfinalizer(workspace_temp.cleanup)
+    state, snapshot = retry_state_for_case(
+        workspace_root,
+        "case-process-retry-claim",
+        intent,
+        attempt_ids=("attempt-a",),
+    )
+    case = object.__getattribute__(snapshot, "_case_workspace")
+    store = object.__getattribute__(snapshot, "_store")
+    supervisor = timeout_supervisor(
+        tmp_path / "process-retry-claim-solver",
+        case_id="case-process-retry-claim",
+        intent=intent,
+        workspace_root=workspace_root,
+        case_workspace=case,
+        record_attempt=False,
+    )
+    result = supervisor.run(timeout_seconds=0.1)
+    retry = decide_retry(
+        FailureClass.TIMEOUT,
+        RetryLedger.from_authority(state),
+        intent=state,
+        supervisor=supervisor,
+        result=result,
+    )
+    retry.persist(store, state)
+    reservation_id = retry.reservation_id
+    assert isinstance(reservation_id, str)
+
+    context = multiprocessing.get_context("spawn")
+    start_gate = context.Event()
+    results = context.Queue()
+    children = tuple(
+        context.Process(
+            target=_claim_retry_from_fresh_process,
+            args=(
+                str(workspace_root / "t"),
+                str(workspace_root / "c"),
+                "case-process-retry-claim",
+                reservation_id,
+                attempt_id,
+                start_gate,
+                results,
+            ),
+        )
+        for attempt_id in ("attempt-b", "attempt-c")
+    )
+    for child in children:
+        child.start()
+    start_gate.set()
+    for child in children:
+        child.join(timeout=20)
+
+    assert all(not child.is_alive() for child in children)
+    outcomes = tuple(results.get(timeout=5) for _ in children)
+    assert all(child.exitcode == 0 for child in children)
+    successes = tuple(outcome for outcome in outcomes if outcome[0] == "ok")
+    failures = tuple(outcome for outcome in outcomes if outcome[0] == "error")
+    assert len(successes) == 1
+    assert len(failures) == 1
+    assert failures[0][2] == "EvidenceIntegrityError"
+    assert "already claimed" in failures[0][3] or "stale" in failures[0][3]
+    assert sorted(path.name for path in case.temporary_root.joinpath("attempts").iterdir()) == [
+        "attempt-a",
+        successes[0][1],
+    ]
+
+    results.close()
+    results.join_thread()
+    for child in children:
+        child.close()
+    del results, start_gate, children
+    gc.collect()
 
 
 @pytest.mark.parametrize("malformation", ["autonomy_null", "solver_state_mismatch"])
