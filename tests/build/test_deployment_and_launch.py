@@ -67,6 +67,35 @@ def test_stage_publishes_latest_atomically_and_records_identity(tmp_path: Path) 
     assert not list(receipt.layout.staging_root.iterdir())
 
 
+def test_stage_atomically_replaces_an_empty_legacy_latest_directory(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    local = tmp_path / "local"
+    make_build(source)
+    legacy = local / "FEBioCaeWorkbench" / "latest-development"
+    legacy.mkdir(parents=True)
+
+    receipt = stage_latest_development(source, local, identity())
+
+    assert receipt.latest == legacy
+    assert (legacy / LAUNCHER_NAME).is_file()
+    assert receipt.rollback_path is None
+    assert receipt.previous_identity is None
+
+
+def test_stage_rejects_a_nonempty_unidentified_latest_directory(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    local = tmp_path / "local"
+    make_build(source)
+    legacy = local / "FEBioCaeWorkbench" / "latest-development"
+    legacy.mkdir(parents=True)
+    (legacy / "unknown.txt").write_text("preserve me", encoding="utf-8")
+
+    with pytest.raises(DeploymentError, match="existing deployment identity is invalid"):
+        stage_latest_development(source, local, identity())
+
+    assert (legacy / "unknown.txt").read_text(encoding="utf-8") == "preserve me"
+
+
 def test_stage_keeps_previous_build_and_can_roll_back(tmp_path: Path) -> None:
     local = tmp_path / "local"
     first_source = tmp_path / "first"

@@ -632,18 +632,34 @@ def stage_latest_development(
 
             latest = _reject_reparse_alias(layout.latest, "latest deployment")
             rollback_path: Path | None = None
+            empty_legacy_path: Path | None = None
             previous_identity: BuildIdentity | None = None
             if os.path.lexists(os.fspath(latest)):
                 _validate_tree(latest, "latest deployment")
                 try:
                     previous_identity = _identity_from_directory(latest)
                 except DeploymentRollbackError as error:
-                    raise DeploymentError("existing deployment identity is invalid") from error
-                rollback_parent = _reject_reparse_alias(layout.rollback_root, "rollback root")
-                rollback_parent.mkdir(parents=True, exist_ok=True)
-                _reject_reparse_alias(rollback_parent, "rollback root")
-                rollback_path = rollback_parent / f"previous-{uuid.uuid4().hex}"
-                os.replace(os.fspath(latest), os.fspath(rollback_path))
+                    try:
+                        is_empty = next(latest.iterdir(), None) is None
+                    except OSError as inspection_error:
+                        raise DeploymentError(
+                            "cannot inspect unidentified existing deployment"
+                        ) from inspection_error
+                    if not is_empty:
+                        raise DeploymentError("existing deployment identity is invalid") from error
+                    empty_legacy_path = layout.staging_root / f"empty-{uuid.uuid4().hex}"
+                    os.replace(os.fspath(latest), os.fspath(empty_legacy_path))
+                    _validate_tree(empty_legacy_path, "empty legacy deployment")
+                    if next(empty_legacy_path.iterdir(), None) is not None:
+                        os.replace(os.fspath(empty_legacy_path), os.fspath(latest))
+                        empty_legacy_path = None
+                        raise DeploymentError("unidentified existing deployment changed") from error
+                else:
+                    rollback_parent = _reject_reparse_alias(layout.rollback_root, "rollback root")
+                    rollback_parent.mkdir(parents=True, exist_ok=True)
+                    _reject_reparse_alias(rollback_parent, "rollback root")
+                    rollback_path = rollback_parent / f"previous-{uuid.uuid4().hex}"
+                    os.replace(os.fspath(latest), os.fspath(rollback_path))
 
             try:
                 os.replace(os.fspath(staging), os.fspath(latest))
@@ -655,7 +671,25 @@ def stage_latest_development(
                         raise DeploymentError(
                             "publish failed and restoring the previous deployment also failed"
                         ) from restore_error
+                elif (
+                    empty_legacy_path is not None
+                    and not latest.exists()
+                    and empty_legacy_path.exists()
+                ):
+                    try:
+                        os.replace(os.fspath(empty_legacy_path), os.fspath(latest))
+                    except OSError as restore_error:
+                        raise DeploymentError(
+                            "publish failed and restoring the empty deployment also failed"
+                        ) from restore_error
                 raise DeploymentError("cannot atomically publish latest-development") from error
+            if empty_legacy_path is not None:
+                try:
+                    empty_legacy_path.rmdir()
+                except OSError as error:
+                    raise DeploymentError(
+                        "published build but could not remove empty legacy deployment"
+                    ) from error
             if not keep_rollback and rollback_path is not None:
                 _remove_owned_tree(rollback_path, "rollback deployment")
                 rollback_path = None
