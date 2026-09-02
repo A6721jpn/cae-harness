@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import shutil
 import subprocess
@@ -68,6 +69,18 @@ class BuildRequest:
 _MANDATORY_STEPS = ("pytest", "format", "lint", "mypy", "boundary", "package", "installed-smoke")
 _StepEvidence = tuple[str, tuple[str, ...], int, str, str]
 _RECEIPTS: dict[int, tuple[object, ...]] = {}
+
+
+def _format_step_evidence(evidence: _StepEvidence) -> str:
+    name, command, exit_code, stdout, stderr = evidence
+    output = stdout if stdout.strip() else stderr
+    lines = tuple(line.strip() for line in output.splitlines() if line.strip())
+    payload = {
+        "command": list(command),
+        "exit_code": exit_code,
+        "summary": lines[-1] if lines else "",
+    }
+    return f"gate={name} {json.dumps(payload, sort_keys=True, separators=(',', ':'))}"
 
 
 class CleanBuildReceipt:
@@ -432,6 +445,12 @@ def _require_receipt(value: object) -> tuple[object, ...]:
     return record
 
 
+def _print_build_evidence(receipt: CleanBuildReceipt) -> None:
+    record = _require_receipt(receipt)
+    for evidence in cast(tuple[_StepEvidence, ...], record[7]):
+        print(_format_step_evidence(evidence))
+
+
 def _validated_stage_record(receipt: CleanBuildReceipt) -> tuple[object, ...]:
     record = _require_receipt(receipt)
     _require_current_python()
@@ -678,9 +697,10 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = build_parser().parse_args(argv)
     result = run_clean_build(BuildRequest(repo_root=arguments.repo_root))
+    print(f"built {result.wheel.name} from {result.commit_sha}")
+    _print_build_evidence(result)
     deployment = stage_clean_build(result)
     shortcut = _install_fixed_shortcut(deployment)
-    print(f"built {result.wheel.name} from {result.commit_sha}")
     print(f"staged {deployment.latest}")
     print(f"shortcut {shortcut}")
     return 0

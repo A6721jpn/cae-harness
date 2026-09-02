@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
 import pickle
 import subprocess
 import sys
@@ -121,6 +122,26 @@ def test_installed_smoke_requires_exact_version_output(tmp_path: Path) -> None:
         )
 
 
+def test_step_evidence_report_retains_exact_command_exit_and_final_summary() -> None:
+    evidence: build_script._StepEvidence = (
+        "pytest",
+        ("python.exe", "-m", "pytest"),
+        0,
+        "progress\n819 passed, 17 skipped in 1.00s\n",
+        "",
+    )
+
+    line = build_script._format_step_evidence(evidence)
+
+    label, encoded = line.split(" ", 1)
+    assert label == "gate=pytest"
+    assert json.loads(encoded) == {
+        "command": ["python.exe", "-m", "pytest"],
+        "exit_code": 0,
+        "summary": "819 passed, 17 skipped in 1.00s",
+    }
+
+
 def test_stale_wheel_is_rejected_by_non_authoritative_plan(tmp_path: Path) -> None:
     dist = tmp_path / "dist"
     dist.mkdir()
@@ -174,19 +195,26 @@ def test_build_cli_stages_only_the_issued_clean_build(
         calls.append(value)
         return deployment
 
+    def report(value: object) -> None:
+        calls.append(("evidence", value))
+        print('gate=pytest {"exit_code":0}')
+
     def install(value: object) -> Path:
         calls.append(value)
         return shortcut
 
     monkeypatch.setattr(build_script, "run_clean_build", run)
+    monkeypatch.setattr(build_script, "_print_build_evidence", report, raising=False)
     monkeypatch.setattr(build_script, "stage_clean_build", stage)
     monkeypatch.setattr(build_script, "_install_fixed_shortcut", install, raising=False)
 
     assert build_script.main(["--repo-root", str(tmp_path)]) == 0
 
-    assert calls == [BuildRequest(tmp_path), receipt, deployment]
+    assert calls == [BuildRequest(tmp_path), ("evidence", receipt), receipt, deployment]
     assert capsys.readouterr().out == (
-        f"built fresh.whl from {'a' * 40}\nstaged {deployment.latest}\nshortcut {shortcut}\n"
+        f"built fresh.whl from {'a' * 40}\n"
+        'gate=pytest {"exit_code":0}\n'
+        f"staged {deployment.latest}\nshortcut {shortcut}\n"
     )
 
 
