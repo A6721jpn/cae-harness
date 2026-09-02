@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import hashlib
 import importlib
 import os
@@ -22,6 +23,46 @@ def _module() -> ModuleType:
 
 def _sha256(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
+
+
+def _normalized_pressure_result(module: ModuleType, xplt_sha256: str) -> dict[str, object]:
+    model_manifest = {
+        "available_fields": [{"index": 0, "name": "pressure"}],
+        "element_count": 1,
+        "node_count": 4,
+        "requested_fields": {
+            "pressure": {
+                "association": "CELL_DATA",
+                "component_index": 0,
+                "component_name": "pressure",
+                "components": 1,
+                "field_index": 0,
+                "tensor_type": "DATA_SCALAR",
+                "vtk_name": "pressure",
+            }
+        },
+        "state_count": 1,
+        "state_times": [0.0],
+    }
+    return {
+        "protocol": 1,
+        "available_fields": ["pressure"],
+        "model_manifest": model_manifest,
+        "model_sha256": module._model_manifest_sha256(model_manifest),
+        "values": {
+            "pressure": {
+                "components": 1,
+                "count": 1,
+                "entity_count": 1,
+                "field_index": 0,
+                "minimum": 0.0,
+                "maximum": 1.0,
+                "state_count": 1,
+            }
+        },
+        "non_finite_fields": [],
+        "xplt_sha256": xplt_sha256,
+    }
 
 
 def _runtime_files(tmp_path: Path) -> tuple[dict[str, Path], dict[str, str]]:
@@ -141,18 +182,54 @@ def test_official_manager_uses_only_live_probe_and_fails_closed_on_bad_output(
     attempt.mkdir()
     xplt = attempt / "result.xplt"
     xplt.write_bytes(b"synthetic-xplt")
+    model_manifest = {
+        "available_fields": [{"index": 0, "name": "stress"}],
+        "element_count": 1,
+        "node_count": 4,
+        "requested_fields": {
+            "stress": {
+                "association": "CELL_DATA",
+                "component_index": 0,
+                "component_name": "stress",
+                "components": 9,
+                "field_index": 0,
+                "tensor_type": "DATA_TENSOR2",
+                "vtk_name": "stress",
+            }
+        },
+        "state_count": 1,
+        "state_times": [0.0],
+    }
+    model_sha256 = module._model_manifest_sha256(model_manifest)
+    xplt_sha256 = _sha256(b"synthetic-xplt")
     responses: list[Mapping[str, object]] = [
         {
             "protocol": 1,
             "available_fields": ["stress"],
-            "values": {"stress": {"count": 9, "minimum": -1.0, "maximum": 2.0}},
+            "model_manifest": model_manifest,
+            "model_sha256": model_sha256,
+            "values": {
+                "stress": {
+                    "components": 9,
+                    "count": 9,
+                    "entity_count": 1,
+                    "field_index": 0,
+                    "minimum": -1.0,
+                    "maximum": 2.0,
+                    "state_count": 1,
+                }
+            },
             "non_finite_fields": [],
+            "xplt_sha256": xplt_sha256,
         },
         {
             "protocol": 1,
             "available_fields": ["stress"],
+            "model_manifest": model_manifest,
+            "model_sha256": model_sha256,
             "values": {},
             "non_finite_fields": ["stress"],
+            "xplt_sha256": xplt_sha256,
         },
     ]
     monkeypatch.setattr(
@@ -171,12 +248,178 @@ def test_official_manager_uses_only_live_probe_and_fails_closed_on_bad_output(
         assert valid.official is True
         assert valid.provenance == "official"
         assert valid.values["stress"] == {
+            "components": 9,
             "count": 9,
+            "entity_count": 1,
+            "field_index": 0,
             "minimum": -1.0,
             "maximum": 2.0,
+            "state_count": 1,
         }
         assert non_finite.valid is False
         assert non_finite.non_finite_fields == ("stress",)
+
+
+def test_official_fbs_receipt_retains_model_manifest_and_private_pipe_provenance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, runtime, _ = _probe(tmp_path / "runtime-fixture", monkeypatch)
+    attempt = tmp_path / "attempt"
+    attempt.mkdir()
+    xplt = attempt / "result.xplt"
+    xplt.write_bytes(b"synthetic-xplt")
+    model_manifest = {
+        "available_fields": [{"index": 0, "name": "stress"}],
+        "element_count": 1,
+        "node_count": 4,
+        "requested_fields": {
+            "stress": {
+                "association": "CELL_DATA",
+                "component_index": 0,
+                "component_name": "stress",
+                "components": 9,
+                "field_index": 0,
+                "tensor_type": "DATA_TENSOR2",
+                "vtk_name": "stress",
+            }
+        },
+        "state_count": 2,
+        "state_times": [0.0, 1.0],
+    }
+    model_sha256 = module._model_manifest_sha256(model_manifest)
+    xplt_sha256 = _sha256(b"synthetic-xplt")
+    monkeypatch.setattr(
+        module,
+        "_invoke_helper",
+        lambda checked, path, fields, root: {
+            "protocol": 1,
+            "available_fields": ["stress"],
+            "model_manifest": model_manifest,
+            "model_sha256": model_sha256,
+            "values": {
+                "stress": {
+                    "components": 9,
+                    "count": 18,
+                    "entity_count": 1,
+                    "field_index": 0,
+                    "minimum": 0.0,
+                    "maximum": 1.0,
+                    "state_count": 2,
+                }
+            },
+            "non_finite_fields": [],
+            "xplt_sha256": xplt_sha256,
+        },
+    )
+
+    manager = module.open_official_fbs_manager(runtime, attempt)
+    with manager:
+        validation = validate_requested_fields(manager.issue_authority(), xplt, ("stress",))
+        receipt = module.require_official_fbs_result(validation)
+
+        assert receipt.validation is validation
+        assert receipt.xplt_path == xplt.resolve()
+        assert receipt.xplt_sha256 == xplt_sha256
+        assert receipt.model_manifest_sha256 == model_sha256
+        assert receipt.node_count == 4
+        assert receipt.element_count == 1
+        assert receipt.state_count == 2
+        assert receipt.state_times == (0.0, 1.0)
+        assert receipt.requested_fields == ("stress",)
+        assert receipt.transport == "private-named-pipe"
+        assert receipt.runtime_identity == runtime.runtime_identity
+        with pytest.raises(TypeError):
+            module.OfficialFbsResultReceipt()
+
+    with pytest.raises(TypeError, match="closed|authority|unavailable"):
+        _ = receipt.node_count
+
+
+@pytest.mark.parametrize("replacement", [False, True], ids=["mutate", "replace"])
+def test_official_fbs_receipt_keeps_exact_xplt_live_until_manager_close(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    replacement: bool,
+) -> None:
+    module, runtime, _ = _probe(tmp_path / "runtime-fixture", monkeypatch)
+    attempt = tmp_path / "attempt"
+    attempt.mkdir()
+    xplt = attempt / "result.xplt"
+    xplt.write_bytes(b"synthetic-xplt")
+    response = _normalized_pressure_result(module, _sha256(b"synthetic-xplt"))
+    monkeypatch.setattr(
+        module,
+        "_invoke_helper",
+        lambda checked, path, fields, root: response,
+    )
+
+    with module.open_official_fbs_manager(runtime, attempt) as manager:
+        validation = validate_requested_fields(manager.issue_authority(), xplt, ("pressure",))
+        receipt = module.require_official_fbs_result(validation)
+
+        blocked = False
+        try:
+            if replacement:
+                candidate = attempt / "replacement.xplt"
+                candidate.write_bytes(b"synthetic-xplt")
+                os.replace(candidate, xplt)
+            else:
+                xplt.write_bytes(b"mutated-xplt")
+        except PermissionError:
+            blocked = True
+
+        if blocked:
+            assert receipt.node_count == 4
+        else:
+            with pytest.raises(TypeError, match="XPLT|binding|unavailable"):
+                _ = receipt.node_count
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("component_index", False),
+        ("components", True),
+        ("field_index", False),
+    ],
+)
+def test_official_fbs_model_manifest_rejects_boolean_integer_fields(
+    name: str,
+    value: bool,
+) -> None:
+    module = _module()
+    response = _normalized_pressure_result(module, "a" * 64)
+    model = cast(dict[str, Any], response["model_manifest"])
+    requested = cast(dict[str, dict[str, object]], model["requested_fields"])
+    requested["pressure"][name] = value
+
+    with pytest.raises(module.OfficialFbsRuntimeError, match="field identity"):
+        module._validate_model_manifest(model, ("pressure",))
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("components", True),
+        ("count", True),
+        ("entity_count", True),
+        ("field_index", False),
+        ("state_count", True),
+    ],
+)
+def test_official_fbs_result_rejects_boolean_summary_cardinality(
+    name: str,
+    value: bool,
+) -> None:
+    module = _module()
+    response = _normalized_pressure_result(module, "a" * 64)
+    mutated = copy.deepcopy(response)
+    values = cast(dict[str, dict[str, object]], mutated["values"])
+    values["pressure"][name] = value
+
+    with pytest.raises(module.OfficialFbsRuntimeError, match="summary"):
+        module._validate_normalized_result(mutated, ("pressure",))
 
 
 def test_runtime_mutation_after_probe_prevents_official_manager(

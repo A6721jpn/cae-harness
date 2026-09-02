@@ -156,6 +156,7 @@ class _ManagerRecord:
     provenance: str
     attempt_root: Path | None
     root_binding: _RootBinding | None
+    xplt_owners: list[_OwnedHandle] = field(default_factory=list)
     authority: FbsAdapterAuthority | None = None
     closed: bool = False
 
@@ -191,8 +192,10 @@ class _ValidationRecord:
     issues: tuple[str, ...]
     digest_before: str
     digest_after: str
+    xplt_owner: _OwnedHandle | None = None
     owner: object | None = None
     result: object | None = None
+    official_result: object | None = None
     revoked: bool = False
 
 
@@ -782,6 +785,30 @@ def _release_root_binding(binding: _RootBinding | None) -> None:
     binding.closed = True
 
 
+def _release_owned_handles(owners: list[_OwnedHandle]) -> list[BaseException]:
+    failures: list[BaseException] = []
+    for owner in tuple(owners):
+        try:
+            _close_owned_handle(owner)
+        except BaseException as error:
+            _retain_cleanup_owner(owner)
+            failures.append(error)
+        if owner.closed:
+            owners[:] = [candidate for candidate in owners if candidate is not owner]
+    return failures
+
+
+def _finalize_manager_filesystem_owners(
+    binding: _RootBinding | None,
+    xplt_owners: list[_OwnedHandle],
+) -> None:
+    for owner in tuple(xplt_owners):
+        _best_effort_close(owner)
+        if owner.closed:
+            xplt_owners[:] = [candidate for candidate in xplt_owners if candidate is not owner]
+    _finalize_root_binding(binding)
+
+
 def _finalize_root_binding(binding: _RootBinding | None) -> None:
     if binding is None or binding.fd is None:
         return
@@ -1042,26 +1069,28 @@ class FbsAdapterManager:
         provenance = _OFFICIAL_PROVENANCE if official else _PROVENANCE
         root_binding = _hold_root(root) if root is not None else None
         object.__setattr__(self, "_finalizer", None)
-        object.__setattr__(
-            self,
-            "_record",
-            _ManagerRecord(
-                manager=self,
-                adapter=adapter,
-                reader=reader,
-                runtime_identity=runtime_identity.strip(),
-                official=official,
-                profile=official_profile,
-                provenance=provenance,
-                attempt_root=root,
-                root_binding=root_binding,
-            ),
+        manager_record = _ManagerRecord(
+            manager=self,
+            adapter=adapter,
+            reader=reader,
+            runtime_identity=runtime_identity.strip(),
+            official=official,
+            profile=official_profile,
+            provenance=provenance,
+            attempt_root=root,
+            root_binding=root_binding,
         )
+        object.__setattr__(self, "_record", manager_record)
         if root_binding is not None:
             object.__setattr__(
                 self,
                 "_finalizer",
-                weakref.finalize(self, _finalize_root_binding, root_binding),
+                weakref.finalize(
+                    self,
+                    _finalize_manager_filesystem_owners,
+                    root_binding,
+                    manager_record.xplt_owners,
+                ),
             )
 
     def __del__(self) -> None:
@@ -1070,7 +1099,8 @@ class FbsAdapterManager:
         try:
             record = object.__getattribute__(self, "_record")
             binding = getattr(record, "root_binding", None)
-            _finalize_root_binding(binding)
+            owners = getattr(record, "xplt_owners", [])
+            _finalize_manager_filesystem_owners(binding, owners)
         except BaseException:
             return
 
@@ -1106,18 +1136,24 @@ class FbsAdapterManager:
         self.close()
 
     def close(self) -> None:
-        """Revoke authority and close only this manager's exact root owner."""
+        """Revoke authority and close this manager's exact filesystem owners."""
 
         record = _manager_record(self)
         record.closed = True
+        failures = _release_owned_handles(record.xplt_owners)
         try:
             _release_root_binding(record.root_binding)
-        except BaseException:
-            raise
+        except BaseException as error:
+            failures.append(error)
         finalizer = object.__getattribute__(self, "_finalizer")
-        if isinstance(finalizer, weakref.finalize):
+        root_closed = record.root_binding is None or record.root_binding.closed
+        if isinstance(finalizer, weakref.finalize) and not record.xplt_owners and root_closed:
             finalizer.detach()
             object.__setattr__(self, "_finalizer", None)
+        if len(failures) == 1:
+            raise failures[0]
+        if failures:
+            raise BaseExceptionGroup("FBS filesystem owner cleanup failed", failures)
 
     def issue_authority(self) -> FbsAdapterAuthority:
         """Issue the manager's exact-instance authority."""
@@ -1507,6 +1543,98 @@ def _close_opened_xplt(opened: _OpenedXplt) -> None:
         raise ValueError("unable to close held XPLT handles") from failures[0]
 
 
+def _duplicate_xplt_owner(owner: _OwnedHandle, path: Path) -> _OwnedHandle:
+    if type(owner) is not _OwnedHandle:
+        raise TypeError("XPLT owner is invalid")
+    if os.name == "nt":
+        duplicate = _windows_duplicate(owner)
+        try:
+            _windows_verify_owner(duplicate, directory=False, expected_path=path)
+        except BaseException:
+            _best_effort_close(duplicate)
+            raise
+        return duplicate
+    value = os.dup(_owned_value(owner))
+    duplicate = _OwnedHandle(value, 0, 0, path, False, identity_known=False)
+    try:
+        metadata = os.fstat(value)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or int(metadata.st_nlink) != 1
+            or int(metadata.st_dev) != owner.device
+            or int(metadata.st_ino) != owner.inode
+        ):
+            raise ValueError("XPLT object identity changed before retention")
+        duplicate.device = int(metadata.st_dev)
+        duplicate.inode = int(metadata.st_ino)
+        duplicate.identity_known = True
+        return duplicate
+    except BaseException:
+        _best_effort_close(duplicate)
+        raise
+
+
+def _verify_validation_xplt_owner(record: _ValidationRecord) -> _OwnedHandle:
+    owner = record.xplt_owner
+    try:
+        authority_record = _authority_record(record.authority)
+        manager_record = _manager_record(authority_record.manager)
+        if (
+            type(owner) is not _OwnedHandle
+            or owner.path != record.xplt_path
+            or not any(candidate is owner for candidate in manager_record.xplt_owners)
+        ):
+            raise ValueError("retained XPLT owner binding is invalid")
+        if os.name == "nt":
+            _windows_verify_owner(owner, directory=False, expected_path=record.xplt_path)
+        else:
+            descriptor_metadata = os.fstat(_owned_value(owner))
+            path_metadata = os.stat(os.fspath(record.xplt_path), follow_symlinks=False)
+            if (
+                not stat.S_ISREG(descriptor_metadata.st_mode)
+                or not stat.S_ISREG(path_metadata.st_mode)
+                or int(descriptor_metadata.st_nlink) != 1
+                or int(path_metadata.st_nlink) != 1
+                or not _same_identity(descriptor_metadata, path_metadata)
+                or int(descriptor_metadata.st_dev) != owner.device
+                or int(descriptor_metadata.st_ino) != owner.inode
+            ):
+                raise ValueError("retained XPLT object identity changed")
+        if record.digest_before != record.digest_after or _digest_fd(owner) != record.digest_before:
+            raise ValueError("retained XPLT content changed")
+    except (OSError, TypeError, ValueError) as error:
+        raise TypeError("FbsValidation XPLT binding is unavailable") from error
+    return owner
+
+
+def _attach_validation_xplt_owner(
+    validation: FbsValidation,
+    owner: _OwnedHandle,
+) -> None:
+    record = _issued_validation_record(validation)
+    authority_record = _authority_record(record.authority)
+    manager_record = _manager_record(authority_record.manager)
+    if (
+        record.official is not True
+        or record.provenance != _OFFICIAL_PROVENANCE
+        or record.xplt_owner is not None
+        or type(owner) is not _OwnedHandle
+        or any(candidate is owner for candidate in manager_record.xplt_owners)
+    ):
+        raise TypeError("official FBS XPLT owner issuance binding is invalid")
+    if owner.path != record.xplt_path or _digest_fd(owner) != record.digest_before:
+        raise TypeError("official FBS XPLT owner context binding is invalid")
+    manager_record.xplt_owners.append(owner)
+    record.xplt_owner = owner
+    _verify_validation_xplt_owner(record)
+
+
+def _require_validation_xplt_owner(validation: FbsValidation) -> _OwnedHandle:
+    """Return the exact retained XPLT owner for a live official validation."""
+
+    return _verify_validation_xplt_owner(_issued_validation_record(validation))
+
+
 def _finite_value(value: object) -> bool:
     if isinstance(value, bool):
         return False
@@ -1649,8 +1777,28 @@ def _unregister_validation(value: object) -> bool:
     if record.revoked:
         return False
     record.revoked = True
+    xplt_owner = record.xplt_owner
+    if xplt_owner is not None:
+        manager_record: _ManagerRecord | None = None
+        try:
+            authority_record = object.__getattribute__(record.authority, "_record")
+            if (
+                isinstance(authority_record, _AuthorityRecord)
+                and authority_record.authority is record.authority
+            ):
+                manager_record = _manager_record(authority_record.manager)
+        except (AttributeError, TypeError):
+            manager_record = None
+        _best_effort_close(xplt_owner)
+        if xplt_owner.closed:
+            record.xplt_owner = None
+            if manager_record is not None:
+                manager_record.xplt_owners[:] = [
+                    owner for owner in manager_record.xplt_owners if owner is not xplt_owner
+                ]
     record.owner = None
     record.result = None
+    record.official_result = None
     return True
 
 
@@ -1836,6 +1984,7 @@ def validate_requested_fields(
     digest_before = ""
     digest_after = ""
     raw_result: object = None
+    retained_xplt_owner: _OwnedHandle | None = None
     try:
         if os.name == "posix":
             opened = _open_bound_xplt(record, reported_path)
@@ -1872,6 +2021,8 @@ def validate_requested_fields(
                 _verify_opened_xplt(opened)
                 digest_after = _digest_fd(opened.fd)
                 _verify_opened_xplt(opened)
+                if record.official:
+                    retained_xplt_owner = _duplicate_xplt_owner(opened.fd, reported_path)
             else:
                 _require_xplt(reported_path, record.attempt_root)
                 digest_after = _digest(path)
@@ -1886,56 +2037,86 @@ def validate_requested_fields(
             )
     finally:
         if opened is not None:
-            _close_opened_xplt(opened)
+            try:
+                _close_opened_xplt(opened)
+            except BaseException:
+                if retained_xplt_owner is not None:
+                    _best_effort_close(retained_xplt_owner)
+                raise
 
-    if digest_before != digest_after:
-        return _invalid_validation(
-            authority,
-            reported_path,
-            fields,
-            "adapter mutated the XPLT artifact",
-            digest_before=digest_before,
-            digest_after=digest_after,
-            authority_record=record,
-        )
-    if not isinstance(raw_result, Mapping):
-        return _invalid_validation(
-            authority,
-            reported_path,
-            fields,
-            "adapter must return a field mapping",
-            digest_before=digest_before,
-            digest_after=digest_after,
-            authority_record=record,
-        )
     try:
-        values: dict[str, object] = dict(raw_result)
-    except Exception as error:
-        return _invalid_validation(
+        if digest_before != digest_after:
+            return _invalid_validation(
+                authority,
+                reported_path,
+                fields,
+                "adapter mutated the XPLT artifact",
+                digest_before=digest_before,
+                digest_after=digest_after,
+                authority_record=record,
+            )
+        if not isinstance(raw_result, Mapping):
+            return _invalid_validation(
+                authority,
+                reported_path,
+                fields,
+                "adapter must return a field mapping",
+                digest_before=digest_before,
+                digest_after=digest_after,
+                authority_record=record,
+            )
+        try:
+            values: dict[str, object] = dict(raw_result)
+        except Exception as error:
+            return _invalid_validation(
+                authority,
+                reported_path,
+                fields,
+                f"adapter returned an unreadable field mapping: {error}",
+                digest_before=digest_before,
+                digest_after=digest_after,
+                authority_record=record,
+            )
+        if any(not isinstance(field, str) for field in values):
+            return _invalid_validation(
+                authority,
+                reported_path,
+                fields,
+                "adapter field mapping keys must be strings",
+                digest_before=digest_before,
+                digest_after=digest_after,
+                authority_record=record,
+            )
+        validation = _build_validation(
             authority,
+            record,
             reported_path,
             fields,
-            f"adapter returned an unreadable field mapping: {error}",
-            digest_before=digest_before,
-            digest_after=digest_after,
-            authority_record=record,
+            values,
+            digest_before,
+            digest_after,
         )
-    if any(not isinstance(field, str) for field in values):
-        return _invalid_validation(
-            authority,
-            reported_path,
-            fields,
-            "adapter field mapping keys must be strings",
-            digest_before=digest_before,
-            digest_after=digest_after,
-            authority_record=record,
-        )
-    return _build_validation(
-        authority,
-        record,
-        reported_path,
-        fields,
-        values,
-        digest_before,
-        digest_after,
-    )
+        if record.official:
+            try:
+                from .official_fbs import _adopt_official_fbs_result
+
+                if retained_xplt_owner is None:  # pragma: no cover - official path guard
+                    raise TypeError("official FBS XPLT owner is unavailable")
+                _attach_validation_xplt_owner(validation, retained_xplt_owner)
+                retained_xplt_owner = None
+                _adopt_official_fbs_result(validation, raw_result, record.adapter)
+            except Exception as error:
+                _unregister_validation(validation)
+                return _invalid_validation(
+                    authority,
+                    reported_path,
+                    fields,
+                    f"official FBS result receipt validation failed: {error}",
+                    digest_before=digest_before,
+                    digest_after=digest_after,
+                    authority_record=record,
+                )
+        return validation
+    finally:
+        if retained_xplt_owner is not None:
+            _best_effort_close(retained_xplt_owner)

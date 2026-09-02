@@ -21,10 +21,12 @@ from .headless import (
 )
 from .log import LogValidation, LogValidator, validate_log, validate_solver_log
 from .official_fbs import (
+    OfficialFbsResultReceipt,
     OfficialFbsRuntime,
     OfficialFbsRuntimeError,
     open_official_fbs_manager,
     probe_official_fbs_runtime,
+    require_official_fbs_result,
     validate_official_fbs_runtime,
 )
 from .runtime import (
@@ -70,6 +72,7 @@ __all__ = [
     "FebioRuntimeDiagnostic",
     "OutputExpectation",
     "OutputFreshnessError",
+    "OfficialFbsResultReceipt",
     "OfficialFbsRuntime",
     "OfficialFbsRuntimeError",
     "ProcessState",
@@ -90,6 +93,7 @@ __all__ = [
     "probe_febio",
     "probe_official_fbs_runtime",
     "probe_runtime",
+    "require_official_fbs_result",
     "open_official_fbs_manager",
     "record_execution_output_artifacts",
     "recover_headless_febio",

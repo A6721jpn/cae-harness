@@ -26,10 +26,12 @@ from . import fbs as _fbs
 from .process_authority import ProcessAuthority, ProcessAuthorityError
 
 __all__ = [
+    "OfficialFbsResultReceipt",
     "OfficialFbsRuntime",
     "OfficialFbsRuntimeError",
     "open_official_fbs_manager",
     "probe_official_fbs_runtime",
+    "require_official_fbs_result",
     "validate_official_fbs_runtime",
 ]
 
@@ -40,6 +42,7 @@ _MAX_RESPONSE_BYTES = 1024 * 1024
 _MAX_STDERR_BYTES = 64 * 1024
 _RUNTIME_TOKEN = object()
 _ADAPTER_TOKEN = object()
+_RESULT_TOKEN = object()
 _WINDOWS_DELETE = 0x00010000
 _WINDOWS_GENERIC_WRITE = 0x40000000
 _WINDOWS_FILE_CREATE = 2
@@ -232,6 +235,119 @@ class OfficialFbsRuntime:
     @property
     def module_attestation_sha256(self) -> str:
         return self._module_attestation_sha256
+
+
+@dataclass(frozen=True, slots=True)
+class _OfficialFbsResultRecord:
+    receipt: OfficialFbsResultReceipt
+    validation: _fbs.FbsValidation
+    adapter: _OfficialFbsAdapter
+    runtime: OfficialFbsRuntime
+    xplt_path: Path
+    xplt_sha256: str
+    model_manifest: Mapping[str, object]
+    model_manifest_sha256: str
+    requested_fields: tuple[str, ...]
+    values: Mapping[str, object]
+    transport: str
+
+
+class OfficialFbsResultReceipt:
+    """Opaque, live receipt for one exact official-FBS result read."""
+
+    __slots__ = ("_record",)
+
+    def __new__(
+        cls,
+        token: object | None = None,
+        *_args: object,
+        **_kwargs: object,
+    ) -> OfficialFbsResultReceipt:
+        if cls is not OfficialFbsResultReceipt or token is not _RESULT_TOKEN:
+            raise TypeError("OfficialFbsResultReceipt instances are manager-issued")
+        return super().__new__(cls)
+
+    def __init__(self, token: object) -> None:
+        if token is not _RESULT_TOKEN:
+            raise TypeError("OfficialFbsResultReceipt instances are manager-issued")
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        del kwargs
+        raise TypeError("OfficialFbsResultReceipt cannot be subclassed")
+
+    def __copy__(self) -> NoReturn:
+        raise TypeError("OfficialFbsResultReceipt cannot be copied")
+
+    def __deepcopy__(self, memo: dict[int, object]) -> NoReturn:
+        del memo
+        raise TypeError("OfficialFbsResultReceipt cannot be copied")
+
+    def __reduce__(self) -> NoReturn:
+        raise TypeError("OfficialFbsResultReceipt cannot be serialized")
+
+    @property
+    def validation(self) -> _fbs.FbsValidation:
+        return _official_result_record(self).validation
+
+    @property
+    def xplt_path(self) -> Path:
+        return _official_result_record(self).xplt_path
+
+    @property
+    def xplt_sha256(self) -> str:
+        return _official_result_record(self).xplt_sha256
+
+    @property
+    def model_manifest(self) -> Mapping[str, object]:
+        return _official_result_record(self).model_manifest
+
+    @property
+    def model_manifest_sha256(self) -> str:
+        return _official_result_record(self).model_manifest_sha256
+
+    @property
+    def node_count(self) -> int:
+        return _manifest_count(_official_result_record(self), "node_count")
+
+    @property
+    def element_count(self) -> int:
+        return _manifest_count(_official_result_record(self), "element_count")
+
+    @property
+    def state_count(self) -> int:
+        return _manifest_count(_official_result_record(self), "state_count")
+
+    @property
+    def state_times(self) -> tuple[float, ...]:
+        record = _official_result_record(self)
+        values = record.model_manifest["state_times"]
+        if not isinstance(values, tuple):  # pragma: no cover - issuance guard
+            raise TypeError("official FBS result receipt binding is invalid")
+        return tuple(float(value) for value in values)
+
+    @property
+    def requested_fields(self) -> tuple[str, ...]:
+        return _official_result_record(self).requested_fields
+
+    @property
+    def values(self) -> Mapping[str, object]:
+        return _official_result_record(self).values
+
+    @property
+    def transport(self) -> str:
+        return _official_result_record(self).transport
+
+    @property
+    def runtime_identity(self) -> str:
+        return _official_result_record(self).runtime.runtime_identity
+
+    @property
+    def runtime_profile(self) -> str:
+        return _official_result_record(self).runtime.profile
+
+    @property
+    def module_attestation_sha256(self) -> str:
+        return _official_result_record(self).runtime.module_attestation_sha256
 
 
 class _HeldEntry:
@@ -1282,7 +1398,7 @@ def _validate_model_manifest(
         )
         vtk_name, association, components = _FIELD_PROFILE[field]
         tensor_type, component_name = _FIELD_COMPONENT_PROFILE[field]
-        if item != {
+        expected = {
             "association": association,
             "component_index": 0,
             "component_name": component_name,
@@ -1290,7 +1406,11 @@ def _validate_model_manifest(
             "field_index": indexes[field],
             "tensor_type": tensor_type,
             "vtk_name": vtk_name,
-        }:
+        }
+        if any(
+            type(item[name]) is not type(expected_value) or item[name] != expected_value
+            for name, expected_value in expected.items()
+        ):
             raise OfficialFbsRuntimeError(f"{field} model field identity is invalid")
     # Keep both model cardinalities live in the validation path; association-specific
     # checks below choose one of them for each field.
@@ -1476,9 +1596,11 @@ def _validate_field_response(
     return {
         "protocol": _PROTOCOL,
         "available_fields": list(available),
+        "model_manifest": model,
         "model_sha256": binding.model_sha256,
         "values": summaries,
         "non_finite_fields": non_finite,
+        "xplt_sha256": binding.xplt_sha256,
     }
 
 
@@ -2022,6 +2144,59 @@ def _invoke_helper(
     return result
 
 
+class _OfficialFieldMapping(Mapping[str, object]):
+    """Field-only view retaining the exact private official helper result."""
+
+    __slots__ = ("_adapter", "_requested_fields", "_response", "_values")
+
+    def __init__(
+        self,
+        token: object,
+        adapter: _OfficialFbsAdapter,
+        requested_fields: tuple[str, ...],
+        response: Mapping[str, object],
+    ) -> None:
+        if token is not _RESULT_TOKEN:
+            raise TypeError("official FBS field mappings are adapter-issued")
+        try:
+            detached = json.loads(
+                json.dumps(
+                    response,
+                    allow_nan=False,
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            raise OfficialFbsRuntimeError("official FBS result is not canonical JSON") from error
+        if not isinstance(detached, dict):  # pragma: no cover - schema guard
+            raise OfficialFbsRuntimeError("official FBS result is not an object")
+        _validate_normalized_result(detached, requested_fields)
+        raw_values = detached["values"]
+        raw_non_finite = detached["non_finite_fields"]
+        if not isinstance(raw_values, dict) or not isinstance(raw_non_finite, list):
+            raise OfficialFbsRuntimeError("official FBS result field data is invalid")
+        values: dict[str, object] = dict(raw_values)
+        for field in raw_non_finite:
+            if not isinstance(field, str):  # pragma: no cover - schema guard
+                raise OfficialFbsRuntimeError("official FBS result field name is invalid")
+            values[field] = math.nan
+        self._adapter = adapter
+        self._requested_fields = requested_fields
+        self._response = MappingProxyType(detached)
+        self._values = MappingProxyType(values)
+
+    def __getitem__(self, key: str) -> object:
+        return self._values[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._values)
+
+    def __len__(self) -> int:
+        return len(self._values)
+
+
 class _OfficialFbsAdapter:
     __slots__ = ("_attempt_root", "_issuance", "_runtime")
 
@@ -2043,14 +2218,266 @@ class _OfficialFbsAdapter:
 
     def read_fields(self, xplt_path: Path, fields: Sequence[str]) -> Mapping[str, object]:
         response = _invoke_helper(self._runtime, xplt_path, fields, self._attempt_root)
-        values, non_finite = response["values"], response["non_finite_fields"]
-        if not isinstance(values, dict) or not isinstance(non_finite, list):
-            raise OfficialFbsRuntimeError("validated helper response was revoked")
-        result: dict[str, object] = dict(values)
-        for field in non_finite:
-            if isinstance(field, str):
-                result[field] = math.nan
-        return result
+        requested_fields = tuple(fields)
+        return _OfficialFieldMapping(
+            _RESULT_TOKEN,
+            self,
+            requested_fields,
+            response,
+        )
+
+
+def _valid_sha256(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _validate_normalized_result(
+    response: Mapping[str, object],
+    requested_fields: Sequence[str],
+) -> Mapping[str, object]:
+    _exact_keys(
+        response,
+        {
+            "available_fields",
+            "model_manifest",
+            "model_sha256",
+            "non_finite_fields",
+            "protocol",
+            "values",
+            "xplt_sha256",
+        },
+        "normalized official FBS result",
+    )
+    if response["protocol"] != _PROTOCOL:
+        raise OfficialFbsRuntimeError("official FBS result protocol mismatch")
+    if not _valid_sha256(response["xplt_sha256"]) or not _valid_sha256(response["model_sha256"]):
+        raise OfficialFbsRuntimeError("official FBS result digest is invalid")
+    model = _validate_model_manifest(response["model_manifest"], requested_fields)
+    if _model_manifest_sha256(model) != response["model_sha256"]:
+        raise OfficialFbsRuntimeError("official FBS result model binding is invalid")
+    available = response["available_fields"]
+    raw_model_available = model["available_fields"]
+    if not isinstance(available, list) or not isinstance(raw_model_available, list):
+        raise OfficialFbsRuntimeError("official FBS available fields are invalid")
+    expected_available = [item["name"] for item in raw_model_available]
+    if available != expected_available:
+        raise OfficialFbsRuntimeError("official FBS available fields changed")
+    values = response["values"]
+    non_finite = response["non_finite_fields"]
+    if (
+        not isinstance(values, dict)
+        or any(not isinstance(key, str) for key in values)
+        or not isinstance(non_finite, list)
+        or any(not isinstance(field, str) for field in non_finite)
+        or len(set(non_finite)) != len(non_finite)
+    ):
+        raise OfficialFbsRuntimeError("official FBS result fields are invalid")
+    requested = set(requested_fields)
+    if not set(values).issubset(requested) or not set(non_finite).issubset(requested):
+        raise OfficialFbsRuntimeError("official FBS result includes unrequested fields")
+    if set(values).intersection(non_finite):
+        raise OfficialFbsRuntimeError("official FBS result field status is contradictory")
+    model_fields = model["requested_fields"]
+    if not isinstance(model_fields, dict):  # pragma: no cover - manifest guard
+        raise OfficialFbsRuntimeError("official FBS model fields are invalid")
+    state_count = model["state_count"]
+    node_count = model["node_count"]
+    element_count = model["element_count"]
+    if not all(isinstance(value, int) for value in (state_count, node_count, element_count)):
+        raise OfficialFbsRuntimeError("official FBS model cardinality is invalid")
+    for field in requested_fields:
+        present = field in available
+        has_result = field in values or field in non_finite
+        if present is not has_result:
+            raise OfficialFbsRuntimeError(f"{field} official FBS result is incomplete")
+        if field not in values:
+            continue
+        summary = values[field]
+        model_field = model_fields.get(field)
+        if not isinstance(summary, dict) or not isinstance(model_field, dict):
+            raise OfficialFbsRuntimeError(f"{field} official FBS summary is invalid")
+        _exact_keys(
+            summary,
+            {
+                "components",
+                "count",
+                "entity_count",
+                "field_index",
+                "maximum",
+                "minimum",
+                "state_count",
+            },
+            f"{field} official FBS summary",
+        )
+        association = model_field["association"]
+        entity_count = node_count if association == "POINT_DATA" else element_count
+        components = model_field["components"]
+        cardinality_names = (
+            "components",
+            "count",
+            "entity_count",
+            "field_index",
+            "state_count",
+        )
+        if any(
+            isinstance(summary[name], bool) or not isinstance(summary[name], int)
+            for name in cardinality_names
+        ):
+            raise OfficialFbsRuntimeError(f"{field} official FBS summary is invalid")
+        if (
+            summary["components"] != components
+            or summary["entity_count"] != entity_count
+            or summary["field_index"] != model_field["field_index"]
+            or summary["state_count"] != state_count
+            or summary["count"] != entity_count * components * state_count
+        ):
+            raise OfficialFbsRuntimeError(f"{field} official FBS cardinality changed")
+        minimum = _number(summary["minimum"], f"{field} minimum")
+        maximum = _number(summary["maximum"], f"{field} maximum")
+        if minimum > maximum:
+            raise OfficialFbsRuntimeError(f"{field} official FBS range is invalid")
+    return response
+
+
+def _same_field_values(
+    validation: _fbs.FbsValidation,
+    raw_result: _OfficialFieldMapping,
+) -> bool:
+    if tuple(validation.values) != tuple(raw_result):
+        return False
+    non_finite = set(raw_result._response["non_finite_fields"])
+    for field in raw_result:
+        actual = validation.values[field]
+        expected = raw_result[field]
+        if field in non_finite:
+            if not (
+                isinstance(actual, float)
+                and isinstance(expected, float)
+                and math.isnan(actual)
+                and math.isnan(expected)
+            ):
+                return False
+        elif actual != expected:
+            return False
+    return True
+
+
+def _adopt_official_fbs_result(
+    validation: _fbs.FbsValidation,
+    raw_result: object,
+    adapter: object,
+) -> OfficialFbsResultReceipt:
+    validation_record = _fbs._issued_validation_record(validation)
+    authority_record = _fbs._authority_record(validation_record.authority)
+    if (
+        type(raw_result) is not _OfficialFieldMapping
+        or type(adapter) is not _OfficialFbsAdapter
+        or raw_result._adapter is not adapter
+        or authority_record.adapter is not adapter
+        or validation_record.official is not True
+        or validation_record.provenance != "official"
+        or validation_record.official_result is not None
+        or raw_result._requested_fields != validation_record.requested_fields
+        or not _same_field_values(validation, raw_result)
+    ):
+        raise TypeError("official FBS result issuance binding is invalid")
+    runtime = validate_official_fbs_runtime(adapter._runtime)
+    response = _validate_normalized_result(
+        raw_result._response,
+        validation_record.requested_fields,
+    )
+    if (
+        response["xplt_sha256"] != validation_record.digest_before
+        or response["xplt_sha256"] != validation_record.digest_after
+        or validation_record.runtime_identity != runtime.runtime_identity
+        or authority_record.profile != runtime.profile
+    ):
+        raise TypeError("official FBS result context binding is invalid")
+    model = response["model_manifest"]
+    values = response["values"]
+    if not isinstance(model, dict) or not isinstance(values, dict):
+        raise TypeError("official FBS result schema is invalid")
+    frozen_model = _fbs._freeze_value(model)
+    if not isinstance(frozen_model, Mapping):  # pragma: no cover - schema guard
+        raise TypeError("official FBS model receipt is invalid")
+    receipt = OfficialFbsResultReceipt(_RESULT_TOKEN)
+    result_record = _OfficialFbsResultRecord(
+        receipt=receipt,
+        validation=validation,
+        adapter=adapter,
+        runtime=runtime,
+        xplt_path=validation_record.xplt_path,
+        xplt_sha256=validation_record.digest_before,
+        model_manifest=frozen_model,
+        model_manifest_sha256=str(response["model_sha256"]),
+        requested_fields=validation_record.requested_fields,
+        values=validation_record.values,
+        transport="private-named-pipe",
+    )
+    object.__setattr__(receipt, "_record", result_record)
+    validation_record.official_result = result_record
+    return receipt
+
+
+def _official_result_record(value: object) -> _OfficialFbsResultRecord:
+    if type(value) is not OfficialFbsResultReceipt:
+        raise TypeError("value is not an exact OfficialFbsResultReceipt instance")
+    try:
+        record = object.__getattribute__(value, "_record")
+    except AttributeError as error:
+        raise TypeError("OfficialFbsResultReceipt was not manager-issued") from error
+    if not isinstance(record, _OfficialFbsResultRecord) or record.receipt is not value:
+        raise TypeError("OfficialFbsResultReceipt binding is invalid")
+    try:
+        validation_record = _fbs._issued_validation_record(record.validation)
+        authority_record = _fbs._authority_record(validation_record.authority)
+        _fbs._require_validation_xplt_owner(record.validation)
+    except TypeError as error:
+        raise TypeError("OfficialFbsResultReceipt authority is unavailable") from error
+    if (
+        validation_record.official_result is not record
+        or validation_record.official is not True
+        or validation_record.provenance != "official"
+        or validation_record.xplt_path != record.xplt_path
+        or validation_record.digest_before != record.xplt_sha256
+        or validation_record.digest_after != record.xplt_sha256
+        or validation_record.requested_fields != record.requested_fields
+        or validation_record.values is not record.values
+        or authority_record.adapter is not record.adapter
+        or record.adapter._runtime is not record.runtime
+    ):
+        raise TypeError("OfficialFbsResultReceipt binding is invalid")
+    checked = validate_official_fbs_runtime(record.runtime)
+    if (
+        checked.runtime_identity != validation_record.runtime_identity
+        or authority_record.profile != checked.profile
+    ):
+        raise TypeError("OfficialFbsResultReceipt authority is unavailable")
+    return record
+
+
+def _manifest_count(record: _OfficialFbsResultRecord, name: str) -> int:
+    value = record.model_manifest[name]
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError("OfficialFbsResultReceipt binding is invalid")
+    return value
+
+
+def require_official_fbs_result(
+    validation: _fbs.FbsValidation,
+) -> OfficialFbsResultReceipt:
+    """Return the manager-issued receipt for an exact live official validation."""
+
+    validation_record = _fbs._issued_validation_record(validation)
+    record = validation_record.official_result
+    if not isinstance(record, _OfficialFbsResultRecord):
+        raise TypeError("FbsValidation has no official FBS result receipt")
+    _official_result_record(record.receipt)
+    return record.receipt
 
 
 def _official_adapter_identity(
