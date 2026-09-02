@@ -33,6 +33,7 @@ from febio_cae_harness.autonomy import (
     RetryDecision,
     RetryLedger,
     StateTransition,
+    bind_retry_proposal,
     classify_failure,
     decide_execution,
     decide_proposal,
@@ -1123,14 +1124,16 @@ def test_negative_jacobian_retry_requires_live_authority_for_declared_repair(
         record_attempt=False,
     )
     result = supervisor.run()
-    proposal = Proposal(
-        proposal_id="negative-jacobian-repair-a",
-        proposal_class=ProposalClass.INTENT_PRESERVING,
-        rationale="synthetic completed mesh diagnostic repair",
-        evidence_ids=("synthetic-negative-jacobian-diagnostic",),
-        changes={"mesh": {"patches": (change,)}},
-        authorized=True,
-        within_contract=True,
+    proposal = bind_retry_proposal(
+        Proposal(
+            proposal_id="pending",
+            proposal_class=ProposalClass.INTENT_PRESERVING,
+            rationale="synthetic completed mesh diagnostic repair",
+            evidence_ids=("synthetic-negative-jacobian-diagnostic",),
+            changes={"mesh": {"patches": (change,)}},
+            authorized=True,
+            within_contract=True,
+        )
     )
     proposal_authority = ProposalAuthorityManager(state).issue(proposal)
 
@@ -1148,6 +1151,76 @@ def test_negative_jacobian_retry_requires_live_authority_for_declared_repair(
     assert decision.failure is FailureClass.NEGATIVE_JACOBIAN
     assert decision.ledger.used == 1
     assert decision.ledger.records[0].proposal_id == proposal.proposal_id
+
+    intent_sha256 = state_snapshot.intent_sha256
+    store = object.__getattribute__(state_snapshot, "_store")
+    case = object.__getattribute__(state_snapshot, "_case_workspace")
+    decision.persist(store, state)
+    reopened = EvidenceStore.open(case)
+    reopened_state = run_transition(reopened.issue_intent_snapshot())
+    reopened_ledger = RetryLedger.from_store(reopened_state, reopened)
+    reservation_id = decision.reservation_id
+    assert isinstance(reservation_id, str)
+    with pytest.raises(EvidenceIntegrityError, match="proposal authority"):
+        reopened_ledger.claim_attempt(
+            reopened,
+            reopened_state,
+            reservation_id,
+            "attempt-blind",
+        )
+
+    reopened_proposal = replace(proposal)
+    reopened_proposal_authority = ProposalAuthorityManager(reopened_state).issue(reopened_proposal)
+    substituted = replace(proposal, rationale="substituted after reservation")
+    substituted_authority = ProposalAuthorityManager(reopened_state).issue(substituted)
+    with pytest.raises(EvidenceIntegrityError, match="exact proposal authority"):
+        reopened_ledger.claim_attempt(
+            reopened,
+            reopened_state,
+            reservation_id,
+            "attempt-substituted",
+            proposal=substituted,
+            proposal_authority=substituted_authority,
+        )
+    claimed = reopened_ledger.claim_attempt(
+        reopened,
+        reopened_state,
+        reservation_id,
+        "attempt-repaired",
+        proposal=reopened_proposal,
+        proposal_authority=reopened_proposal_authority,
+    )
+    claimed_attempt = AttemptWorkspace._from_manager(
+        case,
+        "attempt-repaired",
+        case.temporary_root / "attempts" / "attempt-repaired",
+    )
+    assert claimed_attempt.attempt_id == "attempt-repaired"
+    assert claimed["payload"] == {
+        "retry_claim": {
+            "failure": "NEGATIVE_JACOBIAN",
+            "intent_sha256": intent_sha256,
+            "parent_attempt_id": "attempt-a",
+            "proposal_id": proposal.proposal_id,
+            "reservation_id": reservation_id,
+            "retry_budget": 1,
+            "retry_used": 1,
+        },
+        "status": "retry_claimed",
+    }
+    setup_store = EvidenceStore.open(case)
+    setup_state = run_transition(setup_store.issue_intent_snapshot())
+    setup_ledger = RetryLedger.from_store(setup_state, setup_store)
+    setup_proposal = replace(proposal)
+    setup_authority = ProposalAuthorityManager(setup_state).issue(setup_proposal)
+    assert setup_ledger.begin_attempt_setup(
+        setup_store,
+        setup_state,
+        reservation_id,
+        "attempt-repaired",
+        proposal=setup_proposal,
+        proposal_authority=setup_authority,
+    )
 
 
 def test_retry_does_not_turn_unresolved_non_authoritative_data_into_a_question(

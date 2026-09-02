@@ -9,6 +9,8 @@ in the solver and workspace phases.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import secrets
 from collections.abc import Iterable, Mapping
@@ -57,6 +59,7 @@ __all__ = [
     "RetryResult",
     "StateTransition",
     "advance_intent_state",
+    "bind_retry_proposal",
     "classify_failure",
     "decide_execution",
     "decide_proposal",
@@ -1277,6 +1280,47 @@ def _proposal_projection(proposal: Proposal) -> tuple[object, ...]:
     )
 
 
+def _json_projection(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {key: _json_projection(item) for key, item in sorted(value.items())}
+    if isinstance(value, tuple):
+        return [_json_projection(item) for item in value]
+    if value is None or type(value) in {bool, int, float, str}:
+        return value
+    if isinstance(value, StrEnum):
+        return value.value
+    raise EvidenceIntegrityError("proposal projection is not canonical JSON")
+
+
+def _proposal_fingerprint(proposal: Proposal) -> str:
+    projection = _proposal_projection(proposal)
+    body = {
+        "authorized": projection[5],
+        "changes": _json_projection(projection[4]),
+        "evidence_ids": _json_projection(projection[3]),
+        "proposal_class": cast(ProposalClass, projection[1]).value,
+        "rationale": projection[2],
+        "requires_physical_decision": projection[6],
+        "within_contract": projection[7],
+    }
+    payload = json.dumps(
+        body,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def bind_retry_proposal(proposal: Proposal) -> Proposal:
+    """Return a proposal whose identifier binds its complete retry projection."""
+
+    if type(proposal) is not Proposal:
+        raise TypeError("proposal must be an exact Proposal")
+    return replace(proposal, proposal_id=_proposal_fingerprint(proposal))
+
+
 def _issue_proposal_token(
     manager: _ProposalManagerRecord,
     proposal: Proposal,
@@ -1647,8 +1691,11 @@ class RetryLedger:
         authority: IntentStateAuthority,
         reservation_id: str,
         attempt_id: str,
+        *,
+        proposal: Proposal | None = None,
+        proposal_authority: ProposalAuthority | ProposalValidationReceipt | None = None,
     ) -> dict[str, object]:
-        """Atomically bind one durable no-change reservation to a fresh attempt."""
+        """Atomically bind one durable authorized reservation to a fresh attempt."""
 
         return _claim_retry_attempt(
             self,
@@ -1656,6 +1703,8 @@ class RetryLedger:
             authority,
             reservation_id,
             attempt_id,
+            proposal=proposal,
+            proposal_authority=proposal_authority,
         )
 
     def begin_attempt_setup(
@@ -1664,6 +1713,9 @@ class RetryLedger:
         authority: IntentStateAuthority,
         reservation_id: str,
         attempt_id: str,
+        *,
+        proposal: Proposal | None = None,
+        proposal_authority: ProposalAuthority | ProposalValidationReceipt | None = None,
     ) -> bool:
         """Atomically mark a claimed retry as unsafe to launch more than once."""
 
@@ -1673,6 +1725,8 @@ class RetryLedger:
             authority,
             reservation_id,
             attempt_id,
+            proposal=proposal,
+            proposal_authority=proposal_authority,
         )
 
 
@@ -1762,12 +1816,42 @@ def _validated_retry_ledger(
     return record
 
 
+def _validate_retry_claim_proposal(
+    retry_record: RetryRecord,
+    authority: IntentStateAuthority,
+    proposal: Proposal | None,
+    proposal_authority: ProposalAuthority | ProposalValidationReceipt | None,
+) -> None:
+    if retry_record.proposal_id is None:
+        if (
+            retry_record.failure is not FailureClass.TIMEOUT
+            or proposal is not None
+            or proposal_authority is not None
+        ):
+            raise EvidenceIntegrityError("no-change retry reservation is invalid")
+        return
+    if (
+        retry_record.failure is not FailureClass.NEGATIVE_JACOBIAN
+        or type(proposal) is not Proposal
+        or proposal_authority is None
+        or proposal.proposal_id != retry_record.proposal_id
+        or _proposal_fingerprint(proposal) != retry_record.proposal_id
+    ):
+        raise EvidenceIntegrityError("retry reservation requires its exact proposal authority")
+    decision = decide_proposal(authority, proposal, proposal_authority)
+    if decision.action is not ProposalAction.AUTO_APPLY:
+        raise EvidenceIntegrityError("retry reservation requires its exact proposal authority")
+
+
 def _claim_retry_attempt(
     ledger: RetryLedger,
     store: EvidenceStore,
     authority: IntentStateAuthority,
     reservation_id: str,
     attempt_id: str,
+    *,
+    proposal: Proposal | None,
+    proposal_authority: ProposalAuthority | ProposalValidationReceipt | None,
 ) -> dict[str, object]:
     """Validate policy authority before the evidence layer consumes a reservation."""
 
@@ -1784,10 +1868,12 @@ def _claim_retry_attempt(
     if len(matches) != 1:
         raise EvidenceIntegrityError("retry reservation is not present in the authorized ledger")
     retry_record = matches[0]
-    if retry_record.failure is not FailureClass.TIMEOUT or retry_record.proposal_id is not None:
-        raise EvidenceIntegrityError(
-            "retry reservation requires live proposal authority and cannot be claimed"
-        )
+    _validate_retry_claim_proposal(
+        retry_record,
+        authority,
+        proposal,
+        proposal_authority,
+    )
     if retry_record.attempt_id is None:
         raise EvidenceIntegrityError("retry reservation parent attempt is missing")
     snapshot = ledger_record[2]
@@ -1813,6 +1899,9 @@ def _begin_retry_attempt_setup(
     authority: IntentStateAuthority,
     reservation_id: str,
     attempt_id: str,
+    *,
+    proposal: Proposal | None,
+    proposal_authority: ProposalAuthority | ProposalValidationReceipt | None,
 ) -> bool:
     """Validate policy authority before recording the retry setup boundary."""
 
@@ -1829,10 +1918,12 @@ def _begin_retry_attempt_setup(
     if len(matches) != 1:
         raise EvidenceIntegrityError("retry reservation is not present in the authorized ledger")
     retry_record = matches[0]
-    if retry_record.failure is not FailureClass.TIMEOUT or retry_record.proposal_id is not None:
-        raise EvidenceIntegrityError(
-            "retry reservation requires live proposal authority and cannot begin setup"
-        )
+    _validate_retry_claim_proposal(
+        retry_record,
+        authority,
+        proposal,
+        proposal_authority,
+    )
     if retry_record.attempt_id is None:
         raise EvidenceIntegrityError("retry reservation parent attempt is missing")
     snapshot = ledger_record[2]
@@ -2405,6 +2496,8 @@ def decide_retry(
                 reason=proposal_decision.reason,
                 route=FailureRoute.STOP,
             )
+        if proposal.proposal_id != _proposal_fingerprint(proposal):
+            return stopped("retry proposal identifier does not bind its exact projection")
     if not routing.retryable:
         return stopped(routing.rationale)
     if authority is None or authority_record is None:

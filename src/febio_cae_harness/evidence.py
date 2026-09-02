@@ -1473,9 +1473,15 @@ class EvidenceStore:
             _validate_segment(parent_attempt_id, "parent_attempt_id")
         except (TypeError, ValueError) as error:
             raise EvidenceIntegrityError("retry claim parent attempt is invalid") from error
+        no_change_timeout = failure == "TIMEOUT" and proposal_id is None
+        declared_negative_repair = (
+            failure == "NEGATIVE_JACOBIAN"
+            and isinstance(proposal_id, str)
+            and len(proposal_id) == 64
+            and all(character in "0123456789abcdef" for character in proposal_id)
+        )
         if (
-            failure != "TIMEOUT"
-            or proposal_id is not None
+            not (no_change_timeout or declared_negative_repair)
             or not isinstance(intent_sha256, str)
             or len(intent_sha256) != 64
             or any(character not in "0123456789abcdef" for character in intent_sha256)
@@ -1523,11 +1529,14 @@ class EvidenceStore:
                 raise EvidenceIntegrityError("retry claim reservation is not durable")
             terminal = matching_terminals[0]
             autonomy = cast(dict[str, Any], terminal["autonomy"])
+            expected_solver_states = (
+                {"TIMED_OUT"} if failure == "TIMEOUT" else {"FAILED", "NORMAL_EXIT"}
+            )
             if (
                 terminal.get("attempt_id") != parent_attempt_id
-                or terminal.get("classification") != "TIMEOUT"
+                or terminal.get("classification") != failure
                 or terminal.get("official_fbs") is not False
-                or terminal.get("solver_state") != "TIMED_OUT"
+                or terminal.get("solver_state") not in expected_solver_states
                 or terminal.get("status") != "SOLVER_FAILED"
                 or autonomy.get("decision") != "RETRY"
                 or autonomy.get("route") != "RETRY"
