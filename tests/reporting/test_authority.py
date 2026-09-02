@@ -327,6 +327,51 @@ def test_official_receipt_enables_official_fbs_gate_but_not_physical_evidence(
         evaluate_success_gates(authority)
 
 
+def test_issued_physical_authority_drives_report_gates_without_caller_booleans(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    physical_module = importlib.import_module("febio_cae_harness.reporting.physical")
+    fbs_manager, supervisor, result, evidence, receipt = _official_case(tmp_path, monkeypatch)
+    documents = {kind.value: {"synthetic_plumbing": True} for kind in EvidenceKind}
+    synthetic_evaluation = physical_module.PhysicalEvidenceEvaluation(
+        {kind.value: True for kind in EvidenceKind},
+        documents,
+        {kind.value: () for kind in EvidenceKind},
+    )
+    monkeypatch.setattr(
+        physical_module,
+        "_evaluate_physical_payload",
+        lambda **kwargs: synthetic_evaluation,
+    )
+    try:
+        physical = physical_module.issue_physical_evidence(supervisor, result, receipt)
+        identity = AttemptIdentity(
+            supervisor._case_id, supervisor._intent_id, supervisor._attempt_id
+        )
+        manager = ReportAuthorityManager(
+            supervisor,
+            result,
+            identity,
+            official_fbs_result=receipt,
+            physical_evidence=physical,
+        )
+        authority = manager.issue(evidence)
+        evaluation = evaluate_success_gates(authority)
+
+        assert physical.passed == {kind.value: True for kind in EvidenceKind}
+        assert authority.physical_evidence is physical
+        assert evaluation.checks["mesh_evidence"] is True
+        assert evaluation.checks["jacobian_evidence"] is True
+        assert evaluation.checks["roi_evidence"] is True
+        assert evaluation.checks["evaluation_evidence"] is True
+        assert evaluation.success is True
+        with pytest.raises(TypeError):
+            physical_module.PhysicalEvidenceAuthority()
+    finally:
+        fbs_manager.close()
+
+
 def test_issue_requires_exact_evidence_set_and_live_regular_paths(tmp_path: Path) -> None:
     manager, _, _, evidence = _case(tmp_path)
     with pytest.raises(ValueError):

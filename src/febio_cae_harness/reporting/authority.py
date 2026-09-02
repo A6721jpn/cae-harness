@@ -18,6 +18,7 @@ from febio_cae_harness.solver.official_fbs import (
 )
 from febio_cae_harness.solver.types import _reject_alias as _solver_reject_alias
 
+from .physical import PhysicalEvidenceAuthority, _validated_physical_evidence
 from .types import AttemptIdentity, EvidenceKind
 
 __all__ = ["ReportAuthorityManager", "ReportAuthority"]
@@ -84,7 +85,7 @@ def _manager(value: object) -> _ManagerRecord:
 
 
 def _validate_manager(record: _ManagerRecord) -> None:
-    _, supervisor, result, identity, root, _, _ = record
+    _, supervisor, result, identity, root, _, official_result, physical_evidence = record
     if type(supervisor) is not SolverSupervisor or type(result) is not SolverRunResult:
         raise TypeError("report authority requires exact solver instances")
     try:
@@ -106,6 +107,15 @@ def _validate_manager(record: _ManagerRecord) -> None:
         raise TypeError("solver attempt root/output binding is invalid")
     if any(path == root or not path.is_relative_to(root) for path in (log, xplt)):
         raise TypeError("solver output paths are outside the attempt root")
+    if physical_evidence is not None:
+        if type(official_result) is not OfficialFbsResultReceipt:
+            raise TypeError("physical evidence requires an official FBS result")
+        _validated_physical_evidence(
+            physical_evidence,
+            supervisor=supervisor,
+            result=result,
+            receipt=official_result,
+        )
 
 
 def _issued_fbs(
@@ -180,6 +190,14 @@ def _require_issued_authority(
     _, provenance = _issued_fbs(record[3], record[11])
     if provenance != record[10]:
         raise TypeError("report authority FBS provenance changed")
+    physical_evidence = record[12]
+    if physical_evidence is not None:
+        _validated_physical_evidence(
+            physical_evidence,
+            supervisor=record[2],
+            result=record[3],
+            receipt=record[11],
+        )
     for path, expected in record[7].items():
         current = _snapshot(path, record[5], "report artifact")
         if current != expected:
@@ -227,6 +245,7 @@ class ReportAuthority(_Opaque):
             "runtime_identity": record[9],
             "provenance": record[10],
             "official_fbs_result": record[11],
+            "physical_evidence": record[12],
         }
         try:
             return values[name]
@@ -245,6 +264,7 @@ class ReportAuthorityManager(_Opaque):
         attempt_root: str | os.PathLike[str] | None = None,
         *,
         official_fbs_result: OfficialFbsResultReceipt | None = None,
+        physical_evidence: PhysicalEvidenceAuthority | None = None,
     ) -> None:
         if type(supervisor) is not SolverSupervisor or type(result) is not SolverRunResult:
             raise TypeError("manager requires exact solver instances")
@@ -261,6 +281,11 @@ class ReportAuthorityManager(_Opaque):
             and type(official_fbs_result) is not OfficialFbsResultReceipt
         ):
             raise TypeError("official_fbs_result must be an exact OfficialFbsResultReceipt")
+        if (
+            physical_evidence is not None
+            and type(physical_evidence) is not PhysicalEvidenceAuthority
+        ):
+            raise TypeError("physical_evidence must be an exact PhysicalEvidenceAuthority")
         record: _ManagerRecord = (
             self,
             supervisor,
@@ -269,6 +294,7 @@ class ReportAuthorityManager(_Opaque):
             root,
             None,
             official_fbs_result,
+            physical_evidence,
         )
         _validate_manager(record)
         _MANAGERS[id(self)] = record
@@ -285,6 +311,13 @@ class ReportAuthorityManager(_Opaque):
             for kind, path in _evidence(evidence).items()
         }
         fbs, provenance = _issued_fbs(record[2], record[6])
+        if record[7] is not None:
+            _validated_physical_evidence(
+                record[7],
+                supervisor=record[1],
+                result=record[2],
+                receipt=record[6],
+            )
         outputs = (record[2].log_path, record[2].xplt_path)
         all_paths = tuple(paths.values()) + outputs
         if len({os.path.normcase(os.fspath(path)) for path in all_paths}) != len(all_paths):
@@ -326,6 +359,7 @@ class ReportAuthorityManager(_Opaque):
             fbs.runtime_identity,
             provenance,
             record[6],
+            record[7],
         )
         _MANAGERS[id(self)] = (
             self,
@@ -335,5 +369,6 @@ class ReportAuthorityManager(_Opaque):
             record[4],
             authority,
             record[6],
+            record[7],
         )
         return authority

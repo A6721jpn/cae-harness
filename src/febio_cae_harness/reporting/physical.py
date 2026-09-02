@@ -5,13 +5,28 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import re
+import stat
+import weakref
 import xml.etree.ElementTree as ET
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from types import MappingProxyType
+from typing import NoReturn
 
 from febio_cae_harness.contracts import IntentContract
+from febio_cae_harness.evidence import IntentSnapshotAuthority
+from febio_cae_harness.solver.official_fbs import (
+    OfficialFbsResultReceipt,
+    require_official_fbs_result,
+)
+from febio_cae_harness.solver.supervisor import SolverSupervisor
+from febio_cae_harness.solver.types import (
+    SolverRunResult,
+    _validate_launch_capability,
+)
 
 _REQUIRED_FACTS = (
     "engineering_question",
@@ -47,6 +62,99 @@ class PhysicalEvidenceEvaluation:
         object.__setattr__(self, "passed", MappingProxyType(dict(self.passed)))
         object.__setattr__(self, "documents", MappingProxyType(dict(self.documents)))
         object.__setattr__(self, "failures", MappingProxyType(dict(self.failures)))
+
+
+@dataclass(frozen=True, slots=True)
+class _PhysicalAuthorityBinding:
+    token: object
+    supervisor: SolverSupervisor
+    result: SolverRunResult
+    receipt: OfficialFbsResultReceipt
+    snapshot: IntentSnapshotAuthority
+    input_snapshot: tuple[object, ...]
+    evaluation_sha256: str
+
+
+class PhysicalEvidenceAuthority:
+    """Opaque live authority for physical evidence from one exact solver result."""
+
+    __slots__ = ("_token", "__weakref__")
+
+    def __new__(cls, *args: object, **kwargs: object) -> PhysicalEvidenceAuthority:
+        del args, kwargs
+        raise TypeError("physical evidence authorities are issued by the reporting boundary")
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        del kwargs
+        raise TypeError("PhysicalEvidenceAuthority cannot be subclassed")
+
+    def __setattr__(self, name: str, value: object) -> None:
+        del name, value
+        raise AttributeError("physical evidence authorities are immutable")
+
+    def __delattr__(self, name: str) -> None:
+        del name
+        raise AttributeError("physical evidence authorities are immutable")
+
+    def __copy__(self) -> PhysicalEvidenceAuthority:
+        raise TypeError("physical evidence authorities cannot be copied")
+
+    def __deepcopy__(self, memo: dict[int, object]) -> PhysicalEvidenceAuthority:
+        del memo
+        raise TypeError("physical evidence authorities cannot be copied")
+
+    def __reduce__(self) -> NoReturn:
+        raise TypeError("physical evidence authorities cannot be serialized")
+
+    @property
+    def case_id(self) -> str:
+        binding, _ = _validated_physical_evidence(self)
+        return binding.snapshot.case_id
+
+    @property
+    def intent_sha256(self) -> str:
+        binding, _ = _validated_physical_evidence(self)
+        return binding.snapshot.intent_sha256
+
+    @property
+    def attempt_id(self) -> str:
+        binding, _ = _validated_physical_evidence(self)
+        return binding.supervisor._attempt_id
+
+    @property
+    def passed(self) -> Mapping[str, bool]:
+        _, evaluation = _validated_physical_evidence(self)
+        return MappingProxyType(dict(evaluation.passed))
+
+    def authoritative(self, kind: str) -> bool:
+        _, evaluation = _validated_physical_evidence(self)
+        if kind not in evaluation.passed:
+            raise ValueError("unknown physical evidence kind")
+        return evaluation.passed[kind]
+
+    def document(self, kind: str) -> dict[str, object]:
+        binding, evaluation = _validated_physical_evidence(self)
+        if kind not in evaluation.documents:
+            raise ValueError("unknown physical evidence kind")
+        document = _plain(evaluation.documents[kind])
+        if not isinstance(document, dict):  # pragma: no cover - evaluation guard
+            raise TypeError("physical evidence document is invalid")
+        return {
+            "authority": "official" if evaluation.passed[kind] else "unverified",
+            "case_id": binding.snapshot.case_id,
+            "intent_sha256": binding.snapshot.intent_sha256,
+            "attempt_id": binding.supervisor._attempt_id,
+            "kind": kind,
+            "satisfies_intent": evaluation.passed[kind],
+            "schema_version": "febio-cae-physical-evidence/v1",
+            "verified": evaluation.passed[kind],
+            **document,
+        }
+
+
+_PHYSICAL_AUTHORITIES: weakref.WeakKeyDictionary[
+    PhysicalEvidenceAuthority, _PhysicalAuthorityBinding
+] = weakref.WeakKeyDictionary()
 
 
 @dataclass(frozen=True, slots=True)
@@ -433,4 +541,201 @@ def _evaluate_physical_payload(
     )
 
 
-__all__ = ["PhysicalEvidenceEvaluation"]
+def _plain(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {str(key): _plain(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain(item) for item in value]
+    return value
+
+
+def _evaluation_sha256(evaluation: PhysicalEvidenceEvaluation) -> str:
+    payload = {
+        "passed": _plain(evaluation.passed),
+        "documents": _plain(evaluation.documents),
+        "failures": _plain(evaluation.failures),
+    }
+    try:
+        raw = json.dumps(
+            payload,
+            allow_nan=False,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+    except (TypeError, ValueError) as error:  # pragma: no cover - evaluator guard
+        raise TypeError("physical evidence evaluation is invalid") from error
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _read_bound_input(path: object, expected: tuple[object, ...]) -> bytes:
+    if not isinstance(path, Path) or len(expected) != 6:
+        raise TypeError("physical evidence input binding is invalid")
+    try:
+        metadata = path.lstat()
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise TypeError("physical evidence input is not an exact regular file")
+        with path.open("rb") as stream:
+            opened = os.fstat(stream.fileno())
+            opened_identity = (
+                opened.st_dev,
+                opened.st_ino,
+                opened.st_nlink,
+                opened.st_size,
+                opened.st_mtime_ns,
+            )
+            expected_identity = tuple(expected[:5])
+            metadata_identity = (
+                metadata.st_dev,
+                metadata.st_ino,
+                metadata.st_nlink,
+                metadata.st_size,
+                metadata.st_mtime_ns,
+            )
+            if opened_identity != metadata_identity or opened_identity != expected_identity:
+                raise TypeError("physical evidence input identity changed")
+            payload = stream.read()
+            finished = os.fstat(stream.fileno())
+    except TypeError:
+        raise
+    except OSError as error:
+        raise TypeError("physical evidence input is unavailable") from error
+    if (
+        finished.st_dev,
+        finished.st_ino,
+        finished.st_nlink,
+        finished.st_size,
+        finished.st_mtime_ns,
+    ) != tuple(expected[:5]):
+        raise TypeError("physical evidence input changed while reading")
+    digest = hashlib.sha256(payload).hexdigest()
+    if digest != expected[5]:
+        raise TypeError("physical evidence input digest changed")
+    return payload
+
+
+def _live_physical_evaluation(
+    supervisor: SolverSupervisor,
+    result: SolverRunResult,
+    receipt: OfficialFbsResultReceipt,
+) -> tuple[IntentSnapshotAuthority, tuple[object, ...], PhysicalEvidenceEvaluation]:
+    if (
+        type(supervisor) is not SolverSupervisor
+        or type(result) is not SolverRunResult
+        or type(receipt) is not OfficialFbsResultReceipt
+    ):
+        raise TypeError("physical evidence requires exact solver and FBS authorities")
+    if supervisor._validate_result(result) is not result:
+        raise TypeError("physical evidence solver result binding is invalid")
+    capability_record, _, intent_id, attempt_id, _, _, _ = _validate_launch_capability(
+        supervisor._launch_capability
+    )
+    snapshot = capability_record.intent_snapshot
+    if type(snapshot) is not IntentSnapshotAuthority:
+        raise TypeError("physical evidence intent snapshot is invalid")
+    input_snapshot = capability_record.input_snapshot
+    if not isinstance(input_snapshot, tuple):  # pragma: no cover - issuance guard
+        raise TypeError("physical evidence input snapshot is invalid")
+    if (
+        snapshot.intent_sha256 != intent_id
+        or supervisor._attempt_id != attempt_id
+        or result.fbs_validation is not receipt.validation
+        or require_official_fbs_result(receipt.validation) is not receipt
+        or receipt.xplt_path != result.xplt_path
+        or receipt.requested_fields != supervisor.spec.requested_fields
+    ):
+        raise TypeError("physical evidence authority binding differs")
+    input_bytes = _read_bound_input(supervisor.spec.input_path, input_snapshot)
+    final_record, _, final_intent_id, final_attempt_id, _, _, _ = _validate_launch_capability(
+        supervisor._launch_capability
+    )
+    if (
+        final_record is not capability_record
+        or final_record.intent_snapshot is not snapshot
+        or final_record.input_snapshot != input_snapshot
+        or final_intent_id != intent_id
+        or final_attempt_id != attempt_id
+        or supervisor._validate_result(result) is not result
+    ):
+        raise TypeError("physical evidence authority changed during evaluation")
+    model_manifest = receipt.model_manifest
+    geometry = receipt.geometry_summary
+    values = receipt.values
+    if not isinstance(model_manifest, Mapping) or not isinstance(values, Mapping):
+        raise TypeError("physical evidence official FBS payload is invalid")
+    evaluation = _evaluate_physical_payload(
+        intent=snapshot.intent,
+        input_bytes=input_bytes,
+        input_sha256=str(input_snapshot[5]),
+        model_manifest=model_manifest,
+        geometry=geometry,
+        values=values,
+        requested_fields=receipt.requested_fields,
+    )
+    return snapshot, input_snapshot, evaluation
+
+
+def issue_physical_evidence(
+    supervisor: SolverSupervisor,
+    result: SolverRunResult,
+    receipt: OfficialFbsResultReceipt,
+) -> PhysicalEvidenceAuthority:
+    """Issue a live authority after evaluating one exact input/result binding."""
+
+    snapshot, input_snapshot, evaluation = _live_physical_evaluation(supervisor, result, receipt)
+    authority = object.__new__(PhysicalEvidenceAuthority)
+    token = object()
+    object.__setattr__(authority, "_token", token)
+    _PHYSICAL_AUTHORITIES[authority] = _PhysicalAuthorityBinding(
+        token,
+        supervisor,
+        result,
+        receipt,
+        snapshot,
+        input_snapshot,
+        _evaluation_sha256(evaluation),
+    )
+    return authority
+
+
+def _validated_physical_evidence(
+    value: object,
+    *,
+    supervisor: SolverSupervisor | None = None,
+    result: SolverRunResult | None = None,
+    receipt: OfficialFbsResultReceipt | None = None,
+) -> tuple[_PhysicalAuthorityBinding, PhysicalEvidenceEvaluation]:
+    if type(value) is not PhysicalEvidenceAuthority:
+        raise TypeError("value is not an exact PhysicalEvidenceAuthority")
+    binding = _PHYSICAL_AUTHORITIES.get(value)
+    try:
+        token = object.__getattribute__(value, "_token")
+    except AttributeError as error:
+        raise TypeError("PhysicalEvidenceAuthority was not issued") from error
+    if binding is None or binding.token is not token:
+        raise TypeError("PhysicalEvidenceAuthority was not issued")
+    if (
+        (supervisor is not None and supervisor is not binding.supervisor)
+        or (result is not None and result is not binding.result)
+        or (receipt is not None and receipt is not binding.receipt)
+    ):
+        raise TypeError("PhysicalEvidenceAuthority belongs to another result")
+    snapshot, input_snapshot, evaluation = _live_physical_evaluation(
+        binding.supervisor,
+        binding.result,
+        binding.receipt,
+    )
+    if (
+        snapshot is not binding.snapshot
+        or input_snapshot != binding.input_snapshot
+        or _evaluation_sha256(evaluation) != binding.evaluation_sha256
+    ):
+        raise TypeError("PhysicalEvidenceAuthority binding changed")
+    return binding, evaluation
+
+
+__all__ = [
+    "PhysicalEvidenceAuthority",
+    "PhysicalEvidenceEvaluation",
+    "issue_physical_evidence",
+]

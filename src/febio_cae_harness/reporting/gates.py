@@ -13,9 +13,11 @@ from febio_cae_harness.solver import (
     SolverClassification,
     SolverRunResult,
     SolverState,
+    SolverSupervisor,
 )
 
 from .authority import ReportAuthority, _require_issued_authority
+from .physical import PhysicalEvidenceAuthority, _validated_physical_evidence
 from .types import (
     AttemptIdentity,
     EvidenceKind,
@@ -53,10 +55,23 @@ def _authority_provenance(record: tuple[Any, ...]) -> EvidenceProvenance:
 def _diagnostic_evidence(
     identity: AttemptIdentity,
     paths: Mapping[EvidenceKind, Path],
+    physical_evidence: PhysicalEvidenceAuthority | None,
 ) -> ReportEvidence:
     def reference(kind: EvidenceKind) -> EvidenceReference:
+        authoritative = physical_evidence is not None and physical_evidence.authoritative(
+            kind.value
+        )
         return EvidenceReference(
-            kind, paths[kind], identity.case_id, identity.intent_id, identity.attempt_id
+            kind,
+            paths[kind],
+            identity.case_id,
+            identity.intent_id,
+            identity.attempt_id,
+            verified=authoritative,
+            satisfies_intent=authoritative,
+            provenance=(
+                EvidenceProvenance.OFFICIAL if authoritative else EvidenceProvenance.UNVERIFIED
+            ),
         )
 
     return ReportEvidence(
@@ -85,6 +100,14 @@ def _diagnostic_inputs(
     if type(fbs) is not FbsValidation:
         raise TypeError("report authority result has no exact FbsValidation")
     paths = cast(Mapping[EvidenceKind, Path], record[6])
+    physical_evidence = cast(PhysicalEvidenceAuthority | None, record[12])
+    if physical_evidence is not None:
+        _validated_physical_evidence(
+            physical_evidence,
+            supervisor=cast(SolverSupervisor, record[2]),
+            result=result,
+            receipt=record[11],
+        )
     fresh = FreshOutputValidation(
         identity.attempt_id,
         result.log_path,
@@ -96,7 +119,14 @@ def _diagnostic_inputs(
         True,
         EvidenceProvenance.UNVERIFIED,
     )
-    return record, identity, result, fbs, fresh, _diagnostic_evidence(identity, paths)
+    return (
+        record,
+        identity,
+        result,
+        fbs,
+        fresh,
+        _diagnostic_evidence(identity, paths, physical_evidence),
+    )
 
 
 def _evaluate_authority(
