@@ -1658,6 +1658,23 @@ class RetryLedger:
             attempt_id,
         )
 
+    def begin_attempt_setup(
+        self,
+        store: EvidenceStore,
+        authority: IntentStateAuthority,
+        reservation_id: str,
+        attempt_id: str,
+    ) -> bool:
+        """Atomically mark a claimed retry as unsafe to launch more than once."""
+
+        return _begin_retry_attempt_setup(
+            self,
+            store,
+            authority,
+            reservation_id,
+            attempt_id,
+        )
+
 
 def _retry_record_projection(record: RetryRecord) -> tuple[object, ...]:
     if type(record) is not RetryRecord:
@@ -1788,6 +1805,38 @@ def _claim_retry_attempt(
             "retry_used": record_index + 1,
         },
     )
+
+
+def _begin_retry_attempt_setup(
+    ledger: RetryLedger,
+    store: EvidenceStore,
+    authority: IntentStateAuthority,
+    reservation_id: str,
+    attempt_id: str,
+) -> bool:
+    """Validate policy authority before recording the retry setup boundary."""
+
+    if type(store) is not EvidenceStore:
+        raise TypeError("store must be an exact EvidenceStore")
+    if type(authority) is not IntentStateAuthority:
+        raise TypeError("authority must be an exact IntentStateAuthority")
+    if not isinstance(reservation_id, str):
+        raise TypeError("reservation_id must be a string")
+    if not isinstance(attempt_id, str):
+        raise TypeError("attempt_id must be a string")
+    ledger_record = _validated_retry_ledger(ledger, authority)
+    matches = [record for record in ledger.records if record.reservation_id == reservation_id]
+    if len(matches) != 1:
+        raise EvidenceIntegrityError("retry reservation is not present in the authorized ledger")
+    retry_record = matches[0]
+    if retry_record.failure is not FailureClass.TIMEOUT or retry_record.proposal_id is not None:
+        raise EvidenceIntegrityError(
+            "retry reservation requires live proposal authority and cannot begin setup"
+        )
+    if retry_record.attempt_id is None:
+        raise EvidenceIntegrityError("retry reservation parent attempt is missing")
+    snapshot = ledger_record[2]
+    return store._begin_retry_attempt_setup(snapshot, attempt_id, reservation_id)
 
 
 @dataclass(frozen=True, slots=True)

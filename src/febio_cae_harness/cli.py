@@ -32,6 +32,7 @@ from febio_cae_harness.solver.execution import (
     claim_execution_outputs,
     issue_execution_authority,
     record_execution_output_artifacts,
+    reopen_execution_authority,
 )
 from febio_cae_harness.solver.headless import (
     HeadlessConfigurationError,
@@ -45,7 +46,12 @@ from febio_cae_harness.solver.types import (
     SolverOwnershipError,
     SolverState,
 )
-from febio_cae_harness.workspace import AttemptWorkspace, WorkspaceBoundaryError
+from febio_cae_harness.workspace import (
+    AttemptWorkspace,
+    CaseWorkspace,
+    WorkspaceBoundaryError,
+    _identity_stamp,
+)
 
 _PREFLIGHT_EXIT_CODES = {
     "INVALID_FEB_ROOT": 2,
@@ -180,6 +186,15 @@ def build_parser() -> argparse.ArgumentParser:
     reconnect_febio.add_argument("--case-id", required=True)
     reconnect_febio.add_argument("--attempt-id", required=True)
     reconnect_febio.add_argument("--runtime-probe", required=True, type=Path, metavar="PATH")
+
+    retry_febio = commands.add_parser(
+        "retry-febio",
+        help="claim one durable retry reservation and reuse its recorded launch contract",
+    )
+    retry_febio.add_argument("--capability-stdin", required=True, action="store_true")
+    retry_febio.add_argument("--case-id", required=True)
+    retry_febio.add_argument("--reservation-id", required=True)
+    retry_febio.add_argument("--runtime-probe", required=True, type=Path, metavar="PATH")
     return parser
 
 
@@ -435,6 +450,34 @@ def _select_feb_input(
     return candidates[0]
 
 
+def _open_recorded_attempt(case: CaseWorkspace, attempt_id: str) -> AttemptWorkspace:
+    attempt_root = case.temporary_root / "attempts" / attempt_id
+    attempt_stamp = _identity_stamp(attempt_root, "recorded attempt root")
+    return AttemptWorkspace._from_manager(
+        case,
+        attempt_id,
+        attempt_root,
+        expected_root_stamp=attempt_stamp,
+    )
+
+
+def _retry_already_started(attempt_id: str) -> int:
+    _emit_context_json(
+        _run_failure(
+            "RETRY_ALREADY_STARTED",
+            "durable retry setup already started; the attempt was not relaunched",
+            command="retry-febio",
+            attempt={
+                "attempt_id": attempt_id,
+                "official_fbs": False,
+                "status": "RETRY_ALREADY_STARTED",
+            },
+        ),
+        error=True,
+    )
+    return _RUN_FAILURE_EXIT
+
+
 def _run_febio_command(arguments: argparse.Namespace) -> int:
     terminal_store: EvidenceStore | None = None
     attempt_id: str | None = None
@@ -570,6 +613,7 @@ def _run_febio_command(arguments: argparse.Namespace) -> int:
             retry_reserved = retry.reservation_required
             if retry_reserved:
                 retry.persist(opened.store, state_authority)
+                attempt_payload["retry_reservation_id"] = retry.reservation_id
             if not retry_reserved and not _append_run_terminal(
                 opened.store, attempt_id, "SOLVER_FAILED", solver=solver
             ):
@@ -676,6 +720,370 @@ def _run_febio_command(arguments: argparse.Namespace) -> int:
         )
 
 
+def _retry_febio_command(arguments: argparse.Namespace) -> int:
+    command = "retry-febio"
+    terminal_store: EvidenceStore | None = None
+    attempt_id: str | None = None
+    try:
+        service = _case_service()
+        root_capability = _read_root_capability_stdin()
+        opened = service._open_context(root_capability, arguments.case_id)
+        if opened.result.state is not IntentState.BOUND or opened.result.question is not None:
+            raise _RunCommandError("ASK_AND_BLOCK", "case intent is not authoritatively bound")
+        snapshot = opened.store.issue_intent_snapshot()
+        completeness = assess_authoritative_completeness(snapshot)
+        if completeness.state != IntentState.BOUND.value:
+            raise _RunCommandError(
+                "ASK_AND_BLOCK",
+                "required physical conditions are not authoritatively bound",
+            )
+        reservation_id = arguments.reservation_id
+        if (
+            not isinstance(reservation_id, str)
+            or len(reservation_id) != 64
+            or any(character not in "0123456789abcdef" for character in reservation_id)
+        ):
+            raise _RunCommandError(
+                "INVALID_INPUT",
+                "reservation_id must be one lowercase SHA-256 identifier",
+            )
+        if not arguments.runtime_probe.is_absolute():
+            raise _RunCommandError(
+                "INVALID_INPUT",
+                "runtime_probe must be one absolute executable path",
+            )
+        runtime = probe_febio(arguments.runtime_probe)
+        state_authority = transition_intent(snapshot)
+        ledger = RetryLedger.from_store(state_authority, opened.store)
+        matching_records = [
+            record for record in ledger.records if record.reservation_id == reservation_id
+        ]
+        if len(matching_records) != 1 or matching_records[0].attempt_id is None:
+            raise _RunCommandError(
+                "RETRY_RESERVATION_INVALID",
+                "retry reservation is absent or has no exact parent attempt",
+            )
+        parent_attempt_id = matching_records[0].attempt_id
+        attempt_id = f"retry-{reservation_id}"
+        claim = ledger.claim_attempt(
+            opened.store,
+            state_authority,
+            reservation_id,
+            attempt_id,
+        )
+        if claim.get("attempt_id") != attempt_id:
+            raise _RunCommandError(
+                "EVIDENCE_INTEGRITY_FAILURE",
+                "retry claim attempt identity changed",
+            )
+        snapshot = opened.store.issue_intent_snapshot()
+        completeness = assess_authoritative_completeness(snapshot)
+        if completeness.state != IntentState.BOUND.value:
+            raise _RunCommandError(
+                "ASK_AND_BLOCK",
+                "required physical conditions are not authoritatively bound",
+            )
+        parent_attempt = _open_recorded_attempt(opened.case, parent_attempt_id)
+        parent_execution = reopen_execution_authority(
+            parent_attempt,
+            snapshot,
+            runtime,
+        )
+        parent_input = parent_execution.input_path
+        input_name = parent_input.name
+        expected_sha256 = parent_execution.input_sha256
+        expected_steps = parent_execution.expected_steps
+        expected_final_time = parent_execution.expected_final_time
+        timeout_seconds = parent_execution.timeout_seconds
+        requested_fields = parent_execution.requested_fields
+        execution_name = parent_execution.record_path.name
+
+        attempt = _open_recorded_attempt(opened.case, attempt_id)
+        attempt_relative = Path("90_Temporary") / "attempts" / attempt_id
+        execution_relative = attempt_relative / execution_name
+        with opened.case._exact_transaction() as exact:
+            execution_exists = exact.exists(execution_relative)
+        if execution_exists:
+            reopen_execution_authority(attempt, snapshot, runtime)
+            return _retry_already_started(attempt_id)
+
+        source_relative = parent_input.relative_to(opened.case.root)
+        destination_relative = attempt_relative / input_name
+        with opened.case._exact_transaction() as exact:
+            if exact.exists(destination_relative):
+                if exact.digest(destination_relative) != expected_sha256:
+                    raise _RunCommandError(
+                        "EVIDENCE_INTEGRITY_FAILURE",
+                        "retry input differs from its parent execution",
+                    )
+                staged_input = opened.case.root / destination_relative
+            else:
+                staged_input = exact.copy_create_new(
+                    source_relative,
+                    destination_relative,
+                    expected_sha256,
+                )
+
+        inspection = inspect_feb_file(staged_input)
+        if inspection.sha256 != expected_sha256:
+            raise _RunCommandError(
+                "EVIDENCE_INTEGRITY_FAILURE",
+                "retry input changed after exact copy",
+            )
+        preflight = run_preflight(
+            feb=inspection,
+            completeness=completeness,
+            snapshot=snapshot,
+        )
+        if not preflight.ready:
+            codes = sorted({item.code for item in preflight.blocking_diagnostics})
+            detail = ",".join(codes) if codes else "UNKNOWN"
+            raise _RunCommandError(
+                "PREFLIGHT_BLOCKED",
+                f"retry FEB preflight is blocked: {detail}",
+            )
+
+        setup_state = transition_intent(snapshot)
+        setup_ledger = RetryLedger.from_store(setup_state, opened.store)
+        if not setup_ledger.begin_attempt_setup(
+            opened.store,
+            setup_state,
+            reservation_id,
+            attempt_id,
+        ):
+            return _retry_already_started(attempt_id)
+
+        snapshot = opened.store.issue_intent_snapshot()
+        completeness = assess_authoritative_completeness(snapshot)
+        if completeness.state != IntentState.BOUND.value:
+            raise _RunCommandError(
+                "ASK_AND_BLOCK",
+                "required physical conditions are not authoritatively bound",
+            )
+        parent_attempt = _open_recorded_attempt(opened.case, parent_attempt_id)
+        refreshed_parent_execution = reopen_execution_authority(
+            parent_attempt,
+            snapshot,
+            runtime,
+        )
+        if (
+            refreshed_parent_execution.input_path.name != input_name
+            or refreshed_parent_execution.input_sha256 != expected_sha256
+            or refreshed_parent_execution.expected_steps != expected_steps
+            or refreshed_parent_execution.expected_final_time != expected_final_time
+            or refreshed_parent_execution.timeout_seconds != timeout_seconds
+            or refreshed_parent_execution.requested_fields != requested_fields
+            or refreshed_parent_execution.record_path.name != execution_name
+        ):
+            raise _RunCommandError(
+                "EVIDENCE_INTEGRITY_FAILURE",
+                "parent execution contract changed during retry setup",
+            )
+        attempt = _open_recorded_attempt(opened.case, attempt_id)
+        with opened.case._exact_transaction() as exact:
+            if (
+                not exact.exists(destination_relative)
+                or exact.digest(destination_relative) != expected_sha256
+            ):
+                raise _RunCommandError(
+                    "EVIDENCE_INTEGRITY_FAILURE",
+                    "retry input changed after setup began",
+                )
+        staged_input = opened.case.root / destination_relative
+        inspection = inspect_feb_file(staged_input)
+        if inspection.sha256 != expected_sha256:
+            raise _RunCommandError(
+                "EVIDENCE_INTEGRITY_FAILURE",
+                "retry input changed after setup began",
+            )
+        preflight = run_preflight(
+            feb=inspection,
+            completeness=completeness,
+            snapshot=snapshot,
+        )
+        if not preflight.ready:
+            codes = sorted({item.code for item in preflight.blocking_diagnostics})
+            detail = ",".join(codes) if codes else "UNKNOWN"
+            raise _RunCommandError(
+                "PREFLIGHT_BLOCKED",
+                f"retry FEB preflight is blocked after setup began: {detail}",
+            )
+
+        try:
+            execution = issue_execution_authority(
+                attempt,
+                snapshot,
+                runtime,
+                staged_input,
+                requested_fields=requested_fields,
+                expected_steps=expected_steps,
+                expected_final_time=expected_final_time,
+                timeout_seconds=timeout_seconds,
+            )
+        except ExecutionAuthorityError:
+            with opened.case._exact_transaction() as exact:
+                execution_exists = exact.exists(execution_relative)
+            if execution_exists:
+                reopen_execution_authority(attempt, snapshot, runtime)
+                return _retry_already_started(attempt_id)
+            raise
+        if execution.input_sha256 != expected_sha256:
+            raise _RunCommandError(
+                "EVIDENCE_INTEGRITY_FAILURE",
+                "retry execution input differs from its parent",
+            )
+        session = run_headless_febio_session(
+            attempt,
+            snapshot,
+            runtime,
+            staged_input,
+            expected_steps=expected_steps,
+            expected_final_time=expected_final_time,
+            timeout_seconds=timeout_seconds,
+            requested_fields=requested_fields,
+        )
+        diagnostic = session.diagnostic
+        solver = {
+            "classification": diagnostic.classification.value,
+            "return_code": diagnostic.return_code,
+            "state": diagnostic.state.value,
+        }
+        attempt_payload: dict[str, object] = {
+            "attempt_id": attempt_id,
+            "official_fbs": False,
+            "status": diagnostic.classification.value,
+        }
+        if (
+            diagnostic.state is not SolverState.NORMAL_EXIT
+            or diagnostic.classification is not SolverClassification.FBS_UNVERIFIED
+            or diagnostic.return_code != 0
+            or diagnostic.log_path != execution.log_path
+            or diagnostic.xplt_path != execution.xplt_path
+        ):
+            retry_state = transition_intent(snapshot)
+            retry = decide_retry(
+                diagnostic.classification.value,
+                RetryLedger.from_store(retry_state, opened.store),
+                intent=retry_state,
+                supervisor=session.supervisor,
+                result=session.result,
+            )
+            retry_reserved = retry.reservation_required
+            if retry_reserved:
+                retry.persist(opened.store, retry_state)
+                attempt_payload["retry_reservation_id"] = retry.reservation_id
+            if not retry_reserved and not _append_run_terminal(
+                opened.store,
+                attempt_id,
+                "SOLVER_FAILED",
+                solver=solver,
+            ):
+                return _fail_run(
+                    _RunCommandError(
+                        "EVIDENCE_INTEGRITY_FAILURE",
+                        "retry terminal evidence could not be recorded",
+                    ),
+                    command=command,
+                )
+            _emit_context_json(
+                _run_failure(
+                    "SOLVER_FAILED",
+                    "retried FEBio did not produce one claimable normal result",
+                    command=command,
+                    attempt=attempt_payload,
+                    solver=solver,
+                ),
+                error=True,
+            )
+            return _RUN_FAILURE_EXIT
+
+        execution_record = execution.record_path
+        execution_input_sha256 = execution.input_sha256
+        with claim_execution_outputs(execution) as outputs:
+            record_execution_output_artifacts(outputs, opened.store)
+        opened.store.record_artifact(
+            staged_input,
+            attempt_id=attempt_id,
+            expected_sha256=execution_input_sha256,
+        )
+        opened.store.record_artifact(execution_record, attempt_id=attempt_id)
+        if not _append_run_terminal(
+            opened.store,
+            attempt_id,
+            "FBS_UNAVAILABLE",
+            solver=solver,
+        ):
+            raise _RunCommandError(
+                "EVIDENCE_INTEGRITY_FAILURE",
+                "retry terminal evidence could not be recorded",
+            )
+        _emit_context_json(
+            _run_failure(
+                "FBS_UNAVAILABLE",
+                "official FBS validation is unavailable; retry outputs remain unverified",
+                command=command,
+                attempt=attempt_payload,
+                solver=solver,
+            ),
+            error=True,
+        )
+        return _FBS_UNAVAILABLE_EXIT
+    except _RunCommandError as error:
+        return _fail_run_after_terminal(
+            terminal_store,
+            attempt_id,
+            error.code,
+            error,
+            command=command,
+        )
+    except CaseContextError as error:
+        if (
+            terminal_store is not None
+            and attempt_id is not None
+            and not _append_run_terminal(terminal_store, attempt_id, error.code)
+        ):
+            return _fail_run(
+                _RunCommandError(
+                    "EVIDENCE_INTEGRITY_FAILURE",
+                    "retry terminal evidence could not be recorded",
+                ),
+                command=command,
+            )
+        _emit_context_json(cli_failure(command, error), error=True)
+        return _CONTEXT_EXIT_CODES.get(error.code, _RUN_FAILURE_EXIT)
+    except RuntimeProbeError:
+        return _fail_run_after_terminal(
+            terminal_store,
+            attempt_id,
+            "RUNTIME_PROBE_FAILED",
+            _RunCommandError("RUNTIME_PROBE_FAILED", "FEBio runtime probe failed"),
+            command=command,
+        )
+    except (
+        EvidenceIntegrityError,
+        ExecutionAuthorityError,
+        HeadlessConfigurationError,
+        OSError,
+        ValueError,
+        WorkspaceBoundaryError,
+    ):
+        return _fail_run_after_terminal(
+            terminal_store,
+            attempt_id,
+            "EXECUTION_FAILED",
+            _RunCommandError("EXECUTION_FAILED", "retry execution authority failed"),
+            command=command,
+        )
+    except Exception:
+        return _fail_run_after_terminal(
+            terminal_store,
+            attempt_id,
+            "INTERNAL_ERROR",
+            _RunCommandError("INTERNAL_ERROR", "unexpected retry execution failure"),
+            command=command,
+        )
+
+
 def _reconnect_febio_command(arguments: argparse.Namespace) -> int:
     command = "reconnect-febio"
     terminal_store: EvidenceStore | None = None
@@ -736,6 +1144,7 @@ def _reconnect_febio_command(arguments: argparse.Namespace) -> int:
             retry_reserved = retry.reservation_required
             if retry_reserved:
                 retry.persist(opened.store, state_authority)
+                attempt_payload["retry_reservation_id"] = retry.reservation_id
             if not retry_reserved and not _append_run_terminal(
                 opened.store, attempt_id, "SOLVER_FAILED", solver=solver
             ):
@@ -869,4 +1278,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_febio_command(arguments)
     if arguments.command == "reconnect-febio":
         return _reconnect_febio_command(arguments)
+    if arguments.command == "retry-febio":
+        return _retry_febio_command(arguments)
     return 0

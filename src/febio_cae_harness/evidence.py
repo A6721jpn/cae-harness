@@ -65,6 +65,7 @@ _INTENT_SNAPSHOT_FACTORY = object()
 _DIAGNOSTIC_EVENT = "artifact_validation_diagnostic"
 _PROMOTION_CONSUMED_EVENT = "artifact_promotion_consumed"
 _INTENT_REVISED_EVENT = "intent_revised"
+_RETRY_SETUP_STARTED_EVENT = "retry_setup_started"
 _INTENT_REVISION_FIELDS = frozenset(
     {
         "previous_intent",
@@ -1049,6 +1050,7 @@ class EvidenceStore:
             "artifact_verified",
             _DIAGNOSTIC_EVENT,
             _PROMOTION_CONSUMED_EVENT,
+            _RETRY_SETUP_STARTED_EVENT,
         }:
             raise EvidenceIntegrityError(
                 "verification events must be recorded through their dedicated API"
@@ -1602,6 +1604,72 @@ class EvidenceStore:
         if len(reservation_ids) != len(set(reservation_ids)):
             raise EvidenceIntegrityError("retry reservation was claimed more than once")
         return claims
+
+    def _begin_retry_attempt_setup(
+        self,
+        expected_snapshot: IntentSnapshotAuthority,
+        attempt_id: str,
+        reservation_id: str,
+    ) -> bool:
+        """Atomically consume the one setup-start transition for a retry claim."""
+
+        _validate_segment(attempt_id, "attempt_id")
+        if (
+            not isinstance(reservation_id, str)
+            or len(reservation_id) != 64
+            or any(character not in "0123456789abcdef" for character in reservation_id)
+        ):
+            raise EvidenceIntegrityError("retry setup reservation is invalid")
+        with self._transaction():
+            self._load_and_validate(None)
+            intent = self._validate_expected_intent_snapshot(expected_snapshot)
+            intent_sha256 = _digest(intent.to_dict())
+            claims = self._read_retry_attempt_claims_locked()
+            matching_claims: list[dict[str, object]] = []
+            for record in claims:
+                claim_record = record.get("payload")
+                if not isinstance(claim_record, dict):
+                    continue
+                retry_claim = claim_record.get("retry_claim")
+                if not isinstance(retry_claim, dict):
+                    continue
+                if (
+                    record.get("attempt_id") == attempt_id
+                    and retry_claim.get("reservation_id") == reservation_id
+                    and retry_claim.get("intent_sha256") == intent_sha256
+                ):
+                    matching_claims.append(record)
+            if len(matching_claims) != 1:
+                raise EvidenceIntegrityError("retry setup lacks one exact durable claim")
+            payload = {
+                "attempt_id": attempt_id,
+                "intent_sha256": intent_sha256,
+                "reservation_id": reservation_id,
+            }
+            events, _ = self._read_events()
+            existing = [
+                event
+                for event in events
+                if event.get("event_type") == _RETRY_SETUP_STARTED_EVENT
+                and isinstance(event.get("payload"), dict)
+                and (
+                    event["payload"].get("attempt_id") == attempt_id
+                    or event["payload"].get("reservation_id") == reservation_id
+                )
+            ]
+            if existing:
+                if len(existing) == 1 and existing[0]["payload"] == payload:
+                    return False
+                raise EvidenceIntegrityError("retry setup transition conflicts")
+            if any(
+                event.get("event_type") == "run_febio_terminal"
+                and isinstance(event.get("payload"), dict)
+                and event["payload"].get("attempt_id") == attempt_id
+                for event in events
+            ):
+                raise EvidenceIntegrityError("terminal retry attempt cannot begin setup")
+            self._append_event(_RETRY_SETUP_STARTED_EVENT, payload)
+            return True
 
     def _record_attempt_locked(
         self,

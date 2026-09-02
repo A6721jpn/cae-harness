@@ -14,7 +14,11 @@ from febio_cae_harness import cli as cli_module
 from febio_cae_harness.cli_context import CaseContextService, dump_root_capability
 from febio_cae_harness.contracts import IntentContract, IntentState
 from febio_cae_harness.solver import headless as headless_module
-from febio_cae_harness.solver.execution import issue_execution_authority
+from febio_cae_harness.solver.execution import (
+    ExecutionAuthorityError,
+    issue_execution_authority,
+    reopen_execution_authority,
+)
 from febio_cae_harness.solver.headless import HeadlessRunDiagnostic
 from febio_cae_harness.solver.runtime import (
     FebioRuntimeDiagnostic,
@@ -147,6 +151,20 @@ def _reconnect_arguments(runtime: Path, *extra: str) -> list[str]:
     ]
 
 
+def _retry_arguments(runtime: Path, reservation_id: str, *extra: str) -> list[str]:
+    return [
+        "retry-febio",
+        "--capability-stdin",
+        "--case-id",
+        "case-a",
+        "--reservation-id",
+        reservation_id,
+        "--runtime-probe",
+        str(runtime),
+        *extra,
+    ]
+
+
 def _contains_path_key(value: object) -> bool:
     if isinstance(value, dict):
         return any(
@@ -187,6 +205,29 @@ def test_reconnect_febio_parser_cannot_redefine_recorded_launch_context(
     assert parsed.case_id == "case-a"
     assert parsed.attempt_id == "run-existing"
     assert not {
+        "input",
+        "input_name",
+        "expected_steps",
+        "expected_final_time",
+        "requested_field",
+        "timeout_seconds",
+        "arguments",
+    }.intersection(vars(parsed))
+
+
+def test_retry_febio_parser_accepts_only_durable_reservation_and_runtime(
+    tmp_path: Path,
+) -> None:
+    parsed = cli_module.build_parser().parse_args(
+        _retry_arguments(tmp_path / "febio.exe", "a" * 64)
+    )
+
+    assert parsed.command == "retry-febio"
+    assert parsed.capability_stdin is True
+    assert parsed.case_id == "case-a"
+    assert parsed.reservation_id == "a" * 64
+    assert not {
+        "attempt_id",
         "input",
         "input_name",
         "expected_steps",
@@ -748,3 +789,189 @@ def test_run_febio_persists_retry_reservation_before_terminal(
     assert terminal["autonomy"]["retry_budget"] == 1
     assert terminal["autonomy"]["retry_used"] == 1
     assert len(terminal["autonomy"]["reservation_id"]) == 64
+
+
+def test_retry_febio_claims_reservation_and_reuses_parent_execution_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    service, capability, case_root = _register_case(
+        tmp_path,
+        intent=_complete_intent(retry_budget=1),
+    )
+
+    class CompletedProbe:
+        returncode = 0
+
+        def communicate(self, input: bytes, timeout: float) -> tuple[bytes, bytes]:
+            assert input == b"quit\n"
+            assert timeout > 0
+            return b"version 4.12.0\n", b""
+
+    with monkeypatch.context() as probe_patch:
+        probe_patch.setattr(
+            "febio_cae_harness.solver.runtime.subprocess.Popen",
+            lambda command, **kwargs: CompletedProbe(),
+        )
+        runtime = probe_febio(Path(sys.executable))
+
+    launches: list[tuple[str, str, dict[str, object]]] = []
+
+    def run_timeout(
+        attempt: AttemptWorkspace,
+        snapshot: Any,
+        runtime_diagnostic: FebioRuntimeDiagnostic,
+        input_path: Path,
+        **kwargs: object,
+    ) -> Any:
+        launches.append((attempt.attempt_id, input_path.name, dict(kwargs)))
+        timeout_input = attempt.write_text(
+            f"retry-timeout-{len(launches)}.py",
+            "import time; time.sleep(30)",
+        )
+        return headless_module.run_headless_febio_session(
+            attempt,
+            snapshot,
+            runtime_diagnostic,
+            timeout_input,
+            timeout_seconds=0.1,
+        )
+
+    monkeypatch.setattr(cli_module, "_case_service", lambda: service)
+    monkeypatch.setattr(cli_module, "probe_febio", lambda path: runtime)
+    monkeypatch.setattr(cli_module, "run_headless_febio_session", run_timeout)
+
+    _set_capability_stdin(monkeypatch, capability)
+    assert cli_module.main(_run_arguments(runtime.path)) == 4
+    first_response = json.loads(capsys.readouterr().err)
+    reservation_id = first_response["attempt"]["retry_reservation_id"]
+    assert isinstance(reservation_id, str)
+    assert len(reservation_id) == 64
+
+    original_reopen_execution_authority = reopen_execution_authority
+
+    def reject_parent_execution(*args: object, **kwargs: object) -> Any:
+        del args, kwargs
+        raise ExecutionAuthorityError("synthetic parent reauthentication failure")
+
+    monkeypatch.setattr(
+        cli_module,
+        "reopen_execution_authority",
+        reject_parent_execution,
+    )
+    _set_capability_stdin(monkeypatch, capability)
+    assert cli_module.main(_retry_arguments(runtime.path, reservation_id)) == 4
+    setup_failure = json.loads(capsys.readouterr().err)
+    assert setup_failure["command"] == "retry-febio"
+    assert setup_failure["error"]["code"] == "EXECUTION_FAILED"
+    assert len(launches) == 1
+    setup_terminal_events = [
+        json.loads(line)
+        for line in (case_root / "90_Temporary" / "events.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if json.loads(line)["event_type"] == "run_febio_terminal"
+    ]
+    assert len(setup_terminal_events) == 1
+    assert "autonomy" in setup_terminal_events[0]["payload"]
+
+    monkeypatch.setattr(
+        cli_module,
+        "reopen_execution_authority",
+        original_reopen_execution_authority,
+    )
+    _set_capability_stdin(monkeypatch, capability)
+    assert cli_module.main(_retry_arguments(runtime.path, reservation_id)) == 4
+    retry_response = json.loads(capsys.readouterr().err)
+    retry_attempt_id = f"retry-{reservation_id}"
+    assert retry_response["command"] == "retry-febio"
+    assert retry_response["error"]["code"] == "SOLVER_FAILED"
+    assert retry_response["attempt"]["attempt_id"] == retry_attempt_id
+    assert retry_response["attempt"]["official_fbs"] is False
+
+    assert len(launches) == 2
+    assert launches[1] == (
+        retry_attempt_id,
+        "model.feb",
+        {
+            "expected_final_time": 1.0,
+            "expected_steps": 1,
+            "requested_fields": ("displacement",),
+            "timeout_seconds": None,
+        },
+    )
+    attempts = sorted((case_root / "90_Temporary" / "attempts").iterdir())
+    assert {attempt.name for attempt in attempts} == {
+        launches[0][0],
+        retry_attempt_id,
+    }
+    retry_attempt = case_root / "90_Temporary" / "attempts" / retry_attempt_id
+    retry_record = json.loads((retry_attempt / "ATTEMPT.json").read_text(encoding="utf-8"))
+    assert retry_record["payload"]["status"] == "retry_claimed"
+    assert retry_record["payload"]["retry_claim"]["reservation_id"] == reservation_id
+    assert retry_record["payload"]["retry_claim"]["parent_attempt_id"] == launches[0][0]
+    assert (retry_attempt / "model.feb").read_text(encoding="utf-8") == (
+        case_root / "01_Input" / "model.feb"
+    ).read_text(encoding="utf-8")
+    setup_events = [
+        json.loads(line)
+        for line in (case_root / "90_Temporary" / "events.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if json.loads(line)["event_type"] == "retry_setup_started"
+    ]
+    assert len(setup_events) == 1
+    assert setup_events[0]["payload"] == {
+        "attempt_id": retry_attempt_id,
+        "intent_sha256": retry_record["payload"]["retry_claim"]["intent_sha256"],
+        "reservation_id": reservation_id,
+    }
+
+    terminal_events = [
+        event
+        for event in (
+            json.loads(line)
+            for line in (case_root / "90_Temporary" / "events.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        )
+        if event["event_type"] == "run_febio_terminal"
+    ]
+    assert len(terminal_events) == 2
+    assert "autonomy" in terminal_events[0]["payload"]
+    assert terminal_events[1]["payload"]["attempt_id"] == retry_attempt_id
+    assert terminal_events[1]["payload"]["status"] == "SOLVER_FAILED"
+    assert "autonomy" not in terminal_events[1]["payload"]
+
+    _set_capability_stdin(monkeypatch, capability)
+    assert cli_module.main(_retry_arguments(runtime.path, reservation_id)) == 4
+    replay_response = json.loads(capsys.readouterr().err)
+    assert replay_response["command"] == "retry-febio"
+    assert replay_response["error"]["code"] == "RETRY_ALREADY_STARTED"
+    assert replay_response["attempt"]["attempt_id"] == retry_attempt_id
+    assert len(launches) == 2
+    replay_terminal_events = [
+        json.loads(line)
+        for line in (case_root / "90_Temporary" / "events.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if json.loads(line)["event_type"] == "run_febio_terminal"
+    ]
+    assert replay_terminal_events == terminal_events
+
+    (retry_attempt / "execution.json").unlink()
+    _set_capability_stdin(monkeypatch, capability)
+    assert cli_module.main(_retry_arguments(runtime.path, reservation_id)) == 4
+    missing_execution_response = json.loads(capsys.readouterr().err)
+    assert missing_execution_response["command"] == "retry-febio"
+    assert missing_execution_response["error"]["code"] == "RETRY_ALREADY_STARTED"
+    assert len(launches) == 2
+    after_mutation_terminals = [
+        json.loads(line)
+        for line in (case_root / "90_Temporary" / "events.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if json.loads(line)["event_type"] == "run_febio_terminal"
+    ]
+    assert after_mutation_terminals == terminal_events
