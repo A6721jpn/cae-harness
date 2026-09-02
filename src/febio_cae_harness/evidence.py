@@ -1227,6 +1227,44 @@ class EvidenceStore:
             self._validate_expected_intent_snapshot(expected_snapshot)
             return self._append_event(_STUDIO_FALLBACK_COMPLETED_EVENT, normalised)
 
+    def require_studio_fallback_completion(
+        self,
+        expected_snapshot: IntentSnapshotAuthority,
+        attempt_id: str,
+    ) -> dict[str, str]:
+        """Return one reusable STEP-generated FEB after revalidating its completion."""
+
+        _validate_segment(attempt_id, "attempt_id")
+        with self._transaction():
+            self._load_and_validate(None)
+            self._validate_expected_intent_snapshot(expected_snapshot)
+            events, _ = self._read_events()
+            matching = [
+                event
+                for event in events
+                if event.get("event_type") == _STUDIO_FALLBACK_COMPLETED_EVENT
+                and isinstance(event.get("payload"), dict)
+                and event["payload"].get("attempt_id") == attempt_id
+            ]
+            if len(matching) != 1:
+                raise EvidenceIntegrityError("Studio fallback completion is not uniquely recorded")
+            completion = dict(cast(dict[str, Any], matching[0]["payload"]))
+        self.record_studio_fallback_completion(
+            expected_snapshot,
+            attempt_id,
+            completion,
+        )
+        receipt = completion.get("receipt")
+        if not isinstance(receipt, dict):  # pragma: no cover - validated above
+            raise EvidenceIntegrityError("Studio fallback completion receipt is invalid")
+        return {
+            "attempt_id": attempt_id,
+            "intent_sha256": cast(str, completion["intent_sha256"]),
+            "output_path": (f"90_Temporary/attempts/{attempt_id}/studio-output.feb"),
+            "output_sha256": cast(str, receipt["output_sha256"]),
+            "request_id": cast(str, completion["request_id"]),
+        }
+
     def _record_retry_terminal(
         self,
         expected_snapshot: IntentSnapshotAuthority,

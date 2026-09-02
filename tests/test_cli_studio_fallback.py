@@ -306,6 +306,18 @@ def test_accept_step_studio_fallback_records_evidence_and_headless_return(
     completion_payload = completed[0]["payload"]
     with pytest.raises(EvidenceIntegrityError, match="dedicated API"):
         opened.store.append_event("studio_fallback_completed", completion_payload)
+    current_snapshot = opened.store.issue_intent_snapshot()
+    reusable = opened.store.require_studio_fallback_completion(
+        current_snapshot,
+        attempt_id,
+    )
+    assert reusable == {
+        "attempt_id": attempt_id,
+        "intent_sha256": receipt["intent_sha256"],
+        "output_path": (f"90_Temporary/attempts/{attempt_id}/studio-output.feb"),
+        "output_sha256": hashlib.sha256(FEB).hexdigest(),
+        "request_id": request_id,
+    }
     stale_snapshot = opened.store.issue_intent_snapshot()
     opened.store.append_event("synthetic_intervening_evidence", {"current": True})
     before_rejected_record = (cae_root / "step-case" / "90_Temporary" / "events.jsonl").read_bytes()

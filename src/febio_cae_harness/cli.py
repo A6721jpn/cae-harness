@@ -277,6 +277,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_febio.add_argument("--capability-stdin", required=True, action="store_true")
     run_febio.add_argument("--case-id", required=True)
     run_febio.add_argument("--input-name")
+    run_febio.add_argument("--studio-attempt-id")
     run_febio.add_argument("--runtime-probe", required=True, type=Path, metavar="PATH")
     run_febio.add_argument("--expected-steps", required=True, type=_positive_int)
     run_febio.add_argument("--expected-final-time", required=True, type=_positive_float)
@@ -1548,10 +1549,35 @@ def _run_febio_command(arguments: argparse.Namespace) -> int:
                 "required physical conditions are not authoritatively bound",
             )
         manifest = opened.store.manifest
-        source_relative, input_name, expected_sha256 = _select_feb_input(
-            manifest.get("inputs"),
-            arguments.input_name,
-        )
+        studio_completion: dict[str, str] | None = None
+        if arguments.studio_attempt_id is not None:
+            if arguments.input_name is not None or arguments.apply_declared_mesh_patches:
+                raise _RunCommandError(
+                    "INVALID_INPUT",
+                    "studio_attempt_id cannot be combined with input_name or mesh patches",
+                )
+            studio_completion = opened.store.require_studio_fallback_completion(
+                snapshot,
+                arguments.studio_attempt_id,
+            )
+            expected_path = f"90_Temporary/attempts/{arguments.studio_attempt_id}/studio-output.feb"
+            if (
+                studio_completion.get("attempt_id") != arguments.studio_attempt_id
+                or studio_completion.get("intent_sha256") != snapshot.intent_sha256
+                or studio_completion.get("output_path") != expected_path
+            ):
+                raise _RunCommandError(
+                    "EVIDENCE_INTEGRITY_FAILURE",
+                    "Studio fallback completion source is invalid",
+                )
+            source_relative = Path(expected_path)
+            input_name = "studio-output.feb"
+            expected_sha256 = studio_completion["output_sha256"]
+        else:
+            source_relative, input_name, expected_sha256 = _select_feb_input(
+                manifest.get("inputs"),
+                arguments.input_name,
+            )
         if not arguments.runtime_probe.is_absolute():
             raise _RunCommandError(
                 "INVALID_INPUT",
@@ -1568,7 +1594,14 @@ def _run_febio_command(arguments: argparse.Namespace) -> int:
         fbs_paths = _official_fbs_paths(arguments)
 
         attempt_id = f"run-{secrets.token_hex(16)}"
-        opened.store.record_attempt(attempt_id, {"status": "started"})
+        attempt_record_payload: dict[str, object] = {"status": "started"}
+        if studio_completion is not None:
+            attempt_record_payload["studio_fallback_source"] = {
+                "attempt_id": studio_completion["attempt_id"],
+                "output_sha256": studio_completion["output_sha256"],
+                "request_id": studio_completion["request_id"],
+            }
+        opened.store.record_attempt(attempt_id, attempt_record_payload)
         terminal_store = opened.store
         attempt = AttemptWorkspace._from_manager(
             opened.case,
@@ -1582,6 +1615,16 @@ def _run_febio_command(arguments: argparse.Namespace) -> int:
                 "ASK_AND_BLOCK",
                 "required physical conditions are not authoritatively bound",
             )
+        if studio_completion is not None:
+            refreshed_completion = opened.store.require_studio_fallback_completion(
+                snapshot,
+                arguments.studio_attempt_id,
+            )
+            if refreshed_completion != studio_completion:
+                raise _RunCommandError(
+                    "EVIDENCE_INTEGRITY_FAILURE",
+                    "Studio fallback completion changed before solver staging",
+                )
         destination_relative = Path("90_Temporary") / "attempts" / attempt_id / input_name
         if arguments.apply_declared_mesh_patches:
             with opened.case._exact_transaction() as exact:

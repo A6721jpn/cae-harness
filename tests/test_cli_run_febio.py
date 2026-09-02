@@ -261,6 +261,18 @@ def test_run_febio_parser_accepts_only_case_bound_launch_inputs(tmp_path: Path) 
     }.intersection(vars(parsed))
 
 
+def test_run_febio_parser_accepts_one_verified_studio_attempt_source(tmp_path: Path) -> None:
+    parsed = cli_module.build_parser().parse_args(
+        _run_arguments(
+            tmp_path / "febio.exe",
+            "--studio-attempt-id",
+            "studio-step-verified",
+        )
+    )
+
+    assert parsed.studio_attempt_id == "studio-step-verified"
+
+
 def test_run_febio_applies_only_current_declared_mesh_patches_in_attempt(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -327,6 +339,111 @@ def test_run_febio_applies_only_current_declared_mesh_patches_in_attempt(
     attempts = list((case_root / "90_Temporary" / "attempts").iterdir())
     assert len(attempts) == 1
     assert b'type="tet10"' in (attempts[0] / "model.feb").read_bytes()
+
+
+def test_run_febio_stages_only_the_verified_studio_completion_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    service, capability, _ = _register_case(
+        tmp_path,
+        intent=_complete_intent(),
+        source_text="<febio_spec version='4.0'><Module type='original'/></febio_spec>",
+    )
+    opened = service._open_context(capability, "case-a")
+    fallback_attempt_id = "studio-step-verified"
+    opened.store.record_attempt(fallback_attempt_id, {"status": "synthetic-fixture"})
+    fallback_attempt = AttemptWorkspace._from_manager(
+        opened.case,
+        fallback_attempt_id,
+        opened.case.temporary_root / "attempts" / fallback_attempt_id,
+    )
+    generated = b"<febio_spec version='4.0'><Module type='studio-output'/></febio_spec>"
+    generated_path = fallback_attempt.write_bytes("studio-output.feb", generated)
+    generated_sha256 = hashlib.sha256(generated).hexdigest()
+    fallback_intent_sha256 = opened.store.issue_intent_snapshot().intent_sha256
+    runtime = _issued_runtime(tmp_path, monkeypatch)
+    monkeypatch.setattr(cli_module, "_case_service", lambda: service)
+    monkeypatch.setattr(cli_module, "probe_febio", lambda path: runtime)
+    _set_capability_stdin(monkeypatch, capability)
+    executed: list[bytes] = []
+
+    def require_completion(snapshot: object, attempt_id: str) -> dict[str, str]:
+        del snapshot
+        assert attempt_id == fallback_attempt_id
+        return {
+            "attempt_id": fallback_attempt_id,
+            "intent_sha256": fallback_intent_sha256,
+            "output_path": generated_path.relative_to(opened.case.case_root).as_posix(),
+            "output_sha256": generated_sha256,
+            "request_id": "1" * 64,
+        }
+
+    monkeypatch.setattr(
+        opened.store.__class__,
+        "require_studio_fallback_completion",
+        lambda self, snapshot, attempt_id: require_completion(snapshot, attempt_id),
+    )
+
+    def run_synthetic(
+        attempt: Any,
+        snapshot: Any,
+        runtime_diagnostic: FebioRuntimeDiagnostic,
+        input_path: Path,
+        **kwargs: object,
+    ) -> Any:
+        del attempt, snapshot, kwargs
+        executed.append(input_path.read_bytes())
+        log_path = input_path.with_suffix(".log")
+        xplt_path = input_path.with_suffix(".xplt")
+        log_path.write_bytes(b"synthetic normal termination\n")
+        xplt_path.write_bytes(b"synthetic XPLT\n")
+        return SimpleNamespace(
+            diagnostic=HeadlessRunDiagnostic(
+                runtime_identity=runtime_diagnostic,
+                state=SolverState.NORMAL_EXIT,
+                classification=SolverClassification.FBS_UNVERIFIED,
+                return_code=0,
+                pid=123,
+                log_path=log_path,
+                xplt_path=xplt_path,
+            ),
+            supervisor=None,
+            result=None,
+        )
+
+    monkeypatch.setattr(cli_module, "run_headless_febio_session", run_synthetic)
+
+    assert (
+        cli_module.main(
+            _run_arguments(
+                runtime.path,
+                "--studio-attempt-id",
+                fallback_attempt_id,
+            )
+        )
+        == 5
+    )
+
+    payload = json.loads(capsys.readouterr().err)
+    assert payload["error"]["code"] == "FBS_UNAVAILABLE"
+    assert executed == [generated]
+    run_attempts = [
+        path
+        for path in opened.case.temporary_root.joinpath("attempts").iterdir()
+        if path.name.startswith("run-")
+    ]
+    assert len(run_attempts) == 1
+    run_record = json.loads((run_attempts[0] / "ATTEMPT.json").read_text(encoding="utf-8"))
+    assert run_record["payload"] == {
+        "status": "started",
+        "studio_fallback_source": {
+            "attempt_id": fallback_attempt_id,
+            "output_sha256": generated_sha256,
+            "request_id": "1" * 64,
+        },
+    }
 
 
 def test_run_febio_blocks_nonexact_declared_mesh_patch_before_model_write(
