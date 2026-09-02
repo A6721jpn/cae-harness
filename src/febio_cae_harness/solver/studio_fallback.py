@@ -40,6 +40,22 @@ _REQUIRED_EVIDENCE = (
 )
 _DIGEST_CHARS = frozenset("0123456789abcdef")
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+_REQUEST_FIELDS = frozenset(
+    {
+        "schema",
+        "request_id",
+        "case_id",
+        "attempt_id",
+        "intent_sha256",
+        "operation",
+        "input_name",
+        "step_sha256",
+        "plan",
+        "expected_output",
+        "required_evidence",
+        "status",
+    }
+)
 _EVIDENCE_FIELDS = frozenset(
     {
         "schema",
@@ -135,6 +151,7 @@ class StudioFallbackHandoff:
     case_id: str
     attempt_id: str
     intent_sha256: str
+    input_name: str
     step_sha256: str
     plan: Mapping[str, object]
 
@@ -143,6 +160,10 @@ class StudioFallbackHandoff:
         _segment(self.case_id, "case id")
         _segment(self.attempt_id, "attempt id")
         _digest(self.intent_sha256, "intent")
+        if _segment(self.input_name, "input name") != self.input_name or Path(
+            self.input_name
+        ).suffix.casefold() not in {".step", ".stp"}:
+            raise EvidenceIntegrityError("Studio fallback input name is invalid")
         _digest(self.step_sha256, "STEP")
         frozen = freeze_json(self.plan)
         if not isinstance(frozen, Mapping):
@@ -207,6 +228,7 @@ def _handoff_projection(handoff: StudioFallbackHandoff) -> dict[str, object]:
         "attempt_id": handoff.attempt_id,
         "intent_sha256": handoff.intent_sha256,
         "operation": _OPERATION,
+        "input_name": handoff.input_name,
         "step_sha256": handoff.step_sha256,
         "plan": _thaw(handoff.plan),
         "expected_output": _EXPECTED_OUTPUT,
@@ -262,6 +284,7 @@ def issue_step_studio_handoff(
     step: STEPInspection,
     snapshot: IntentSnapshotAuthority,
     *,
+    input_name: str,
     attempt_id: str,
 ) -> StudioFallbackHandoff:
     """Issue a request for the currently Studio-only STEP import/mesh operation."""
@@ -280,6 +303,7 @@ def issue_step_studio_handoff(
         "attempt_id": _segment(attempt_id, "attempt id"),
         "intent_sha256": snapshot.intent_sha256,
         "operation": _OPERATION,
+        "input_name": _segment(input_name, "input name"),
         "step_sha256": step.sha256,
         "plan": plan_projection,
         "expected_output": _EXPECTED_OUTPUT,
@@ -292,6 +316,7 @@ def issue_step_studio_handoff(
         case_id=snapshot.case_id,
         attempt_id=cast(str, request_body["attempt_id"]),
         intent_sha256=snapshot.intent_sha256,
+        input_name=cast(str, request_body["input_name"]),
         step_sha256=step.sha256,
         plan=plan_projection,
     )
@@ -299,6 +324,30 @@ def issue_step_studio_handoff(
     _HANDOFFS[handoff] = _HandoffBinding(snapshot=snapshot, projection=projection)
     _require_handoff(handoff)
     return handoff
+
+
+def restore_step_studio_handoff(
+    persisted: Mapping[str, object],
+    step: STEPInspection,
+    snapshot: IntentSnapshotAuthority,
+) -> StudioFallbackHandoff:
+    """Reissue one live handoff only from its exact persisted projection."""
+
+    if not isinstance(persisted, Mapping) or set(persisted) != _REQUEST_FIELDS:
+        raise EvidenceIntegrityError("persisted Studio fallback request is invalid")
+    input_name = persisted.get("input_name")
+    attempt_id = persisted.get("attempt_id")
+    if not isinstance(input_name, str) or not isinstance(attempt_id, str):
+        raise EvidenceIntegrityError("persisted Studio fallback request is invalid")
+    restored = issue_step_studio_handoff(
+        step,
+        snapshot,
+        input_name=input_name,
+        attempt_id=attempt_id,
+    )
+    if _canonical_sha256(persisted) != _canonical_sha256(restored.to_dict()):
+        raise EvidenceIntegrityError("persisted Studio fallback request differs")
+    return restored
 
 
 def _runtime_digest(runtime: object) -> str:
@@ -427,4 +476,5 @@ __all__ = [
     "StudioFallbackReceipt",
     "accept_step_studio_output",
     "issue_step_studio_handoff",
+    "restore_step_studio_handoff",
 ]

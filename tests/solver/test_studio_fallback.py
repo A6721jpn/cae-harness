@@ -9,6 +9,7 @@ import pytest
 from febio_cae_harness.contracts import IntentContract, IntentState
 from febio_cae_harness.evidence import EvidenceIntegrityError, EvidenceStore
 from febio_cae_harness.model import inspect_step
+from febio_cae_harness.solver import studio_fallback as studio_module
 from febio_cae_harness.solver.studio_fallback import (
     accept_step_studio_output,
     issue_step_studio_handoff,
@@ -102,6 +103,7 @@ def test_issues_current_bound_step_handoff_without_claiming_studio_success(
     handoff = issue_step_studio_handoff(
         inspect_step(STEP, source_name="part.step"),
         snapshot,
+        input_name="part.step",
         attempt_id="studio-step-1",
     )
 
@@ -113,6 +115,7 @@ def test_issues_current_bound_step_handoff_without_claiming_studio_success(
         "attempt_id": "studio-step-1",
         "intent_sha256": snapshot.intent_sha256,
         "operation": "STEP_IMPORT_MESH_FEB",
+        "input_name": "part.step",
         "step_sha256": hashlib.sha256(STEP).hexdigest(),
         "plan": {
             "element_family": "tet10",
@@ -143,6 +146,7 @@ def test_accepts_only_exact_official_evidence_and_reinspected_tet10_feb(
     handoff = issue_step_studio_handoff(
         inspect_step(STEP),
         store.issue_intent_snapshot(),
+        input_name="part.step",
         attempt_id="studio-step-1",
     )
     executable = tmp_path / "FEBioStudio.exe"
@@ -193,6 +197,7 @@ def test_rejects_unbound_studio_claims_without_issuing_headless_receipt(
     handoff = issue_step_studio_handoff(
         inspect_step(STEP),
         store.issue_intent_snapshot(),
+        input_name="part.step",
         attempt_id="studio-step-1",
     )
     executable = tmp_path / "FEBioStudio.exe"
@@ -216,6 +221,7 @@ def test_rejects_blocked_or_stale_intent_and_wrong_mesh_family(tmp_path: Path) -
         issue_step_studio_handoff(
             inspect_step(STEP),
             blocked.issue_intent_snapshot(),
+            input_name="part.step",
             attempt_id="studio-step-1",
         )
 
@@ -223,6 +229,7 @@ def test_rejects_blocked_or_stale_intent_and_wrong_mesh_family(tmp_path: Path) -
     handoff = issue_step_studio_handoff(
         inspect_step(STEP),
         store.issue_intent_snapshot(),
+        input_name="part.step",
         attempt_id="studio-step-1",
     )
     executable = tmp_path / "stale" / "FEBioStudio.exe"
@@ -242,6 +249,7 @@ def test_rejects_blocked_or_stale_intent_and_wrong_mesh_family(tmp_path: Path) -
     fresh_handoff = issue_step_studio_handoff(
         inspect_step(STEP),
         fresh.issue_intent_snapshot(),
+        input_name="part.step",
         attempt_id="studio-step-1",
     )
     fresh_executable = tmp_path / "wrong-family" / "FEBioStudio.exe"
@@ -257,3 +265,31 @@ def test_rejects_blocked_or_stale_intent_and_wrong_mesh_family(tmp_path: Path) -
             after_png=PNG_AFTER,
             action_evidence=wrong_evidence,
         )
+
+
+def test_restores_only_an_exact_persisted_handoff_projection(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    snapshot = store.issue_intent_snapshot()
+    step = inspect_step(STEP, source_name="part.step")
+    issued = issue_step_studio_handoff(
+        step,
+        snapshot,
+        input_name="part.step",
+        attempt_id="studio-step-1",
+    )
+    persisted = issued.to_dict()
+
+    restored = studio_module.restore_step_studio_handoff(persisted, step, snapshot)
+
+    assert restored is not issued
+    assert restored.to_dict() == persisted
+
+    for field, value in (
+        ("request_id", "0" * 64),
+        ("input_name", "other.step"),
+        ("expected_output", "other.feb"),
+    ):
+        tampered = dict(persisted)
+        tampered[field] = value
+        with pytest.raises(EvidenceIntegrityError, match="persisted|request"):
+            studio_module.restore_step_studio_handoff(tampered, step, snapshot)

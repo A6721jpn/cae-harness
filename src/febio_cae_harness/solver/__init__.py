@@ -50,6 +50,7 @@ from .studio_fallback import (
     StudioFallbackReceipt,
     accept_step_studio_output,
     issue_step_studio_handoff,
+    restore_step_studio_handoff,
 )
 from .supervisor import SolverSupervisor
 from .types import (
@@ -117,6 +118,7 @@ __all__ = [
     "run_headless_febio_session",
     "accept_step_studio_output",
     "issue_step_studio_handoff",
+    "restore_step_studio_handoff",
     "validate_log",
     "validate_official_fbs_runtime",
     "validate_requested_fields",
