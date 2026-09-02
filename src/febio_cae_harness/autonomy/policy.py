@@ -2372,6 +2372,11 @@ def decide_retry(
             reason=routing.rationale,
             route=routing.route,
         )
+    if classification is FailureClass.NEGATIVE_JACOBIAN and proposal is None:
+        return stopped(
+            "negative-Jacobian retry requires a completed mesh diagnostic and explicit repair "
+            "proposal"
+        )
     if proposal is not None:
         if raw_intent_supplied or authority is None or authority_record is None:
             return stopped("proposal evaluation requires a live BOUND intent state authority")

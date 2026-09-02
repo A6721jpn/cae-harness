@@ -1048,6 +1048,48 @@ def test_mismatched_failure_evidence_cannot_promote_same_supervisor_result(
     assert decision.failure is FailureClass.TIMEOUT
 
 
+def test_negative_jacobian_result_cannot_reserve_an_unchanged_blind_retry(
+    tmp_path: Path,
+    request: pytest.FixtureRequest,
+) -> None:
+    intent = bound_intent(retry_budget=1)
+    workspace_temp, workspace_root = short_workspace_root(tmp_path)
+    request.addfinalizer(workspace_temp.cleanup)
+    state, state_snapshot = retry_state_for_case(
+        workspace_root,
+        "case-negative-blind",
+        intent,
+        attempt_ids=("attempt-a",),
+    )
+    state_case = object.__getattribute__(state_snapshot, "_case_workspace")
+    supervisor = timeout_supervisor(
+        tmp_path / "solver-negative-blind",
+        case_id="case-negative-blind",
+        classification=SolverClassification.NEGATIVE_JACOBIAN,
+        intent=intent,
+        workspace_root=workspace_root,
+        case_workspace=state_case,
+        record_attempt=False,
+    )
+    result = supervisor.run()
+    ledger = RetryLedger.from_authority(state)
+
+    decision = decide_retry(
+        FailureClass.NEGATIVE_JACOBIAN,
+        ledger,
+        intent=state,
+        supervisor=supervisor,
+        result=result,
+    )
+
+    assert decision.decision is RetryDecision.STOP
+    assert decision.failure is FailureClass.NEGATIVE_JACOBIAN
+    assert decision.ledger is ledger
+    assert ledger.used == 0
+    assert "diagnostic" in decision.reason
+    assert "proposal" in decision.reason
+
+
 def test_retry_does_not_turn_unresolved_non_authoritative_data_into_a_question(
     tmp_path: Path,
 ) -> None:
