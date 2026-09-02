@@ -49,7 +49,11 @@ def test_command_plan_runs_gates_with_bound_environment_but_no_authority(
     monkeypatch.setenv("PYTHONPATH", "inherited-value")
     request = BuildRequest(tmp_path)
     evidence = list(build_script._execute_command_plan(request, runner=runner))
-    evidence.extend(build_script._run_installed_smoke(tmp_path / "dist" / "febio_cae_harness-0.1.0-py3-none-any.whl", tmp_path, runner=runner))
+    evidence.extend(
+        build_script._run_installed_smoke(
+            tmp_path / "dist" / "febio_cae_harness-0.1.0-py3-none-any.whl", tmp_path, runner=runner
+        )
+    )
 
     assert [item[0] for item in evidence] == [
         "pytest",
@@ -119,7 +123,11 @@ def test_receipt_is_exact_opaque_authority_and_staging_is_fail_closed() -> None:
     forged = object.__new__(CleanBuildReceipt)
     with pytest.raises(TypeError):
         _ = forged.wheel
-    for operation in (lambda: copy.copy(forged), lambda: copy.deepcopy(forged), lambda: pickle.dumps(forged)):
+    for operation in (
+        lambda: copy.copy(forged),
+        lambda: copy.deepcopy(forged),
+        lambda: pickle.dumps(forged),
+    ):
         with pytest.raises(TypeError):
             operation()
     with pytest.raises(TypeError):
@@ -129,3 +137,35 @@ def test_receipt_is_exact_opaque_authority_and_staging_is_fail_closed() -> None:
 
     with pytest.raises(BuildFailure, match="staging is unavailable"):
         build_script.stage_clean_build(forged, Path("arbitrary-source"), Path("arbitrary-app"))
+
+
+def test_windows_console_launcher_retarget_is_exact_and_single_use(tmp_path: Path) -> None:
+    launcher = tmp_path / "febio-cae.exe"
+    old_python = tmp_path / "aaaaaaaa" / "Scripts" / "python.exe"
+    new_python = tmp_path / "bbbbbbbb" / "Scripts" / "python.exe"
+    old_shebang = b"#!" + str(old_python).encode("utf-8") + b"\n"
+    new_shebang = b"#!" + str(new_python).encode("utf-8") + b"\n"
+    launcher.write_bytes(b"MZ-native-launcher\0" + old_shebang + b"zip-payload")
+
+    build_script._retarget_windows_console_launcher(launcher, old_python, new_python)
+
+    assert launcher.read_bytes() == b"MZ-native-launcher\0" + new_shebang + b"zip-payload"
+
+    duplicated = b"MZ" + old_shebang + old_shebang
+    launcher.write_bytes(duplicated)
+    with pytest.raises(BuildFailure, match="exactly one embedded interpreter"):
+        build_script._retarget_windows_console_launcher(launcher, old_python, new_python)
+    assert launcher.read_bytes() == duplicated
+
+
+def test_windows_console_launcher_retarget_requires_equal_length_paths(tmp_path: Path) -> None:
+    launcher = tmp_path / "febio-cae.exe"
+    launcher.write_bytes(b"MZ")
+
+    with pytest.raises(BuildFailure, match="equal-length"):
+        build_script._retarget_windows_console_launcher(
+            launcher,
+            tmp_path / "short" / "python.exe",
+            tmp_path / "much-longer" / "python.exe",
+        )
+    assert launcher.read_bytes() == b"MZ"

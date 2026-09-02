@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -214,7 +215,9 @@ def require_clean_repository(repo_root: Path) -> None:
 
 
 def current_commit(repo_root: Path) -> str:
-    output = _git_output(repo_root, ("git", "rev-parse", "HEAD"), "determine build commit", _REAL_RUN)
+    output = _git_output(
+        repo_root, ("git", "rev-parse", "HEAD"), "determine build commit", _REAL_RUN
+    )
     if not output.strip():
         raise BuildFailure("cannot determine build commit")
     return output.strip()
@@ -243,7 +246,11 @@ def _run_step(
             env=environment,
         )
         returncode, stdout, stderr = completed.returncode, completed.stdout, completed.stderr
-        if type(returncode) is not int or not isinstance(stdout, str) or not isinstance(stderr, str):
+        if (
+            type(returncode) is not int
+            or not isinstance(stdout, str)
+            or not isinstance(stderr, str)
+        ):
             raise TypeError("command did not capture text output and an exit code")
     except BuildFailure:
         raise
@@ -314,6 +321,54 @@ def _smoke_executable(venv_root: Path) -> Path:
     directory = "Scripts" if os.name == "nt" else "bin"
     suffix = ".exe" if os.name == "nt" else ""
     return venv_root / directory / f"febio-cae{suffix}"
+
+
+def _retarget_windows_console_launcher(
+    launcher: Path,
+    old_python: Path,
+    new_python: Path,
+) -> None:
+    """Atomically retarget one distlib launcher to an equal-length venv path."""
+
+    source = Path(os.path.abspath(os.fspath(old_python)))
+    target = Path(os.path.abspath(os.fspath(new_python)))
+    old_shebang = b"#!" + os.fspath(source).encode("utf-8") + b"\n"
+    new_shebang = b"#!" + os.fspath(target).encode("utf-8") + b"\n"
+    if len(old_shebang) != len(new_shebang):
+        raise BuildFailure("console launcher retarget requires equal-length interpreter paths")
+    try:
+        if launcher.is_symlink() or not launcher.is_file():
+            raise BuildFailure(f"console launcher is not a regular file: {launcher}")
+        payload = launcher.read_bytes()
+    except BuildFailure:
+        raise
+    except OSError as error:
+        raise BuildFailure(f"cannot read console launcher: {launcher}") from error
+    if payload.count(old_shebang) != 1:
+        raise BuildFailure("console launcher must contain exactly one embedded interpreter")
+
+    replacement = payload.replace(old_shebang, new_shebang, 1)
+    temporary_name: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            prefix=f".{launcher.name}.",
+            suffix=".tmp",
+            dir=launcher.parent,
+            delete=False,
+        ) as stream:
+            temporary_name = stream.name
+            stream.write(replacement)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary_name, launcher.stat().st_mode)
+        os.replace(temporary_name, launcher)
+    except OSError as error:
+        raise BuildFailure(f"cannot retarget console launcher: {launcher}") from error
+    finally:
+        if temporary_name is not None:
+            with suppress(OSError):
+                Path(temporary_name).unlink(missing_ok=True)
 
 
 def _run_installed_smoke(
