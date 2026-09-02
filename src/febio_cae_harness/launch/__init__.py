@@ -25,6 +25,7 @@ from .planner import LaunchError, LaunchPlan, launch_cli, plan_cli_launch, read_
 from .shortcut import (
     SHORTCUT_DESCRIPTOR_NAME,
     SHORTCUT_DISPLAY_NAME,
+    SHORTCUT_LINK_NAME,
     START_MENU_RELATIVE_PATH,
     ShortcutDescriptor,
     ShortcutDescriptorManager,
@@ -54,6 +55,7 @@ __all__ = [
     "ROLLBACK_DIRECTORY_NAME",
     "SHORTCUT_DESCRIPTOR_NAME",
     "SHORTCUT_DISPLAY_NAME",
+    "SHORTCUT_LINK_NAME",
     "START_MENU_RELATIVE_PATH",
     "STAGING_DIRECTORY_NAME",
     "ShortcutDescriptor",

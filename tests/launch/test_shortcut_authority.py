@@ -21,6 +21,7 @@ from febio_cae_harness.launch.deployment import (
 )
 from febio_cae_harness.launch.shortcut import (
     SHORTCUT_DESCRIPTOR_NAME,
+    SHORTCUT_LINK_NAME,
     ShortcutDescriptor,
     ShortcutDescriptorManager,
     default_start_menu_root,
@@ -91,6 +92,15 @@ def test_manager_issues_only_the_fixed_live_descriptor_and_writes_it(
     payload = json.loads(path.read_text(encoding="utf-8"))
     assert payload["target"] == str(layout.launcher)
     assert payload["build_identity"]["build_id"] == "build"
+    link_path = path.parent / SHORTCUT_LINK_NAME
+    assert link_path.read_bytes()[:4] == b"L\0\0\0"
+    link = shortcut_module._read_windows_shell_link(link_path)
+    assert link == {
+        "arguments": "--headless",
+        "description": "Launch the FEBio CAE Harness headlessly",
+        "target": str(layout.launcher),
+        "working_directory": str(layout.latest),
+    }
     assert manager.verify(descriptor) == path
     assert write_shortcut_descriptor(descriptor) == path
     assert manager.verify(descriptor) == path
@@ -171,6 +181,19 @@ def test_changed_persisted_descriptor_is_rejected(
     payload = json.loads(descriptor.path.read_text(encoding="utf-8"))
     payload["target"] = str(tmp_path / "arbitrary.exe")
     descriptor.path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(DeploymentError):
+        manager.verify(descriptor)
+
+
+def test_changed_persisted_shell_link_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _layout, manager = _published(tmp_path, monkeypatch)
+    descriptor = manager.issue_descriptor()
+    manager.write(descriptor)
+    link_path = descriptor.path.parent / SHORTCUT_LINK_NAME
+    link_path.write_bytes(b"tampered")
+
     with pytest.raises(DeploymentError):
         manager.verify(descriptor)
 

@@ -4,8 +4,10 @@ import ctypes
 import json
 import os
 import stat
+import subprocess
+import tempfile
 from collections.abc import Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -26,6 +28,7 @@ from .deployment import (
 )
 
 SHORTCUT_DESCRIPTOR_NAME = "FEBio CAE Workbench.shortcut.json"
+SHORTCUT_LINK_NAME = "FEBio CAE Workbench.lnk"
 START_MENU_RELATIVE_PATH = Path("Microsoft") / "Windows" / "Start Menu" / "Programs"
 SHORTCUT_DISPLAY_NAME = "FEBio CAE Workbench"
 _TOKEN = object()
@@ -46,11 +49,139 @@ _FOLDERID_PROGRAMS = _Guid(
     0x44C3,
     (ctypes.c_ubyte * 8)(0xA6, 0xA2, 0xAB, 0xA6, 0x01, 0x05, 0x4A, 0x51),
 )
+_CLSID_SHELL_LINK = _Guid(
+    0x00021401,
+    0x0000,
+    0x0000,
+    (ctypes.c_ubyte * 8)(0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46),
+)
+_IID_SHELL_LINK_W = _Guid(
+    0x000214F9,
+    0x0000,
+    0x0000,
+    (ctypes.c_ubyte * 8)(0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46),
+)
+_IID_PERSIST_FILE = _Guid(
+    0x0000010B,
+    0x0000,
+    0x0000,
+    (ctypes.c_ubyte * 8)(0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46),
+)
 
 _FILE_ATTRIBUTE_DIRECTORY, _FILE_ATTRIBUTE_REPARSE_POINT = 0x10, 0x400
 _DELETE, _FILE_READ_ATTRIBUTES, _SYNCHRONIZE = 0x00010000, 0x80, 0x00100000
 _FILE_FLAG_BACKUP_SEMANTICS, _FILE_FLAG_OPEN_REPARSE_POINT = 0x02000000, 0x00200000
 _FILE_SHARE_READ, _FILE_SHARE_WRITE, _OPEN_EXISTING = 0x1, 0x2, 3
+_CLSCTX_INPROC_SERVER = 0x1
+_COINIT_APARTMENTTHREADED = 0x2
+_RPC_E_CHANGED_MODE = ctypes.c_long(0x80010106).value
+_SHELL_LINK_BUFFER_SIZE = 32768
+
+
+def _failed_hresult(result: int) -> bool:
+    return ctypes.c_long(result).value < 0
+
+
+def _com_method(
+    interface: ctypes.c_void_p,
+    index: int,
+    result_type: type[ctypes._SimpleCData[Any]],
+    *argument_types: type[Any],
+) -> Any:
+    try:
+        vtable = ctypes.cast(
+            interface,
+            ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)),
+        ).contents
+        address = vtable[index]
+        function_type = getattr(ctypes, "WINFUNCTYPE", ctypes.CFUNCTYPE)
+        return function_type(result_type, ctypes.c_void_p, *argument_types)(address)
+    except (AttributeError, IndexError, TypeError, ValueError) as error:
+        raise DeploymentError("cannot bind Windows Shell Link COM method") from error
+
+
+def _call_hresult(
+    interface: ctypes.c_void_p,
+    index: int,
+    *arguments: object,
+    argument_types: tuple[type[Any], ...],
+    label: str,
+) -> None:
+    method = _com_method(interface, index, ctypes.c_long, *argument_types)
+    try:
+        result = method(interface, *arguments)
+    except (OSError, TypeError, ValueError) as error:
+        raise DeploymentError(f"Windows Shell Link {label} failed") from error
+    if _failed_hresult(result):
+        raise DeploymentError(
+            f"Windows Shell Link {label} failed (HRESULT 0x{result & 0xFFFFFFFF:08x})"
+        )
+
+
+def _release_com(interface: ctypes.c_void_p | None) -> None:
+    if interface is None or not interface.value:
+        return
+    method = _com_method(interface, 2, ctypes.c_ulong)
+    method(interface)
+
+
+@contextmanager
+def _shell_link_interfaces() -> Iterator[tuple[ctypes.c_void_p, ctypes.c_void_p]]:
+    if os.name != "nt":
+        raise DeploymentError("Windows Shell Link COM is available only on Windows")
+    ole32 = ctypes.OleDLL("ole32", use_last_error=True)
+    ole32.CoInitializeEx.argtypes = (ctypes.c_void_p, ctypes.c_uint32)
+    ole32.CoInitializeEx.restype = ctypes.c_long
+    initialise_result = int(ole32.CoInitializeEx(None, _COINIT_APARTMENTTHREADED))
+    should_uninitialise = not _failed_hresult(initialise_result)
+    if _failed_hresult(initialise_result) and initialise_result != _RPC_E_CHANGED_MODE:
+        raise DeploymentError(
+            "cannot initialise Windows Shell Link COM "
+            f"(HRESULT 0x{initialise_result & 0xFFFFFFFF:08x})"
+        )
+
+    link = ctypes.c_void_p()
+    persist = ctypes.c_void_p()
+    try:
+        ole32.CoCreateInstance.argtypes = (
+            ctypes.POINTER(_Guid),
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.POINTER(_Guid),
+            ctypes.POINTER(ctypes.c_void_p),
+        )
+        ole32.CoCreateInstance.restype = ctypes.c_long
+        create_result = int(
+            ole32.CoCreateInstance(
+                ctypes.byref(_CLSID_SHELL_LINK),
+                None,
+                _CLSCTX_INPROC_SERVER,
+                ctypes.byref(_IID_SHELL_LINK_W),
+                ctypes.byref(link),
+            )
+        )
+        if _failed_hresult(create_result) or not link.value:
+            raise DeploymentError(
+                f"cannot create Windows Shell Link (HRESULT 0x{create_result & 0xFFFFFFFF:08x})"
+            )
+        _call_hresult(
+            link,
+            0,
+            ctypes.byref(_IID_PERSIST_FILE),
+            ctypes.byref(persist),
+            argument_types=(ctypes.POINTER(_Guid), ctypes.POINTER(ctypes.c_void_p)),
+            label="QueryInterface(IPersistFile)",
+        )
+        if not persist.value:
+            raise DeploymentError("Windows Shell Link returned no IPersistFile interface")
+        yield link, persist
+    except OSError as error:
+        raise DeploymentError("Windows Shell Link COM is unavailable") from error
+    finally:
+        _release_com(persist)
+        _release_com(link)
+        if should_uninitialise:
+            ole32.CoUninitialize()
 
 
 class _ByHandleFileInformation(ctypes.Structure):
@@ -361,6 +492,145 @@ def _normalise_arguments(arguments: Sequence[str]) -> tuple[str, ...]:
     return normalised
 
 
+def _save_windows_shell_link(
+    path: Path,
+    *,
+    target: Path,
+    arguments: str,
+    working_directory: Path,
+    description: str,
+) -> None:
+    with _shell_link_interfaces() as (link, persist):
+        for index, value, label in (
+            (20, os.fspath(target), "SetPath"),
+            (11, arguments, "SetArguments"),
+            (9, os.fspath(working_directory), "SetWorkingDirectory"),
+            (7, description, "SetDescription"),
+        ):
+            _call_hresult(
+                link,
+                index,
+                value,
+                argument_types=(ctypes.c_wchar_p,),
+                label=label,
+            )
+        _call_hresult(
+            persist,
+            6,
+            os.fspath(path),
+            True,
+            argument_types=(ctypes.c_wchar_p, ctypes.c_int),
+            label="IPersistFile.Save",
+        )
+
+
+def _read_windows_shell_link(path: Path) -> dict[str, str]:
+    """Read the executable properties of a real Windows ``.lnk`` file."""
+
+    safe = _reject_reparse_alias(path, "Start Menu shortcut")
+    _stamp(safe, "Start Menu shortcut")
+    with _shell_link_interfaces() as (link, persist):
+        _call_hresult(
+            persist,
+            5,
+            os.fspath(safe),
+            0,
+            argument_types=(ctypes.c_wchar_p, ctypes.c_uint32),
+            label="IPersistFile.Load",
+        )
+        target = ctypes.create_unicode_buffer(_SHELL_LINK_BUFFER_SIZE)
+        arguments = ctypes.create_unicode_buffer(_SHELL_LINK_BUFFER_SIZE)
+        working_directory = ctypes.create_unicode_buffer(_SHELL_LINK_BUFFER_SIZE)
+        description = ctypes.create_unicode_buffer(_SHELL_LINK_BUFFER_SIZE)
+        _call_hresult(
+            link,
+            3,
+            target,
+            _SHELL_LINK_BUFFER_SIZE,
+            None,
+            0,
+            argument_types=(
+                ctypes.POINTER(ctypes.c_wchar),
+                ctypes.c_int,
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+            ),
+            label="GetPath",
+        )
+        for index, buffer, label in (
+            (10, arguments, "GetArguments"),
+            (8, working_directory, "GetWorkingDirectory"),
+            (6, description, "GetDescription"),
+        ):
+            _call_hresult(
+                link,
+                index,
+                buffer,
+                _SHELL_LINK_BUFFER_SIZE,
+                argument_types=(ctypes.POINTER(ctypes.c_wchar), ctypes.c_int),
+                label=label,
+            )
+    return {
+        "arguments": arguments.value,
+        "description": description.value,
+        "target": target.value,
+        "working_directory": working_directory.value,
+    }
+
+
+def _expected_shell_link(record: _DescriptorRecord) -> dict[str, str]:
+    return {
+        "arguments": subprocess.list2cmdline(record.arguments),
+        "description": "Launch the FEBio CAE Harness headlessly",
+        "target": os.fspath(record.target),
+        "working_directory": os.fspath(record.target.parent),
+    }
+
+
+def _shell_link_path(record: _DescriptorRecord) -> Path:
+    manager = _manager(record.manager)
+    return manager.start_menu_root / PRODUCT_DIRECTORY_NAME / SHORTCUT_LINK_NAME
+
+
+def _check_shell_link(record: _DescriptorRecord) -> None:
+    link_path = _shell_link_path(record)
+    expected_path = record.path.parent / SHORTCUT_LINK_NAME
+    if link_path != expected_path:
+        raise DeploymentError("shortcut link path is not the approved product path")
+    actual = _read_windows_shell_link(link_path)
+    expected = _expected_shell_link(record)
+    if actual != expected:
+        raise DeploymentError("Start Menu shortcut does not match issuance")
+
+
+def _write_windows_shell_link_atomic(record: _DescriptorRecord) -> None:
+    link_path = _shell_link_path(record)
+    expected = _expected_shell_link(record)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{link_path.stem}.", suffix=".lnk", dir=os.fspath(link_path.parent)
+    )
+    os.close(descriptor)
+    temporary = Path(temporary_name)
+    try:
+        _save_windows_shell_link(
+            temporary,
+            target=record.target,
+            arguments=expected["arguments"],
+            working_directory=record.target.parent,
+            description=expected["description"],
+        )
+        if _read_windows_shell_link(temporary) != expected:
+            raise DeploymentError("temporary Start Menu shortcut does not match issuance")
+        os.replace(temporary, link_path)
+    except DeploymentError:
+        raise
+    except OSError as error:
+        raise DeploymentError("cannot atomically write Start Menu shortcut") from error
+    finally:
+        with suppress(OSError):
+            temporary.unlink(missing_ok=True)
+
+
 def _issued_live(record: _DescriptorRecord) -> None:
     current = _live(_manager(record.manager))
     expected = (record.identity, record.launcher_stamp, record.identity_stamp)
@@ -402,6 +672,7 @@ def _check_written(record: _DescriptorRecord, expected: Mapping[str, object]) ->
         raise DeploymentError("shortcut descriptor cannot be read") from error
     if actual != dict(expected):
         raise DeploymentError("shortcut descriptor contents do not match issuance")
+    _check_shell_link(record)
 
 
 def _issue(
@@ -472,6 +743,7 @@ class ShortcutManager(_Opaque):
         with _output_authority(_manager(self)):
             _output(record)
             _write_json_atomic(record.path, expected)
+            _write_windows_shell_link_atomic(record)
             _check_written(record, expected)
         return record.path
 
@@ -538,6 +810,7 @@ shortcut_descriptor = fixed_shortcut_descriptor
 __all__ = [
     "SHORTCUT_DESCRIPTOR_NAME",
     "SHORTCUT_DISPLAY_NAME",
+    "SHORTCUT_LINK_NAME",
     "START_MENU_RELATIVE_PATH",
     "ShortcutDescriptor",
     "ShortcutDescriptorManager",
