@@ -81,6 +81,7 @@ def make_authority(tmp_path: Path) -> tuple[ReportAuthority, SolverRunResult]:
         expected_steps=1,
         expected_final_time=1.0,
         timeout_seconds=None,
+        requested_fields=("stress",),
     )
     root = capability.spec.attempt_root
     fbs = FbsAdapterManager(_Adapter(), "synthetic-runtime", root).issue_authority()

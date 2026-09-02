@@ -1,4 +1,4 @@
-"""Synthetic, integrity-only authority for one solver attempt."""
+"""Integrity authority for one solver attempt and its live FBS provenance."""
 
 from __future__ import annotations
 
@@ -12,13 +12,18 @@ from typing import Any, NoReturn, cast
 
 from febio_cae_harness.solver import FbsValidation, SolverRunResult, SolverSupervisor, validate_log
 from febio_cae_harness.solver.fbs import _require_issued_validation
+from febio_cae_harness.solver.official_fbs import (
+    OfficialFbsResultReceipt,
+    require_official_fbs_result,
+)
 from febio_cae_harness.solver.types import _reject_alias as _solver_reject_alias
 
 from .types import AttemptIdentity, EvidenceKind
 
 __all__ = ["ReportAuthorityManager", "ReportAuthority"]
 _TOKEN = object()
-_PROVENANCE = "synthetic-unverified"
+_SYNTHETIC_PROVENANCE = "synthetic-unverified"
+_OFFICIAL_PROVENANCE = "official"
 _Identity = tuple[int, int]
 _FileRecord = tuple[_Identity, str]
 _ManagerRecord = tuple[Any, ...]
@@ -79,7 +84,7 @@ def _manager(value: object) -> _ManagerRecord:
 
 
 def _validate_manager(record: _ManagerRecord) -> None:
-    _, supervisor, result, identity, root, _ = record
+    _, supervisor, result, identity, root, _, _ = record
     if type(supervisor) is not SolverSupervisor or type(result) is not SolverRunResult:
         raise TypeError("report authority requires exact solver instances")
     try:
@@ -103,7 +108,10 @@ def _validate_manager(record: _ManagerRecord) -> None:
         raise TypeError("solver output paths are outside the attempt root")
 
 
-def _issued_fbs(result: SolverRunResult) -> FbsValidation:
+def _issued_fbs(
+    result: SolverRunResult,
+    official_result: OfficialFbsResultReceipt | None,
+) -> tuple[FbsValidation, str]:
     validation = result.fbs_validation
     if type(validation) is not FbsValidation or validation.authority is None:
         raise TypeError("solver result must contain an issued FbsValidation")
@@ -113,11 +121,25 @@ def _issued_fbs(result: SolverRunResult) -> FbsValidation:
         )
     except (AttributeError, TypeError, ValueError, RuntimeError) as error:
         raise TypeError("solver result FbsValidation issuance is invalid") from error
-    if checked is not validation or validation.official is not False:
-        raise TypeError("report authority cannot claim official FBS provenance")
-    if validation.provenance != _PROVENANCE:
+    if checked is not validation:
+        raise TypeError("solver result FbsValidation binding is invalid")
+    if validation.official is True:
+        if type(official_result) is not OfficialFbsResultReceipt:
+            raise TypeError("official FBS validation requires its exact live result receipt")
+        try:
+            current = require_official_fbs_result(validation)
+        except (AttributeError, TypeError, ValueError, RuntimeError) as error:
+            raise TypeError("official FBS result receipt is unavailable") from error
+        if current is not official_result or official_result.validation is not validation:
+            raise TypeError("official FBS result receipt binding is invalid")
+        if validation.provenance != _OFFICIAL_PROVENANCE:
+            raise TypeError("official FbsValidation provenance is invalid")
+        return validation, _OFFICIAL_PROVENANCE
+    if official_result is not None:
+        raise TypeError("non-official FBS validation cannot use an official result receipt")
+    if validation.official is not False or validation.provenance != _SYNTHETIC_PROVENANCE:
         raise TypeError("FbsValidation provenance is invalid")
-    return validation
+    return validation, _SYNTHETIC_PROVENANCE
 
 
 def _evidence(value: object) -> dict[EvidenceKind, object]:
@@ -155,7 +177,9 @@ def _require_issued_authority(
     if result is not None and result is not record[3]:
         raise TypeError("report authority belongs to another solver result")
     _validate_manager(_manager(record[1]))
-    _issued_fbs(record[3])
+    _, provenance = _issued_fbs(record[3], record[11])
+    if provenance != record[10]:
+        raise TypeError("report authority FBS provenance changed")
     for path, expected in record[7].items():
         current = _snapshot(path, record[5], "report artifact")
         if current != expected:
@@ -202,6 +226,7 @@ class ReportAuthority(_Opaque):
             "requested_fields": record[8],
             "runtime_identity": record[9],
             "provenance": record[10],
+            "official_fbs_result": record[11],
         }
         try:
             return values[name]
@@ -218,6 +243,8 @@ class ReportAuthorityManager(_Opaque):
         result: SolverRunResult,
         identity: AttemptIdentity,
         attempt_root: str | os.PathLike[str] | None = None,
+        *,
+        official_fbs_result: OfficialFbsResultReceipt | None = None,
     ) -> None:
         if type(supervisor) is not SolverSupervisor or type(result) is not SolverRunResult:
             raise TypeError("manager requires exact solver instances")
@@ -229,7 +256,20 @@ class ReportAuthorityManager(_Opaque):
         )
         if root != _absolute(supervisor.spec.attempt_root, "attempt root"):
             raise ValueError("attempt root does not match the solver supervisor")
-        record: _ManagerRecord = (self, supervisor, result, identity, root, None)
+        if (
+            official_fbs_result is not None
+            and type(official_fbs_result) is not OfficialFbsResultReceipt
+        ):
+            raise TypeError("official_fbs_result must be an exact OfficialFbsResultReceipt")
+        record: _ManagerRecord = (
+            self,
+            supervisor,
+            result,
+            identity,
+            root,
+            None,
+            official_fbs_result,
+        )
         _validate_manager(record)
         _MANAGERS[id(self)] = record
 
@@ -237,14 +277,14 @@ class ReportAuthorityManager(_Opaque):
         raise TypeError("ReportAuthorityManager cannot be subclassed")
 
     def issue(self, evidence: Mapping[EvidenceKind, str | os.PathLike[str]]) -> ReportAuthority:
-        """Issue one explicitly synthetic-unverified authority."""
+        """Issue one authority carrying the exact live FBS provenance."""
         record = _manager(self)
         _validate_manager(record)
         paths = {
             kind: _absolute(path, f"{kind.value} evidence")
             for kind, path in _evidence(evidence).items()
         }
-        fbs = _issued_fbs(record[2])
+        fbs, provenance = _issued_fbs(record[2], record[6])
         outputs = (record[2].log_path, record[2].xplt_path)
         all_paths = tuple(paths.values()) + outputs
         if len({os.path.normcase(os.fspath(path)) for path in all_paths}) != len(all_paths):
@@ -284,7 +324,16 @@ class ReportAuthorityManager(_Opaque):
             MappingProxyType(files),
             fbs.requested_fields,
             fbs.runtime_identity,
-            _PROVENANCE,
+            provenance,
+            record[6],
         )
-        _MANAGERS[id(self)] = (self, record[1], record[2], record[3], record[4], authority)
+        _MANAGERS[id(self)] = (
+            self,
+            record[1],
+            record[2],
+            record[3],
+            record[4],
+            authority,
+            record[6],
+        )
         return authority
