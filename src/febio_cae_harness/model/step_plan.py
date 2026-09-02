@@ -5,7 +5,9 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from math import isfinite
+from typing import cast
 
+from ..evidence import EvidenceIntegrityError, IntentSnapshotAuthority
 from ._immutability import FrozenJSON, freeze_json
 from .step import STEPInspection, STEPInspectionError, StepUnitFact
 from .types import ASK_AND_BLOCK, EvidenceProvenance, normalise_provenance
@@ -31,6 +33,9 @@ _UNIT_ALIASES = {
 _KNOWN_UNITS = frozenset({"m", "mm", "cm", "um", "nm", "in", "ft"})
 _SUPPORTED_ELEMENT_FAMILIES = frozenset({"tet4", "tet10"})
 _SUPPORTED_QUALITY_CRITERIA = frozenset({"min_jacobian", "max_aspect_ratio"})
+_STEP_MESH_SETTING_KEYS = frozenset(
+    {"step_sha256", "element_family", "length_unit", "target_size", "quality_criteria"}
+)
 
 
 def _text(name: str, value: str | None) -> None:
@@ -242,4 +247,66 @@ def plan_step_meshing(
     )
 
 
-__all__ = ["StepMeshingPlan", "StepMeshingRequest", "plan_step_meshing"]
+def plan_authoritative_step_meshing(
+    step: STEPInspection,
+    snapshot: IntentSnapshotAuthority,
+) -> StepMeshingPlan:
+    """Plan STEP meshing only from the exact current persisted intent.
+
+    The supported intent shape is
+    ``allowed_mesh_changes.mesh.step_meshing``.  A selected STEP is bound by
+    its SHA-256; caller-supplied booleans or free-standing request files do not
+    authorize a mesh.
+    """
+
+    if not isinstance(step, STEPInspection):
+        raise TypeError("step must be a STEPInspection")
+    if type(snapshot) is not IntentSnapshotAuthority:
+        raise TypeError("snapshot must be an exact IntentSnapshotAuthority")
+    intent = snapshot.intent
+    intent_sha256 = snapshot.intent_sha256
+    declarations = intent.allowed_mesh_changes
+    settings: Mapping[str, object] | None = None
+    if isinstance(declarations, Mapping):
+        mesh = declarations.get("mesh")
+        if isinstance(mesh, Mapping) and "step_meshing" in mesh:
+            candidate = mesh["step_meshing"]
+            if not isinstance(candidate, Mapping):
+                raise EvidenceIntegrityError("STEP meshing intent must be a mapping")
+            settings = candidate
+    provenance = EvidenceProvenance(
+        "intent_snapshot",
+        f"sha256:{intent_sha256}",
+        authoritative=True,
+    )
+    if settings is None:
+        request = StepMeshingRequest(evidence=(provenance,))
+    else:
+        unknown = set(settings) - _STEP_MESH_SETTING_KEYS
+        if unknown:
+            raise EvidenceIntegrityError("STEP meshing intent contains unexpected fields")
+        source_digest = settings.get("step_sha256")
+        if source_digest != step.sha256:
+            raise EvidenceIntegrityError("STEP meshing intent does not match the selected STEP")
+        request = StepMeshingRequest(
+            element_family=cast(str | None, settings.get("element_family")),
+            length_unit=cast(str | None, settings.get("length_unit")),
+            target_size=cast(float | None, settings.get("target_size")),
+            quality_criteria=cast(
+                Mapping[str, object] | None,
+                settings.get("quality_criteria"),
+            ),
+            evidence=(provenance,),
+        )
+    plan = plan_step_meshing(step, request)
+    if snapshot.intent_sha256 != intent_sha256:
+        raise EvidenceIntegrityError("intent snapshot changed during STEP meshing planning")
+    return plan
+
+
+__all__ = [
+    "StepMeshingPlan",
+    "StepMeshingRequest",
+    "plan_authoritative_step_meshing",
+    "plan_step_meshing",
+]

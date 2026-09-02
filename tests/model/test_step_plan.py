@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
+from pathlib import Path
 from types import MappingProxyType
+from typing import Any
 
 import pytest
 
+from febio_cae_harness.contracts import IntentContract
+from febio_cae_harness.evidence import EvidenceIntegrityError, EvidenceStore
 from febio_cae_harness.model import (
     ASK_AND_BLOCK,
     EvidenceProvenance,
@@ -12,8 +16,10 @@ from febio_cae_harness.model import (
     StepMeshingPlan,
     StepMeshingRequest,
     inspect_step,
+    plan_authoritative_step_meshing,
     plan_step_meshing,
 )
+from febio_cae_harness.workspace import ValidatedCaseWorkspace
 
 AUTH = EvidenceProvenance("synthetic-intent", "intent.json", authoritative=True)
 UNAUTH = EvidenceProvenance("synthetic-note", "note.txt")
@@ -26,6 +32,16 @@ DATA;
 ENDSEC;
 END-ISO-10303-21;
 """
+
+
+def _snapshot(tmp_path: Path, allowed_mesh_changes: Any) -> tuple[EvidenceStore, object]:
+    workspace = ValidatedCaseWorkspace(tmp_path / "tool", tmp_path / "02_CAE")
+    case = workspace.create_case("step-case")
+    store = EvidenceStore(
+        case,
+        IntentContract(allowed_mesh_changes=allowed_mesh_changes),
+    )
+    return store, store.issue_intent_snapshot()
 
 
 def test_ready_plan_is_digest_bound_immutable_and_deterministic() -> None:
@@ -190,3 +206,73 @@ def test_explicit_step_length_unit_satisfies_missing_request_unit() -> None:
     assert plan.status == "READY"
     assert plan.length_unit == "mm"
     assert plan.questions == ()
+
+
+def test_authoritative_step_plan_uses_only_current_digest_bound_intent(
+    tmp_path: Path,
+) -> None:
+    inspection = inspect_step(STEP)
+    store, snapshot = _snapshot(
+        tmp_path,
+        {
+            "mesh": {
+                "step_meshing": {
+                    "step_sha256": inspection.sha256,
+                    "element_family": "tet10",
+                    "length_unit": "mm",
+                    "target_size": 1.25,
+                    "quality_criteria": {
+                        "min_jacobian": 0.1,
+                        "max_aspect_ratio": 4.0,
+                    },
+                }
+            }
+        },
+    )
+
+    plan = plan_authoritative_step_meshing(inspection, snapshot)  # type: ignore[arg-type]
+
+    assert plan.status == "READY"
+    assert plan.step_sha256 == inspection.sha256
+    assert plan.element_family == "tet10"
+    assert plan.length_unit == "mm"
+    assert plan.target_size == 1.25
+    assert plan.evidence[0].source == "intent_snapshot"
+    assert plan.evidence[0].location == f"sha256:{snapshot.intent_sha256}"  # type: ignore[attr-defined]
+    assert plan.evidence[0].authoritative is True
+
+    store.revise_intent(IntentContract(allowed_mesh_changes=()))
+    with pytest.raises(EvidenceIntegrityError, match="snapshot"):
+        plan_authoritative_step_meshing(inspection, snapshot)  # type: ignore[arg-type]
+
+
+def test_authoritative_step_plan_blocks_absent_settings_and_rejects_wrong_source(
+    tmp_path: Path,
+) -> None:
+    inspection = inspect_step(STEP)
+    _, empty_snapshot = _snapshot(tmp_path / "empty", ())
+
+    blocked = plan_authoritative_step_meshing(inspection, empty_snapshot)  # type: ignore[arg-type]
+
+    assert blocked.status == ASK_AND_BLOCK
+    assert blocked.questions == (
+        "Which element family should be used for meshing?",
+        "What target element size should be used?",
+        "Which mesh quality criteria must be enforced?",
+    )
+
+    _, wrong_snapshot = _snapshot(
+        tmp_path / "wrong",
+        {
+            "mesh": {
+                "step_meshing": {
+                    "step_sha256": "0" * 64,
+                    "element_family": "tet10",
+                    "target_size": 1.0,
+                    "quality_criteria": {"min_jacobian": 0.1},
+                }
+            }
+        },
+    )
+    with pytest.raises(EvidenceIntegrityError, match="STEP"):
+        plan_authoritative_step_meshing(inspection, wrong_snapshot)  # type: ignore[arg-type]

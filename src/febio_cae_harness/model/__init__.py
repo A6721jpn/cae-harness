@@ -96,7 +96,12 @@ from .step import (
     inspect_step_file,
     inspect_step_text,
 )
-from .step_plan import StepMeshingPlan, StepMeshingRequest, plan_step_meshing
+from .step_plan import (
+    StepMeshingPlan,
+    StepMeshingRequest,
+    plan_authoritative_step_meshing,
+    plan_step_meshing,
+)
 from .synthetic import SyntheticFebReceipt, generate_synthetic_feb
 from .types import (
     ASK_AND_BLOCK,
@@ -209,6 +214,7 @@ __all__ = [
     "generate_synthetic_feb",
     "inventory_feb_xml",
     "plan_derived_model",
+    "plan_authoritative_step_meshing",
     "plan_step_meshing",
     "preflight",
     "preflight_model",
