@@ -8,7 +8,7 @@ import stat
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -21,7 +21,8 @@ from febio_cae_harness.solver.execution import (
     issue_execution_authority,
     reopen_execution_authority,
 )
-from febio_cae_harness.solver.headless import HeadlessRunDiagnostic
+from febio_cae_harness.solver.headless import HeadlessRunDiagnostic, HeadlessRunSession
+from febio_cae_harness.solver.log import validate_log
 from febio_cae_harness.solver.official_fbs import OfficialFbsRuntime
 from febio_cae_harness.solver.runtime import (
     FebioRuntimeDiagnostic,
@@ -359,6 +360,153 @@ def test_run_febio_blocks_nonexact_declared_mesh_patch_before_model_write(
     attempts = list((case_root / "90_Temporary" / "attempts").iterdir())
     assert len(attempts) == 1
     assert not (attempts[0] / "model.feb").exists()
+
+
+def test_negative_jacobian_repair_proposal_binds_log_and_current_intent(
+    tmp_path: Path,
+) -> None:
+    change = {
+        "target": "/febio_spec/Mesh[1]/Elements[1]",
+        "mode": "ATTRIBUTE",
+        "attribute_name": "type",
+        "value": "tet10",
+    }
+    repair_evidence = {
+        "initial_mesh_valid": True,
+        "surrounding_mesh_metrics": {"scaled_jacobian": 0.61},
+        "roi_relation_evidence": {"relation": "outside ROI"},
+        "contact_relation_evidence": {"relation": "outside contact"},
+        "constraint_relation_evidence": {"relation": "outside constraint"},
+    }
+    intent = _complete_intent(
+        retry_budget=1,
+        allowed_mesh_changes={
+            "mesh": {
+                "patches": (change,),
+                "negative_jacobian_evidence": repair_evidence,
+            }
+        },
+    )
+    service, capability, _ = _register_case(tmp_path, intent=intent)
+    opened = service._open_context(capability, "case-a")
+    snapshot = opened.store.issue_intent_snapshot()
+    log_path = tmp_path / "failed.log"
+    log_path.write_text(
+        "time step = 2\n"
+        "time = 0.25\n"
+        "Negative Jacobian determinant = -0.125 at element 17, integration point 3\n",
+        encoding="utf-8",
+    )
+    validation = validate_log(log_path)
+
+    proposal = cli_module._negative_jacobian_repair_proposal(
+        snapshot,
+        attempt_id="run-failed",
+        validation=validation,
+    )
+
+    assert proposal is not None
+    assert len(proposal.proposal_id) == 64
+    assert proposal.changes == {"mesh": {"patches": (change,)}}
+    assert snapshot.intent_sha256 in proposal.evidence_ids
+    assert hashlib.sha256(log_path.read_bytes()).hexdigest() in proposal.evidence_ids
+    assert (
+        cli_module._negative_jacobian_repair_proposal(
+            snapshot,
+            attempt_id="run-failed",
+            validation=validation,
+        )
+        == proposal
+    )
+
+
+def test_run_febio_routes_exact_negative_jacobian_repair_into_retry_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    change = {
+        "target": "/febio_spec",
+        "mode": "ATTRIBUTE",
+        "attribute_name": "version",
+        "value": "4.0",
+    }
+    intent = _complete_intent(
+        retry_budget=1,
+        allowed_mesh_changes={
+            "mesh": {
+                "patches": (change,),
+                "negative_jacobian_evidence": {
+                    "initial_mesh_valid": True,
+                    "surrounding_mesh_metrics": {"scaled_jacobian": 0.61},
+                    "roi_relation_evidence": {"relation": "outside ROI"},
+                    "contact_relation_evidence": {"relation": "outside contact"},
+                    "constraint_relation_evidence": {"relation": "outside constraint"},
+                },
+            }
+        },
+    )
+    service, capability, _ = _register_case(tmp_path, intent=intent)
+    runtime = _issued_runtime(tmp_path, monkeypatch)
+    _set_capability_stdin(monkeypatch, capability)
+    monkeypatch.setattr(cli_module, "_case_service", lambda: service)
+    monkeypatch.setattr(cli_module, "probe_febio", lambda path: runtime)
+
+    def run_negative(
+        attempt: Any,
+        snapshot: Any,
+        runtime_diagnostic: FebioRuntimeDiagnostic,
+        input_path: Path,
+        **kwargs: object,
+    ) -> HeadlessRunSession:
+        del attempt, snapshot, kwargs
+        log_path = input_path.with_suffix(".log")
+        xplt_path = input_path.with_suffix(".xplt")
+        log_path.write_text(
+            "time step = 1\n"
+            "time = 1.0\n"
+            "Negative Jacobian determinant = -0.125 at element 17, integration point 3\n",
+            encoding="utf-8",
+        )
+        xplt_path.write_bytes(b"synthetic XPLT")
+        validation = validate_log(
+            log_path,
+            expected_steps=1,
+            expected_final_time=1.0,
+        )
+        result = SimpleNamespace(log_validation=validation)
+        return HeadlessRunSession(
+            supervisor=cast(Any, object()),
+            result=cast(Any, result),
+            diagnostic=HeadlessRunDiagnostic(
+                runtime_identity=runtime_diagnostic,
+                state=SolverState.NORMAL_EXIT,
+                classification=SolverClassification.NEGATIVE_JACOBIAN,
+                return_code=0,
+                pid=123,
+                log_path=log_path,
+                xplt_path=xplt_path,
+            ),
+        )
+
+    captured_policy: dict[str, object] = {}
+
+    def decide(*args: object, **kwargs: object) -> object:
+        del args
+        captured_policy.update(kwargs)
+        return SimpleNamespace(reservation_required=False)
+
+    monkeypatch.setattr(cli_module, "run_headless_febio_session", run_negative)
+    monkeypatch.setattr(cli_module, "decide_retry", decide)
+
+    assert cli_module.main(_run_arguments(runtime.path)) == 4
+
+    response = json.loads(capsys.readouterr().err)
+    assert response["error"]["code"] == "SOLVER_FAILED"
+    proposal = captured_policy["proposal"]
+    assert proposal is not None
+    assert len(cast(Any, proposal).proposal_id) == 64
+    assert captured_policy["proposal_authority"] is not None
 
 
 def test_reconnect_febio_parser_cannot_redefine_recorded_launch_context(

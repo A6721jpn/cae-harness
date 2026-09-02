@@ -15,7 +15,10 @@ from febio_cae_harness.autonomy import (
     ProposalAuthorityManager,
     ProposalClass,
     RetryLedger,
+    bind_retry_proposal,
     decide_retry,
+    diagnose_negative_jacobian,
+    observe_negative_jacobian_log,
     transition_intent,
 )
 from febio_cae_harness.cli_context import (
@@ -28,7 +31,7 @@ from febio_cae_harness.cli_context import (
     load_intent_document,
     load_root_capability,
 )
-from febio_cae_harness.contracts import IntentState
+from febio_cae_harness.contracts import IntentState, JSONValue
 from febio_cae_harness.evidence import (
     EvidenceIntegrityError,
     EvidenceStore,
@@ -66,6 +69,7 @@ from febio_cae_harness.solver.headless import (
     recover_headless_febio,
     run_headless_febio_session,
 )
+from febio_cae_harness.solver.log import LogValidation
 from febio_cae_harness.solver.official_fbs import (
     OfficialFbsResultReceipt,
     OfficialFbsRuntimeError,
@@ -935,57 +939,10 @@ def _write_declared_mesh_input(
             "EVIDENCE_INTEGRITY_FAILURE",
             "registered FEB input digest changed before derivation",
         )
-    declarations = snapshot.intent.allowed_mesh_changes
-    if not isinstance(declarations, Mapping) or set(declarations) != {"mesh"}:
-        raise _RunCommandError(
-            "ASK_AND_BLOCK",
-            "current intent does not declare one exact FEB mesh patch set",
-        )
-    mesh = declarations["mesh"]
-    if not isinstance(mesh, Mapping) or set(mesh) != {"patches"}:
-        raise _RunCommandError(
-            "ASK_AND_BLOCK",
-            "current intent does not declare one exact FEB mesh patch set",
-        )
-    raw_patches = mesh["patches"]
-    if not isinstance(raw_patches, tuple) or not raw_patches:
-        raise _RunCommandError(
-            "ASK_AND_BLOCK",
-            "current intent does not declare one exact FEB mesh patch set",
-        )
+    raw_patches = _declared_mesh_patch_records(snapshot)
 
     patches: list[FebPatch] = []
     for raw in raw_patches:
-        if not isinstance(raw, Mapping):
-            raise _RunCommandError(
-                "ASK_AND_BLOCK",
-                "current intent FEB mesh patches are not exact mappings",
-            )
-        mode = raw.get("mode")
-        required = (
-            {"target", "mode", "value"}
-            if mode == "TEXT"
-            else {"target", "mode", "attribute_name", "value"}
-        )
-        value = raw.get("value")
-        if (
-            set(raw) != required
-            or type(raw.get("target")) is not str
-            or not cast(str, raw["target"]).strip()
-            or mode not in {"TEXT", "ATTRIBUTE"}
-            or type(value) not in {str, int, float, bool}
-            or isinstance(value, float)
-            and not math.isfinite(value)
-            or mode == "ATTRIBUTE"
-            and (
-                type(raw.get("attribute_name")) is not str
-                or not cast(str, raw["attribute_name"]).strip()
-            )
-        ):
-            raise _RunCommandError(
-                "ASK_AND_BLOCK",
-                "current intent FEB mesh patch schema is not exact",
-            )
         patches.append(
             FebPatch(
                 target=cast(str, raw.get("target")),
@@ -1018,6 +975,132 @@ def _write_declared_mesh_input(
         proposal_authority=authority,
     )
     return receipt.destination, receipt.derived_sha256
+
+
+def _declared_mesh_patch_records(
+    snapshot: IntentSnapshotAuthority,
+) -> tuple[Mapping[str, JSONValue], ...]:
+    declarations = snapshot.intent.allowed_mesh_changes
+    if not isinstance(declarations, Mapping) or set(declarations) != {"mesh"}:
+        raise _RunCommandError(
+            "ASK_AND_BLOCK",
+            "current intent does not declare one exact FEB mesh patch set",
+        )
+    mesh = declarations["mesh"]
+    if not isinstance(mesh, Mapping) or set(mesh) not in (
+        {"patches"},
+        {"negative_jacobian_evidence", "patches"},
+    ):
+        raise _RunCommandError(
+            "ASK_AND_BLOCK",
+            "current intent does not declare one exact FEB mesh patch set",
+        )
+    raw_patches = mesh["patches"]
+    if not isinstance(raw_patches, tuple) or not raw_patches:
+        raise _RunCommandError(
+            "ASK_AND_BLOCK",
+            "current intent does not declare one exact FEB mesh patch set",
+        )
+
+    records: list[Mapping[str, JSONValue]] = []
+    for raw in raw_patches:
+        if not isinstance(raw, Mapping):
+            raise _RunCommandError(
+                "ASK_AND_BLOCK",
+                "current intent FEB mesh patches are not exact mappings",
+            )
+        mode = raw.get("mode")
+        required = (
+            {"target", "mode", "value"}
+            if mode == "TEXT"
+            else {"target", "mode", "attribute_name", "value"}
+        )
+        value = raw.get("value")
+        if (
+            set(raw) != required
+            or type(raw.get("target")) is not str
+            or not cast(str, raw["target"]).strip()
+            or mode not in {"TEXT", "ATTRIBUTE"}
+            or type(value) not in {str, int, float, bool}
+            or isinstance(value, float)
+            and not math.isfinite(value)
+            or mode == "ATTRIBUTE"
+            and (
+                type(raw.get("attribute_name")) is not str
+                or not cast(str, raw["attribute_name"]).strip()
+            )
+        ):
+            raise _RunCommandError(
+                "ASK_AND_BLOCK",
+                "current intent FEB mesh patch schema is not exact",
+            )
+        records.append(cast(Mapping[str, JSONValue], raw))
+    return tuple(records)
+
+
+def _negative_jacobian_repair_proposal(
+    snapshot: IntentSnapshotAuthority,
+    *,
+    attempt_id: str,
+    validation: LogValidation,
+) -> Proposal | None:
+    if type(validation) is not LogValidation:
+        return None
+    try:
+        raw_patches = _declared_mesh_patch_records(snapshot)
+    except _RunCommandError:
+        return None
+    declarations = snapshot.intent.allowed_mesh_changes
+    assert isinstance(declarations, Mapping)
+    mesh = declarations["mesh"]
+    assert isinstance(mesh, Mapping)
+    repair_evidence = mesh.get("negative_jacobian_evidence")
+    required = {
+        "initial_mesh_valid",
+        "surrounding_mesh_metrics",
+        "roi_relation_evidence",
+        "contact_relation_evidence",
+        "constraint_relation_evidence",
+    }
+    if not isinstance(repair_evidence, Mapping) or set(repair_evidence) != required:
+        return None
+    if type(repair_evidence["initial_mesh_valid"]) is not bool:
+        return None
+    metrics = repair_evidence["surrounding_mesh_metrics"]
+    if not isinstance(metrics, Mapping) or not metrics:
+        return None
+    relations = (
+        repair_evidence["roi_relation_evidence"],
+        repair_evidence["contact_relation_evidence"],
+        repair_evidence["constraint_relation_evidence"],
+    )
+    if any(not isinstance(value, Mapping) or not value for value in relations):
+        return None
+    try:
+        observation = observe_negative_jacobian_log(
+            validation,
+            attempt_id=attempt_id,
+            initial_mesh_valid=repair_evidence["initial_mesh_valid"],
+            surrounding_mesh_metrics=cast(Mapping[str, float], metrics),
+            roi_relation_evidence=relations[0],
+            contact_relation_evidence=relations[1],
+            constraint_relation_evidence=relations[2],
+        )
+        diagnostic = diagnose_negative_jacobian(observation)
+    except (TypeError, ValueError):
+        return None
+    if diagnostic.missing_technical_evidence:
+        return None
+    proposal = Proposal(
+        proposal_id="pending",
+        proposal_class=ProposalClass.INTENT_PRESERVING,
+        rationale="repair exact negative-Jacobian evidence within the current mesh contract",
+        evidence_ids=(snapshot.intent_sha256, observation.log_evidence_digest),
+        changes={"mesh": {"patches": raw_patches}},
+        authorized=True,
+        within_contract=True,
+    )
+    return bind_retry_proposal(proposal)
 
 
 def _run_febio_command(arguments: argparse.Namespace) -> int:
@@ -1216,10 +1299,28 @@ def _run_febio_command(arguments: argparse.Namespace) -> int:
             or diagnostic.xplt_path != execution.xplt_path
         ):
             state_authority = transition_intent(snapshot)
+            repair_proposal = None
+            repair_authority = None
+            if (
+                diagnostic.classification is SolverClassification.NEGATIVE_JACOBIAN
+                and type(session) is HeadlessRunSession
+                and type(session.result.log_validation) is LogValidation
+            ):
+                repair_proposal = _negative_jacobian_repair_proposal(
+                    snapshot,
+                    attempt_id=attempt_id,
+                    validation=session.result.log_validation,
+                )
+                if repair_proposal is not None:
+                    repair_authority = ProposalAuthorityManager(state_authority).issue(
+                        repair_proposal
+                    )
             retry = decide_retry(
                 diagnostic.classification.value,
                 RetryLedger.from_store(state_authority, opened.store),
                 intent=state_authority,
+                proposal=repair_proposal,
+                proposal_authority=repair_authority,
                 supervisor=session.supervisor,
                 result=session.result,
             )
