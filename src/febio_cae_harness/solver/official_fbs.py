@@ -1454,8 +1454,8 @@ def _validate_geometry_summary(
     if not isinstance(cell_types, list) or not cell_types or len(cell_types) > 256:
         raise OfficialFbsRuntimeError("geometry cell types are invalid")
     supported = {
-        10: ("tet4", 4, 1),
-        24: ("tet10", 10, 4),
+        10: ("tet4", 4, "gauss1", 1),
+        24: ("tet10", 10, "gauss4", 4),
     }
     seen: set[int] = set()
     total_elements = 0
@@ -1466,7 +1466,14 @@ def _validate_geometry_summary(
             raise OfficialFbsRuntimeError("geometry cell type is invalid")
         _exact_keys(
             item,
-            {"vtk_id", "name", "nodes", "elements", "integration_points"},
+            {
+                "vtk_id",
+                "name",
+                "nodes",
+                "elements",
+                "integration_rule",
+                "integration_points",
+            },
             "geometry cell type",
         )
         vtk_id = item["vtk_id"]
@@ -1475,11 +1482,12 @@ def _validate_geometry_summary(
         profile = supported.get(vtk_id)
         if profile is None:
             raise OfficialFbsRuntimeError("geometry cell type is unsupported")
-        name, nodes, integration_points = profile
+        name, nodes, integration_rule, integration_points = profile
         elements = _positive_count(item["elements"], "geometry cell count", maximum=element_count)
         if (
             item["name"] != name
             or item["nodes"] != nodes
+            or item["integration_rule"] != integration_rule
             or item["integration_points"] != integration_points
         ):
             raise OfficialFbsRuntimeError("geometry cell type identity is invalid")

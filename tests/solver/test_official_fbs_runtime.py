@@ -76,6 +76,7 @@ def _tet4_geometry_summary() -> dict[str, object]:
                 "name": "tet4",
                 "nodes": 4,
                 "elements": 1,
+                "integration_rule": "gauss1",
                 "integration_points": 1,
             }
         ],
@@ -391,6 +392,7 @@ def test_official_fbs_receipt_retains_validated_geometry_summary(
         assert geometry["node_count"] == 4
         assert geometry["element_count"] == 1
         assert geometry["cell_types"][0]["name"] == "tet4"
+        assert geometry["cell_types"][0]["integration_rule"] == "gauss1"
         assert geometry["states"][0]["minimum_jacobian"] == 1.0
 
 
