@@ -29,6 +29,8 @@ _UNIT_ALIASES = {
     "foot": "ft",
 }
 _KNOWN_UNITS = frozenset({"m", "mm", "cm", "um", "nm", "in", "ft"})
+_SUPPORTED_ELEMENT_FAMILIES = frozenset({"tet4", "tet10"})
+_SUPPORTED_QUALITY_CRITERIA = frozenset({"min_jacobian", "max_aspect_ratio"})
 
 
 def _text(name: str, value: str | None) -> None:
@@ -52,6 +54,19 @@ def _quality(value: Mapping[str, object] | None) -> Mapping[str, FrozenJSON] | N
         raise TypeError("quality_criteria must be a mapping or None")
     if any(not isinstance(key, str) or not key.strip() for key in value):
         raise ValueError("quality_criteria keys must be non-empty strings")
+    unknown = set(value) - _SUPPORTED_QUALITY_CRITERIA
+    if unknown:
+        raise ValueError("quality_criteria contains an unsupported criterion")
+    for name, item in value.items():
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            raise TypeError("quality_criteria values must be real numbers")
+        numeric = float(item)
+        if not isfinite(numeric):
+            raise ValueError("quality_criteria values must be finite")
+        if name == "min_jacobian" and numeric <= 0:
+            raise ValueError("quality_criteria min_jacobian must be positive")
+        if name == "max_aspect_ratio" and numeric < 1:
+            raise ValueError("quality_criteria max_aspect_ratio must be at least one")
     frozen = freeze_json(value)
     if not isinstance(frozen, Mapping):  # pragma: no cover - guarded by input type
         raise TypeError("quality_criteria must be a mapping")
@@ -129,6 +144,11 @@ class StepMeshingRequest:
 
     def __post_init__(self) -> None:
         _text("element_family", self.element_family)
+        if (
+            self.element_family is not None
+            and self.element_family not in _SUPPORTED_ELEMENT_FAMILIES
+        ):
+            raise ValueError("element_family must be exactly tet4 or tet10")
         _text("length_unit", self.length_unit)
         _size(self.target_size)
         object.__setattr__(self, "quality_criteria", _quality(self.quality_criteria))

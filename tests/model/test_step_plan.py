@@ -101,6 +101,33 @@ def test_request_rejects_nonfinite_or_nonpositive_target_size(size: float) -> No
         StepMeshingRequest(target_size=size, evidence=(AUTH,))
 
 
+@pytest.mark.parametrize("element_family", ["hex8", "Tet10", "tet15", " tet4"])
+def test_request_rejects_unsupported_or_noncanonical_element_family(
+    element_family: str,
+) -> None:
+    with pytest.raises(ValueError, match="element_family"):
+        StepMeshingRequest(element_family=element_family, evidence=(AUTH,))
+
+
+@pytest.mark.parametrize(
+    "criteria",
+    [
+        {"minimum_jacobian": 0.1, "max_aspect_ratio": 4.0},
+        {"min_jacobian": 0.0, "max_aspect_ratio": 4.0},
+        {"min_jacobian": -0.1, "max_aspect_ratio": 4.0},
+        {"min_jacobian": float("nan"), "max_aspect_ratio": 4.0},
+        {"min_jacobian": 0.1, "max_aspect_ratio": 0.99},
+        {"min_jacobian": 0.1, "max_aspect_ratio": float("inf")},
+        {"min_jacobian": True, "max_aspect_ratio": 4.0},
+    ],
+)
+def test_request_rejects_quality_criteria_that_cannot_be_verified(
+    criteria: dict[str, object],
+) -> None:
+    with pytest.raises((TypeError, ValueError), match="quality_criteria"):
+        StepMeshingRequest(quality_criteria=criteria, evidence=(AUTH,))
+
+
 def test_request_rejects_empty_evidence_and_planner_separates_step_errors() -> None:
     with pytest.raises(ValueError, match="evidence"):
         StepMeshingRequest(evidence=())
