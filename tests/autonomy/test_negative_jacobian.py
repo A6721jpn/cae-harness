@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
 from math import inf, nan
+from pathlib import Path
 
 import pytest
 
@@ -9,7 +10,9 @@ from febio_cae_harness.autonomy import (
     NegativeJacobianDiagnostic,
     NegativeJacobianObservation,
     diagnose_negative_jacobian,
+    observe_negative_jacobian_log,
 )
+from febio_cae_harness.solver import validate_log
 
 
 def make_observation(**overrides: object) -> NegativeJacobianObservation:
@@ -20,6 +23,8 @@ def make_observation(**overrides: object) -> NegativeJacobianObservation:
         "failure_step": 2,
         "failure_time": 0.25,
         "element_id": 17,
+        "integration_point": 3,
+        "log_line_number": 8,
         "integration_point_jacobian": -0.125,
         "surrounding_mesh_metrics": {"aspect_ratio": 1.4, "scaled_jacobian": 0.71},
         "roi_relation_evidence": {
@@ -55,6 +60,8 @@ def test_observation_binds_explicit_context_and_detaches_inputs() -> None:
     assert observation.failure_step == 2
     assert observation.failure_time == 0.25
     assert observation.element_id == 17
+    assert observation.integration_point == 3
+    assert observation.log_line_number == 8
     assert observation.integration_point_jacobian == -0.125
     assert observation.surrounding_mesh_metrics["aspect_ratio"] == 1.4
     assert observation.roi_relation_evidence["relation"] == "supplied"  # type: ignore[index]
@@ -187,3 +194,47 @@ def test_diagnosis_is_pure_and_rejects_non_observations() -> None:
     assert observation.surrounding_mesh_metrics["aspect_ratio"] == 1.4
     with pytest.raises(TypeError, match="observation"):
         diagnose_negative_jacobian({})  # type: ignore[arg-type]
+
+
+def test_observation_is_derived_from_explicit_log_location(tmp_path: Path) -> None:
+    path = tmp_path / "attempt.log"
+    payload = (
+        b"time step = 2\n"
+        b"time = 0.25\n"
+        b"Negative Jacobian determinant = -0.125 at element 17, integration point 3\n"
+    )
+    path.write_bytes(payload)
+    validation = validate_log(path)
+
+    observation = observe_negative_jacobian_log(
+        validation,
+        attempt_id="attempt-3",
+        initial_mesh_valid=True,
+        surrounding_mesh_metrics={"aspect_ratio": 1.4},
+        roi_relation_evidence=None,
+        contact_relation_evidence=None,
+        constraint_relation_evidence=None,
+    )
+
+    assert observation.failure_step == 2
+    assert observation.failure_time == 0.25
+    assert observation.element_id == 17
+    assert observation.integration_point == 3
+    assert observation.log_line_number == 3
+    assert observation.integration_point_jacobian == -0.125
+
+
+def test_observation_rejects_log_without_complete_explicit_location(tmp_path: Path) -> None:
+    path = tmp_path / "attempt.log"
+    path.write_text("Negative Jacobian determinant at element 17", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="explicit"):
+        observe_negative_jacobian_log(
+            validate_log(path),
+            attempt_id="attempt-3",
+            initial_mesh_valid=True,
+            surrounding_mesh_metrics={},
+            roi_relation_evidence=None,
+            contact_relation_evidence=None,
+            constraint_relation_evidence=None,
+        )

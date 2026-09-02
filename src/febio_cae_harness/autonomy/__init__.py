@@ -4,6 +4,7 @@ from .negative_jacobian import (
     NegativeJacobianDiagnostic,
     NegativeJacobianObservation,
     diagnose_negative_jacobian,
+    observe_negative_jacobian_log,
 )
 from .policy import (
     ExecutionAction,
@@ -102,4 +103,5 @@ __all__ = [
     "NegativeJacobianObservation",
     "NegativeJacobianDiagnostic",
     "diagnose_negative_jacobian",
+    "observe_negative_jacobian_log",
 ]

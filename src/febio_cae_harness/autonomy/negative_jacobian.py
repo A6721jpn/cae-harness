@@ -4,13 +4,18 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from hashlib import sha256
 from math import isfinite
 from types import MappingProxyType
+
+from ..solver.log import LogValidation, validate_log
+from ..solver.types import SolverClassification
 
 __all__ = [
     "NegativeJacobianObservation",
     "NegativeJacobianDiagnostic",
     "diagnose_negative_jacobian",
+    "observe_negative_jacobian_log",
 ]
 _RELATION_FIELDS = tuple(
     "roi_relation_evidence contact_relation_evidence constraint_relation_evidence".split()  # noqa: SIM905
@@ -99,6 +104,8 @@ class NegativeJacobianObservation:
     failure_step: int
     failure_time: float
     element_id: int
+    integration_point: int
+    log_line_number: int
     integration_point_jacobian: float
     surrounding_mesh_metrics: Mapping[str, float]
     roi_relation_evidence: object | None
@@ -123,12 +130,20 @@ class NegativeJacobianObservation:
         element_id = _finite_int(self.element_id, "element_id")
         if element_id <= 0:
             raise ValueError("element_id must be positive")
+        integration_point = _finite_int(self.integration_point, "integration_point")
+        if integration_point <= 0:
+            raise ValueError("integration_point must be positive")
+        log_line_number = _finite_int(self.log_line_number, "log_line_number")
+        if log_line_number <= 0:
+            raise ValueError("log_line_number must be positive")
         jacobian = _finite_float(self.integration_point_jacobian, "integration_point_jacobian")
         if jacobian >= 0:
             raise ValueError("integration_point_jacobian must be negative")
         object.__setattr__(self, "failure_step", step)
         object.__setattr__(self, "failure_time", failure_time)
         object.__setattr__(self, "element_id", element_id)
+        object.__setattr__(self, "integration_point", integration_point)
+        object.__setattr__(self, "log_line_number", log_line_number)
         object.__setattr__(self, "integration_point_jacobian", jacobian)
         object.__setattr__(
             self, "surrounding_mesh_metrics", _metrics(self.surrounding_mesh_metrics)
@@ -190,6 +205,8 @@ def diagnose_negative_jacobian(
         "failure_step": observation.failure_step,
         "failure_time": observation.failure_time,
         "element_id": observation.element_id,
+        "integration_point": observation.integration_point,
+        "log_line_number": observation.log_line_number,
         "integration_point_jacobian": observation.integration_point_jacobian,
     }
     technical_missing: tuple[str, ...] = ()
@@ -212,4 +229,63 @@ def diagnose_negative_jacobian(
         missing_technical_evidence=technical_missing,
         missing_physical_authority_evidence=tuple(authority_missing),
         repair_comparison_checklist=_REPAIR_CHECKLIST,
+    )
+
+
+def observe_negative_jacobian_log(
+    validation: LogValidation,
+    *,
+    attempt_id: str,
+    initial_mesh_valid: bool,
+    surrounding_mesh_metrics: Mapping[str, float],
+    roi_relation_evidence: object | None,
+    contact_relation_evidence: object | None,
+    constraint_relation_evidence: object | None,
+) -> NegativeJacobianObservation:
+    """Create one observation from explicit, currently revalidated LOG facts."""
+
+    if type(validation) is not LogValidation:
+        raise TypeError("validation must be an exact LogValidation")
+    if validation.classification is not SolverClassification.NEGATIVE_JACOBIAN:
+        raise ValueError("LOG validation is not a negative-Jacobian failure")
+    try:
+        payload = validation.path.read_bytes()
+    except OSError as error:
+        raise ValueError("negative-Jacobian LOG cannot be reread") from error
+    current = validate_log(
+        validation.path,
+        expected_steps=validation.expected_steps,
+        expected_final_time=validation.expected_final_time,
+    )
+    if current != validation:
+        raise ValueError("negative-Jacobian LOG changed after validation")
+    if current.observed_steps is None or current.observed_final_time is None:
+        raise ValueError("negative-Jacobian LOG lacks explicit step or time evidence")
+    complete = tuple(
+        item
+        for item in current.negative_jacobian_evidence
+        if item.element_id is not None
+        and item.integration_point is not None
+        and item.determinant is not None
+    )
+    if not complete:
+        raise ValueError("negative-Jacobian LOG lacks an explicit failure location")
+    failure = complete[0]
+    assert failure.element_id is not None
+    assert failure.integration_point is not None
+    assert failure.determinant is not None
+    return NegativeJacobianObservation(
+        attempt_id=attempt_id,
+        log_evidence_digest=sha256(payload).hexdigest(),
+        initial_mesh_valid=initial_mesh_valid,
+        failure_step=current.observed_steps,
+        failure_time=current.observed_final_time,
+        element_id=failure.element_id,
+        integration_point=failure.integration_point,
+        log_line_number=failure.line_number,
+        integration_point_jacobian=failure.determinant,
+        surrounding_mesh_metrics=surrounding_mesh_metrics,
+        roi_relation_evidence=roi_relation_evidence,
+        contact_relation_evidence=contact_relation_evidence,
+        constraint_relation_evidence=constraint_relation_evidence,
     )
