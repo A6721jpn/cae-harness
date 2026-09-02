@@ -36,7 +36,7 @@ from febio_cae_harness.solver.execution import (
 from febio_cae_harness.solver.headless import (
     HeadlessConfigurationError,
     recover_headless_febio,
-    run_headless_febio,
+    run_headless_febio_session,
 )
 from febio_cae_harness.solver.runtime import RuntimeProbeError, probe_febio
 from febio_cae_harness.solver.types import (
@@ -531,7 +531,7 @@ def _run_febio_command(arguments: argparse.Namespace) -> int:
                 "EVIDENCE_INTEGRITY_FAILURE",
                 "execution input changed after preflight",
             )
-        diagnostic = run_headless_febio(
+        session = run_headless_febio_session(
             attempt,
             snapshot,
             runtime,
@@ -541,6 +541,7 @@ def _run_febio_command(arguments: argparse.Namespace) -> int:
             timeout_seconds=arguments.timeout_seconds,
             requested_fields=requested_fields,
         )
+        diagnostic = session.diagnostic
         solver = {
             "classification": diagnostic.classification.value,
             "return_code": diagnostic.return_code,
@@ -558,11 +559,19 @@ def _run_febio_command(arguments: argparse.Namespace) -> int:
             or diagnostic.log_path != execution.log_path
             or diagnostic.xplt_path != execution.xplt_path
         ):
-            if not _append_run_terminal(
-                opened.store,
-                attempt_id,
-                "SOLVER_FAILED",
-                solver=solver,
+            state_authority = transition_intent(snapshot)
+            retry = decide_retry(
+                diagnostic.classification.value,
+                RetryLedger.from_store(state_authority, opened.store),
+                intent=state_authority,
+                supervisor=session.supervisor,
+                result=session.result,
+            )
+            retry_reserved = retry.reservation_required
+            if retry_reserved:
+                retry.persist(opened.store, state_authority)
+            if not retry_reserved and not _append_run_terminal(
+                opened.store, attempt_id, "SOLVER_FAILED", solver=solver
             ):
                 return _fail_run(
                     _RunCommandError(

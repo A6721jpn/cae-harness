@@ -472,23 +472,27 @@ def test_run_febio_solves_but_fails_closed_without_official_fbs(
         runtime_diagnostic: FebioRuntimeDiagnostic,
         input_path: Path,
         **kwargs: object,
-    ) -> HeadlessRunDiagnostic:
+    ) -> Any:
         del snapshot, kwargs
         log_path = input_path.with_suffix(".log")
         xplt_path = input_path.with_suffix(".xplt")
         log_path.write_bytes(b"synthetic normal termination\n")
         xplt_path.write_bytes(b"synthetic XPLT\n")
-        return HeadlessRunDiagnostic(
-            runtime_identity=runtime_diagnostic,
-            state=SolverState.NORMAL_EXIT,
-            classification=SolverClassification.FBS_UNVERIFIED,
-            return_code=0,
-            pid=123,
-            log_path=log_path,
-            xplt_path=xplt_path,
+        return SimpleNamespace(
+            diagnostic=HeadlessRunDiagnostic(
+                runtime_identity=runtime_diagnostic,
+                state=SolverState.NORMAL_EXIT,
+                classification=SolverClassification.FBS_UNVERIFIED,
+                return_code=0,
+                pid=123,
+                log_path=log_path,
+                xplt_path=xplt_path,
+            ),
+            supervisor=None,
+            result=None,
         )
 
-    monkeypatch.setattr(cli_module, "run_headless_febio", run_synthetic)
+    monkeypatch.setattr(cli_module, "run_headless_febio_session", run_synthetic)
 
     assert cli_module.main(_run_arguments(runtime.path)) == 5
 
@@ -621,19 +625,23 @@ def test_run_febio_solver_failure_is_not_relabelled_as_fbs_unavailable(
         runtime_diagnostic: FebioRuntimeDiagnostic,
         input_path: Path,
         **kwargs: object,
-    ) -> HeadlessRunDiagnostic:
+    ) -> Any:
         del attempt, snapshot, kwargs
-        return HeadlessRunDiagnostic(
-            runtime_identity=runtime_diagnostic,
-            state=SolverState.FAILED,
-            classification=SolverClassification.FATAL,
-            return_code=1,
-            pid=123,
-            log_path=input_path.with_suffix(".log"),
-            xplt_path=input_path.with_suffix(".xplt"),
+        return SimpleNamespace(
+            diagnostic=HeadlessRunDiagnostic(
+                runtime_identity=runtime_diagnostic,
+                state=SolverState.FAILED,
+                classification=SolverClassification.FATAL,
+                return_code=1,
+                pid=123,
+                log_path=input_path.with_suffix(".log"),
+                xplt_path=input_path.with_suffix(".xplt"),
+            ),
+            supervisor=None,
+            result=None,
         )
 
-    monkeypatch.setattr(cli_module, "run_headless_febio", fail_synthetic)
+    monkeypatch.setattr(cli_module, "run_headless_febio_session", fail_synthetic)
 
     assert cli_module.main(_run_arguments(runtime.path)) == 4
 
@@ -652,3 +660,91 @@ def test_run_febio_solver_failure_is_not_relabelled_as_fbs_unavailable(
     ]
     assert events[-1]["event_type"] == "run_febio_terminal"
     assert events[-1]["payload"]["status"] == "SOLVER_FAILED"
+
+
+def test_run_febio_persists_retry_reservation_before_terminal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    service, capability, case_root = _register_case(
+        tmp_path,
+        intent=_complete_intent(retry_budget=1),
+    )
+
+    class CompletedProbe:
+        returncode = 0
+
+        def communicate(self, input: bytes, timeout: float) -> tuple[bytes, bytes]:
+            assert input == b"quit\n"
+            assert timeout > 0
+            return b"version 4.12.0\n", b""
+
+    with monkeypatch.context() as probe_patch:
+        probe_patch.setattr(
+            "febio_cae_harness.solver.runtime.subprocess.Popen",
+            lambda command, **kwargs: CompletedProbe(),
+        )
+        runtime = probe_febio(Path(sys.executable))
+
+    def run_timeout(
+        attempt: AttemptWorkspace,
+        snapshot: Any,
+        runtime_diagnostic: FebioRuntimeDiagnostic,
+        input_path: Path,
+        **kwargs: object,
+    ) -> Any:
+        del input_path, kwargs
+        timeout_input = attempt.write_text(
+            "retry-timeout.py",
+            "import time; time.sleep(30)",
+        )
+        return headless_module.run_headless_febio_session(
+            attempt,
+            snapshot,
+            runtime_diagnostic,
+            timeout_input,
+            timeout_seconds=0.1,
+        )
+
+    _set_capability_stdin(monkeypatch, capability)
+    monkeypatch.setattr(cli_module, "_case_service", lambda: service)
+    monkeypatch.setattr(cli_module, "probe_febio", lambda path: runtime)
+    monkeypatch.setattr(cli_module, "run_headless_febio_session", run_timeout)
+
+    assert cli_module.main(_run_arguments(runtime.path)) == 4
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    response = json.loads(captured.err)
+    assert response["error"]["code"] == "SOLVER_FAILED"
+    attempts = list((case_root / "90_Temporary" / "attempts").iterdir())
+    assert len(attempts) == 1
+    attempt_id = attempts[0].name
+    terminal_events = [
+        event
+        for event in (
+            json.loads(line)
+            for line in (case_root / "90_Temporary" / "events.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        )
+        if event["event_type"] == "run_febio_terminal"
+    ]
+    assert len(terminal_events) == 1
+    terminal = terminal_events[0]["payload"]
+    assert {
+        key: value for key, value in terminal.items() if key not in {"autonomy", "return_code"}
+    } == {
+        "attempt_id": attempt_id,
+        "classification": "TIMEOUT",
+        "official_fbs": False,
+        "solver_state": "TIMED_OUT",
+        "status": "SOLVER_FAILED",
+    }
+    assert terminal["return_code"] is None or isinstance(terminal["return_code"], int)
+    assert terminal["autonomy"]["decision"] == "RETRY"
+    assert terminal["autonomy"]["failure"] == "TIMEOUT"
+    assert terminal["autonomy"]["retry_budget"] == 1
+    assert terminal["autonomy"]["retry_used"] == 1
+    assert len(terminal["autonomy"]["reservation_id"]) == 64

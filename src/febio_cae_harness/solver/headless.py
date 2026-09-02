@@ -22,6 +22,7 @@ from .types import (
     SolverConfigurationError,
     SolverLaunchCapability,
     SolverLaunchSpec,
+    SolverRunResult,
     SolverState,
 )
 
@@ -29,10 +30,12 @@ __all__ = [
     "HeadlessConfigurationError",
     "HeadlessReconnectSession",
     "HeadlessRunDiagnostic",
+    "HeadlessRunSession",
     "headless_exit_code",
     "recover_headless_febio",
     "reconnect_headless_febio",
     "run_headless_febio",
+    "run_headless_febio_session",
 ]
 
 _REPARSE_POINT: Final[int] = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
@@ -133,6 +136,15 @@ class HeadlessRunDiagnostic:
 
 
 @dataclass(frozen=True, slots=True)
+class HeadlessRunSession:
+    """Exact supervisor result retained alongside its public diagnostic."""
+
+    supervisor: SolverSupervisor
+    result: SolverRunResult
+    diagnostic: HeadlessRunDiagnostic
+
+
+@dataclass(frozen=True, slots=True)
 class HeadlessReconnectSession:
     """Authenticated recovery state for one recorded execution attempt."""
 
@@ -154,6 +166,31 @@ def run_headless_febio(
 ) -> HeadlessRunDiagnostic:
     """Run one attempt using only live, manager-issued context capabilities."""
 
+    return run_headless_febio_session(
+        attempt_workspace,
+        intent_snapshot,
+        runtime_diagnostic,
+        input_path,
+        expected_steps=expected_steps,
+        expected_final_time=expected_final_time,
+        timeout_seconds=timeout_seconds,
+        requested_fields=requested_fields,
+    ).diagnostic
+
+
+def run_headless_febio_session(
+    attempt_workspace: AttemptWorkspace,
+    intent_snapshot: IntentSnapshotAuthority,
+    runtime_diagnostic: FebioRuntimeDiagnostic,
+    input_path: str | Path,
+    *,
+    expected_steps: int | None = None,
+    expected_final_time: float | None = None,
+    timeout_seconds: float | None = None,
+    requested_fields: Sequence[str] = (),
+) -> HeadlessRunSession:
+    """Run one attempt while retaining exact retry-policy authorities."""
+
     _, _, _, root = _validate_context(
         attempt_workspace,
         intent_snapshot,
@@ -170,8 +207,9 @@ def run_headless_febio(
         timeout_seconds=timeout_seconds,
         requested_fields=requested_fields,
     )
-    result = SolverSupervisor(capability).run()
-    return HeadlessRunDiagnostic(
+    supervisor = SolverSupervisor(capability)
+    result = supervisor.run()
+    diagnostic = HeadlessRunDiagnostic(
         runtime_identity=runtime,
         state=result.state,
         classification=result.classification,
@@ -180,6 +218,11 @@ def run_headless_febio(
         log_path=result.log_path,
         xplt_path=result.xplt_path,
         success=result.success is True,
+    )
+    return HeadlessRunSession(
+        supervisor=supervisor,
+        result=result,
+        diagnostic=diagnostic,
     )
 
 
