@@ -1029,6 +1029,7 @@ def _declared_mesh_patch_records(
             set(raw) != required
             or type(raw.get("target")) is not str
             or not cast(str, raw["target"]).strip()
+            or not cast(str, raw["target"]).startswith("/febio_spec/Mesh[")
             or mode not in {"TEXT", "ATTRIBUTE"}
             or type(value) not in {str, int, float, bool}
             or isinstance(value, float)

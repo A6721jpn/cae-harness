@@ -16,6 +16,7 @@ from ..autonomy.policy import (
     Proposal,
     ProposalAction,
     ProposalAuthority,
+    ProposalClass,
     decide_proposal,
     validate_attempt_workspace,
 )
@@ -209,10 +210,21 @@ def _require_authorized_patch_set(
         raise TypeError("proposal_authority must be an exact ProposalAuthority")
     if state_authority.current is not IntentState.BOUND:
         raise EvidenceIntegrityError("derived FEB writes require a BOUND state authority")
+    if proposal.classification is not ProposalClass.INTENT_PRESERVING or any(
+        not isinstance(patch, FebPatch) or patch.intent_impact is not IntentImpact.INTENT_PRESERVING
+        for patch in patches
+    ):
+        raise EvidenceIntegrityError("derived FEB writes require intent-preserving patches")
     decision = decide_proposal(state_authority, proposal, proposal_authority)
     if decision.action is not ProposalAction.AUTO_APPLY:
         raise EvidenceIntegrityError("derived FEB write requires an AUTO_APPLY proposal decision")
     declared = _proposal_patch_records(proposal)
+    if any(
+        not isinstance(record.get("target"), str)
+        or not str(record["target"]).startswith("/febio_spec/Mesh[")
+        for record in declared
+    ):
+        raise EvidenceIntegrityError("mesh proposal patches must target the FEB Mesh section")
     if len(declared) != len(patches) or any(
         not isinstance(record, FebPatch) or not _patch_exactly_matches(record, change)
         for record, change in zip(patches, declared, strict=True)

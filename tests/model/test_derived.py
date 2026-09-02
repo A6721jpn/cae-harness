@@ -31,10 +31,12 @@ FEB = b"""<?xml version="1.0" encoding="UTF-8"?>
   <Control><time_steps>4</time_steps></Control>
   <Module type="solid"/>
   <Material><material id="1" name="synthetic"/></Material>
+  <Mesh><Elements type="tet4"/></Mesh>
 </febio_spec>
 """
 TIME = "/febio_spec/Control[1]/time_steps[1]"
 MODULE = "/febio_spec/Module[1]"
+MESH_ELEMENTS = "/febio_spec/Mesh[1]/Elements[1]"
 EVIDENCE = EvidenceProvenance("synthetic-intent", "intent.json", authoritative=True)
 
 
@@ -156,29 +158,84 @@ def test_authorized_write_requires_exact_proposal_patch_binding(tmp_path: Path) 
     source = tmp_path / "original.feb"
     source.write_bytes(FEB)
     original = OriginalModel.from_path(source)
-    change: dict[str, JSONValue] = {"target": TIME, "mode": "TEXT", "value": 8}
+    change: dict[str, JSONValue] = {
+        "target": MESH_ELEMENTS,
+        "mode": "ATTRIBUTE",
+        "attribute_name": "type",
+        "value": "tet10",
+    }
     context = authorized_context(tmp_path, change)
     attempt = context[4]
     destination = attempt.root / "derived.feb"
     receipt = write_authorized(
         original,
-        (patch(TIME, "TEXT", 8),),
+        (patch(MESH_ELEMENTS, "ATTRIBUTE", "tet10", attribute_name="type"),),
         destination,
         attempt,
         context,
     )
 
-    assert receipt.applied_patch_targets == (TIME,)
-    assert b"<time_steps>8</time_steps>" in destination.read_bytes()
+    assert receipt.applied_patch_targets == (MESH_ELEMENTS,)
+    assert b'type="tet10"' in destination.read_bytes()
+
+
+@pytest.mark.parametrize("target", [TIME, MODULE])
+def test_mesh_proposal_cannot_patch_non_mesh_sections(tmp_path: Path, target: str) -> None:
+    source = tmp_path / f"original-{target.rsplit('/', 1)[-1]}.feb"
+    source.write_bytes(FEB)
+    change: dict[str, JSONValue] = {"target": target, "mode": "TEXT", "value": 8}
+    context = authorized_context(tmp_path, change, f"non-mesh-{target.rsplit('/', 1)[-1]}")
+    attempt = context[4]
+    destination = attempt.root / "derived.feb"
+
+    with pytest.raises(EvidenceIntegrityError, match="Mesh"):
+        write_authorized(
+            OriginalModel.from_path(source),
+            (patch(target, "TEXT", 8),),
+            destination,
+            attempt,
+            context,
+        )
+    assert not destination.exists()
+
+
+def test_mesh_proposal_rejects_intent_changing_patch_marker(tmp_path: Path) -> None:
+    source = tmp_path / "original-impact.feb"
+    source.write_bytes(FEB)
+    change: dict[str, JSONValue] = {
+        "target": MODULE,
+        "mode": "ATTRIBUTE",
+        "attribute_name": "type",
+        "value": "hex8",
+    }
+    context = authorized_context(tmp_path, change, "intent-impact")
+    attempt = context[4]
+
+    with pytest.raises(EvidenceIntegrityError, match="intent-preserving"):
+        write_authorized(
+            OriginalModel.from_path(source),
+            (
+                patch(
+                    MODULE,
+                    "ATTRIBUTE",
+                    "hex8",
+                    attribute_name="type",
+                    intent_impact=IntentImpact.INTENT_CHANGING,
+                ),
+            ),
+            attempt.root / "derived.feb",
+            attempt,
+            context,
+        )
 
 
 @pytest.mark.parametrize(
     "record",
     [
         patch(MODULE, "TEXT", 8),
-        patch(TIME, "ATTRIBUTE", 8, attribute_name="type"),
-        patch(TIME, "TEXT", 9),
-        patch(TIME, "TEXT", 8, attribute_name="type"),
+        patch(MESH_ELEMENTS, "TEXT", "tet10"),
+        patch(MESH_ELEMENTS, "ATTRIBUTE", "hex8", attribute_name="type"),
+        patch(MESH_ELEMENTS, "ATTRIBUTE", "tet10", attribute_name="name"),
     ],
 )
 def test_authorized_write_rejects_any_patch_field_mismatch(
@@ -186,7 +243,12 @@ def test_authorized_write_rejects_any_patch_field_mismatch(
 ) -> None:
     source = tmp_path / "original.feb"
     source.write_bytes(FEB)
-    change: dict[str, JSONValue] = {"target": TIME, "mode": "TEXT", "value": 8}
+    change: dict[str, JSONValue] = {
+        "target": MESH_ELEMENTS,
+        "mode": "ATTRIBUTE",
+        "attribute_name": "type",
+        "value": "tet10",
+    }
     context = authorized_context(tmp_path, change, "mismatch")
     attempt = context[4]
     destination = attempt.root / "derived.feb"
@@ -205,7 +267,12 @@ def test_authorized_write_rejects_any_patch_field_mismatch(
 def test_forged_foreign_stale_and_mismatched_authorities_never_write(tmp_path: Path) -> None:
     source = tmp_path / "original.feb"
     source.write_bytes(FEB)
-    change: dict[str, JSONValue] = {"target": TIME, "mode": "TEXT", "value": 8}
+    change: dict[str, JSONValue] = {
+        "target": MESH_ELEMENTS,
+        "mode": "ATTRIBUTE",
+        "attribute_name": "type",
+        "value": "tet10",
+    }
 
     local_context = authorized_context(tmp_path, change, "authority")
     state_authority, proposal, proposal_authority, store, local_attempt = local_context
@@ -220,7 +287,7 @@ def test_forged_foreign_stale_and_mismatched_authorities_never_write(tmp_path: P
         with pytest.raises((TypeError, ValueError, EvidenceIntegrityError)):
             write_authorized(
                 OriginalModel.from_path(source),
-                (patch(TIME, "TEXT", 8),),
+                (patch(MESH_ELEMENTS, "ATTRIBUTE", "tet10", attribute_name="type"),),
                 destination,
                 local_attempt,
                 (state, candidate, cast(ProposalAuthority, authority), store, local_attempt),
@@ -232,7 +299,7 @@ def test_forged_foreign_stale_and_mismatched_authorities_never_write(tmp_path: P
     with pytest.raises((TypeError, ValueError, EvidenceIntegrityError)):
         write_authorized(
             OriginalModel.from_path(source),
-            (patch(TIME, "TEXT", 8),),
+            (patch(MESH_ELEMENTS, "ATTRIBUTE", "tet10", attribute_name="type"),),
             destination,
             local_attempt,
             (state_authority, mismatched, proposal_authority, store, local_attempt),
@@ -249,7 +316,7 @@ def test_forged_foreign_stale_and_mismatched_authorities_never_write(tmp_path: P
     with pytest.raises((TypeError, ValueError, EvidenceIntegrityError)):
         write_authorized(
             OriginalModel.from_path(source),
-            (patch(TIME, "TEXT", 8),),
+            (patch(MESH_ELEMENTS, "ATTRIBUTE", "tet10", attribute_name="type"),),
             destination,
             stale_attempt,
             stale_context,
@@ -264,7 +331,12 @@ def test_derived_write_rejects_foreign_issued_and_raw_attempts_before_output(
 ) -> None:
     source = tmp_path / "original.feb"
     source.write_bytes(FEB)
-    change: dict[str, JSONValue] = {"target": TIME, "mode": "TEXT", "value": 8}
+    change: dict[str, JSONValue] = {
+        "target": MESH_ELEMENTS,
+        "mode": "ATTRIBUTE",
+        "attribute_name": "type",
+        "value": "tet10",
+    }
     state_authority, proposal, proposal_authority, store, _ = authorized_context(
         tmp_path, change, "attempt-binding"
     )
@@ -292,7 +364,7 @@ def test_derived_write_rejects_foreign_issued_and_raw_attempts_before_output(
         with pytest.raises((TypeError, EvidenceIntegrityError, WorkspaceBoundaryError)):
             write_derived_feb(
                 OriginalModel.from_path(source),
-                (patch(TIME, "TEXT", 8),),
+                (patch(MESH_ELEMENTS, "ATTRIBUTE", "tet10", attribute_name="type"),),
                 destination,
                 supplied_attempt,  # type: ignore[arg-type]
                 state_authority=state_authority,
@@ -302,18 +374,23 @@ def test_derived_write_rejects_foreign_issued_and_raw_attempts_before_output(
         assert not destination.exists()
 
 
-def test_writes_detached_text_derived_and_receipt(tmp_path: Path) -> None:
+def test_writes_detached_mesh_derived_and_receipt(tmp_path: Path) -> None:
     source = tmp_path / "original.feb"
     source.write_bytes(FEB)
     original = OriginalModel.from_path(source)
-    change: dict[str, JSONValue] = {"target": TIME, "mode": "TEXT", "value": 8}
+    change: dict[str, JSONValue] = {
+        "target": MESH_ELEMENTS,
+        "mode": "ATTRIBUTE",
+        "attribute_name": "type",
+        "value": "tet10",
+    }
     context = authorized_context(tmp_path, change, "detached")
     attempt = context[4]
     destination = attempt.root / "derived.feb"
 
     receipt = write_authorized(
         original,
-        (patch(TIME, "TEXT", 8),),
+        (patch(MESH_ELEMENTS, "ATTRIBUTE", "tet10", attribute_name="type"),),
         destination,
         attempt,
         context,
@@ -321,9 +398,9 @@ def test_writes_detached_text_derived_and_receipt(tmp_path: Path) -> None:
 
     assert receipt.original_sha256 == original.sha256
     assert receipt.destination == destination
-    assert receipt.applied_patch_targets == (TIME,)
+    assert receipt.applied_patch_targets == (MESH_ELEMENTS,)
     assert receipt.derived_sha256 != receipt.original_sha256
-    assert b"<time_steps>8</time_steps>" in destination.read_bytes()
+    assert b'type="tet10"' in destination.read_bytes()
     assert source.read_bytes() == FEB
     assert original.verify()
 
@@ -332,18 +409,17 @@ def test_writes_attribute_and_preserves_diagnostic_metadata(tmp_path: Path) -> N
     source = tmp_path / "original.feb"
     source.write_bytes(FEB)
     patch_record = patch(
-        MODULE,
+        MESH_ELEMENTS,
         "ATTRIBUTE",
-        "hex8",
+        "tet10",
         attribute_name="type",
         provenance=(),
-        intent_impact=IntentImpact.INTENT_CHANGING,
     )
     change = {
-        "target": MODULE,
+        "target": MESH_ELEMENTS,
         "mode": "ATTRIBUTE",
         "attribute_name": "type",
-        "value": "hex8",
+        "value": "tet10",
     }
     context = authorized_context(tmp_path, change, "attribute")
     attempt = context[4]
@@ -356,12 +432,17 @@ def test_writes_attribute_and_preserves_diagnostic_metadata(tmp_path: Path) -> N
         context,
     )
 
-    assert b'type="hex8"' in (attempt.root / "x.feb").read_bytes()
+    assert b'type="tet10"' in (attempt.root / "x.feb").read_bytes()
 
 
 def test_rejects_unsafe_destination_and_dtd(tmp_path: Path) -> None:
     original = OriginalModel.from_bytes(FEB)
-    change: dict[str, JSONValue] = {"target": TIME, "mode": "TEXT", "value": 2}
+    change: dict[str, JSONValue] = {
+        "target": MESH_ELEMENTS,
+        "mode": "ATTRIBUTE",
+        "attribute_name": "type",
+        "value": "tet10",
+    }
     context = authorized_context(tmp_path, change, "unsafe")
     attempt = context[4]
     destination = attempt.root / "derived.feb"
@@ -370,7 +451,7 @@ def test_rejects_unsafe_destination_and_dtd(tmp_path: Path) -> None:
     with pytest.raises(FileExistsError):
         write_authorized(
             original,
-            (patch(TIME, "TEXT", 2),),
+            (patch(MESH_ELEMENTS, "ATTRIBUTE", "tet10", attribute_name="type"),),
             destination,
             attempt,
             context,
@@ -378,7 +459,7 @@ def test_rejects_unsafe_destination_and_dtd(tmp_path: Path) -> None:
     with pytest.raises(ValueError):
         write_authorized(
             original,
-            (patch(TIME, "TEXT", 2),),
+            (patch(MESH_ELEMENTS, "ATTRIBUTE", "tet10", attribute_name="type"),),
             tmp_path / "out.feb",
             attempt,
             context,
@@ -388,7 +469,7 @@ def test_rejects_unsafe_destination_and_dtd(tmp_path: Path) -> None:
     with pytest.raises(ValueError):
         write_authorized(
             original.from_bytes(dtd),
-            (patch(TIME, "TEXT", 2),),
+            (patch(MESH_ELEMENTS, "ATTRIBUTE", "tet10", attribute_name="type"),),
             attempt.root / "d.feb",
             attempt,
             context,

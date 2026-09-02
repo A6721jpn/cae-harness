@@ -266,17 +266,20 @@ def test_run_febio_applies_only_current_declared_mesh_patches_in_attempt(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    target = "/febio_spec/Control[1]/time_steps[1]"
-    declaration = {"target": target, "mode": "TEXT", "value": 8}
+    target = "/febio_spec/Mesh[1]/Elements[1]"
+    declaration = {
+        "target": target,
+        "mode": "ATTRIBUTE",
+        "attribute_name": "type",
+        "value": "tet10",
+    }
     intent = _complete_intent(
         allowed_mesh_changes={"mesh": {"patches": (declaration,)}},
     )
     service, capability, case_root = _register_case(
         tmp_path,
         intent=intent,
-        source_text=(
-            "<febio_spec version='4.0'><Control><time_steps>4</time_steps></Control></febio_spec>"
-        ),
+        source_text=("<febio_spec version='4.0'><Mesh><Elements type='tet4'/></Mesh></febio_spec>"),
     )
     runtime = _issued_runtime(tmp_path, monkeypatch)
     _set_capability_stdin(monkeypatch, capability)
@@ -319,11 +322,11 @@ def test_run_febio_applies_only_current_declared_mesh_patches_in_attempt(
     payload = json.loads(captured.err)
     assert payload["error"]["code"] == "FBS_UNAVAILABLE"
     assert len(executed) == 1
-    assert b"<time_steps>8</time_steps>" in executed[0]
-    assert b"<time_steps>4</time_steps>" in (case_root / "01_Input" / "model.feb").read_bytes()
+    assert b'type="tet10"' in executed[0]
+    assert b"type='tet4'" in (case_root / "01_Input" / "model.feb").read_bytes()
     attempts = list((case_root / "90_Temporary" / "attempts").iterdir())
     assert len(attempts) == 1
-    assert b"<time_steps>8</time_steps>" in (attempts[0] / "model.feb").read_bytes()
+    assert b'type="tet10"' in (attempts[0] / "model.feb").read_bytes()
 
 
 def test_run_febio_blocks_nonexact_declared_mesh_patch_before_model_write(
@@ -426,10 +429,10 @@ def test_run_febio_routes_exact_negative_jacobian_repair_into_retry_policy(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     change = {
-        "target": "/febio_spec",
+        "target": "/febio_spec/Mesh[1]/Elements[1]",
         "mode": "ATTRIBUTE",
-        "attribute_name": "version",
-        "value": "4.0",
+        "attribute_name": "type",
+        "value": "tet10",
     }
     intent = _complete_intent(
         retry_budget=1,
@@ -446,7 +449,11 @@ def test_run_febio_routes_exact_negative_jacobian_repair_into_retry_policy(
             }
         },
     )
-    service, capability, _ = _register_case(tmp_path, intent=intent)
+    service, capability, _ = _register_case(
+        tmp_path,
+        intent=intent,
+        source_text=("<febio_spec version='4.0'><Mesh><Elements type='tet4'/></Mesh></febio_spec>"),
+    )
     runtime = _issued_runtime(tmp_path, monkeypatch)
     _set_capability_stdin(monkeypatch, capability)
     monkeypatch.setattr(cli_module, "_case_service", lambda: service)
@@ -515,10 +522,10 @@ def test_retry_febio_applies_its_exact_reserved_negative_jacobian_repair(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     change = {
-        "target": "/febio_spec",
+        "target": "/febio_spec/Mesh[1]/Elements[1]",
         "mode": "ATTRIBUTE",
-        "attribute_name": "version",
-        "value": "4.1",
+        "attribute_name": "type",
+        "value": "tet10",
     }
     intent = _complete_intent(
         retry_budget=1,
@@ -535,7 +542,11 @@ def test_retry_febio_applies_its_exact_reserved_negative_jacobian_repair(
             }
         },
     )
-    service, capability, case_root = _register_case(tmp_path, intent=intent)
+    service, capability, case_root = _register_case(
+        tmp_path,
+        intent=intent,
+        source_text=("<febio_spec version='4.0'><Mesh><Elements type='tet4'/></Mesh></febio_spec>"),
+    )
 
     class CompletedProbe:
         returncode = 0
@@ -638,8 +649,8 @@ def test_retry_febio_applies_its_exact_reserved_negative_jacobian_repair(
     second = json.loads(capsys.readouterr().err)
     assert second["error"]["code"] == "FBS_UNAVAILABLE"
     assert len(repaired_inputs) == 1
-    assert b'version="4.1"' in repaired_inputs[0]
-    assert b"version='4.0'" in (case_root / "01_Input" / "model.feb").read_bytes()
+    assert b'type="tet10"' in repaired_inputs[0]
+    assert b"type='tet4'" in (case_root / "01_Input" / "model.feb").read_bytes()
 
 
 def test_reconnect_febio_parser_cannot_redefine_recorded_launch_context(
