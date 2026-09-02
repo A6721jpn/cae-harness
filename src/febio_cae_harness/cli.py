@@ -10,7 +10,14 @@ from pathlib import Path
 from typing import cast
 
 from febio_cae_harness import __version__
-from febio_cae_harness.autonomy import RetryLedger, decide_retry, transition_intent
+from febio_cae_harness.autonomy import (
+    Proposal,
+    ProposalAuthorityManager,
+    ProposalClass,
+    RetryLedger,
+    decide_retry,
+    transition_intent,
+)
 from febio_cae_harness.cli_context import (
     CaseContextError,
     CaseContextService,
@@ -28,8 +35,10 @@ from febio_cae_harness.evidence import (
     IntentSnapshotAuthority,
 )
 from febio_cae_harness.model.completeness import assess_authoritative_completeness
+from febio_cae_harness.model.derived import FebPatch, write_derived_feb
 from febio_cae_harness.model.feb import inspect_feb_file, inspect_feb_xml
 from febio_cae_harness.model.incomplete import inspect_incomplete_feb
+from febio_cae_harness.model.plan import OriginalModel
 from febio_cae_harness.model.preflight import PreflightResult, run_preflight
 from febio_cae_harness.model.step import inspect_step, inspect_step_file
 from febio_cae_harness.model.step_plan import plan_authoritative_step_meshing
@@ -253,6 +262,11 @@ def build_parser() -> argparse.ArgumentParser:
     run_febio.add_argument("--fbs-python", type=Path, metavar="PATH")
     run_febio.add_argument("--fbs-module", type=Path, metavar="PATH")
     run_febio.add_argument("--fbs-zlib", type=Path, metavar="PATH")
+    run_febio.add_argument(
+        "--apply-declared-mesh-patches",
+        action="store_true",
+        help="derive the attempt input from exact mesh patches in the current intent",
+    )
 
     reconnect_febio = commands.add_parser(
         "reconnect-febio",
@@ -907,6 +921,105 @@ def _retry_already_started(attempt_id: str) -> int:
     return _RUN_FAILURE_EXIT
 
 
+def _write_declared_mesh_input(
+    *,
+    snapshot: IntentSnapshotAuthority,
+    source_payload: bytes,
+    expected_sha256: str,
+    input_name: str,
+    attempt: AttemptWorkspace,
+) -> tuple[Path, str]:
+    original = OriginalModel.from_bytes(source_payload, source_name=input_name)
+    if original.sha256 != expected_sha256:
+        raise _RunCommandError(
+            "EVIDENCE_INTEGRITY_FAILURE",
+            "registered FEB input digest changed before derivation",
+        )
+    declarations = snapshot.intent.allowed_mesh_changes
+    if not isinstance(declarations, Mapping) or set(declarations) != {"mesh"}:
+        raise _RunCommandError(
+            "ASK_AND_BLOCK",
+            "current intent does not declare one exact FEB mesh patch set",
+        )
+    mesh = declarations["mesh"]
+    if not isinstance(mesh, Mapping) or set(mesh) != {"patches"}:
+        raise _RunCommandError(
+            "ASK_AND_BLOCK",
+            "current intent does not declare one exact FEB mesh patch set",
+        )
+    raw_patches = mesh["patches"]
+    if not isinstance(raw_patches, tuple) or not raw_patches:
+        raise _RunCommandError(
+            "ASK_AND_BLOCK",
+            "current intent does not declare one exact FEB mesh patch set",
+        )
+
+    patches: list[FebPatch] = []
+    for raw in raw_patches:
+        if not isinstance(raw, Mapping):
+            raise _RunCommandError(
+                "ASK_AND_BLOCK",
+                "current intent FEB mesh patches are not exact mappings",
+            )
+        mode = raw.get("mode")
+        required = (
+            {"target", "mode", "value"}
+            if mode == "TEXT"
+            else {"target", "mode", "attribute_name", "value"}
+        )
+        value = raw.get("value")
+        if (
+            set(raw) != required
+            or type(raw.get("target")) is not str
+            or not cast(str, raw["target"]).strip()
+            or mode not in {"TEXT", "ATTRIBUTE"}
+            or type(value) not in {str, int, float, bool}
+            or isinstance(value, float)
+            and not math.isfinite(value)
+            or mode == "ATTRIBUTE"
+            and (
+                type(raw.get("attribute_name")) is not str
+                or not cast(str, raw["attribute_name"]).strip()
+            )
+        ):
+            raise _RunCommandError(
+                "ASK_AND_BLOCK",
+                "current intent FEB mesh patch schema is not exact",
+            )
+        patches.append(
+            FebPatch(
+                target=cast(str, raw.get("target")),
+                mode=cast(str, raw.get("mode")),
+                attribute_name=cast(str | None, raw.get("attribute_name")),
+                value=cast(str | int | float | bool, raw.get("value")),
+                reason="exact current intent mesh patch declaration",
+            )
+        )
+
+    state_authority = transition_intent(snapshot)
+    proposal = Proposal(
+        proposal_id=f"declared-mesh-{snapshot.intent_sha256}",
+        proposal_class=ProposalClass.INTENT_PRESERVING,
+        rationale="apply the exact current intent mesh patch declaration",
+        evidence_ids=(snapshot.intent_sha256,),
+        changes={"mesh": {"patches": raw_patches}},
+        authorized=True,
+        within_contract=True,
+    )
+    manager = ProposalAuthorityManager(state_authority)
+    authority = manager.issue(proposal)
+    receipt = write_derived_feb(
+        original,
+        patches,
+        attempt.root / input_name,
+        attempt,
+        state_authority=state_authority,
+        proposal=proposal,
+        proposal_authority=authority,
+    )
+    return receipt.destination, receipt.derived_sha256
+
+
 def _run_febio_command(arguments: argparse.Namespace) -> int:
     terminal_store: EvidenceStore | None = None
     attempt_id: str | None = None
@@ -962,15 +1075,27 @@ def _run_febio_command(arguments: argparse.Namespace) -> int:
                 "required physical conditions are not authoritatively bound",
             )
         destination_relative = Path("90_Temporary") / "attempts" / attempt_id / input_name
-        with opened.case._exact_transaction() as exact:
-            staged_input = exact.copy_create_new(
-                source_relative,
-                destination_relative,
-                expected_sha256,
+        if arguments.apply_declared_mesh_patches:
+            with opened.case._exact_transaction() as exact:
+                source_payload = exact.read_bytes(source_relative)
+            staged_input, staged_sha256 = _write_declared_mesh_input(
+                snapshot=snapshot,
+                source_payload=source_payload,
+                expected_sha256=expected_sha256,
+                input_name=input_name,
+                attempt=attempt,
             )
+        else:
+            with opened.case._exact_transaction() as exact:
+                staged_input = exact.copy_create_new(
+                    source_relative,
+                    destination_relative,
+                    expected_sha256,
+                )
+            staged_sha256 = expected_sha256
 
         inspection = inspect_feb_file(staged_input)
-        if inspection.sha256 != expected_sha256:
+        if inspection.sha256 != staged_sha256:
             raise _RunCommandError(
                 "EVIDENCE_INTEGRITY_FAILURE",
                 "staged FEB input digest changed",

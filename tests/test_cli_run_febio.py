@@ -33,7 +33,11 @@ from febio_cae_harness.solver.types import SolverClassification, SolverState
 from febio_cae_harness.workspace import AttemptWorkspace
 
 
-def _complete_intent(*, retry_budget: int | None = None) -> IntentContract:
+def _complete_intent(
+    *,
+    retry_budget: int | None = None,
+    allowed_mesh_changes: object = (),
+) -> IntentContract:
     names = (
         "engineering_question",
         "units",
@@ -59,6 +63,7 @@ def _complete_intent(*, retry_budget: int | None = None) -> IntentContract:
             name: {"authoritative": True, "current": True, "source": "synthetic-user"}
             for name in names
         },
+        allowed_mesh_changes=allowed_mesh_changes,  # type: ignore[arg-type]
         retry_budget=retry_budget,
         state=IntentState.GATHERING,
     )
@@ -78,6 +83,7 @@ def _register_case(
     *,
     intent: IntentContract,
     source_names: tuple[str, ...] = ("model.feb",),
+    source_text: str = "<febio_spec version='4.0' />",
 ) -> tuple[CaseContextService, object, Path]:
     service = _service(root)
     cae_root = root / "02_CAE"
@@ -85,7 +91,7 @@ def _register_case(
     sources: list[Path] = []
     for name in source_names:
         source = root / name
-        source.write_text("<febio_spec version='4.0' />", encoding="utf-8")
+        source.write_text(source_text, encoding="utf-8")
         sources.append(source)
     registered = service.register_root(cae_root)
     service.create_case(
@@ -252,6 +258,107 @@ def test_run_febio_parser_accepts_only_case_bound_launch_inputs(tmp_path: Path) 
         "arguments",
         "fbs_adapter",
     }.intersection(vars(parsed))
+
+
+def test_run_febio_applies_only_current_declared_mesh_patches_in_attempt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    target = "/febio_spec/Control[1]/time_steps[1]"
+    declaration = {"target": target, "mode": "TEXT", "value": 8}
+    intent = _complete_intent(
+        allowed_mesh_changes={"mesh": {"patches": (declaration,)}},
+    )
+    service, capability, case_root = _register_case(
+        tmp_path,
+        intent=intent,
+        source_text=(
+            "<febio_spec version='4.0'><Control><time_steps>4</time_steps></Control></febio_spec>"
+        ),
+    )
+    runtime = _issued_runtime(tmp_path, monkeypatch)
+    _set_capability_stdin(monkeypatch, capability)
+    monkeypatch.setattr(cli_module, "_case_service", lambda: service)
+    monkeypatch.setattr(cli_module, "probe_febio", lambda path: runtime)
+    executed: list[bytes] = []
+
+    def run_synthetic(
+        attempt: Any,
+        snapshot: Any,
+        runtime_diagnostic: FebioRuntimeDiagnostic,
+        input_path: Path,
+        **kwargs: object,
+    ) -> Any:
+        del attempt, snapshot, kwargs
+        executed.append(input_path.read_bytes())
+        log_path = input_path.with_suffix(".log")
+        xplt_path = input_path.with_suffix(".xplt")
+        log_path.write_bytes(b"synthetic normal termination\n")
+        xplt_path.write_bytes(b"synthetic XPLT\n")
+        return SimpleNamespace(
+            diagnostic=HeadlessRunDiagnostic(
+                runtime_identity=runtime_diagnostic,
+                state=SolverState.NORMAL_EXIT,
+                classification=SolverClassification.FBS_UNVERIFIED,
+                return_code=0,
+                pid=123,
+                log_path=log_path,
+                xplt_path=xplt_path,
+            ),
+            supervisor=None,
+            result=None,
+        )
+
+    monkeypatch.setattr(cli_module, "run_headless_febio_session", run_synthetic)
+
+    assert cli_module.main(_run_arguments(runtime.path, "--apply-declared-mesh-patches")) == 5
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.err)
+    assert payload["error"]["code"] == "FBS_UNAVAILABLE"
+    assert len(executed) == 1
+    assert b"<time_steps>8</time_steps>" in executed[0]
+    assert b"<time_steps>4</time_steps>" in (case_root / "01_Input" / "model.feb").read_bytes()
+    attempts = list((case_root / "90_Temporary" / "attempts").iterdir())
+    assert len(attempts) == 1
+    assert b"<time_steps>8</time_steps>" in (attempts[0] / "model.feb").read_bytes()
+
+
+def test_run_febio_blocks_nonexact_declared_mesh_patch_before_model_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    declaration = {
+        "target": "/febio_spec",
+        "mode": "ATTRIBUTE",
+        "attribute_name": "version",
+        "value": "4.1",
+        "material": "must never become an implicit edit",
+    }
+    intent = _complete_intent(
+        allowed_mesh_changes={"mesh": {"patches": (declaration,)}},
+    )
+    service, capability, case_root = _register_case(tmp_path, intent=intent)
+    _set_capability_stdin(monkeypatch, capability)
+    monkeypatch.setattr(cli_module, "_case_service", lambda: service)
+
+    assert (
+        cli_module.main(
+            _run_arguments(
+                (tmp_path / "febio.exe").resolve(),
+                "--apply-declared-mesh-patches",
+            )
+        )
+        == 4
+    )
+
+    payload = json.loads(capsys.readouterr().err)
+    assert payload["error"]["code"] == "ASK_AND_BLOCK"
+    attempts = list((case_root / "90_Temporary" / "attempts").iterdir())
+    assert len(attempts) == 1
+    assert not (attempts[0] / "model.feb").exists()
 
 
 def test_reconnect_febio_parser_cannot_redefine_recorded_launch_context(
