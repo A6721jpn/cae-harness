@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 
-from febio_cae_harness.contracts import IntentContract
+from febio_cae_harness.contracts import IntentContract, IntentState
 from febio_cae_harness.evidence import EvidenceIntegrityError, EvidenceStore
 from febio_cae_harness.model import (
     ASK_AND_BLOCK,
@@ -39,7 +39,10 @@ def _snapshot(tmp_path: Path, allowed_mesh_changes: Any) -> tuple[EvidenceStore,
     case = workspace.create_case("step-case")
     store = EvidenceStore(
         case,
-        IntentContract(allowed_mesh_changes=allowed_mesh_changes),
+        IntentContract(
+            allowed_mesh_changes=allowed_mesh_changes,
+            state=IntentState.BOUND,
+        ),
     )
     return store, store.issue_intent_snapshot()
 

@@ -31,7 +31,8 @@ from febio_cae_harness.model.completeness import assess_authoritative_completene
 from febio_cae_harness.model.feb import inspect_feb_file, inspect_feb_xml
 from febio_cae_harness.model.incomplete import inspect_incomplete_feb
 from febio_cae_harness.model.preflight import PreflightResult, run_preflight
-from febio_cae_harness.model.step import inspect_step_file
+from febio_cae_harness.model.step import inspect_step, inspect_step_file
+from febio_cae_harness.model.step_plan import plan_authoritative_step_meshing
 from febio_cae_harness.reporting import (
     AttemptIdentity,
     EvidenceKind,
@@ -170,6 +171,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     inspect_incomplete_feb_command.add_argument("--case-id", required=True)
     inspect_incomplete_feb_command.add_argument("--input-name")
+
+    plan_step_mesh = commands.add_parser(
+        "plan-step-mesh",
+        help="plan one registered STEP mesh from its current authoritative case intent",
+    )
+    plan_step_mesh.add_argument("--capability-stdin", required=True, action="store_true")
+    plan_step_mesh.add_argument("--case-id", required=True)
+    plan_step_mesh.add_argument("--input-name")
 
     preflight_feb = commands.add_parser(
         "preflight-feb", help="preflight FEB XML structure and explicit references"
@@ -690,6 +699,45 @@ def _select_feb_input(
     return candidates[0]
 
 
+def _select_step_input(
+    inputs: object,
+    selected_name: object,
+) -> tuple[Path, str, str]:
+    if selected_name is not None and (
+        not isinstance(selected_name, str)
+        or not selected_name
+        or Path(selected_name).name != selected_name
+        or "/" in selected_name
+        or "\\" in selected_name
+    ):
+        raise _RunCommandError("INVALID_INPUT", "input_name must be one exact basename")
+    if not isinstance(inputs, list):
+        raise _RunCommandError("EVIDENCE_INTEGRITY_FAILURE", "case inputs are invalid")
+    candidates: list[tuple[Path, str, str]] = []
+    for raw in inputs:
+        if not isinstance(raw, Mapping):
+            raise _RunCommandError("EVIDENCE_INTEGRITY_FAILURE", "case inputs are invalid")
+        path_value = raw.get("path")
+        digest = raw.get("sha256")
+        if not isinstance(path_value, str) or not isinstance(digest, str):
+            raise _RunCommandError("EVIDENCE_INTEGRITY_FAILURE", "case inputs are invalid")
+        path = Path(path_value)
+        if path.suffix.casefold() not in {".step", ".stp"}:
+            continue
+        name = path.name
+        if selected_name is None or name == selected_name:
+            candidates.append((path, name, digest))
+    if not candidates:
+        code = "INPUT_NOT_FOUND" if selected_name is not None else "INPUT_SELECTION_REQUIRED"
+        raise _RunCommandError(code, "registered STEP input selection failed")
+    if len(candidates) != 1:
+        raise _RunCommandError(
+            "INPUT_SELECTION_REQUIRED",
+            "multiple registered STEP inputs require one exact input_name",
+        )
+    return candidates[0]
+
+
 def _open_recorded_attempt(case: CaseWorkspace, attempt_id: str) -> AttemptWorkspace:
     attempt_root = case.temporary_root / "attempts" / attempt_id
     attempt_stamp = _identity_stamp(attempt_root, "recorded attempt root")
@@ -768,6 +816,73 @@ def _inspect_incomplete_feb_command(arguments: argparse.Namespace) -> int:
         failure = CaseContextError(
             "INTERNAL_ERROR",
             "unexpected registered FEB inspection failure",
+        )
+        _emit_context_json(cli_failure(command, failure), error=True)
+        return _CONTEXT_EXIT_CODES[failure.code]
+    _emit_context_json(payload)
+    return 0
+
+
+def _plan_step_mesh_command(arguments: argparse.Namespace) -> int:
+    command = "plan-step-mesh"
+    try:
+        service = _case_service()
+        root_capability = _read_root_capability_stdin()
+        opened = service._open_context(root_capability, arguments.case_id)
+        snapshot = opened.result.snapshot
+        source_relative, input_name, expected_sha256 = _select_step_input(
+            opened.store.manifest.get("inputs"),
+            arguments.input_name,
+        )
+        with opened.case._exact_transaction() as exact:
+            source = exact.read_bytes(source_relative)
+        inspection = inspect_step(source, source_name=input_name)
+        if inspection.sha256 != expected_sha256:
+            raise CaseContextError(
+                "EVIDENCE_INTEGRITY_FAILURE",
+                "registered STEP input does not match its manifest digest",
+            )
+        plan = plan_authoritative_step_meshing(inspection, snapshot)
+        plan_payload = plan.to_dict()
+        payload = cli_success(
+            command,
+            case={
+                "case_id": snapshot.case_id,
+                "intent": {"sha256": snapshot.intent_sha256},
+                "state": opened.result.state.value,
+            },
+        )
+        payload["input"] = {"name": input_name, "sha256": expected_sha256}
+        payload["plan"] = plan_payload
+        payload["status"] = plan_payload["status"]
+    except _RunCommandError as error:
+        context_error = CaseContextError(error.code, str(error))
+        _emit_context_json(cli_failure(command, context_error), error=True)
+        if error.code == "EVIDENCE_INTEGRITY_FAILURE":
+            return _CONTEXT_EXIT_CODES[error.code]
+        return _CONTEXT_EXIT_CODES["INVALID_INPUT"]
+    except CaseContextError as error:
+        _emit_context_json(cli_failure(command, error), error=True)
+        return _CONTEXT_EXIT_CODES.get(error.code, _CONTEXT_EXIT_CODES["INTERNAL_ERROR"])
+    except (EvidenceIntegrityError, WorkspaceBoundaryError):
+        failure = CaseContextError(
+            "EVIDENCE_INTEGRITY_FAILURE",
+            "registered STEP or intent evidence is invalid",
+        )
+        _emit_context_json(cli_failure(command, failure), error=True)
+        return _CONTEXT_EXIT_CODES[failure.code]
+    except (TypeError, ValueError):
+        failure = CaseContextError("INVALID_INPUT", "registered STEP meshing plan failed")
+        _emit_context_json(cli_failure(command, failure), error=True)
+        return _CONTEXT_EXIT_CODES[failure.code]
+    except OSError:
+        failure = CaseContextError("IO_OR_LOCK_FAILURE", "registered STEP planning I/O failed")
+        _emit_context_json(cli_failure(command, failure), error=True)
+        return _CONTEXT_EXIT_CODES[failure.code]
+    except Exception:
+        failure = CaseContextError(
+            "INTERNAL_ERROR",
+            "unexpected registered STEP planning failure",
         )
         _emit_context_json(cli_failure(command, failure), error=True)
         return _CONTEXT_EXIT_CODES[failure.code]
@@ -1800,6 +1915,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _emit_probe(arguments.path)
     if arguments.command == "inspect-incomplete-feb":
         return _inspect_incomplete_feb_command(arguments)
+    if arguments.command == "plan-step-mesh":
+        return _plan_step_mesh_command(arguments)
     if arguments.command in {"root", "case"}:
         return _run_context_command(arguments)
     if arguments.command == "run-febio":

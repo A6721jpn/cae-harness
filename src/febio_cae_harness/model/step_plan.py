@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from math import isfinite
 from typing import cast
 
+from ..contracts import IntentState
 from ..evidence import EvidenceIntegrityError, IntentSnapshotAuthority
 from ._immutability import FrozenJSON, freeze_json
 from .step import STEPInspection, STEPInspectionError, StepUnitFact
@@ -264,6 +265,8 @@ def plan_authoritative_step_meshing(
     if type(snapshot) is not IntentSnapshotAuthority:
         raise TypeError("snapshot must be an exact IntentSnapshotAuthority")
     intent = snapshot.intent
+    if intent.state is not IntentState.BOUND:
+        raise EvidenceIntegrityError("STEP meshing requires a BOUND intent snapshot")
     intent_sha256 = snapshot.intent_sha256
     declarations = intent.allowed_mesh_changes
     settings: Mapping[str, object] | None = None

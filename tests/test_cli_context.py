@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib
 import importlib.util
 import io
@@ -720,6 +721,76 @@ def test_cli_inspect_incomplete_feb_redacts_unexpected_internal_failure(
     }
     assert str(tmp_path) not in captured.err
     assert "Traceback" not in captured.err
+
+
+def test_cli_plans_registered_step_from_current_bound_intent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    service = _service(tmp_path)
+    cae_root = tmp_path / "02_CAE"
+    cae_root.mkdir(parents=True)
+    source = tmp_path / "synthetic.step"
+    step_bytes = (
+        b"ISO-10303-21;HEADER;FILE_SCHEMA(('AUTOMOTIVE_DESIGN_CC2'));ENDSEC;DATA;"
+        b"#10=(NAMED_UNIT(*)SI_UNIT(.MILLI.,.METRE.)LENGTH_UNIT());"
+        b"ENDSEC;END-ISO-10303-21;"
+    )
+    source.write_bytes(step_bytes)
+    step_sha256 = hashlib.sha256(step_bytes).hexdigest()
+    intent = _complete_intent(
+        allowed_mesh_changes={
+            "mesh": {
+                "step_meshing": {
+                    "step_sha256": step_sha256,
+                    "element_family": "tet10",
+                    "length_unit": "mm",
+                    "target_size": 1.25,
+                    "quality_criteria": {
+                        "min_jacobian": 0.1,
+                        "max_aspect_ratio": 4.0,
+                    },
+                }
+            }
+        }
+    )
+    registered = service.register_root(cae_root)
+    created = service.create_case(
+        root_capability=registered["capability"],
+        case_id="step-case",
+        sources=(source,),
+        intent=intent,
+    )
+    assert created["lifecycle"]["state"] == "BOUND"
+    monkeypatch.setattr(cli_module, "_case_service", lambda: service)
+    _set_capability_stdin(monkeypatch, registered["capability"])
+
+    assert (
+        cli_module.main(
+            [
+                "plan-step-mesh",
+                "--case-id",
+                "step-case",
+                "--capability-stdin",
+                "--input-name",
+                "synthetic.step",
+            ]
+        )
+        == 0
+    )
+
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    payload = json.loads(captured.out)
+    assert payload["command"] == "plan-step-mesh"
+    assert payload["ok"] is True
+    assert payload["status"] == "READY"
+    assert payload["input"] == {"name": "synthetic.step", "sha256": step_sha256}
+    assert payload["plan"]["element_family"] == "tet10"
+    assert payload["plan"]["length_unit"] == "mm"
+    assert payload["plan"]["target_size"] == 1.25
+    assert str(tmp_path) not in captured.out
 
 
 def test_production_registry_ignores_environment_override(
