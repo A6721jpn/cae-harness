@@ -101,7 +101,7 @@ raw runtime recordは「自己申告したJSON」と混同しないよう、solv
 
 - GmshのTet10 local coordinatesはGmsh APIから取得した。FEBio documented local coordinatesは、4 corner nodesに続く6 edge nodesの列として保存した。
 - 照合結果はidentityではなく、Gmshの最後2点 `(0,0.5,0.5)` と `(0.5,0,0.5)` がFEBio列と逆順だった。したがって全elementへ、zero-based `[0,1,2,3,4,5,6,7,9,8]`、one-based `[1,2,3,4,5,6,7,8,10,9]` を明示適用した。
-- FEBio v4 inputのmesh sectionは`<Mesh>`である。初期probeの`<Geometry>`は4.12.0に拒否されたため、`attempt-03`以降は`<Mesh>`を使った。
+- FEBio v4 inputのmesh sectionは`<Mesh>`である。初期probeの`<Geometry>`は4.12.0に拒否されたため、`attempt-04`以降は`<Mesh>`を使った。
 - `SolidDomain`の`mat`はこのinputでmaterial name `elastic_patch`を参照した。数値`1`を渡した`attempt-04`は拒否された。
 - outputのnode listは1行に連結した。16個ごとの改行を含む初期形式では3 node（17, 33, 49）が出力から欠落したため、`attempt-06`では63/63を直接確認した。
 
@@ -190,7 +190,7 @@ processはtimeoutなし、duration `177.5877 ms`、exit `0`、stderr empty、std
 | element mean `sxx` | `-1000 Pa` | `-997.677028991708 Pa` | relative `0.2323%`, `PASS` |
 | element mean `syy` | `0 Pa` | `0.375375375276 Pa` | `sxx`の`0.0376%`、副次残差 |
 | element mean `szz` | `0 Pa` | `0.375375375261 Pa` | `sxx`の`0.0376%`、副次残差 |
-| element mean shear | `0 Pa` | 最大絶対値 `4.75e-12 Pa` | 数値残差 |
+| element mean shear components | `0 Pa` | mean `(sxy, syz, sxz) = (4.753211441839583e-12, 2.5622747443535835e-11, -2.8051239481602082e-11) Pa`; 最大絶対値 `2.8051239481602082e-11 Pa` | 数値残差 |
 | x=0 reaction x | `+0.100000 N` | `+0.0998275724668 N` | sign/equilibrium一致 |
 | x=L reaction x | `-0.100000 N` | `-0.0998275725249 N` | magnitude relative `0.1724%`, `PASS` |
 | x reaction sum | `0 N` | `-5.8079305254e-11 N` | 釣合い観測 |
@@ -237,6 +237,8 @@ processはtimeoutなし、duration `177.5877 ms`、exit `0`、stderr empty、std
 - Gmsh Tet10のexplicit permutationはこのGmsh API結果とFEBio Theoryのdocumented coordinatesに基づく。任意の要素型、surface face order、outward orientation、曲面、複数domainを保証しない。
 - corner Jacobianの最小値は幾何orientationのsanity checkであり、全積分点、退化、mesh convergence、接触面の独立性を保証しない。
 - `isotropic elastic`の合成`E`と`nu`はscreening入力であり、実材料のgrade、温度、rate、製造条件、許容値ではない。
+- 全63 nodeへaffineな`prescribed deformation`を与えているため、変位一致はprescribed fieldとoutputの整合性を確認するものであり、free-DOF displacement solveの独立検証ではない。
+- 記録したSHA-256はmain `febio4.exe`のdigestである。実行時にloadedされたsolver DLL、plugins、configurationのidentityは完全には固定・検証していない。
 - XPLTは生成されたが、compression、header/dictionary/state、readerの独立数値照合は未実施である。
 - FEBio Studioは起動していない。GUI read confirmation、FBS、実モデル、実行所有、子孫drain、timeout後cleanup、final BottomFrame E2Eは未検証である。
 - pytest、ruff、mypy、build、installed smoke、公式FBS、real E2E、product release gateはこのtaskでは実行していない。未実行をpassとして数えていない。
