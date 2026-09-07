@@ -71,18 +71,37 @@ INCOMPLETE_CODES = frozenset(
         "GIT_PATH_INVALID",
         "GIT_ROOT_MISMATCH",
         "GIT_TRACKING_UNAVAILABLE",
+        "FILESYSTEM_METADATA_ERROR",
+        "UNINSPECTABLE_CONTENT",
+        "UNSUPPORTED_CONTENT_ENCODING",
         "UNSAFE_REPARSE_POINT",
         "UNSUPPORTED_GIT_MODE",
     }
 )
 _FEBIO_ROOT = re.compile(rb"<febio_spec(?:\s|>)", re.IGNORECASE)
 _FEBIO_CLOSE = re.compile(rb"</febio_spec\s*>", re.IGNORECASE)
+_FEBIO_ROOT_TEXT = re.compile(r"<febio_spec(?:\s|>)", re.IGNORECASE)
+_FEBIO_CLOSE_TEXT = re.compile(r"</febio_spec\s*>", re.IGNORECASE)
+_XML_DECLARATION = re.compile(r"^\s*<\?xml\b.*?\?>", re.IGNORECASE | re.DOTALL)
+_XML_ENCODING = re.compile(r"\bencoding\s*=\s*(['\"])([^'\"]+)\1", re.IGNORECASE)
 _PRIVATE_KEY = re.compile(
     rb"-----BEGIN(?: [A-Z0-9]+)? PRIVATE KEY-----\s*"
     rb"([A-Z0-9+/=\r\n]{64,})\s*"
     rb"-----END(?: [A-Z0-9]+)? PRIVATE KEY-----",
     re.IGNORECASE,
 )
+_ENCRYPTED_RSA_PEM = re.compile(
+    rb"-----BEGIN RSA PRIVATE KEY-----\s*"
+    rb"Proc-Type:\s*4,ENCRYPTED\s*"
+    rb"DEK-Info:\s*[A-Z0-9-]+,[A-F0-9]+\s*\r?\n"
+    rb"\s*[A-Z0-9+/=\r\n]{32,}\s*"
+    rb"-----END RSA PRIVATE KEY-----",
+    re.IGNORECASE,
+)
+_STEP_START = b"ISO-10303-21;"
+_STEP_END = b"END-ISO-10303-21;"
+_XPLT_MAGIC = b"BEF\x00\x00\x00\x01"
+_SUPPORTED_XML_ENCODINGS = frozenset({"utf-8", "utf8", "utf-16", "utf16", "utf-16-le", "utf-16-be"})
 
 
 @dataclass(frozen=True)
@@ -253,20 +272,143 @@ def _read_git_blob(root: Path, object_id: str) -> tuple[bytes | None, str | None
     return content_result.stdout, None
 
 
-def _content_issue(relative_path: str, content: bytes, *, source: str) -> ScanIssue | None:
-    prefix = content
-    if prefix.startswith(b"\xef\xbb\xbf"):
-        prefix = prefix[3:]
-    prefix = prefix.lstrip(b" \t\r\n")
-    if prefix.startswith(b"<?xml"):
-        declaration_end = prefix.find(b"?>")
-        if declaration_end >= 0:
-            prefix = prefix[declaration_end + 2 :].lstrip(b" \t\r\n")
-    if _FEBIO_ROOT.match(prefix) and _FEBIO_CLOSE.search(content):
+def _xml_candidate(content: bytes) -> bool:
+    prefix = content[:512].lstrip(b" \t\r\n")
+    return prefix.startswith(
+        (
+            b"\xef\xbb\xbf",
+            b"\xff\xfe",
+            b"\xfe\xff",
+            b"\xff\xfe\x00\x00",
+            b"\x00\x00\xfe\xff",
+            b"<?xml",
+            b"<?",
+            b"<!--",
+            b"<febio_spec",
+            b"<\x00?\x00",
+            b"\x00<\x00?",
+        )
+    )
+
+
+def _decode_xml_candidate(
+    relative_path: str, content: bytes
+) -> tuple[str | None, ScanIssue | None]:
+    if not _xml_candidate(content):
+        return None, None
+    if content.startswith((b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff")):
+        return None, ScanIssue(
+            code="UNSUPPORTED_CONTENT_ENCODING",
+            path=relative_path,
+            message="UTF-32 XML content is outside the bounded XML encoding support.",
+        )
+
+    encoding = "utf-8"
+    if content.startswith((b"\xff\xfe", b"\xfe\xff")):
+        encoding = "utf-16"
+    elif content.startswith(b"\xef\xbb\xbf"):
+        encoding = "utf-8-sig"
+    else:
+        prefix = content[:16]
+        if prefix.startswith(b"<\x00?\x00"):
+            encoding = "utf-16-le"
+        elif prefix.startswith(b"\x00<\x00?"):
+            encoding = "utf-16-be"
+    try:
+        text = content.decode(encoding)
+    except UnicodeDecodeError as error:
+        return None, ScanIssue(
+            code="UNINSPECTABLE_CONTENT",
+            path=relative_path,
+            message=f"XML-like content could not be decoded safely: {error}",
+        )
+
+    declaration = _XML_DECLARATION.match(text)
+    if declaration:
+        encoding_match = _XML_ENCODING.search(declaration.group(0))
+        if encoding_match:
+            declared = encoding_match.group(2).casefold().replace("_", "-")
+            if declared not in _SUPPORTED_XML_ENCODINGS:
+                return None, ScanIssue(
+                    code="UNSUPPORTED_CONTENT_ENCODING",
+                    path=relative_path,
+                    message=f"XML encoding {encoding_match.group(2)!r} is not supported safely.",
+                )
+    return text, None
+
+
+def _febio_xml_issue(relative_path: str, content: bytes, *, source: str) -> ScanIssue | None:
+    text, decode_issue = _decode_xml_candidate(relative_path, content)
+    if decode_issue:
+        return decode_issue
+    if text is None:
+        return None
+
+    cursor = text.lstrip("\ufeff \t\r\n")
+    declaration = _XML_DECLARATION.match(cursor)
+    if declaration:
+        cursor = cursor[declaration.end() :]
+    while True:
+        cursor = cursor.lstrip(" \t\r\n")
+        if cursor.startswith("<!--"):
+            comment_end = cursor.find("-->", 4)
+            if comment_end < 0:
+                return ScanIssue(
+                    code="UNINSPECTABLE_CONTENT",
+                    path=relative_path,
+                    message="XML comment was not terminated within the bounded content.",
+                )
+            cursor = cursor[comment_end + 3 :]
+            continue
+        if cursor.startswith("<?"):
+            processing_end = cursor.find("?>", 2)
+            if processing_end < 0:
+                return ScanIssue(
+                    code="UNINSPECTABLE_CONTENT",
+                    path=relative_path,
+                    message="XML processing instruction was not terminated within the bounded content.",
+                )
+            cursor = cursor[processing_end + 2 :]
+            continue
+        if cursor.startswith(("<!DOCTYPE", "<![CDATA[")):
+            return ScanIssue(
+                code="UNINSPECTABLE_CONTENT",
+                path=relative_path,
+                message="XML declaration contains a construct outside the safe bounded detector.",
+            )
+        break
+
+    if _FEBIO_ROOT_TEXT.match(cursor) and _FEBIO_CLOSE_TEXT.search(text):
         return ScanIssue(
             code="FORBIDDEN_CAE_CONTENT",
             path=relative_path,
             message=f"Recognizable FEBio XML content was found in {source} bytes.",
+        )
+    return None
+
+
+def _content_issue(relative_path: str, content: bytes, *, source: str) -> ScanIssue | None:
+    xml_issue = _febio_xml_issue(relative_path, content, source=source)
+    if xml_issue:
+        return xml_issue
+    stripped = content.lstrip(b"\xef\xbb\xbf \t\r\n")
+    if stripped.startswith(_STEP_START) and _STEP_END in content:
+        return ScanIssue(
+            code="FORBIDDEN_CAE_CONTENT",
+            path=relative_path,
+            message=f"Recognizable STEP exchange content was found in {source} bytes.",
+        )
+    if content.startswith(_XPLT_MAGIC):
+        return ScanIssue(
+            code="FORBIDDEN_CAE_CONTENT",
+            path=relative_path,
+            message=f"Recognizable XPLT signature was found in {source} bytes.",
+        )
+    if _ENCRYPTED_RSA_PEM.search(content):
+        return ScanIssue(
+            code="FORBIDDEN_SENSITIVE_CONTENT",
+            path=relative_path,
+            message=f"Recognizable encrypted RSA private-key PEM content was found in {source} bytes.",
         )
     if _PRIVATE_KEY.search(content):
         return ScanIssue(
@@ -340,13 +482,22 @@ def _inspect_git_index(
 
 
 def _is_reparse_point(path: Path) -> bool:
-    try:
-        if path.is_symlink():
-            return True
-        attributes = getattr(os.lstat(path), "st_file_attributes", 0)
-    except OSError:
-        return False
+    if path.is_symlink():
+        return True
+    attributes = getattr(os.lstat(path), "st_file_attributes", 0)
     return bool(attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+
+
+def _metadata_issue(root: Path, path: Path, error: OSError) -> ScanIssue:
+    try:
+        relative = _relative_path(root, path)
+    except ValueError:
+        relative = str(path)
+    return ScanIssue(
+        code="FILESYSTEM_METADATA_ERROR",
+        path=relative,
+        message=f"Filesystem metadata inspection failed: {error}",
+    )
 
 
 def _filesystem_error_path(root: Path, error: OSError) -> str:
@@ -380,7 +531,16 @@ def _scan_filesystem(root: Path) -> tuple[tuple[ScanIssue, ...], int, tuple[str,
         root, topdown=True, followlinks=False, onerror=onerror
     ):
         current_path = Path(current)
-        if current_path != root and _is_reparse_point(current_path):
+        if current_path != root:
+            try:
+                current_is_reparse = _is_reparse_point(current_path)
+            except OSError as error:
+                _merge_issue(issues, _metadata_issue(root, current_path, error))
+                directories[:] = []
+                continue
+        else:
+            current_is_reparse = False
+        if current_is_reparse:
             _merge_issue(
                 issues,
                 ScanIssue(
@@ -401,7 +561,12 @@ def _scan_filesystem(root: Path) -> tuple[tuple[ScanIssue, ...], int, tuple[str,
                 excluded_paths.add(_excluded_component(relative_directory) or relative_directory)
                 continue
             directory_path = current_path / directory
-            if _is_reparse_point(directory_path):
+            try:
+                directory_is_reparse = _is_reparse_point(directory_path)
+            except OSError as error:
+                _merge_issue(issues, _metadata_issue(root, directory_path, error))
+                continue
+            if directory_is_reparse:
                 _merge_issue(
                     issues,
                     ScanIssue(
@@ -426,7 +591,12 @@ def _scan_filesystem(root: Path) -> tuple[tuple[ScanIssue, ...], int, tuple[str,
                 excluded_paths.add(_excluded_component(relative_file) or relative_file)
                 continue
             file_path = current_path / filename
-            if _is_reparse_point(file_path):
+            try:
+                file_is_reparse = _is_reparse_point(file_path)
+            except OSError as error:
+                _merge_issue(issues, _metadata_issue(root, file_path, error))
+                continue
+            if file_is_reparse:
                 _merge_issue(
                     issues,
                     ScanIssue(
