@@ -94,7 +94,7 @@ def _profile(
 def _local(
     mesh: ModuleType,
     *,
-    refinement_id: str = "local-A",
+    refinement_id: object = "local-A",
     selection: object = _MISSING,
     size: object = _MISSING,
 ) -> Any:
