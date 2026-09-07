@@ -18,6 +18,7 @@ def _optional_module(name: str) -> ModuleType | None:
 
 
 BUDGET_MODULE = _optional_module("febio_cae.domain.budget")
+_MISSING = object()
 
 
 def _budget() -> ModuleType:
@@ -29,14 +30,14 @@ def _budget() -> ModuleType:
 def _value(
     budget: ModuleType,
     *,
-    max_elapsed: Quantity | None = None,
+    max_elapsed: object = _MISSING,
     max_attempts: object = 3,
     cpu_workers: object = 2,
     max_llm_calls: object = 0,
     max_llm_tokens: object = 0,
 ) -> Any:
     return budget.Budget(
-        max_elapsed=Quantity(2, "s") if max_elapsed is None else max_elapsed,
+        max_elapsed=Quantity(2, "s") if max_elapsed is _MISSING else max_elapsed,
         max_attempts=max_attempts,
         cpu_workers=cpu_workers,
         max_llm_calls=max_llm_calls,
@@ -132,7 +133,9 @@ def test_budget_rejects_negative_llm_allocations(field: str, bad_value: int) -> 
         _value(budget, **{field: bad_value})
 
 
-@pytest.mark.parametrize("field", ["max_attempts", "cpu_workers", "max_llm_calls", "max_llm_tokens"])
+@pytest.mark.parametrize(
+    "field", ["max_attempts", "cpu_workers", "max_llm_calls", "max_llm_tokens"]
+)
 @pytest.mark.parametrize("bad_value", [True, False, 1.0, 1.5, "1", None])
 def test_budget_counts_are_strict_integers_and_reject_bool(field: str, bad_value: object) -> None:
     budget = _budget()
@@ -190,13 +193,16 @@ def test_budget_accepts_large_but_serializable_integer_identity_without_float_ro
     assert value.max_llm_tokens == large
     assert value.to_dict()["max_attempts"] == large
     assert value.to_dict()["max_llm_tokens"] == large
-    assert value.to_bytes() == budget.Budget(
-        max_elapsed=Quantity(2, "s"),
-        max_attempts=large,
-        cpu_workers=2,
-        max_llm_calls=0,
-        max_llm_tokens=large,
-    ).to_bytes()
+    assert (
+        value.to_bytes()
+        == budget.Budget(
+            max_elapsed=Quantity(2, "s"),
+            max_attempts=large,
+            cpu_workers=2,
+            max_llm_calls=0,
+            max_llm_tokens=large,
+        ).to_bytes()
+    )
 
 
 def test_budget_rejects_integer_beyond_shared_json_serialization_range_at_construction() -> None:
