@@ -137,6 +137,51 @@ def test_unit_direction_normalizes_explicit_vector_in_its_explicit_frame() -> No
 @pytest.mark.parametrize(
     "components",
     [
+        (-4.169659670808031, -0.007757769290062555, -8.308205353086127),
+        (math.ulp(0.0), math.ulp(0.0), 0.0),
+        (1.0, 2.0, 3.0),
+    ],
+)
+def test_unit_direction_from_dict_preserves_normalized_components_and_bytes(
+    components: tuple[float, float, float],
+) -> None:
+    spatial = _spatial()
+    direction = spatial.UnitDirection(spatial.FrameId("World"), *components)
+    decoder = getattr(spatial.UnitDirection, "from_dict", None)
+    assert callable(decoder), "UnitDirection.from_dict is required"
+
+    payload = direction.to_dict()
+    restored = decoder(payload)
+
+    assert restored.to_dict() == payload
+    assert restored.to_bytes() == direction.to_bytes()
+    payload["x"] = 99.0
+    assert restored.to_dict() == direction.to_dict()
+
+
+def test_unit_direction_from_dict_is_strict_and_requires_a_unit_vector() -> None:
+    spatial = _spatial()
+    direction = spatial.UnitDirection(spatial.FrameId("World"), 3, 4, 0)
+    decoder = getattr(spatial.UnitDirection, "from_dict", None)
+    assert callable(decoder), "UnitDirection.from_dict is required"
+    payload = direction.to_dict()
+
+    for invalid in (
+        {**payload, "unexpected": 1},
+        {key: value for key, value in payload.items() if key != "z"},
+        {**payload, "schema_version": "2"},
+        {**payload, "frame": 1},
+        {**payload, "x": True},
+        {**payload, "x": math.nan},
+        {**payload, "x": payload["x"] + 0.001},
+    ):
+        with pytest.raises(ValueError):
+            decoder(invalid)
+
+
+@pytest.mark.parametrize(
+    "components",
+    [
         (math.ulp(0.0), math.ulp(0.0), 0.0),
         (math.ulp(0.0), math.ulp(0.0), math.ulp(0.0)),
         (-math.ulp(0.0), math.ulp(0.0), 0.0),

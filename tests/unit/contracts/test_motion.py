@@ -58,6 +58,9 @@ def _profile(
     samples: list[Any] | None = None,
     reference_point: Point3 | None = None,
     direction: UnitDirection | None = None,
+    direction_evidence: EvidenceRef | None = None,
+    initial_reference_point_evidence: EvidenceRef | None = None,
+    history_evidence: EvidenceRef | None = None,
 ) -> Any:
     frame = FrameId("World") if frame is None else frame
     direction = UnitDirection(frame, 0, 0, 1) if direction is None else direction
@@ -76,11 +79,25 @@ def _profile(
         if samples is None
         else samples
     )
+    direction_evidence = (
+        _evidence("motion.direction", "c") if direction_evidence is None else direction_evidence
+    )
+    initial_reference_point_evidence = (
+        _evidence("motion.initial_reference_point", "d")
+        if initial_reference_point_evidence is None
+        else initial_reference_point_evidence
+    )
+    history_evidence = (
+        _evidence("motion.history", "e") if history_evidence is None else history_evidence
+    )
     return motion.MotionProfile(
         direction=direction,
         initial_reference_point=reference_point,
         samples=samples,
         applicability=_applicability(motion),
+        direction_evidence=direction_evidence,
+        initial_reference_point_evidence=initial_reference_point_evidence,
+        history_evidence=history_evidence,
     )
 
 
@@ -248,11 +265,77 @@ def test_motion_profile_retains_evidence_for_each_physical_field() -> None:
     motion = _motion()
     payload = _profile(motion).to_dict()
 
-    assert {
-        "direction_evidence",
-        "initial_reference_point_evidence",
-        "history_evidence",
-    } <= set(payload)
+    assert payload["direction_evidence"]["target_field"] == "motion.direction"
+    assert (
+        payload["initial_reference_point_evidence"]["target_field"]
+        == "motion.initial_reference_point"
+    )
+    assert payload["history_evidence"]["target_field"] == "motion.history"
+
+
+@pytest.mark.parametrize(
+    "missing_field",
+    ["direction_evidence", "initial_reference_point_evidence", "history_evidence"],
+)
+def test_motion_profile_from_dict_requires_each_physical_field_evidence(
+    missing_field: str,
+) -> None:
+    motion = _motion()
+    payload = _profile(motion).to_dict()
+    payload.pop(missing_field)
+
+    with pytest.raises(ValueError):
+        motion.MotionProfile.from_dict(payload)
+
+
+@pytest.mark.parametrize(
+    ("field", "wrong_target"),
+    [
+        ("direction_evidence", "motion.initial_reference_point"),
+        ("initial_reference_point_evidence", "motion.history"),
+        ("history_evidence", "motion.direction"),
+    ],
+)
+def test_motion_profile_from_dict_rejects_swapped_physical_field_evidence(
+    field: str,
+    wrong_target: str,
+) -> None:
+    motion = _motion()
+    payload = _profile(motion).to_dict()
+    payload[field]["target_field"] = wrong_target
+
+    with pytest.raises(ValueError):
+        motion.MotionProfile.from_dict(payload)
+
+
+def test_motion_profile_evidence_is_field_bound_and_changes_canonical_bytes() -> None:
+    motion = _motion()
+    profile = _profile(motion)
+    changed = _profile(
+        motion,
+        direction_evidence=_evidence("motion.direction", "f"),
+    )
+
+    assert profile.to_bytes() != changed.to_bytes()
+    payload = profile.to_dict()
+    payload["direction_evidence"]["content_digest"] = "f" * 64
+    payload["samples"][0]["time"]["value"] = 99.0
+    assert profile.direction_evidence.content_digest == "c" * 64
+    assert profile.samples[0].time.to_si().value == 2.0
+    assert profile.to_bytes() == canonical_bytes(profile.to_dict())
+
+
+def test_motion_profile_payload_roundtrip_preserves_evidence_and_history() -> None:
+    motion = _motion()
+    profile = _profile(motion)
+    payload = profile.to_dict()
+    restored = motion.MotionProfile.from_dict(payload)
+
+    assert restored.to_dict() == payload
+    assert restored.to_bytes() == profile.to_bytes()
+    assert [sample.to_dict() for sample in restored.samples] == [
+        sample.to_dict() for sample in profile.samples
+    ]
 
 
 @pytest.mark.parametrize(
