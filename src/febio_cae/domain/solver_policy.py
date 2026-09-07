@@ -55,6 +55,16 @@ def _strict_integer(value: object, field: str, minimum: int) -> int:
     return value
 
 
+def _validate_integer_canonical(value: int, field: str) -> None:
+    try:
+        canonical_bytes({field: value})
+    except (TypeError, ValueError) as error:
+        raise SolverPolicyValidationError(
+            f"{field} is not canonically serializable; "
+            "time increment policy projection is not canonically serializable"
+        ) from error
+
+
 def _copy_sequence(value: object, field: str) -> tuple[object, ...]:
     if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
         raise SolverPolicyValidationError(f"{field} must be a sequence")
@@ -128,6 +138,8 @@ class TimeIncrementPolicy:
             raise SolverPolicyValidationError("adaptive must be a boolean")
         max_steps = _strict_integer(self.max_steps, "max_steps", 1)
         max_step_retries = _strict_integer(self.max_step_retries, "max_step_retries", 0)
+        _validate_integer_canonical(max_steps, "max_steps")
+        _validate_integer_canonical(max_step_retries, "max_step_retries")
         object.__setattr__(self, "max_steps", max_steps)
         object.__setattr__(self, "max_step_retries", max_step_retries)
 
