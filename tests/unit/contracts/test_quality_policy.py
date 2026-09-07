@@ -230,7 +230,7 @@ def test_quality_criterion_copies_and_sorts_threshold_semantic_set() -> None:
     assert [threshold.parameter_id for threshold in criterion.thresholds] == ["a_limit", "z_limit"]
 
 
-@pytest.mark.parametrize("thresholds", ["threshold", b"threshold", {"a": _threshold()}])
+@pytest.mark.parametrize("thresholds", ["threshold", b"threshold", {"a": object()}])
 def test_quality_criterion_rejects_non_sequence_thresholds(thresholds: object) -> None:
     with pytest.raises(_quality().QualityPolicyValidationError, match="thresholds"):
         _criterion(thresholds=thresholds)
