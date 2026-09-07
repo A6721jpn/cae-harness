@@ -21,11 +21,11 @@ This is a synthetic native observation, not product verification. A new local ge
 | small compression | `diag(0.999, 1, 1)` | exit `0`, normal termination, cleanup verified |
 | finite compression | `diag(0.95, 1, 1)` | exit `0`, normal termination, cleanup verified |
 
-The direct FEBio text outputs matched the analytic Cauchy stress, face reaction forces, prescribed displacement, and `sed` strain-energy-density reference to the frozen preflight thresholds. The maximum nonzero stress relative residual was `1.75e-12` for the small case and `1.12e-12` for the finite case; the maximum face-reaction relative residual was about `1.0e-9`. The finite-case largest absolute reaction residual was `7.05e-9 N`, below the frozen `1e-8 N` equilibrium bound.
+The direct FEBio text outputs matched the analytic Cauchy stress, face reaction forces, and prescribed displacement to the frozen preflight thresholds. The numeric `sed` values also matched the analytic `W` values, but the authoritative density/volume convention for this direct logfile field remains unverified. The maximum nonzero stress relative residual was `1.75e-12` for the small case and `1.12e-12` for the finite case; the maximum face-reaction relative residual was about `1.0e-9`. The largest global reaction-sum residual was `6.16e-13 N`, below the frozen `1e-8 N` global-equilibrium bound; the largest raw per-face residual was `7.05e-9 N` and is not compared with that global bound.
 
 This supports only the following narrow inference:
 
-> The installed FEBio 4.12.0 native executable accepted this newly generated homogeneous Tet10 input and returned numerically consistent neo-Hookean stress, reaction, displacement, and direct `sed` output for the two prescribed fields.
+> The installed FEBio 4.12.0 native executable accepted this newly generated homogeneous Tet10 input and returned numerically consistent neo-Hookean stress, reaction, and displacement for the two prescribed fields. Its direct `sed` numbers agree with the analytic `W` values, while the `sed` measure convention remains unverified.
 
 It does not verify the product adapter, free-DOF equilibrium, contact, FBS, XPLT reader, FEBio Studio, real models, production material calibration, or any P0/P3/E2E gate.
 
@@ -41,16 +41,23 @@ The authority documents remain the [design specification](../specs/2026-08-27-fe
 
 ## 3. Frozen analytic preflight / 事前固定値
 
-The immutable preflight was written before the first native solver invocation:
+The immutable preflight bytes were written and validated before the first native solver invocation:
 
 ```text
 C:\Users\backo\.codex\worktrees\e081\CAE-harness\.local\verification\P0B-neo-hookean-observation-01\preflight.json
 SHA-256: E34C225C6883D3B29A73D9010DAB5CF15C82547286FFB752A81A890A9492F164
 ```
 
-It was marked read-only after validation. The constitutive model is the manual's
+It was marked read-only after validation. The bounded original command-event extract is:
 
-The supplemental provenance record observed filesystem creation of `preflight.json` at `2026-09-07T06:40:24Z`, before the first generated input at `06:43:42Z` and the first native solver start at `06:44:06.789381Z`.
+```text
+C:\Users\backo\.codex\worktrees\e081\CAE-harness\.local\verification\P0B-neo-hookean-observation-01\preflight-event-extract.json
+SHA-256: 07243FE07AF9F97CD1977FAACDFD5070AD35A7F2A049B13C8B13F9C274B052CD
+```
+
+That extract records the preflight write command at `06:40:23.868707Z`, JSON/hash/read-only validation at `06:40:31.787391Z` with result observed at `06:40:38.338412Z`, and the first native command only at `06:44:05.528429Z` (process start `06:44:06.789381Z`). The JSON contains a manually entered `created_utc` value of `2026-09-07T06:45:00Z`; that value is inaccurate and is explicitly not used as chronology evidence. The original preflight bytes and hash are preserved unchanged.
+
+The constitutive model is defined by the manual's
 
 ```text
 W = mu/2 * (I1 - 3) - mu*ln(J) + lambda/2 * ln(J)^2
@@ -68,7 +75,7 @@ sigma = (1/J) * (mu*(B-I) + lambda*ln(J)*I)
 P = mu*(F-F^(-T)) + lambda*ln(J)*F^(-T)
 ```
 
-`W` is retained as reference-volume energy density. The diagnostic current-volume density is `W/J`; the reference total is `W*V0` and the current-volume diagnostic total is `W*J*V0`. Native total-energy semantics are not inferred from the `sed` field.
+`W` is retained as reference-volume energy density. The current-volume density diagnostic is `W/J`; multiplying that density by the current volume `J*V0` gives the same physical total `W*V0`. The preflight field named `expected_current_volume_total_energy_Nmm` stores `W*J*V0`; it is retained as a deliberately mismatched-volume diagnostic for historical traceability, not as an alternative physical total. Native total-energy semantics and the direct logfile `sed` measure convention are not inferred from numerical agreement alone.
 
 With `V0=1000 mm^3`, reference face area `A0=100 mm^2`, the x-face current area is `100 mm^2`, and the y/z current face area is `a*100 mm^2`. The low-coordinate face reaction has positive normal sign and the high-coordinate face reaction has negative normal sign.
 
@@ -94,7 +101,7 @@ No bound was tuned after seeing native output.
 
 - The [FEBio 4.13 neo-Hookean feature page](https://febiosoftware.github.io/febio-feature-manual/features/solid_material_neo-hookean/) names the material type, `E`/`v` inputs, the `W` formula, the `E`/`nu` to `mu`/`lambda` mapping, and the displacement-based formulation caution.
 - The [FEBio plot-variable page](https://febiosoftware.github.io/febio-feature-manual/plotvars/) identifies `stress` as Cauchy stress, `reaction forces` as nodal reaction forces, `strain energy density` as `Psi(C)`, and `current element strain energy` as the element's total energy at the current configuration.
-- The v4 logfile syntax and `element_data` `sed` variable are recorded against the [FEBio User Manual output section](https://help.febio.org/docs/FEBioUser-4-9/UM49-3.19.1.3.html). Local executable acceptance is a separate native observation below.
+- The v4 logfile syntax and `element_data` `sed` variable are recorded against the [FEBio User Manual output section](https://help.febio.org/docs/FEBioUser-4-9/UM49-3.19.1.3.html). This establishes the output request syntax, but this evidence set does not provide a primary definition tying the direct logfile `sed` field to the reference-volume `W` convention. Local executable acceptance is a separate native observation below.
 
 These references establish names and formulas; they do not establish product adapter support or the exact semantics of every XPLT/logfile quantity across executable builds.
 
@@ -177,20 +184,20 @@ The independent text analyzer read only the final (`Step=1`) records and saved `
 
 All element shear components were expected zero. The largest absolute shear residual was `1.308e-16 MPa` in the small case and `1.362e-16 MPa` in the finite case, below the frozen `1e-8 MPa` bound. Element stress spread was at most `1.001e-15 MPa` for the small case and below the printed precision for the finite case.
 
-The direct logfile `sed` field was homogeneous and matched the frozen reference-volume `W`:
+The direct logfile `sed` field was homogeneous and numerically matched the frozen reference-volume `W`. Because a primary definition specific to the direct logfile field's density/volume measure was not captured, this is reported as a numeric match with measure convention `UNVERIFIED`, not as a universal density acceptance:
 
 | Case | Expected `W` (MPa) | Observed mean (MPa) | Max relative residual | Result |
 |---|---:|---:|---:|---|
-| small | `6.734939506222832e-7` | `6.734939506535208e-7` | `7.976e-11` | `PASS` under the stated density convention |
-| finite | `1.737133047844787e-3` | `1.737133047840000e-3` | `2.755e-12` | `PASS` under the stated density convention |
+| small | `6.734939506222832e-7` | `6.734939506535208e-7` | `7.976e-11` | numeric match; measure convention `UNVERIFIED` |
+| finite | `1.737133047844787e-3` | `1.737133047840000e-3` | `2.755e-12` | numeric match; measure convention `UNVERIFIED` |
 
-The total reference energies (`0.0006734939506222832 N*mm` and `1.7371330478447866 N*mm`) and current-volume diagnostics (`0.000672820456671661 N*mm` and `1.6502763954525472 N*mm`) were precomputed but not claimed as native total-energy results. The XPLT files were hashed only; no XPLT reader or viewer acceptance was claimed.
+The physical reference totals (`0.0006734939506222832 N*mm` and `1.7371330478447866 N*mm`) were precomputed but not claimed as native total-energy results. The preflight's `W*J*V0` values (`0.000672820456671661 N*mm` and `1.6502763954525472 N*mm`) are deliberately mismatched-volume diagnostics, not physical current-volume alternatives. The XPLT files were hashed only; no XPLT reader or viewer acceptance was claimed.
 
 ### 7.2 Prescribed displacement and reaction forces
 
 Maximum displacement errors were `8.674e-18 mm` (small) and `4.441e-16 mm` (finite), both below `1e-10 mm`. Current-coordinate errors were zero at the reported precision.
 
-For each case, the six face reaction sums had the preflight signs and magnitudes. The largest face-normal relative residual was `9.981e-10` (small) and `9.984e-10` (finite). The largest absolute face-normal residual was `1.345e-10 N` (small) and `7.047e-9 N` (finite), both below the frozen `1e-8 N` bound. Global reaction sums were at most `5.78e-14 N` (small) and `6.16e-13 N` (finite) by component.
+For each case, the six face reaction sums had the preflight signs and magnitudes. The largest face-normal relative residual was `9.981e-10` (small) and `9.984e-10` (finite), well below the predeclared `1%` nonzero face-force criterion. The largest raw absolute per-face residual was `1.345e-10 N` (small) and `7.047e-9 N` (finite); no absolute per-face criterion was declared. Global reaction sums were at most `5.78e-14 N` (small) and `6.16e-13 N` (finite) by component, both below the separately declared `1e-8 N` global-equilibrium criterion.
 
 This confirms reaction output against the analytic traction integral for this fully prescribed field. It is not a free-equilibrium or support/contact validation.
 
@@ -202,6 +209,7 @@ Repository product gates were intentionally not run for this documentation-only 
 
 - product `src`/CLI integration and all required pytest, ruff, mypy, build, installed-smoke gates;
 - official FBS identity, receipt, named-pipe, freshness, and report boundaries;
+- the primary density/volume convention of the direct logfile `sed` field;
 - XPLT parsing, dictionary/state/variable validation, compression handling, and viewer acceptance;
 - FEBio Studio GUI read confirmation;
 - free-DOF equilibrium, contact, rigid-body, solver descendant drain, and timeout cleanup certification;
@@ -209,7 +217,7 @@ Repository product gates were intentionally not run for this documentation-only 
 
 ## 9. Final bounded verdict / 最終判定
 
-`P0-B SYNTHETIC NATIVE COMPRESSIBLE NEO-HOOKEAN OBSERVATION RECORDED; PRODUCT/FBS/XPLT-READER/STUDIO/FREE-DOF/REAL-MODEL COMPATIBILITY UNVERIFIED`
+`P0-B SYNTHETIC NATIVE COMPRESSIBLE NEO-HOOKEAN OBSERVATION RECORDED; SED-MEASURE-CONVENTION/PRODUCT/FBS/XPLT-READER/STUDIO/FREE-DOF/REAL-MODEL COMPATIBILITY UNVERIFIED`
 
 The candidate material is therefore recorded as a narrow synthetic native observation, not as production support.
 
