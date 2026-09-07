@@ -14,6 +14,7 @@ from .contact import (
     SpecifiedGap,
 )
 from .evidence import SUPPORTED_SOURCE_KINDS, EvidenceRef
+from .geometry import GeometryIntent, GeometryValidationError
 from .material import (
     CompressibleNeoHookean,
     IsotropicLinearElastic,
@@ -122,6 +123,8 @@ __all__ = [
     "FrictionIntent",
     "Frictionless",
     "GeometryId",
+    "GeometryIntent",
+    "GeometryValidationError",
     "IsotropicLinearElastic",
     "KinematicCompatibility",
     "MaterialApplicability",
