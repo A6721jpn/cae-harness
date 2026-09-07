@@ -75,7 +75,7 @@ PMから明示された本体pathだけを読取り、solverの版表示を一�
 
 | 実体 | path | SHA-256 | 観測 |
 |---|---|---|---|
-| FEBio solver | `C:\Program Files\FEBioStudio\bin\febio4.exe` | `03B9DB12C4B3E2ED0CF027BE6B8B5D0CEF2D4EDC9EAB26F5A2BD8193EFB770C` | `febio4 -info -norun -noconfig` stdout: `compiled on Feb 25 2026`, `FEBio version = 4.12.0`; exit **1**、stderr empty |
+| FEBio solver | `C:\Program Files\FEBioStudio\bin\febio4.exe` | `03B9DB12C4B3E2ED0CF027BE6B8B5D0CEF2D4EDC9EAB26F5A2BD8193EFB770C9` | `febio4 -info -norun -noconfig` stdout: `compiled on Feb 25 2026`, `FEBio version = 4.12.0`; exit **1**、stderr empty |
 | FEBio Studio | `C:\Program Files\FEBioStudio\bin\FEBioStudio.exe` | `703AE324AE46AB03E9E5389116FA90AF5EFFE39364ED136DD6041AB8264252AE` | GUI未起動・XPLT未読込 |
 
 FEBioのexit 1はそのまま記録する。stdoutの版表示が得られたという観測であり、solver起動正常、解析成功、XPLT生成、FBS、Studio読込の証拠ではない。solverのraw stdout SHA-256は`374271884EBF61519CC964AB46CE820017DB4898E8CB4AD70340D0B0DC11B7A4`である。
