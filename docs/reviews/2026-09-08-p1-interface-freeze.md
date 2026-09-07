@@ -63,6 +63,16 @@ still obtain a fresh independent whole-candidate review before integration.
   candidate's static checks and smoke are not presented as clean evidence for
   the later commit.
 
+Historical attribution correction: the original static GREEN at
+17:58:43.237Z ran against dirty parent 5999998 plus the test changes, before
+the f15e9c2 commit at 17:58:55.189Z; it is not clean evidence for f15e9c2.
+The original 18:00:02.364Z smoke used a venv interpreter with an inline
+command from the source checkout, without -I or an import-origin assertion,
+and used python -m febio_cae --version rather than the installed
+febio-cae.exe. The supported original results are the full 1,025-test pass
+and focused 19-test pass only. The original failure records remain preserved
+in the ignored coordination evidence.
+
 ## Frozen API and ownership split
 
 - artifacts.py owns SourceAssetRef, SourceAssetContent,
@@ -208,10 +218,15 @@ C:\Users\backo\.codex\worktrees\8dd5\CAE-harness\.local\verification\P1-IF-R1-wh
 The venv and wheel install both exited 0. The executable was run from
 .local/verification/P1-IF-R1-installed-cwd-final-01, outside the source
 package path, and printed febio-cae 0.1.0 with exit 0. The isolated public
-construction record was:
+construction record was P1-IF-R1-installed-import-final-01. Its exact argv,
+cwd, unset PYTHONPATH/PYTHONHOME, HEAD, exit code, and raw stream paths are
+in .local/coordination/runs/P1-IF-R1-installed-import-final-01/metadata.json;
+the inline script round-tripped a minimal CaseDraft through the public codec,
+checked the installed import origin, and constructed TrustedOwnerContext and
+RunnerPort.
 
 ~~~text
-C:\Users\backo\.codex\worktrees\8dd5\CAE-harness\.local\verification\P1-IF-R1-wheel-venv-final-01\Scripts\python.exe -I -c "installed codec/ports construction and origin assertion"
+C:\Users\backo\.codex\worktrees\8dd5\CAE-harness\.local\verification\P1-IF-R1-wheel-venv-final-01\Scripts\python.exe -I -c [inline smoke script recorded in metadata.json]
 ~~~
 
 Record P1-IF-R1-installed-import-final-01 exited 0 with PYTHONPATH and
