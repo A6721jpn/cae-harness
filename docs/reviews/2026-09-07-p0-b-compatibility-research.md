@@ -2,7 +2,8 @@
 
 日付: 2026-09-07
 対象: FEBio CAE Harness V2 の P0-B 公式互換性調査
-対象コミット: `0cc803a6c5a568172662592e5ec932b9c7d09112`
+調査時点対象コミット: `0cc803a6c5a568172662592e5ec932b9c7d09112`
+独立レビュー修正ベース: `d88c6e9debb7d8f8dd9be58860e938b82b3952b0`
 ブランチ: `codex/p0-b-compatibility-research`
 remote: `https://github.com/A6721jpn/cae-harness.git`（`REMOTE_CONFIGURED`）
 
@@ -12,7 +13,7 @@ remote: `https://github.com/A6721jpn/cae-harness.git`（`REMOTE_CONFIGURED`）
 
 したがって、本記録の判定は次のとおりとする。
 
-> `P0-B DOCUMENTARY BASELINE COMPLETE; NATIVE COMPATIBILITY UNVERIFIED; P0 NOT READY`
+> `P0-B DOCUMENTARY RESEARCH RECORDED; INDEPENDENT REVIEW REQUIRED; NATIVE COMPATIBILITY UNVERIFIED; P0 NOT READY`
 
 公式資料を根拠に候補を実装可能と宣言してはならない。P0の対応表では、以下をすべて `UNVERIFIED` のまま保持する。
 
@@ -48,8 +49,8 @@ remote: `https://github.com/A6721jpn/cae-harness.git`（`REMOTE_CONFIGURED`）
 |---|---|---|---|
 | GMSH | [Gmsh 4.15.2 Reference Manual](https://gmsh.info/doc/texinfo/gmsh.html) | OpenCASCADEによるSTEP/IGES取込、`SetFactory("OpenCASCADE")`、`ShapeFromFile`、`Geometry.OCCTargetUnit`、順序付き要素節点、要素型11の10節点二次四面体、要素プロパティ・面・辺のAPI | FEBio用のTet10節点順、面順、FEBio入力生成、ローカル実体の適合性 |
 | FBIO-CLI | [FEBio User Manual 4.9 — Command line options](https://help.febio.org/docs/FEBioUser-4-9/UM49-Section-2.3.html) | `febio4`の`-i`入力、`-p` plot、`-o` log、`-silent`、`-noappend`、`-norun`等。`-p`は主結果のバイナリplot、`-o`はlogとして説明される | 実際に登録された実行ファイル、版・ハッシュ、引数の受理、終了コード、出力の完全性 |
-| FBIO-XPLT | [FEBio User Manual 4.9 — Appendix D](https://help.febio.org/docs/FEBioUser-4-9/UM49-Appendix-D.html) と [D.1](https://help.febio.org/docs/FEBioUser-4-9/UM49-Section-D.1.html)、[D.1.1](https://help.febio.org/docs/FEBioUser-4-9/UM49-Subsection-D.1.1.html)、[D.2](https://help.febio.org/docs/FEBioUser-4-9/UM49-Section-D.2.html)、[D.2.1](https://help.febio.org/docs/FEBioUser-4-9/UM49-Subsection-D.2.1.html)、[D.2.2](https://help.febio.org/docs/FEBioUser-4-9/UM49-Subsection-D.2.2.html)、[D.3](https://help.febio.org/docs/FEBioUser-4-9/UM49-Section-D.3.html)、[D.3.1](https://help.febio.org/docs/FEBioUser-4-9/UM49-Subsection-D.3.1.html)、[D.3.2](https://help.febio.org/docs/FEBioUser-4-9/UM49-Subsection-D.3.2.html)、[D.4](https://help.febio.org/docs/FEBioUser-4-9/UM49-Section-D.4.html)、[D.5](https://help.febio.org/docs/FEBioUser-4-9/UM49-Section-D.5.html)、[D.5.2](https://help.febio.org/docs/FEBioUser-4-9/UM49-Subsection-D.5.2.html) | v3.0、自記述・拡張可能な構造、`0x00464542` root tag、`ROOT/MESH/STATE`階層、header/dictionary、型・storage format、node/domain/surface/globalの配置、stateデータ、圧縮フラグの位置づけ | readerの実装、圧縮decoder、版差分、エンディアン・破損・切断への拒否、物理単位・符号、要求変数の意味 |
-| FBIO-FEATURE | [FEBio 4.13 Feature Manual](https://febiosoftware.github.io/febio-feature-manual/) の [isotropic elastic](https://febiosoftware.github.io/febio-feature-manual/features/solid_material_isotropic_elastic/)、[neo-Hookean](https://febiosoftware.github.io/febio-feature-manual/features/solid_material_neo-hookean/)、[rigid body](https://febiosoftware.github.io/febio-feature-manual/features/solid_material_rigid_body/)、[prescribed displacement](https://febiosoftware.github.io/febio-feature-manual/features/solid_bc_prescribed_displacement/)、[sliding-elastic](https://febiosoftware.github.io/febio-feature-manual/features/solid_surfaceinteraction_sliding-elastic/)、[plot variables](https://febiosoftware.github.io/febio-feature-manual/plotvars/) | 候補の入力type、代表パラメータ、処方変位、Sliding-Elastic、代表的なplot変数の公式語彙 | 4.13の語彙が登録環境で受理されること、要素・接触・拘束との組合せ、数値品質、readerでの意味の復元 |
+| FBIO-XPLT | [FEBio User Manual 4.9 — Appendix D](https://help.febio.org/docs/FEBioUser-4-9/UM49-Appendix-D.html) と [D.1](https://help.febio.org/docs/FEBioUser-4-9/UM49-Section-D.1.html)、[D.1.1](https://help.febio.org/docs/FEBioUser-4-9/UM49-Subsection-D.1.1.html)、[D.2](https://help.febio.org/docs/FEBioUser-4-9/UM49-Section-D.2.html)、[D.2.1](https://help.febio.org/docs/FEBioUser-4-9/UM49-Subsection-D.2.1.html)、[D.2.2](https://help.febio.org/docs/FEBioUser-4-9/UM49-Subsection-D.2.2.html)、[D.3](https://help.febio.org/docs/FEBioUser-4-9/UM49-Section-D.3.html)、[D.3.1](https://help.febio.org/docs/FEBioUser-4-9/UM49-Subsection-D.3.1.html)、[D.3.2](https://help.febio.org/docs/FEBioUser-4-9/UM49-Subsection-D.3.2.html)、[D.4](https://help.febio.org/docs/FEBioUser-4-9/UM49-Section-D.4.html)、[D.5](https://help.febio.org/docs/FEBioUser-4-9/UM49-Section-D.5.html)、[D.5.2](https://help.febio.org/docs/FEBioUser-4-9/UM49-Subsection-D.5.2.html) | フォーマット仕様v3.0（D.1.1）、先頭DWORDのFEBio file identifier/magic `0x00464542`（sizeなし、D.2.2）、その後の`ROOT` block `0x01000000`、通常blockのID+size+payload（D.2.1）、`ROOT/MESH/STATE`階層、header/dictionary、型・storage format、node/domain/surface/globalの配置、stateデータ、圧縮フラグの位置づけ | readerの実装、圧縮decoder、版差分、エンディアン・破損・切断への拒否、物理単位・符号、要求変数の意味 |
+| FBIO-FEATURE | [FEBio 4.13 Feature Manual](https://febiosoftware.github.io/febio-feature-manual/) の [isotropic elastic](https://febiosoftware.github.io/febio-feature-manual/features/solid_material_isotropic_elastic/)、[neo-Hookean](https://febiosoftware.github.io/febio-feature-manual/features/solid_material_neo-hookean/)、[rigid body](https://febiosoftware.github.io/febio-feature-manual/features/solid_material_rigid_body/)、[prescribed displacement](https://febiosoftware.github.io/febio-feature-manual/features/solid_bc_prescribed_displacement/)、[rigid_displacement](https://febiosoftware.github.io/febio-feature-manual/features/solid_bc_rigid_displacement/)、[sliding-elastic](https://febiosoftware.github.io/febio-feature-manual/features/solid_surfaceinteraction_sliding-elastic/)、[plot variables](https://febiosoftware.github.io/febio-feature-manual/plotvars/) | 候補の入力type、代表パラメータ、node BC、rigid BC、Sliding-Elastic、代表的なplot変数の公式語彙 | 4.13の語彙が登録環境で受理されること、要素・接触・拘束との組合せ、数値品質、readerでの意味の復元 |
 | STUDIO | [FEBio Studio 2.8 — The Post Environment UI](https://help.febio.org/docs/FEBioStudio-2-8/FSM28-Section-13.1.html) | plot読込後にPost環境へ移り、Model/Buildを隠し、View/Material/Data/StateのPost機能を示す | ローカルStudioの起動、対象XPLTの読込、最終stateと必要変数の表示、確認証拠の取得方法 |
 | RELEASE | [FEBio official releases](https://github.com/febiosoftware/FEBio/releases) | plot形式がAppendix Dで説明されること、`noappend`や圧縮関連のリリース差分があること | 現在の登録版、ローカルでの版差分の影響、readerの互換性 |
 
@@ -63,12 +64,13 @@ remote: `https://github.com/A6721jpn/cae-harness.git`（`REMOTE_CONFIGURED`）
 | Gmsh Tet10 | MSH type 11は10節点二次四面体。Gmshは順序付きnode listと要素・面・辺の局所順を扱う | FEBioの要素語彙、節点順、面節点順、面法線、要素ID、集合、曲面近似、退化、Jacobianを独立に検証する。Gmshの順序をそのままFEBio順とみなさない | `Published` / 変換は`UNVERIFIED` |
 | 等方線形弾性 | `isotropic elastic`とE/vの公式語彙がある。小ひずみ線形への還元と大ひずみ適用上の注意が説明される | E、v、単位、domain、解析設定、出力変数、参照解との誤差、適用ひずみ範囲をprofileとして登録する | `Published` / 組合せは`UNVERIFIED` |
 | 圧縮性neo-Hookean | `neo-Hookean`のtype、密度/E/v、超弾性としての説明がある。非圧縮に近い条件の注意がある | パラメータ変換、単純変形の解析参照、エネルギー・応力の整合、収束、出力測度を確認する | `Published` / 組合せは`UNVERIFIED` |
-| 剛体治具 | `rigid body`、密度、E/v、COM等の語彙がある。初期自由度と接触用の設定が説明される | 独立メッシュ、6自由度の拘束・処方・自由の解決、COM、反力・トルクの履歴、部品とのnode共有禁止を確認する | `Published` / 実行は`UNVERIFIED` |
-| 処方変位 | `prescribed displacement`、DOF、value、relativeの語彙がある。反力取得には処方変位が必要と説明される | 変位の符号、zeroと未指定の区別、load controller、押込み深さ、反力符号を既知解で確認する | `Published` / 実行は`UNVERIFIED` |
+| 剛体治具 | `rigid body`、密度、E/v、COM等の語彙がある。初期自由度と接触用の設定が説明される | 独立メッシュ、剛体material参照、並進・回転6自由度の拘束・処方・自由の解決、COM、剛体position/force/torqueの履歴、部品とのnode共有禁止を確認する | `Published` / 実行は`UNVERIFIED` |
+| node_setの処方変位 | `prescribed displacement`はnode_setに対するnodal displacement BCで、DOF、value、relativeの語彙がある。node reactionが必要な場合はzeroでもこのBCを使うと説明される | `<bc type="prescribed displacement" node_set="...">`と`zero displacement`を区別し、nodeの変位、node reaction、符号、load controller、押込み深さを既知解で確認する。これは剛体運動BCの根拠に拡張しない | `Published` / 実行は`UNVERIFIED` |
+| rbの剛体運動BC | `rigid_displacement`は`rb`で指定したrigid materialの剛体DOFを処方し、`dof`、`value`、`relative`を持つ。剛体の回転・固定は別のrigid BC語彙で扱う | `<rigid_bc type="rigid_displacement">`と`rb`、並進3DOF、回転3DOF、固定条件、rigid position/force/torqueの所属・符号をnode BCと別probeで確認する | `Published` / 実行は`UNVERIFIED` |
 | 接触 | `sliding-elastic`はfacet-on-facetの滑り・摩擦接触。`fric_coeff`、tension、ALM/penalty等の語彙がある | primary/secondary、法線、摩擦、penalty等、初期gap、食い込み、力の釣り合い、摩擦の滑り・固着を実行で確認する | `Published` / 組合せは`UNVERIFIED` |
 | 出力変数 | 変位、応力、Lagrange strain、nodal strain/stress、reaction、rigid position/force/torque、contact area/force/gap/pressure/status/traction等の候補がある | 実版の正確な名前、global/node/domain/surface、NODE/ITEM/MULT、状態番号、積分点と節点、単位、符号をreader契約へ固定する | `Published` / 必須変数は`UNVERIFIED` |
 | CLI実行 | `-i`、`-p`、`-o`等の公式CLI語彙がある。`-noappend`等の出力管理オプションがある | 絶対パス、版・ハッシュ、引数配列、cwd、終了コード、log、plotの所属・freshness、stale/truncated/改変拒否を記録する | `Published` / ローカルは`UNVERIFIED` |
-| XPLT構造 | v3.0、header/dictionary、root tag、mesh/state、storage format、圧縮フラグ等が説明される | エンディアン、block長、dictionary、圧縮/非圧縮、mesh/state、region、storage、状態、必要変数を専用readerで解釈し、未知形式を拒否する | `Published` / readerは`UNVERIFIED` |
+| XPLT構造 | フォーマット仕様v3.0、先頭file identifier/magic `0x00464542`（sizeなし）、`ROOT` block `0x01000000`、通常blockのID+size+payload、header/dictionary、mesh/state、storage format、圧縮フラグ等が説明される | magicと通常のROOT blockを別段階で読み、エンディアン、block長、dictionary、圧縮/非圧縮、mesh/state、region、storage、状態、必要変数を専用readerで解釈し、未知形式を拒否する | `Published` / readerは`UNVERIFIED` |
 | XPLTの物理意味 | XPLTの構造・変数配置は説明される | ケースの単位・測度・符号をmanifestと同じ試行に結び付け、logまたは解析解と独立照合する。平滑化値を評価値へ無断転用しない | `Inference` / `UNVERIFIED` |
 | Studio preview | plot読込後のPost環境と表示領域が公式説明される | `LAUNCHED`と`CONFIRMED`を分離し、XPLT hash、Studio版、最終state、必要変数の視認証拠を記録する | `Published` / 実機は`UNVERIFIED` |
 
@@ -79,15 +81,23 @@ remote: `https://github.com/A6721jpn/cae-harness.git`（`REMOTE_CONFIGURED`）
 ### 5.1 環境同定
 
 1. 登録されたGmsh、FEBio、FEBio Studioの絶対パス、版表示、実行ファイルhash、関連plugin/library、実行機を取得する。
-2. FEBioのCLIで`-info`相当の版表示、最小入力、`-norun`、`-noappend`の受理を個別に記録する。
+2. 公式CLI例に合わせ、`febio4 -info -norun`で版情報を取得し、最小入力、`-norun`、`-noappend`の受理を個別に記録する。これは版表示・入力検査のprobeであり、解析成功ではない。
 3. どれか一つでも実体、版、hash、登録根拠が欠ける場合、後続の能力を`verified`にしない。
 
 ### 5.2 Gmsh形状・単位probe
 
-1. 既知寸法の合成primitiveと、許可された合成STEPをGmshへ入力する。
+[Gmsh 4.15.2 OpenCASCADE API](https://gmsh.info/doc/texinfo/gmsh.html#Namespace-gmsh_002fmodel_002focc)に記載された`addSphere`、`addCylinder`、`addBox`を、互いに独立した小さい合成probeとして使用する。以下の寸法はmmを想定した`Assumption`/`Synthetic reference`であり、実生成・実測結果ではない。
+
+| probe | API入力（nominal mm） | 期待する姿勢・bbox | 解析的な期待体積 |
+|---|---|---|---|
+| 球 | `addSphere(0, 0, 0, 10)`。中心 `(0,0,0)`、半径10 | 任意方向で同じ。`[-10,10] × [-10,10] × [-10,10]` | `4/3*pi*10^3 = 4000*pi/3 ≈ 4188.790 mm³` |
+| 円柱 | `addCylinder(0, 0, 0, 0, 0, 20, 5)`。底面中心 `(0,0,0)`、軸ベクトル `(0,0,20)`、半径5 | z軸方向。`[-5,5] × [-5,5] × [0,20]` | `pi*5^2*20 = 500*pi ≈ 1570.796 mm³` |
+| 直方体 | `addBox(0, 0, 0, 10, 20, 30)`。基点 `(0,0,0)`、x/y/z方向の辺長 `(10,20,30)` | 座標軸方向。`[0,10] × [0,20] × [0,30]` | `10*20*30 = 6000 mm³` |
+
+1. 各形状を別tag・別modelとして生成し、元の入力寸法、位置、軸または姿勢、最高次元entity、solid/body数、bbox、体積、面集合を記録する。形状同士をfuseせず、治具と部品を結合・節点共有しない。
 2. OpenCASCADE経路で得られた最高次元entity、solid/body数、面集合、bbox、向きを記録する。
-3. 元単位と`Geometry.OCCTargetUnit`の変換を既知寸法で照合し、単位不明の入力は停止する。
-4. 生成メッシュのelement type、node list、entity orientation、face/edge node listをAPI結果と保存する。
+3. 元単位と`Geometry.OCCTargetUnit`の変換を既知寸法で照合する。例えばmm入力をmへ変換する場合、bboxの各長さを`1e-3`倍、体積を`1e-9`倍として期待値を再計算し、単位不明の入力は停止する。
+4. 生成メッシュのelement type、node list、entity orientation、face/edge node listをAPI結果と保存する。APIの存在・引数仕様を確認したことは、ローカル版での実生成成功を意味しない。
 
 ### 5.3 Tet10・面・Jacobian probe
 
@@ -98,14 +108,16 @@ remote: `https://github.com/A6721jpn/cae-harness.git`（`REMOTE_CONFIGURED`）
 
 ### 5.4 材料・既知解probe
 
-計画書の合成弾性patchを用いる。これは製品の合成検証条件であり、実部品の材料値ではない。
+計画書の[5.1 均一ひずみの弾性パッチ試験](../plans/2026-08-27-febio-cae-harness-greenfield-plan.md#51-均一ひずみの弾性パッチ試験)を用いる。これは製品の合成検証条件であり、実部品の材料値ではない。圧縮軸をxとすると、期待する均一場は軸ひずみ `-delta/L = -0.001`、Poisson横ひずみ `+nu*delta/L = +0.0003` であり、底面全面固定をこの解析解の代用にしない。単軸応力と整合する境界を全体で定義し、代表応力と反力の相対誤差1%以内、変位場と向きの一致を別々に判定する。
 
 | 条件 | 値・参照 |
 |---|---|
 | 材料 | E = 1 MPa、nu = 0.3 |
 | 形状・変位 | L = 10 mm、A = 100 mm²、delta = 0.01 mm |
 | 独立参照 | `F = E A delta / L = 0.100 N` |
-| 適用範囲 | 小ひずみ、等方線形弾性、均一場、接触なし |
+| 均一場の参照 | 軸ひずみ `-0.001`、横ひずみ `+0.0003`、軸応力の大きさ `E*delta/L = 0.001 MPa` |
+| 適用範囲 | 小ひずみ、等方線形弾性、均一場、接触なし。底面全面固定で代用しない |
+| 合格基準 | 反力・代表応力の相対誤差1%以内、変位場と向きの一致 |
 
 FEBioの最終反力が0.100 Nになることだけで合格とせず、入力語彙、支持、変位、変位量、反力符号、要求出力、log/XPLTの一致を同時に確認する。
 
@@ -113,10 +125,18 @@ FEBioの最終反力が0.100 Nになることだけで合格とせず、入力�
 
 ### 5.5 剛体・処方変位・反力probe
 
-1. 独立メッシュの剛体治具を用い、並進3・回転3自由度の各状態を明示する。
-2. prescribed displacementを用いた既知運動で、zero、relative、load controller、最終位置を区別する。
-3. rigid position/force/torque、prescribed node reaction、全体の力の釣り合いを比較する。
-4. 処方変位がないと反力を取得できないケース、COM指定と自動COM、部品とのnode共有を含む境界を個別に確認する。
+候補語彙と対象を混同しないため、node_set向けBCとrb向け剛体BCを別probeにする。
+
+| 対象 | 候補語彙 | 対象・主な確認値 |
+|---|---|---|
+| 部品のnode_set | `prescribed displacement`、`<bc type="prescribed displacement" node_set="...">` | nodeのDOF、`value`、`relative`、zeroと未指定、node reaction、変位場、反力符号。node reactionが必要な場合はzeroでもprescribed displacementを使うという公式説明を検証する |
+| 剛体material | `rigid_displacement`、`<rigid_bc type="rigid_displacement">`、`rb`、`dof`、`value`、`relative` | rigid materialに結び付いた並進x/y/z、剛体position、rigid force/torque、所属・符号。これはnode_setのprescribed displacementとは別の語彙である |
+| 剛体の回転・固定 | `rigid_euler_angles`、`rigid_rotation`、`rigid_fixed`等の対応版語彙 | 回転x/y/z、固定・自由の6DOF、COM、rigid position/force/torque。正確な受理語彙と出力所属はnative probeで確認する |
+
+1. 独立メッシュの剛体治具を用い、並進3・回転3自由度を、node_set BC、rigid BC、固定、自由の各意味に分けて明示する。
+2. node_setの既知変位probeではzero、relative、load controller、node reaction、最終位置を確認する。剛体の既知運動probeでは`rigid_displacement`の`rb`、`dof`、`value`、`relative`、rigid position/force/torqueを確認する。
+3. 部品のprescribed node reactionと剛体のrigid force/torqueを別の出力として、全体の力・モーメントの釣り合いとともに比較する。node向けの「反力取得にはprescribed displacementが必要」という説明を、剛体反力へ無条件に拡張しない。
+4. COM指定と自動COM、回転固定、部品とのnode共有禁止を含む境界を個別に確認する。公式語彙を資料から確認しただけでは、登録版での実行や数値符号を`verified`にしない。
 
 ### 5.6 接触・摩擦probe
 
@@ -131,10 +151,11 @@ Hertz参照は小変形・弾性・小接触領域・十分大きい試験片の
 ### 5.7 XPLT reader probe
 
 1. 同一の合成実行から、非圧縮と圧縮のXPLTを取得できる場合は両方を保存し、取得できない形式は未対応として記録する。
-2. root tag、version、header、dictionary、mesh、state、block長、endian、compression、region、storage format、node/domain/surface/global、state番号を段階的に検証する。
-3. 必須の変位、応力・ひずみ、剛体履歴、接触診断の存在、型、配置、状態、単位、符号を確認する。
-4. 切断、長さ改変、dictionary改変、古いrunのファイル差替え、hash不一致、未知version、未知compressionを拒否する。
-5. readerの数値は、同じ試行のlog、単純な解析参照、力の釣り合い、要素積分または独立計算と照合する。readerが読めたことだけを正しさの証拠にしない。
+2. フォーマット仕様v3.0とFEBio User Manual 4.9を混同しない。まず先頭DWORDのfile identifier/magic `0x00464542`をsizeなしで検証し、その直後に通常blockのsizeを読まない。次に`ROOT` block `0x01000000`を通常blockとして検証し、以降の通常blockをID+size+payloadとして読む。
+3. `ROOT` block、version、header、dictionary、mesh、state、block長、endian、compression、region、storage format、node/domain/surface/global、state番号を段階的に検証する。
+4. 必須の変位、応力・ひずみ、剛体履歴、接触診断の存在、型、配置、状態、単位、符号を確認する。
+5. 切断、長さ改変、dictionary改変、古いrunのファイル差替え、hash不一致、未知version、未知compressionを拒否する。
+6. readerの数値は、同じ試行のlog、単純な解析参照、力の釣り合い、要素積分または独立計算と照合する。readerが読めたことだけを正しさの証拠にしない。
 
 XPLT Appendix Dの記述から圧縮decoderの互換性を推論してはならない。圧縮実データを取得し、版・hashを固定した実行でreaderを検証するまで、圧縮対応は`UNVERIFIED`である。
 
@@ -145,23 +166,51 @@ XPLT Appendix Dの記述から圧縮decoderの互換性を推論してはなら�
 3. 読込確認には、XPLT hash、Studio版・hash、対象state、表示した変数、確認者または確認手順、時刻、必要な画面証拠を付ける。
 4. 起動できても読込できない、別ファイルを表示した、古いstateを表示した、必要変数がない場合は`FAILED`または`UNVERIFIED`であり、成功扱いにしない。
 
-## 6. P0合格ゲートと現状
+## 6. 権威Gateとの対応と現状
 
-| ゲート | 合格に必要な証拠 | 現状 |
-|---|---|---|
-| ENV-01 | Gmsh/FEBio/Studioの絶対パス、版、hash、登録根拠 | `UNVERIFIED` |
-| GM-01 | 合成STEP取込、単位、最高次元tag、bbox、面集合の実測 | `UNVERIFIED` |
-| GM-02 | Tet10節点・面順、法線、Jacobian、退化・負値の独立検証 | `UNVERIFIED` |
-| FB-01 | 候補材料・剛体・支持・接触の実入力、実行、結果 | `UNVERIFIED` |
-| FB-02 | 処方変位、反力、剛体位置・力・トルクの既知解と符号 | `UNVERIFIED` |
-| FB-03 | XPLT header/dictionary/mesh/state/圧縮/必須変数と改変拒否 | `UNVERIFIED` |
-| QA-01 | 弾性patchの0.100 N、接触参照の0.00463 N、収束・釣り合い | `UNVERIFIED` |
-| QA-02 | 摩擦なし・摩擦あり・neo-Hookeanのprofile別基準 | `UNVERIFIED` |
-| VW-01 | Studioの起動記録と対象XPLTの人による読込確認 | `UNVERIFIED` |
-| P0-LOCAL | 指定pytest、ruff、mypy、CAE boundary、build、installed smoke | `UNEXECUTED` |
-| E2E-03 | 許可済み実モデルと最終BottomFrameのfreshな全経路 | `UNVERIFIED` |
+次表は[実装・検証計画のGate表](../plans/2026-08-27-febio-cae-harness-greenfield-plan.md#4-検証の種類と範囲)のID・種類・意味を保持したものである。P0-Bの文書調査では、これらの権威Gateを新しいprobe名や数値結果で置換しない。`UNEXECUTED`は今回の実行対象外、`UNVERIFIED`は実機・実行・結果の証拠がまだないことを示す。
 
-P0の実装へ進む場合も、合成probeの合格を実製品経路の成功、実FEBio/FBSの成功、Studio確認、実モデルE2Eの成功へ置き換えてはならない。計画書どおり、P0 probeは製品経路の成功に数えず、アダプター実装後のP3・P6で再実行する。
+| 権威Gate | 種類 | 権威計画が確認する振る舞い | 現状 |
+|---|---|---|---|
+| CT-01 | unit | 物理根拠、単位、schema、対応範囲、必須値、未指定とゼロ | `UNEXECUTED` |
+| CT-02 | unit/component | 草案世代、質問の一度だけの適用、親版一致、登録からの実行権限 | `UNEXECUTED` |
+| CT-03 | component | 原子的保存、二重起動防止、リンク・パス境界、失敗後の復旧 | `UNEXECUTED` |
+| GM-01 | component/native | STEP単位・ボディ選択と、3種類の剛体生成の寸法・姿勢 | `UNVERIFIED` |
+| GM-02 | component/native | 領域、節点順、面方向、Tet10、接触面の非共有、品質 | `UNVERIFIED` |
+| GM-03 | component/native | 再メッシュの領域継承、形状変更での再解決、キャッシュ改変検出 | `UNVERIFIED` |
+| FB-01 | component/native | 材料・剛体・支持・接触・運動・出力要求のFEBio変換 | `UNVERIFIED` |
+| FB-02 | component/native | 実行の所有、子孫の排出、停止、タイムアウト、残存プロセス | `UNVERIFIED` |
+| FB-03 | component/native | stale/truncated/改変出力の拒否、XPLT必須変数・状態、反力符号 | `UNVERIFIED` |
+| QA-01 | native | 合成の既知解・接触参照解・メッシュ依存性・釣り合い | `UNVERIFIED` |
+| VW-01 | native/manual | 公式Studioで対象XPLT、最終状態、変位等の読込・表示確認 | `UNVERIFIED` |
+| AI-01 | component | 自然言語からの提案、根拠不明時の質問、LLM出力のスキーマ・権限検証 | `UNEXECUTED` |
+| AI-02 | native | 実際のLLM接続から日本語意図→草案→質問→版確定までの経路 | `UNEXECUTED` |
+| RV-01 | component/native | 元版保存、型付き差分、再解析、変更依存性と予算 | `UNEXECUTED` |
+| CP-01 | component/native | 共通移動量、単位・領域・測度、意図した差分、ゼロ基準値、補間範囲 | `UNEXECUTED` |
+| PK-01 | local/installed | 全ローカルゲート、wheelの起動、インストール先からのimport | `UNEXECUTED` |
+| E2E-01 | installed/native | 合成STEP→実FEBio→検証→Studio→部分変更→比較 | `UNVERIFIED` |
+| E2E-02 | installed/real model | 許可された実STEPの同じ全経路 | `UNVERIFIED` |
+| E2E-03 | installed/real model | 最終BottomFrameケースの全経路と指定の品質・比較 | `UNVERIFIED` |
+
+P0-Bで使う独自probe識別子は、権威Gateの代わりではなく、対応する部分証拠を追跡するためのローカル名である。
+
+| 独自probe ID | 対応する権威Gate | このprobeで示す部分 | このprobe単独で満たさないもの |
+|---|---|---|---|
+| `P0B-ENV-01` | GM-01、FB-01、VW-01、PK-01 | Gmsh/FEBio/Studioの実体・版・hash・登録根拠 | 各Gateの実行、ライフサイクル、wheel全経路 |
+| `P0B-GM-CAD-01` | GM-01 | 3種類のOpenCASCADE primitiveの寸法・姿勢・bbox・体積と単位期待値 | STEPの実ボディ選択、実Gmsh、3種生成の製品変換 |
+| `P0B-GM-TET10-01` | GM-02 | Tet10節点・面順、面方向、Jacobian、非共有接触面の独立チェック | 再メッシュ・cache、FEBio受理、全GM-02品質 |
+| `P0B-FB-FEATURE-01` | FB-01 | 材料・剛体・node BC・rigid BC・接触の候補語彙の対応 | 登録版での受理、実変換、実行、出力の正しさ |
+| `P0B-FB-NODE-BC-01` | FB-01、FB-03、QA-01 | node_setのprescribed displacement、node reaction、zero/relativeの部分確認 | 剛体の6DOF、process ownership、XPLT必須変数全体 |
+| `P0B-FB-RB-BC-01` | FB-01、QA-01 | `rigid_displacement`、`rb`、剛体位置・力・トルク、回転・固定の部分確認 | node BC、FB-02の停止・drain・timeout、全FB-01 |
+| `P0B-FB-XPLT-01` | FB-03、QA-01 | magic/ROOT、dictionary、mesh/state、圧縮、要求変数、独立数値照合の部分確認 | stale/truncated/改変出力の全拒否、実readerの版互換性 |
+| `P0B-QA-ELASTIC-01` | QA-01 | 均一場、Poisson収縮、反力・代表応力の1%参照 | 実native解析、FB-02、P0全体 |
+| `P0B-QA-HERTZ-01` | QA-01 | Hertz反力、境界・メッシュ依存性、摩擦なし接触の部分確認 | 実native解析、摩擦profile、E2E-01/02/03 |
+| `P0B-QA-PROFILE-01` | FB-01、QA-01 | 摩擦あり、neo-Hookean、接触・剛体運動のprofile別基準 | 権威Gateの全入力・process・reader証拠 |
+| `P0B-VW-STUDIO-01` | VW-01 | 起動と対象XPLT・最終state・必要変数の読込確認計画 | 実Studio読込、E2E-01、E2E-02、E2E-03 |
+
+上表の独自probeはすべて現状未実施であり、対応する権威Gateを合格扱いにしない。特にFB-02は数値結果ではなく、実行所有権、子孫プロセス排出、停止、timeout、残存プロセスの証拠が必要である。E2E-02は許可された一般real STEP、E2E-03は最終BottomFrameであり、同じ行や同じ証拠へ混合しない。P0-BはP3/P6/P7の完了を宣言せず、P0 probeの合格を製品経路の成功、実FEBio/FBSの成功、Studio確認、実モデルE2Eの成功へ置き換えない。
+
+独立した合成モデルを実FEBioで実行できた場合は、モデルの出所、実行backend、結果reader、viewerを別項目に記録した`native probe`として報告する。それは実FEBioの合成probe証拠であり、製品経路、公式FBS、E2E-01、許可された実モデル、E2E-03を完了したことを意味しない。
 
 ## 7. 実施記録の境界
 
@@ -170,7 +219,7 @@ P0の実装へ進む場合も、合成probeの合格を実製品経路の成功�
 - 製品の2権威文書からP0互換性要求、合成参照値、未検証の扱いを確認した。
 - Gmsh、FEBio User/Feature、FEBio Studioの公式資料を版付きで調査した。
 - 公式資料の語彙と、製品アダプターが独自に検証すべき境界を対応表へ整理した。
-- 次の合成probe、独立数値照合、Studio確認、P0ゲートを定義した。
+- 次の合成probe、独立数値照合、Studio確認、権威Gateとの対応を定義した。
 
 ### 実施していないこと
 
@@ -182,4 +231,4 @@ P0の実装へ進む場合も、合成probeの合格を実製品経路の成功�
 - Studioの起動、対象XPLTの読込確認、画面証拠の収集。
 - 製品実装、製品pytestのRED/GREEN、ruff、mypy、CAE境界スキャナー、build、installed smoke。
 
-従って、本記録には実測の合格件数、実行時間、性能値、解析結果はない。次タスクは、P0の実装・検証担当がこの記録のENV/GM/FB/QA/VWゲートを実環境で実施し、実体・版・hash・コマンド・件数・終了コード・未検証項目を対応表へ固定することである。
+従って、本記録には実測の合格件数、実行時間、性能値、解析結果はない。次タスクは、P0の実装・検証担当が独自probe IDを実環境で実施し、対応する権威Gate（GM-01/02、FB-01/02/03、QA-01、VW-01、必要なPK-01/E2E-01等）ごとに、実体・版・hash・コマンド・件数・終了コード・未検証項目を固定することである。P0-Bの文書判定は独立レビュー待ちであり、P0・P3・P6・P7やE2E-02/E2E-03の完了を宣言しない。
