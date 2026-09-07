@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import importlib
-import os
 import sys
 import time
 from dataclasses import replace
@@ -16,15 +15,11 @@ from febio_cae.domain import (
     AttemptRecord,
     CapabilityStatus,
     ExecutionBundle,
-    ExecutionSetting,
-    FileEntry,
     ProcessIdentity,
     RunState,
     ToolIdentity,
     TrustedOwnerContext,
 )
-from febio_cae.domain.quality_policy import QualityThreshold
-from febio_cae.domain.results import ResultDataRef
 
 from .fixtures import make_mesh, make_profile, make_revision, make_xplt_fixture
 
@@ -33,7 +28,9 @@ def _module(name: str) -> Any:
     return importlib.import_module(name)
 
 
-def _attempt(bundle: ExecutionBundle, revision: Any, cwd: Path, *, state: RunState) -> AttemptRecord:
+def _attempt(
+    bundle: ExecutionBundle, revision: Any, cwd: Path, *, state: RunState
+) -> AttemptRecord:
     executable = Path(bundle.argv[0])
     digest = hashlib.sha256(executable.read_bytes()).hexdigest()
     process = ProcessIdentity(
@@ -120,13 +117,13 @@ def test_compiler_emits_owned_deterministic_bundle_and_identity(tmp_path: Path) 
     # Re-open the staged store to prove the bytes are not merely compiler metadata.
     content = store.resolve(bundle, "input/case.feb")
 
-    assert content.startswith(b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>")
-    assert b"<febio_spec version=\"4.12\">" in content
-    assert b"<material " in content and b"type=\"isotropic elastic\"" in content
-    assert b"<contact type=\"sliding-elastic\"" in content
+    assert content.startswith(b'<?xml version="1.0" encoding="UTF-8"?>')
+    assert b'<febio_spec version="4.12">' in content
+    assert b"<material " in content and b'type="isotropic elastic"' in content
+    assert b'<contact type="sliding-elastic"' in content
     assert b"<primary>tool-contact</primary>" in content
     assert b"<secondary>part-contact</secondary>" in content
-    assert b"<node id=\"1\"" in content and b"<elem id=\"2\" type=\"tet10\"" in content
+    assert b'<node id="1"' in content and b'<elem id="2" type="tet10"' in content
     assert b"<include" not in content
     assert bundle.spec_digest == revision.spec_digest
     assert bundle.mesh_digest == mesh.artifact_digest
@@ -148,8 +145,28 @@ def test_compiler_rejects_unverified_required_capability(tmp_path: Path) -> None
         store=compiler_module.LocalBundleStore(tmp_path / "bundles"), executable=sys.executable
     )
 
-    with pytest.raises(Exception, match="capabil"):
+    with pytest.raises(RuntimeError, match="capabil"):
         compiler.compile(revision, mesh, profile)
+
+
+def test_compiler_rejects_selection_mapping_that_loses_cross_record_identity(
+    tmp_path: Path,
+) -> None:
+    compiler_module = _module("febio_cae.adapters.febio.compiler")
+    revision = make_revision()
+    mesh = make_mesh(revision.spec)
+    tool_digest = mesh.sets[1].source_selection_digest
+    broken_sets = tuple(
+        replace(item, source_selection_digest=tool_digest) if item.body_id == "part-body" else item
+        for item in mesh.sets
+    )
+    broken_mesh = replace(mesh, sets=broken_sets)
+    compiler = compiler_module.CompilerAdapter(
+        store=compiler_module.LocalBundleStore(tmp_path / "bundles"), executable=sys.executable
+    )
+
+    with pytest.raises(RuntimeError, match="selection mapping"):
+        compiler.compile(revision, broken_mesh, make_profile(sys.executable))
 
 
 def test_reader_validates_binary_xplt_and_exposes_numeric_data(tmp_path: Path) -> None:
@@ -184,6 +201,9 @@ def test_reader_validates_binary_xplt_and_exposes_numeric_data(tmp_path: Path) -
     assert reaction.mapping.raw_sign == -1
     assert reaction.values[-1][-1] == pytest.approx(-2.0)
 
+    with pytest.raises(RuntimeError, match="before"):
+        reader.read(replace(attempt, state=RunState.RUNNING), bundle)
+
 
 @pytest.mark.parametrize(
     "mutation",
@@ -211,12 +231,40 @@ def test_reader_rejects_truncated_or_mutated_or_wrong_attempt_xplt(
     )
     reader = _module("febio_cae.adapters.febio.xplt_reader").XpltReaderAdapter(profile=profile)
 
-    with pytest.raises(Exception):
+    with pytest.raises(RuntimeError):
+        reader.read(_owned_attempt(bundle, revision, output_root), bundle)
+
+
+def test_reader_rejects_nonfinite_numeric_payload(tmp_path: Path) -> None:
+    revision, mesh, profile, bundle = _compiled(tmp_path)
+    output_root = tmp_path / "attempt-p3"
+    output_path = output_root / "output" / "results.xplt"
+    output_path.parent.mkdir(parents=True)
+    output_path.write_bytes(
+        make_xplt_fixture(
+            attempt_id="attempt-p3",
+            bundle_digest=bundle.bundle_digest,
+            mesh_digest=mesh.artifact_digest,
+            values={
+                "displacement": (
+                    ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0)),
+                    ((0.0, 0.0, float("nan")), (0.0, 0.0, 0.2)),
+                ),
+                "reaction forces": (
+                    ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0)),
+                    ((0.0, 0.0, 1.0), (0.0, 0.0, 2.0)),
+                ),
+            },
+        )
+    )
+    reader = _module("febio_cae.adapters.febio.xplt_reader").XpltReaderAdapter(profile=profile)
+
+    with pytest.raises(RuntimeError, match="nonfinite"):
         reader.read(_owned_attempt(bundle, revision, output_root), bundle)
 
 
 def test_runner_uses_owned_process_and_rejects_wrong_owner(tmp_path: Path) -> None:
-    revision, _mesh, profile, bundle = _compiled(tmp_path)
+    revision, _mesh, _profile, bundle = _compiled(tmp_path)
     runner_module = _module("febio_cae.adapters.febio.runner")
     ownership = _Ownership()
     runner = runner_module.RunnerAdapter(ownership=ownership, root=tmp_path / "runs")
@@ -226,7 +274,7 @@ def test_runner_uses_owned_process_and_rejects_wrong_owner(tmp_path: Path) -> No
     started = runner.start(bundle, owner, revision.spec.budget)
     assert started.state is RunState.RUNNING
     assert ownership.claimed == [owner]
-    with pytest.raises(Exception):
+    with pytest.raises(RuntimeError):
         runner.poll(started, TrustedOwnerContext("case-p3", "run-p3", "other", 1))
 
     current = started
@@ -305,10 +353,15 @@ def test_preview_requires_independent_observation_and_invalidates_mutation(tmp_p
     preview_module = _module("febio_cae.adapters.preview.studio")
     studio = ToolIdentity("febio-studio", "2.8.0", "f" * 64)
     launched: list[Path] = []
+
+    def launch(path: Path, identity: ToolIdentity) -> bool:
+        launched.append(path)
+        return identity == studio
+
     preview = preview_module.PreviewAdapter(
         studio=studio,
         source=preview_module.FileSystemPreviewSource(output_path),
-        launcher=lambda path, identity: launched.append(path) or identity == studio,
+        launcher=launch,
         observer=lambda path, identity: preview_module.PreviewObservation(
             state_ids=(0, 1), variables=("displacement", "reaction forces")
         ),

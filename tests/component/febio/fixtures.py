@@ -10,10 +10,10 @@ from febio_cae.domain import (
     AsPlaced,
     BodyId,
     Budget,
-    CaseRevision,
-    CaseSpec,
     CapabilityRef,
     CapabilityStatus,
+    CaseRevision,
+    CaseSpec,
     CompatibilityProfile,
     ContactId,
     ContactIntent,
@@ -55,7 +55,6 @@ from febio_cae.domain import (
     SolidSupport,
     SolverControl,
     SolverPolicy,
-    SourceAssetRef,
     SupportComponent,
     SupportId,
     SupportSet,
@@ -67,7 +66,6 @@ from febio_cae.domain import (
 )
 from febio_cae.domain.artifacts import FileEntry
 from febio_cae.domain.spatial import ProperRotation
-
 
 WORLD = FrameId("World")
 PART_BODY = BodyId("part-body")
@@ -114,7 +112,9 @@ def selection_digest(value: SelectionRef) -> str:
 def make_case_spec() -> CaseSpec:
     part_contact = selection("part-contact", "part_contact_surface", PART_DIGEST, PART_BODY, "part")
     tool_contact = selection("tool-contact", "tool_contact_surface", TOOL_DIGEST, TOOL_BODY, "tool")
-    support_selection = selection("support-region", "support_surface", PART_DIGEST, PART_BODY, "support")
+    support_selection = selection(
+        "support-region", "support_surface", PART_DIGEST, PART_BODY, "support"
+    )
     output_part = selection("part-output", "output_region", PART_DIGEST, PART_BODY, "output-part")
     output_tool = selection("tool-output", "output_region", TOOL_DIGEST, TOOL_BODY, "output-tool")
 
@@ -202,7 +202,9 @@ def make_case_spec() -> CaseSpec:
             quasi_static_statement="synthetic quasi-static profile",
             quasi_static_evidence=evidence("motion.quasi_static_applicability", "motion-qs"),
             rate_independent_statement="synthetic rate-independent profile",
-            rate_independent_evidence=evidence("motion.rate_independent_applicability", "motion-rate"),
+            rate_independent_evidence=evidence(
+                "motion.rate_independent_applicability", "motion-rate"
+            ),
         ),
         direction_evidence=evidence("motion.direction", "motion-direction"),
         initial_reference_point_evidence=evidence(
@@ -331,11 +333,9 @@ def make_mesh(spec: CaseSpec) -> MeshArtifact:
     )
     selection_digests = tuple(selection_digest(item) for item in selections)
     nodes = tuple(
-        MeshNode(index, (float((index - 1) % 10) * 0.001, 0.0, 0.001))
-        for index in range(1, 11)
+        MeshNode(index, (float((index - 1) % 10) * 0.001, 0.0, 0.001)) for index in range(1, 11)
     ) + tuple(
-        MeshNode(index, (float((index - 11) % 10) * 0.001, 0.0, 0.002))
-        for index in range(11, 21)
+        MeshNode(index, (float((index - 11) % 10) * 0.001, 0.0, 0.002)) for index in range(11, 21)
     )
     elements = (
         MeshElement(1, "tet10", tuple(range(1, 11)), PART_BODY.value),
@@ -347,15 +347,29 @@ def make_mesh(spec: CaseSpec) -> MeshArtifact:
     )
     source_for = {selection.name: selection_digest(selection) for selection in selections}
     sets = (
-        MeshSet("part-body", "body", PART_BODY.value, (PART_BODY.value,), source_for["part-contact"]),
-        MeshSet("tool-body", "body", TOOL_BODY.value, (TOOL_BODY.value,), source_for["tool-contact"]),
+        MeshSet(
+            "part-body", "body", PART_BODY.value, (PART_BODY.value,), source_for["part-contact"]
+        ),
+        MeshSet(
+            "tool-body", "body", TOOL_BODY.value, (TOOL_BODY.value,), source_for["tool-contact"]
+        ),
         MeshSet("part-elements", "element", PART_BODY.value, (1,), source_for["part-contact"]),
         MeshSet("tool-elements", "element", TOOL_BODY.value, (2,), source_for["tool-contact"]),
-        MeshSet("part-contact", "face", PART_BODY.value, ("part-face",), source_for["part-contact"]),
-        MeshSet("tool-contact", "face", TOOL_BODY.value, ("tool-face",), source_for["tool-contact"]),
-        MeshSet("support-region", "face", PART_BODY.value, ("part-face",), source_for["support-region"]),
-        MeshSet("part-output", "node", PART_BODY.value, tuple(range(1, 11)), source_for["part-output"]),
-        MeshSet("tool-output", "node", TOOL_BODY.value, tuple(range(11, 21)), source_for["tool-output"]),
+        MeshSet(
+            "part-contact", "face", PART_BODY.value, ("part-face",), source_for["part-contact"]
+        ),
+        MeshSet(
+            "tool-contact", "face", TOOL_BODY.value, ("tool-face",), source_for["tool-contact"]
+        ),
+        MeshSet(
+            "support-region", "face", PART_BODY.value, ("part-face",), source_for["support-region"]
+        ),
+        MeshSet(
+            "part-output", "node", PART_BODY.value, tuple(range(1, 11)), source_for["part-output"]
+        ),
+        MeshSet(
+            "tool-output", "node", TOOL_BODY.value, tuple(range(11, 21)), source_for["tool-output"]
+        ),
     )
     return MeshArtifact(
         artifact_id="mesh-p3",
@@ -409,9 +423,7 @@ def make_profile(executable: str | Path | None = None) -> CompatibilityProfile:
         for capability_id in REQUIRED_CAPABILITIES
     )
     mappings = (
-        OutputMapping(
-            "displacement", "displacement", "node", "VEC3F", "m", WORLD, 1, 1, "value"
-        ),
+        OutputMapping("displacement", "displacement", "node", "VEC3F", "m", WORLD, 1, 1, "value"),
         OutputMapping(
             "contact_force", "reaction forces", "rigid_body", "VEC3F", "N", WORLD, -1, 1, "value"
         ),
@@ -460,33 +472,30 @@ def make_xplt_fixture(
             field(0x01010008, text(mesh_digest)),
         )
     )
-    dictionary = (
-        field(
-            0x01020001,
-            b"".join(
-                (
-                    field(0x01020002, struct.pack("<I", 3)),
-                    field(0x01020003, struct.pack("<I", 0)),
-                    field(0x01020004, text("displacement")),
-                    field(0x01020005, text("node")),
-                    field(0x01020006, text("VEC3F")),
-                    field(0x01020007, text("m")),
-                )
-            ),
-        )
-        + field(
-            0x01020001,
-            b"".join(
-                (
-                    field(0x01020002, struct.pack("<I", 3)),
-                    field(0x01020003, struct.pack("<I", 0)),
-                    field(0x01020004, text("reaction forces")),
-                    field(0x01020005, text("rigid_body")),
-                    field(0x01020006, text("VEC3F")),
-                    field(0x01020007, text("N")),
-                )
-            ),
-        )
+    dictionary = field(
+        0x01020001,
+        b"".join(
+            (
+                field(0x01020002, struct.pack("<I", 3)),
+                field(0x01020003, struct.pack("<I", 0)),
+                field(0x01020004, text("displacement")),
+                field(0x01020005, text("node")),
+                field(0x01020006, text("VEC3F")),
+                field(0x01020007, text("m")),
+            )
+        ),
+    ) + field(
+        0x01020001,
+        b"".join(
+            (
+                field(0x01020002, struct.pack("<I", 3)),
+                field(0x01020003, struct.pack("<I", 0)),
+                field(0x01020004, text("reaction forces")),
+                field(0x01020005, text("rigid_body")),
+                field(0x01020006, text("VEC3F")),
+                field(0x01020007, text("N")),
+            )
+        ),
     )
     root = block(0x01000000, block(0x01010000, header) + block(0x01020000, dictionary))
 
@@ -530,8 +539,18 @@ def make_xplt_fixture(
     return payload
 
 
-def make_bundle(*, bundle_id: str, case_id: str, revision_id: str, spec_digest: str, mesh_digest: str,
-                profile_id: str, root: Path, file_entry: FileEntry, argv: tuple[str, ...]) -> ExecutionBundle:
+def make_bundle(
+    *,
+    bundle_id: str,
+    case_id: str,
+    revision_id: str,
+    spec_digest: str,
+    mesh_digest: str,
+    profile_id: str,
+    root: Path,
+    file_entry: FileEntry,
+    argv: tuple[str, ...],
+) -> ExecutionBundle:
     return ExecutionBundle(
         bundle_id=bundle_id,
         case_id=case_id,
