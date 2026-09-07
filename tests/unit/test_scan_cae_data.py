@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import struct
 import subprocess
 import sys
 from collections.abc import Callable, Iterator
@@ -41,6 +42,19 @@ def _init_git_repo(root: Path) -> None:
         check=True,
         text=True,
     )
+
+
+def _set_index_or_worktree_payload(candidate: Path, content: bytes, source: str) -> None:
+    if source == "index":
+        candidate.write_bytes(content)
+        subprocess.run(["git", "-C", str(candidate.parent), "add", candidate.name], check=True)
+        candidate.write_text("ordinary worktree notes", encoding="utf-8")
+    elif source == "worktree":
+        candidate.write_text("ordinary staged notes", encoding="utf-8")
+        subprocess.run(["git", "-C", str(candidate.parent), "add", candidate.name], check=True)
+        candidate.write_bytes(content)
+    else:
+        raise AssertionError(f"unknown payload source: {source}")
 
 
 def test_clean_repository_boundary_scan_returns_structured_pass() -> None:
@@ -134,6 +148,52 @@ def test_boundary_scan_inspects_staged_febio_xml_even_if_worktree_is_benign(
     )
 
 
+@pytest.mark.parametrize("leading_spaces", [500, 512, 600])
+@pytest.mark.parametrize("source", ["index", "worktree"])
+def test_boundary_scan_rejects_febio_xml_after_bounded_leading_spaces(
+    tmp_path: Path, leading_spaces: int, source: str
+) -> None:
+    _init_git_repo(tmp_path)
+    candidate = tmp_path / "payload.txt"
+    content = b" " * leading_spaces + (
+        b'<febio_spec version="4.0"><Module type="solid"/></febio_spec>'
+    )
+    _set_index_or_worktree_payload(candidate, content, source)
+
+    completed = _run_scanner(tmp_path)
+
+    assert completed.returncode == 4, completed.stderr
+    payload = json.loads(completed.stdout)
+    assert payload["status"] == "REJECT"
+    assert any(
+        issue["code"] == "FORBIDDEN_CAE_CONTENT" and issue["path"] == candidate.name
+        for issue in payload["issues"]
+    )
+
+
+@pytest.mark.parametrize("source", ["index", "worktree"])
+def test_boundary_scan_marks_doctype_first_febio_xml_uninspectable(
+    tmp_path: Path, source: str
+) -> None:
+    _init_git_repo(tmp_path)
+    candidate = tmp_path / "payload.txt"
+    content = (
+        b"<!DOCTYPE febio_spec>\n"
+        b'<febio_spec version="4.0"><Module type="solid"/></febio_spec>'
+    )
+    _set_index_or_worktree_payload(candidate, content, source)
+
+    completed = _run_scanner(tmp_path)
+
+    assert completed.returncode == 4, completed.stderr
+    payload = json.loads(completed.stdout)
+    assert payload["status"] == "INCOMPLETE"
+    assert any(
+        issue["code"] == "UNINSPECTABLE_CONTENT" and issue["path"] == candidate.name
+        for issue in payload["issues"]
+    )
+
+
 @pytest.mark.parametrize(
     ("fixture_name", "content"),
     [
@@ -205,13 +265,16 @@ def test_boundary_scan_rejects_staged_step_signature_with_neutral_name(tmp_path:
     )
 
 
-def test_boundary_scan_rejects_staged_xplt_signature_with_neutral_name(tmp_path: Path) -> None:
+@pytest.mark.parametrize("source", ["index", "worktree"])
+def test_boundary_scan_rejects_independent_xplt_signature_with_neutral_name(
+    tmp_path: Path, source: str
+) -> None:
     _init_git_repo(tmp_path)
     candidate = tmp_path / "artifact.txt"
-    content = b"BEF" + b"\x00\x00\x00\x01\x00\x00\x00\x00"
-    candidate.write_bytes(content)
-    subprocess.run(["git", "-C", str(tmp_path), "add", candidate.name], check=True)
-    candidate.write_text("ordinary worktree notes", encoding="utf-8")
+    content = struct.pack("<III", 0x00464542, 0x01000000, 0)
+    assert len(content) == 12
+    assert content[:8].hex() == "4245460000000001"
+    _set_index_or_worktree_payload(candidate, content, source)
 
     completed = _run_scanner(tmp_path)
 
