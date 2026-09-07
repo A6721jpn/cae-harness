@@ -95,7 +95,7 @@ C:\Users\backo\.codex\worktrees\e081\CAE-harness\.local\verification\P0B-xplt-ob
 
 ### 4.1 Exact commands and exits / コマンドとexit
 
-正常probeは次の1 processで実行した。
+当初dispatchの記録上、次はselected final successful runのcommand descriptionである。original command-event ledgerには、先行する`UNKNOWN_TAG` rejection（event `2745`, exit `2`）、final normal event `2970`（captured probe exit `0`）、final mutation wrapper event `2977`（outer exit `0`、6つのinner Python exit `2`）がある。全履歴は[original command events](C:/Users/backo/.codex/worktrees/4063/CAE-harness/.local/coordination/p0b-xplt-original-command-events.json)に保存されている。
 
 ```text
 python -X utf8 .local\verification\P0B-xplt-observation-01\bounded_xplt_probe.py \
@@ -106,6 +106,8 @@ python -X utf8 .local\verification\P0B-xplt-observation-01\bounded_xplt_probe.py
 ```
 
 結果は`exit 0`、`accepted=true`、`blocks=137`である。mutationは同じscriptをmutation fileごとに新しいPython processで実行し、各回`--no-hash`、exit `2`とした。中断run、collection error、partial outputは合格件数に含めていない。
+
+このoriginal ledgerは相対command、wrapper範囲、wrapper stdoutを保持するが、各inner processの個別UTC、resolved Python executable、分離stderrは保持していない。それらは§4.2のsupplemental fresh captureで補っており、後からoriginal executionへ遡及して割り当てていない。
 
 ### 4.2 Fresh process capture addendum / 完全process証跡
 
@@ -125,7 +127,7 @@ capture parentは`2026-09-07T05:57:52.529Z`–`2026-09-07T05:57:53.701Z`、pre/p
 | existing mutation copies with `--no-hash` | `6` | all `2` | truncation、bad magic、version、compression、unknown root/state tagを各JSONでreject | expected inner rejection; not capture failure |
 | changed expected hash | `1` | `2` | `HASH_MISMATCH`; actual input SHA `0B835386...F4094A4` vs deliberate `FF...FF` | expected inner rejection; not capture failure |
 
-normal childのraw stdout/stderr、6 mutation childのraw stdout/stderr、hash probeのraw stdout/stderrは各case recordから辿れる。mutationの各`--no-hash`は既存copyを入力にし、出力JSONだけをcapture directoryへ新規作成した。hash probeは新規helperからimmutable readerを正しく`sys.modules`へ登録してimportし、expected SHA-256だけをそのprocess内で`FF`×64へ置換した。
+normal childのraw stdout/stderr、6 mutation childのraw stdout/stderr、hash probeのraw stdout/stderrは各case recordから辿れる。mutationの各`--no-hash`は既存copyを入力にし、出力JSONだけをcapture directoryへ新規作成した。hash probeは新規helperからimmutable readerを正しく`sys.modules`へ登録してimportし、expected SHA-256だけをそのprocess内でhex character `F` repeated 64 timesへ置換した。
 
 このcaptureは、元のscopeどおり両stateをparseしたうえで数値比較はfinal stateだけを比較したnormal probeのprocess証跡を補うものであり、新しい物理・product compatibility claimを追加しない。
 
@@ -187,11 +189,11 @@ state dataの各DATA leafには8-byte observed prefixがあり、`<storage_code,
 | domain | `Patch`, `TET10`, element type `7`, part ID `1` |
 | elements | `24`, each `10` connectivity entries |
 | parts | ID `1`, name `elastic_patch` |
-| element-set region | ID `1`, name `Patch`, `24` zero-based element indices |
+| element-set region | ID `1`, name `Patch`; observed tag `0x01046200` at `0xFB2`, payload `96` bytes ending at `0x101A`, DWORD values `1..24` matching the element IDs |
 | nodesets | ID1 `Patch` `63`; ID2 `all_nodes` `63`; ID3 `x0_nodes` `13`; ID4 `xL_nodes` `13` |
 | node-set index range | ID1/2 `0..62`; ID3 `0..24`; ID4 `4..29` |
 
-XPLT connectivityとnodeset indicesはzero-basedで保存されているため、direct textのone-based node/element IDsと比較する場合は`+1`を適用する境界を明記する。今回のstate valuesはnode section orderとdictionary orderをshape検査して対応付けた。
+XPLT connectivityとnodeset entriesはzero-basedで保存されているため、direct textのone-based inputと比較する場合の`+1`はこの2種類にだけ適用する。XPLTのnode IDs・element IDsと、上記element-set payloadの`1..24`には`+1`を適用しない。`0x01046000`系はundocumented extensionであり、このartifactで観測した値にuniversalなsemantic ruleを付けない。original experimental readerのelement-set内部label `indices_zero_based`は不正確なhistorical labelとして保存しており、修正後のsemantic authorityではない。今回のstate valuesはnode section orderとdictionary orderをshape検査して対応付けた。
 
 ### 6.4 States and variables
 
