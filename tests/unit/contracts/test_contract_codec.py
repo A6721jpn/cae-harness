@@ -2,12 +2,23 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import pytest
-from workflow_fixtures import case_revision
+from workflow_fixtures import case_revision, evidence
 
-from febio_cae.domain import CaseDraft, CaseRevision, PartialCaseSpec
+from febio_cae.domain import (
+    CaseDraft,
+    CasePatch,
+    CasePatchEdit,
+    CaseRevision,
+    FileEntry,
+    IssuedQuestion,
+    OperationStatus,
+    PartialCaseSpec,
+    PreviewRequest,
+)
 
 try:
     from febio_cae.domain.codec import CodecError, decode_record, encode_record
@@ -75,3 +86,50 @@ def test_codec_encode_rejects_mappings() -> None:
     _require_codec()
     with pytest.raises(CodecError, match="record|supported"):
         encode_record({"schema_version": "1"})
+
+
+def test_codec_rejects_unknown_nested_contact_keys(synthetic_case_spec: Any) -> None:
+    _require_codec()
+    revision = case_revision(synthetic_case_spec)
+    payload = json.loads(encode_record(revision))
+    payload["spec"]["contact"]["friction"]["extra_physical_condition"] = "reject"
+    with pytest.raises(CodecError, match="unknown or missing"):
+        decode_record(json.dumps(payload), CaseRevision)
+    payload = json.loads(encode_record(revision))
+    payload["spec"]["contact"]["arrangement"]["extra_physical_condition"] = "reject"
+    with pytest.raises(CodecError, match="unknown or missing"):
+        decode_record(json.dumps(payload), CaseRevision)
+
+
+def test_codec_rejects_nonnull_value_on_absent_patch_edit() -> None:
+    _require_codec()
+    patch = CasePatch(
+        "revision-interface",
+        "a" * 64,
+        (CasePatchEdit("geometry", None, False),),
+        (evidence("case_patch.evidence", "patch"),),
+    )
+    payload = json.loads(encode_record(patch))
+    payload["edits"][0]["value"] = {"unexpected": "value"}
+    with pytest.raises(CodecError, match="absent|value"):
+        decode_record(json.dumps(payload), CasePatch)
+
+
+def test_codec_round_trips_all_declared_service_and_leaf_top_level_records() -> None:
+    _require_codec()
+    records = (
+        IssuedQuestion(
+            "question-interface",
+            "case-interface",
+            "draft-interface",
+            2,
+            ("geometry",),
+            (evidence("question.geometry", "question"),),
+        ),
+        OperationStatus("READY"),
+        FileEntry("output/case.xplt", "a" * 64, 4, "xplt"),
+        PreviewRequest("preview-interface", "manifest-interface", (0, 1), ("displacement",)),
+    )
+    for record in records:
+        restored = decode_record(encode_record(record), type(record))
+        assert restored.to_bytes() == record.to_bytes()

@@ -25,7 +25,7 @@ try:
         MeshSet,
         SourceAssetRef,
     )
-    from febio_cae.domain.comparison import ComparisonAxis, ComparisonSpec
+    from febio_cae.domain.comparison import ComparisonAxis, ComparisonInterval, ComparisonSpec
     from febio_cae.domain.compatibility import (
         CapabilityRef,
         CapabilityStatus,
@@ -113,6 +113,29 @@ except ImportError:
     PREVIEW_API: Any = None
     RESULTS_API: Any = None
 
+try:
+    from febio_cae.domain.artifacts import (
+        GeometrySelectionRequest,
+        SourceAssetContent,
+        TET10_CORNER_NODE_POSITIONS,
+        TET10_EDGE_NODE_POSITIONS,
+        TET10_FACE_NODE_POSITIONS,
+    )
+    from febio_cae.domain.results import NumericResultData, ResultDataRef
+
+    REPAIR_ARTIFACTS_API: Any = True
+    REPAIR_RESULTS_API: Any = True
+except ImportError:
+    GeometrySelectionRequest = None
+    SourceAssetContent = None
+    TET10_CORNER_NODE_POSITIONS = None
+    TET10_EDGE_NODE_POSITIONS = None
+    TET10_FACE_NODE_POSITIONS = None
+    NumericResultData = None
+    ResultDataRef = None
+    REPAIR_ARTIFACTS_API: Any = None
+    REPAIR_RESULTS_API: Any = None
+
 
 def _require_api() -> None:
     if any(
@@ -146,9 +169,12 @@ def _mesh() -> Any:
             face_ordering_id="tet10-face-canonical-v1",
         ),
         nodes=tuple(MeshNode(index, (float(index), 0.0, 0.0)) for index in range(1, 11)),
-        elements=(MeshElement(1, "tet10", tuple(range(1, 11))),),
+        elements=(MeshElement(1, "tet10", tuple(range(1, 11)), "part-body"),),
         faces=(MeshFace("face-1", "part-body", (1, 2, 3, 5, 6, 7), (1,), (0,)),),
-        sets=(MeshSet("body-set", "body", "part-body", (1,)),),
+        sets=(
+            MeshSet("body-set", "body", "part-body", ("part-body",), "b" * 64),
+            MeshSet("face-set", "face", "part-body", ("face-1",), "b" * 64),
+        ),
         quality_records=(
             MeshQualityRecord("jacobian", 0.5, "1", 0.0, AssessmentStatus.PASS, "synthetic"),
         ),
@@ -228,6 +254,14 @@ def _attempt(bundle: Any, revision: CaseRevision) -> Any:
 
 
 def _manifest(attempt: Any, bundle: Any, profile: Any) -> Any:
+    observation_kwargs: dict[str, object] = {}
+    if ResultDataRef is not None:
+        observation_kwargs["data_ref"] = ResultDataRef(
+            "displacement-data",
+            "a" * 64,
+            "numeric-result-v1",
+            "output/case.xplt",
+        )
     observation = OutputObservation(
         output_id="displacement",
         location="node",
@@ -236,6 +270,7 @@ def _manifest(attempt: Any, bundle: Any, profile: Any) -> Any:
         frame=FrameId("World"),
         measure_id="value",
         state_count=2,
+        **observation_kwargs,
     )
     read_result = ReadResult(
         status=ReadStatus.VALIDATED,
@@ -296,8 +331,8 @@ def test_mesh_artifact_validates_tet10_structure_and_detaches_sequences() -> Non
             provenance=mesh.provenance,
             nodes=mesh.nodes,
             elements=(
-                MeshElement(1, "tet10", tuple(range(1, 11))),
-                MeshElement(1, "tet10", tuple(range(1, 11))),
+                MeshElement(1, "tet10", tuple(range(1, 11)), "part-body"),
+                MeshElement(1, "tet10", tuple(range(1, 11)), "part-body"),
             ),
             faces=mesh.faces,
             sets=mesh.sets,
@@ -398,3 +433,190 @@ def test_comparison_freezes_identity_and_conditions() -> None:
         axes=(ComparisonAxis("force", "N", "part", "peak", "linear"),),
     )
     assert comparison.axes[0].unit == "N"
+
+
+def _require_repair_api() -> None:
+    assert REPAIR_ARTIFACTS_API is not None, "P1 repair artifact API is not available"
+    assert REPAIR_RESULTS_API is not None, "P1 repair result-data API is not available"
+
+
+def test_mesh_contract_exposes_canonical_tet10_tables_and_nonempty_typed_sets() -> None:
+    _require_repair_api()
+    assert TET10_CORNER_NODE_POSITIONS == (0, 1, 2, 3)
+    assert TET10_EDGE_NODE_POSITIONS == (
+        (0, 1),
+        (1, 2),
+        (2, 0),
+        (0, 3),
+        (1, 3),
+        (2, 3),
+    )
+    assert TET10_FACE_NODE_POSITIONS == (
+        (0, 1, 2, 4, 5, 6),
+        (0, 1, 3, 4, 7, 8),
+        (1, 2, 3, 5, 8, 9),
+        (0, 2, 3, 6, 7, 9),
+    )
+    mesh = _mesh()
+    assert any(item.kind == "face" and item.member_ids == ("face-1",) for item in mesh.sets)
+    assert all(item.source_selection_digest == "b" * 64 for item in mesh.sets)
+
+
+def test_mesh_rejects_cross_body_and_bad_oriented_face_references() -> None:
+    _require_repair_api()
+    mesh = _mesh()
+    with pytest.raises(ValueError, match="body"):
+        MeshArtifact(
+            artifact_id="bad-body",
+            frame=mesh.frame,
+            provenance=mesh.provenance,
+            nodes=mesh.nodes,
+            elements=(MeshElement(1, "tet10", tuple(range(1, 11)), "unknown-body"),),
+            faces=mesh.faces,
+            sets=mesh.sets,
+            quality_records=mesh.quality_records,
+        )
+    with pytest.raises(ValueError, match="face|local|node"):
+        MeshArtifact(
+            artifact_id="bad-face",
+            frame=mesh.frame,
+            provenance=mesh.provenance,
+            nodes=mesh.nodes,
+            elements=mesh.elements,
+            faces=(MeshFace("bad-face", "part-body", (1, 2, 3, 8, 9, 10), (1,), (0,)),),
+            sets=mesh.sets,
+            quality_records=mesh.quality_records,
+        )
+
+
+def test_file_identity_rejects_windows_lexical_forms_and_casefold_collisions(
+    synthetic_case_spec: Any,
+) -> None:
+    _require_api()
+    for path in ("output/case.xplt:stream", "output/NUL.xplt", "output./case.xplt", "output /case.xplt"):
+        with pytest.raises(ValueError):
+            FileEntry(path, "a" * 64, 1, "output")
+    revision = case_revision(synthetic_case_spec)
+    mesh = _mesh()
+    profile = _profile()
+    with pytest.raises(ValueError, match="duplicate|case"):
+        _bundle_with_files(
+            revision,
+            mesh,
+            profile,
+            (
+                FileEntry("input/CASE.feb", "f" * 64, 128, "input"),
+                FileEntry("input/case.feb", "e" * 64, 128, "input"),
+            ),
+        )
+
+
+def _bundle_with_files(
+    revision: CaseRevision, mesh: Any, profile: Any, files: Any
+) -> Any:
+    return ExecutionBundle(
+        bundle_id="bundle-casefold",
+        case_id=revision.case_id,
+        revision_id=revision.revision_id,
+        spec_digest=revision.spec_digest,
+        mesh_digest=mesh.artifact_digest,
+        profile_id=profile.profile_id,
+        tool=profile.solver,
+        files=files,
+        argv=("febio4.exe", "-i", "case.feb"),
+        cwd="C:/registered-case/runs/attempt-interface",
+        thread_count=1,
+        settings=(ExecutionSetting("solver_threads", 1),),
+    )
+
+
+def test_comparison_axis_records_common_interval_and_interpolation() -> None:
+    _require_api()
+    comparison = ComparisonSpec(
+        comparison_id="comparison-interval",
+        baseline_manifest_id="manifest-baseline",
+        candidate_manifest_id="manifest-interface",
+        intended_changes=("mesh refinement",),
+        fixed_conditions=("material", "support", "motion"),
+        axes=(
+            ComparisonAxis(
+                "force",
+                "N",
+                "part",
+                "peak",
+                "maximum",
+                interval=ComparisonInterval("N", 0.0, 10.0),
+                interpolation="linear",
+            ),
+        ),
+    )
+    assert comparison.axes[0].interval.lower == 0.0
+    assert comparison.axes[0].interval.upper == 10.0
+    assert comparison.axes[0].interpolation == "linear"
+    with pytest.raises(ValueError):
+        ComparisonInterval("N", 10.0, 0.0)
+
+
+def test_preview_confirmation_preserves_observed_values_and_requires_explicit_data() -> None:
+    _require_api()
+    evidence_ref = evidence("preview.confirmation", "preview-observation")
+    studio = ToolIdentity("febio-studio", "3.1.0", "b" * 64)
+    existing = PreviewReceipt(
+        receipt_id="receipt-observed",
+        manifest_id="manifest-interface",
+        xplt_digest="8" * 64,
+        studio=studio,
+        status=PreviewStatus.LAUNCHED,
+        requested_state_ids=(2,),
+        requested_variables=("displacement",),
+        observed_state_ids=(4,),
+        observed_variables=("reaction_force",),
+        confirmation_evidence=(),
+    )
+    confirmed = existing.confirmed(evidence=(evidence_ref,))
+    assert confirmed.observed_state_ids == (4,)
+    assert confirmed.observed_variables == ("reaction_force",)
+    empty = PreviewReceipt(
+        receipt_id="receipt-empty",
+        manifest_id="manifest-interface",
+        xplt_digest="8" * 64,
+        studio=studio,
+        status=PreviewStatus.REQUESTED,
+        requested_state_ids=(2,),
+        requested_variables=("displacement",),
+        observed_state_ids=(),
+        observed_variables=(),
+        confirmation_evidence=(),
+    )
+    with pytest.raises(ValueError, match="observed"):
+        empty.confirmed(evidence=(evidence_ref,))
+
+
+def test_source_and_numeric_data_contracts_carry_actual_resolved_values() -> None:
+    _require_repair_api()
+    content = b"synthetic-step-content"
+    source = SourceAssetRef(
+        "source-interface",
+        hashlib.sha256(content).hexdigest(),
+        "model/step",
+    )
+    resolved = SourceAssetContent(source, content)
+    assert resolved.source_asset == source
+    reference = ResultDataRef(
+        "displacement-data",
+        "a" * 64,
+        "numeric-result-v1",
+        "output/case.xplt",
+    )
+    data = NumericResultData(
+        reference=reference,
+        output_id="displacement",
+        value_type="VEC3F",
+        unit="m",
+        frame=FrameId("World"),
+        state_ids=(0, 1),
+        state_coordinates=(0.0, 1.0),
+        values=((0.0, 0.0, 0.0), (0.1, 0.0, 0.0)),
+    )
+    assert data.values[1][0] == 0.1
+    assert data.state_coordinates == (0.0, 1.0)
