@@ -439,7 +439,13 @@ def make_profile(executable: str | Path | None = None) -> CompatibilityProfile:
 
 
 def make_xplt_fixture(
-    *, attempt_id: str, bundle_digest: str, mesh_digest: str, values: dict[str, Any] | None = None
+    *,
+    attempt_id: str,
+    bundle_digest: str,
+    mesh_digest: str,
+    values: dict[str, Any] | None = None,
+    state_count: int = 2,
+    include_identity: bool = True,
 ) -> bytes:
     """Build the bounded binary XPLT 0x35 fixture used by component tests.
 
@@ -461,17 +467,21 @@ def make_xplt_fixture(
     def field(identifier: int, payload: bytes) -> bytes:
         return block(identifier, payload)
 
-    header = b"".join(
-        (
-            field(0x01010001, struct.pack("<I", 0x35)),
-            field(0x01010002, struct.pack("<I", 0)),
-            field(0x01010004, text("FEBio 4.12.0")),
-            field(0x01010005, text("SI")),
-            field(0x01010006, text(attempt_id)),
-            field(0x01010007, text(bundle_digest)),
-            field(0x01010008, text(mesh_digest)),
+    header_fields = [
+        field(0x01010001, struct.pack("<I", 0x35)),
+        field(0x01010002, struct.pack("<I", 0)),
+        field(0x01010004, text("FEBio 4.12.0")),
+        field(0x01010005, text("SI")),
+    ]
+    if include_identity:
+        header_fields.extend(
+            (
+                field(0x01010006, text(attempt_id)),
+                field(0x01010007, text(bundle_digest)),
+                field(0x01010008, text(mesh_digest)),
+            )
         )
-    )
+    header = b"".join(header_fields)
     dictionary = field(
         0x01020001,
         b"".join(
@@ -518,8 +528,10 @@ def make_xplt_fixture(
             ((0.0, 0.0, 1.0), (0.0, 0.0, 2.0)),
         ),
     }
+    if state_count not in {1, 2}:
+        raise ValueError("state_count must be one or two")
     states: list[bytes] = []
-    for state_index, time_value in enumerate((0.0, 1.0)):
+    for state_index, time_value in enumerate((0.0, 1.0)[:state_count]):
         state_data = b""
         for name in ("displacement", "reaction forces"):
             rows = displacement[name][state_index]
