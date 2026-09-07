@@ -815,14 +815,14 @@ def test_mesh_accepts_all_cyclically_rotated_opposite_interior_face_cycles(
 
 def test_mesh_keeps_interior_face_rejections_for_same_facing_wrong_midside_and_unknown_node() -> None:
     _require_repair_api()
-    valid_mesh, valid_second_nodes = _cyclic_neighbor_mesh(("B", "A", "C", "D2"), 0)
+    valid_mesh, valid_second_nodes = _cyclic_neighbor_mesh(("A", "C", "B", "D2"), 0)
     with pytest.raises(ValueError, match="opposite|orientation"):
         _cyclic_neighbor_mesh(("A", "B", "C", "D2"), 0)
     wrong_midside = list(valid_second_nodes)
     wrong_midside[4], wrong_midside[5] = wrong_midside[5], wrong_midside[4]
     with pytest.raises(ValueError, match="opposite|orientation"):
         _cyclic_neighbor_mesh(
-            ("B", "A", "C", "D2"),
+            ("A", "C", "B", "D2"),
             0,
             second_node_ids=tuple(wrong_midside),
         )
