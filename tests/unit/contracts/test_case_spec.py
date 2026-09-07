@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib
 from dataclasses import FrozenInstanceError
 from types import ModuleType
@@ -83,12 +84,13 @@ def _evidence(
     source_kind: str = "registered_document",
     reference: str = "SyntheticCaseSource:1",
 ) -> EvidenceRef:
+    digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()
     return EvidenceRef(
         schema_version="1",
         source_kind=source_kind,
         reference=reference,
         target_field=target_field,
-        content_digest=seed * 64,
+        content_digest=digest,
     )
 
 
@@ -126,6 +128,24 @@ def _part_selection(
         frame=frame,
         rule=WholeBodyRule(body_id) if rule is None else rule,
         resolution=resolution,
+    )
+
+
+def _support_selection(
+    *,
+    geometry_digest: str = PART_DIGEST,
+    body_id: BodyId = PART_BODY,
+    frame: FrameId = WORLD,
+    name: str = "support-region",
+) -> SelectionRef:
+    return SelectionRef(
+        name=name,
+        role="support_surface",
+        role_evidence=_evidence("selection.role", "s"),
+        geometry_digest=geometry_digest,
+        body_id=body_id,
+        frame=frame,
+        rule=WholeBodyRule(body_id),
     )
 
 
@@ -218,9 +238,14 @@ def _face_selection(
     )
 
 
-def _geometry(*, body_id: BodyId = PART_BODY, target_frame: FrameId = WORLD) -> GeometryIntent:
+def _geometry(
+    *,
+    body_id: BodyId = PART_BODY,
+    target_frame: FrameId = WORLD,
+    source_step_digest: str = "1" * 64,
+) -> GeometryIntent:
     return GeometryIntent(
-        source_step_digest="1" * 64,
+        source_step_digest=source_step_digest,
         geometry_digest=PART_DIGEST,
         inspection_digest="2" * 64,
         body_id=body_id,
@@ -257,7 +282,7 @@ def _support(
 ) -> SolidSupport:
     return SolidSupport(
         support_id=SupportId(support_id),
-        selection=_part_selection(name=f"support-{support_id}"),
+        selection=_support_selection(name=f"support-{support_id}"),
         frame=frame,
         x=SupportComponent("fixed", _evidence("support.x", "n")),
         y=SupportComponent("free", _evidence("support.y", "o")),
@@ -400,7 +425,7 @@ def _output(*, requests: list[OutputRequest] | None = None) -> OutputPolicy:
     if requests is None:
         requests = [
             OutputRequest(
-                request_id="request-tool",
+                request_id="request_tool",
                 quantity_id="contact_force",
                 measure_id="max",
                 component_id="z",
@@ -408,10 +433,10 @@ def _output(*, requests: list[OutputRequest] | None = None) -> OutputPolicy:
                 selection=tool,
                 frame=WORLD,
                 display_unit="N",
-                evidence=_evidence("outputs.requests.request-tool", "e"),
+                evidence=_evidence("outputs.requests.request_tool", "e"),
             ),
             OutputRequest(
-                request_id="request-part",
+                request_id="request_part",
                 quantity_id="displacement",
                 measure_id="max",
                 component_id="z",
@@ -419,7 +444,7 @@ def _output(*, requests: list[OutputRequest] | None = None) -> OutputPolicy:
                 selection=part,
                 frame=WORLD,
                 display_unit="mm",
-                evidence=_evidence("outputs.requests.request-part", "f"),
+                evidence=_evidence("outputs.requests.request_part", "f"),
             ),
         ]
     return OutputPolicy(
@@ -428,38 +453,38 @@ def _output(*, requests: list[OutputRequest] | None = None) -> OutputPolicy:
         saved_times=[Quantity(1000, "ms"), Quantity(2, "s"), Quantity(3000, "ms")],
         evaluations=[
             EvaluationRequest(
-                evaluation_id="evaluation-tool",
-                output_request_id="request-tool",
+                evaluation_id="evaluation_tool",
+                output_request_id="request_tool",
                 aggregation_id="peak",
                 selection=tool,
                 state_times=[Quantity(1, "s"), Quantity(3, "s")],
-                evidence=_evidence("outputs.evaluations.evaluation-tool", "g"),
+                evidence=_evidence("outputs.evaluations.evaluation_tool", "g"),
             ),
             EvaluationRequest(
-                evaluation_id="evaluation-part",
-                output_request_id="request-part",
+                evaluation_id="evaluation_part",
+                output_request_id="request_part",
                 aggregation_id="peak",
                 selection=part,
                 state_times=[Quantity(2, "s")],
-                evidence=_evidence("outputs.evaluations.evaluation-part", "h"),
+                evidence=_evidence("outputs.evaluations.evaluation_part", "h"),
             ),
         ],
     )
 
 
 def _quality(
-    *, evaluation_ids: tuple[str, ...] = ("evaluation-part", "evaluation-tool")
+    *, evaluation_ids: tuple[str, ...] = ("evaluation_part", "evaluation_tool")
 ) -> QualityPolicy:
     return QualityPolicy(
         profile=NumericalProfileRef("quality-profile", "quality", "f" * 64),
         criteria=(
             QualityCriterion(
-                criterion_id="criterion-main",
+                criterion_id="criterion_main",
                 metric_id="residual_norm",
                 evaluation_ids=evaluation_ids,
                 thresholds=(QualityThreshold("absolute_tolerance", Quantity(1, "MPa")),),
                 applicability_reason="解析条件 — convergence étape 1",
-                evidence=_evidence("quality_policy.criteria.criterion-main", "i"),
+                evidence=_evidence("quality_policy.criteria.criterion_main", "i"),
             ),
         ),
     )
@@ -557,7 +582,7 @@ def test_case_spec_rejects_support_selection_part_identity_mismatch() -> None:
     bad_support = _support("support-bad", frame=WORLD)
     bad_support = SolidSupport(
         support_id=bad_support.support_id,
-        selection=_part_selection(geometry_digest=TOOL_DIGEST, body_id=TOOL_BODY),
+        selection=_support_selection(geometry_digest=TOOL_DIGEST, body_id=TOOL_BODY),
         frame=bad_support.frame,
         x=bad_support.x,
         y=bad_support.y,
@@ -571,7 +596,7 @@ def test_case_spec_rejects_support_selection_part_identity_mismatch() -> None:
 def test_case_spec_rejects_nonfirst_support_selection_frame_mismatch() -> None:
     bad_support = SolidSupport(
         support_id=SupportId("support-bad"),
-        selection=_part_selection(frame=FrameId("OtherFrame")),
+        selection=_support_selection(frame=FrameId("OtherFrame")),
         frame=FrameId("OtherFrame"),
         x=SupportComponent("fixed", _evidence("support.x", "a")),
         y=SupportComponent("free", _evidence("support.y", "b")),
@@ -701,7 +726,7 @@ def test_case_spec_rejects_unrelated_or_noncommon_frame_selection_in_every_colle
         kwargs = {"mesh_policy": changed}
     elif owner == "request":
         request = OutputRequest(
-            request_id="request-bad",
+            request_id="request_bad",
             quantity_id="displacement",
             measure_id="max",
             component_id="z",
@@ -709,19 +734,19 @@ def test_case_spec_rejects_unrelated_or_noncommon_frame_selection_in_every_colle
             selection=unrelated,
             frame=WORLD,
             display_unit="mm",
-            evidence=_evidence("outputs.requests.request-bad", "n"),
+            evidence=_evidence("outputs.requests.request_bad", "n"),
         )
         kwargs = {"outputs": _output(requests=[request])}
     else:
         output = _output()
-        bad_selection = _output_selection(geometry_digest="c" * 64, body_id=BodyId("other-body"))
+        bad_selection = _output_selection(frame=FrameId("OtherFrame"))
         bad_evaluation = EvaluationRequest(
-            evaluation_id="evaluation-bad",
-            output_request_id="request-part",
+            evaluation_id="evaluation_bad",
+            output_request_id="request_part",
             aggregation_id="peak",
             selection=bad_selection,
             state_times=[Quantity(2, "s")],
-            evidence=_evidence("outputs.evaluations.evaluation-bad", "n"),
+            evidence=_evidence("outputs.evaluations.evaluation_bad", "n"),
         )
         kwargs = {
             "outputs": OutputPolicy(
@@ -738,7 +763,7 @@ def test_case_spec_rejects_unrelated_or_noncommon_frame_selection_in_every_colle
 def test_case_spec_rejects_selection_with_declared_identity_but_wrong_common_frame() -> None:
     wrong_frame = _output_selection(frame=FrameId("OtherFrame"))
     request = OutputRequest(
-        request_id="request-bad-frame",
+        request_id="request_bad_frame",
         quantity_id="displacement",
         measure_id="max",
         component_id="z",
@@ -746,7 +771,7 @@ def test_case_spec_rejects_selection_with_declared_identity_but_wrong_common_fra
         selection=wrong_frame,
         frame=WORLD,
         display_unit="mm",
-        evidence=_evidence("outputs.requests.request-bad-frame", "n"),
+        evidence=_evidence("outputs.requests.request_bad_frame", "n"),
     )
     with pytest.raises(_case().CaseSpecValidationError, match="selection"):
         _case_value(outputs=_output(requests=[request]))
@@ -777,20 +802,20 @@ def test_case_spec_accepts_si_equivalent_saved_times_and_rejects_out_of_interval
                 saved_times=[Quantity(1, "s"), Quantity(2, "s"), Quantity(4, "s")],
                 evaluations=[
                     EvaluationRequest(
-                        evaluation_id="evaluation-tool",
-                        output_request_id="request-tool",
+                        evaluation_id="evaluation_tool",
+                        output_request_id="request_tool",
                         aggregation_id="peak",
                         selection=case.outputs.evaluations[1].selection,
-                        state_times=[Quantity(1, "s"), Quantity(3, "s")],
-                        evidence=_evidence("outputs.evaluations.evaluation-tool", "g"),
+                        state_times=[Quantity(1, "s"), Quantity(2, "s")],
+                        evidence=_evidence("outputs.evaluations.evaluation_tool", "g"),
                     ),
                     EvaluationRequest(
-                        evaluation_id="evaluation-part",
-                        output_request_id="request-part",
+                        evaluation_id="evaluation_part",
+                        output_request_id="request_part",
                         aggregation_id="peak",
                         selection=case.outputs.evaluations[0].selection,
                         state_times=[Quantity(2, "s")],
-                        evidence=_evidence("outputs.evaluations.evaluation-part", "h"),
+                        evidence=_evidence("outputs.evaluations.evaluation_part", "h"),
                     ),
                 ],
             )
@@ -828,6 +853,6 @@ def test_case_spec_canonical_bytes_follow_public_child_canonical_bytes_and_ident
         ),
     )
     assert first.to_bytes() == second.to_bytes()
-    changed = _case_value(geometry=_geometry(body_id=BodyId("different-part")))
+    changed = _case_value(geometry=_geometry(source_step_digest="3" * 64))
     assert changed.to_bytes() != first.to_bytes()
     assert first.to_bytes() == canonical_bytes(first.to_dict())
