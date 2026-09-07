@@ -9,8 +9,20 @@
   tests, schemas, skills, releases, branches, or worktrees from another repository.
 - This is a greenfield Python 3.12 project. Do not introduce Codex Desktop or Orca as a
   product runtime dependency. The initial product is a headless CLI; do not add a GUI.
-- Keep repository remotes unset until a new remote is explicitly supplied. Report this
-  state as `REMOTE_PENDING`.
+- The authorized remote is `https://github.com/A6721jpn/cae-harness.git` and the
+  integration branch is `V2`. Report this state as `REMOTE_CONFIGURED`.
+- V2 has an independent history containing only the new V2 design and implementation.
+  Do not reuse or inspect legacy CAE Harness code, tests, schemas, releases, branches,
+  worktrees, or case assets. Limit fetches and integration to V2 and its development branches.
+- The development PM is `gpt-6-astra` / `high`, implementation workers are independent
+  `gpt-5.6-luna` / `max` tasks created and continued through the Luna Spawn skill, and
+  the code reviewer is an independent `gpt-6-astra` / `medium` task.
+- The PM owns scope and integration. Workers own assigned implementation files. The
+  reviewer inspects exact commits read-only and reports findings to the PM. Only the PM
+  integrates reviewed, clean, passing changes into V2 and pushes V2 without force.
+- Keep task IDs, runtime metadata, launcher prompts, and local coordination state outside
+  Git, under an ignored local coordination directory. These tools are development tools,
+  not product runtime dependencies.
 
 ## Data and authority boundaries
 

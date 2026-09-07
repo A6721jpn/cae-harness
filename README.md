@@ -2,7 +2,7 @@
 
 STEP部品に新しく生成した剛体治具を接触させ、押し込みによる変形を解析するプロトタイプ。自然言語による条件設定、FEBio実行、XPLTプレビュー、部分編集と再解析比較を対象とする。
 
-現在は設計文書の段階であり、CLI・解析機能は未実装。Python 3.12のheadless CLIを開発し、プレビューには外部のFEBio Studioを使用する。
+V2は今回の設計文書から始める独立した開発履歴であり、CLI・解析機能は未実装。Python 3.12のheadless CLIを開発し、プレビューには外部のFEBio Studioを使用する。
 
 ## 開発文書
 
@@ -19,4 +19,6 @@ STEP部品に新しく生成した剛体治具を接触させ、押し込みに�
 
 P0で最小CLI・配布骨格をテスト先行で作り、実際のFEBio・Studio・Gmshの互換性を合成形状で確認する。実部品の物理条件はケース実行時に根拠から確定する。
 
-実CAEモデル・結果・認証情報はGitへ含めない。remoteは未設定で、状態は`REMOTE_PENDING`。
+開発体制はAstra HighのPM、Luna Spawnで起動するLuna Maxワーカー、Astra Mediumのコードレビュー担当とする。詳細は実装・検証計画の作業分担に従う。
+
+実CAEモデル・結果・認証情報はGitへ含めない。公開先は[GitHubのV2ブランチ](https://github.com/A6721jpn/cae-harness/tree/V2)、状態は`REMOTE_CONFIGURED`。既存CAE Harnessの資産はV2へ引き継がない。
