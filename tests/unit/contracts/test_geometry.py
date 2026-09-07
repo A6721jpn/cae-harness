@@ -27,6 +27,7 @@ def _optional_module(name: str) -> ModuleType | None:
 
 
 GEOMETRY_MODULE = _optional_module("febio_cae.domain.geometry")
+_MISSING = object()
 
 
 def _geometry() -> ModuleType:
@@ -74,10 +75,10 @@ def _value(
     inspection_digest: object = "c" * 64,
     body_id: object = BodyId("body-A"),
     step_unit: object = "mm",
-    placement: object = None,
-    body_evidence: object = None,
-    unit_evidence: object = None,
-    placement_evidence: object = None,
+    placement: object = _MISSING,
+    body_evidence: object = _MISSING,
+    unit_evidence: object = _MISSING,
+    placement_evidence: object = _MISSING,
 ) -> Any:
     return geometry.GeometryIntent(
         source_step_digest=source_step_digest,
@@ -85,16 +86,16 @@ def _value(
         inspection_digest=inspection_digest,
         body_id=body_id,
         step_unit=step_unit,
-        placement=_placement() if placement is None else placement,
+        placement=_placement() if placement is _MISSING else placement,
         body_evidence=(
-            _evidence("geometry.body_id", "d") if body_evidence is None else body_evidence
+            _evidence("geometry.body_id", "d") if body_evidence is _MISSING else body_evidence
         ),
         unit_evidence=(
-            _evidence("geometry.step_unit", "e") if unit_evidence is None else unit_evidence
+            _evidence("geometry.step_unit", "e") if unit_evidence is _MISSING else unit_evidence
         ),
         placement_evidence=(
             _evidence("geometry.placement", "f")
-            if placement_evidence is None
+            if placement_evidence is _MISSING
             else placement_evidence
         ),
     )
