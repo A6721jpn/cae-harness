@@ -22,6 +22,12 @@ from .material import (
     MaterialCandidate,
     MaterialValidationError,
 )
+from .mesh_policy import (
+    LocalRefinement,
+    MeshPolicy,
+    MeshPolicyValidationError,
+    NumericalProfileRef,
+)
 from .motion import MotionApplicability, MotionProfile, MotionSample, MotionValidationError
 from .rigid import RigidPrimitive, RigidValidationError
 from .rigid_kinematics import (
@@ -127,15 +133,19 @@ __all__ = [
     "GeometryValidationError",
     "IsotropicLinearElastic",
     "KinematicCompatibility",
+    "LocalRefinement",
     "MaterialApplicability",
     "MaterialCandidate",
     "MaterialValidationError",
+    "MeshPolicy",
+    "MeshPolicyValidationError",
     "MotionApplicability",
     "MotionCompatibility",
     "MotionProfile",
     "MotionSample",
     "MotionValidationError",
     "NamedAttributeRule",
+    "NumericalProfileRef",
     "OpaqueId",
     "Point3",
     "ProperRotation",
