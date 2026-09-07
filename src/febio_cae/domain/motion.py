@@ -9,7 +9,7 @@ from typing import cast
 
 from .canonical import canonical_bytes
 from .evidence import EvidenceRef
-from .spatial import FrameId, Point3, UnitDirection
+from .spatial import FrameId, Point3, SpatialValidationError, UnitDirection
 from .units import Dimension, Quantity
 
 SCHEMA_VERSION = "1"
@@ -90,20 +90,10 @@ def _number(value: object, field: str) -> int | float:
 
 
 def _direction_from_dict(value: object) -> UnitDirection:
-    payload = _strict_mapping(
-        value,
-        frozenset({"schema_version", "frame", "x", "y", "z"}),
-        "direction",
-    )
-    if payload["schema_version"] != SCHEMA_VERSION:
-        raise MotionValidationError("unsupported direction schema version")
-    frame = _require_text(payload["frame"], "direction.frame")
-    return UnitDirection(
-        FrameId(frame),
-        _number(payload["x"], "direction.x"),
-        _number(payload["y"], "direction.y"),
-        _number(payload["z"], "direction.z"),
-    )
+    try:
+        return UnitDirection.from_dict(value)
+    except SpatialValidationError as error:
+        raise MotionValidationError(str(error)) from error
 
 
 def _point_from_dict(value: object) -> Point3:
@@ -242,7 +232,16 @@ class MotionSample:
 
 
 _MOTION_KEYS = frozenset(
-    {"schema_version", "direction", "initial_reference_point", "samples", "applicability"}
+    {
+        "schema_version",
+        "direction",
+        "initial_reference_point",
+        "samples",
+        "applicability",
+        "direction_evidence",
+        "initial_reference_point_evidence",
+        "history_evidence",
+    }
 )
 
 
@@ -254,6 +253,9 @@ class MotionProfile:
     initial_reference_point: Point3
     samples: Sequence[MotionSample]
     applicability: MotionApplicability
+    direction_evidence: EvidenceRef
+    initial_reference_point_evidence: EvidenceRef
+    history_evidence: EvidenceRef
 
     def __post_init__(self) -> None:
         if not isinstance(self.direction, UnitDirection):
@@ -266,6 +268,13 @@ class MotionProfile:
             )
         if not isinstance(self.applicability, MotionApplicability):
             raise MotionValidationError("applicability must be a MotionApplicability")
+        _require_evidence(self.direction_evidence, "motion.direction", "direction_evidence")
+        _require_evidence(
+            self.initial_reference_point_evidence,
+            "motion.initial_reference_point",
+            "initial_reference_point_evidence",
+        )
+        _require_evidence(self.history_evidence, "motion.history", "history_evidence")
         if isinstance(self.samples, (str, bytes)) or not isinstance(self.samples, Sequence):
             raise MotionValidationError("samples must be a sequence")
         copied = tuple(self.samples)
@@ -292,6 +301,9 @@ class MotionProfile:
             "initial_reference_point": self.initial_reference_point.to_dict(),
             "samples": [sample.to_dict() for sample in self.samples],
             "applicability": self.applicability.to_dict(),
+            "direction_evidence": self.direction_evidence.to_dict(),
+            "initial_reference_point_evidence": self.initial_reference_point_evidence.to_dict(),
+            "history_evidence": self.history_evidence.to_dict(),
         }
 
     @classmethod
@@ -307,6 +319,14 @@ class MotionProfile:
             initial_reference_point=_point_from_dict(payload["initial_reference_point"]),
             samples=[MotionSample.from_dict(item) for item in raw_samples],
             applicability=MotionApplicability.from_dict(payload["applicability"]),
+            direction_evidence=_evidence_from_dict(
+                payload["direction_evidence"], "direction_evidence"
+            ),
+            initial_reference_point_evidence=_evidence_from_dict(
+                payload["initial_reference_point_evidence"],
+                "initial_reference_point_evidence",
+            ),
+            history_evidence=_evidence_from_dict(payload["history_evidence"], "history_evidence"),
         )
 
     def to_bytes(self) -> bytes:
