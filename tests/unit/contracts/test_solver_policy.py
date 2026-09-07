@@ -438,6 +438,25 @@ def test_time_increment_rejects_integer_beyond_shared_json_serialization_range()
         _increments(solver, max_steps=10**5000)
 
 
+@pytest.mark.parametrize("field", ["max_steps", "max_step_retries"])
+def test_time_increment_rejects_unrepresentable_count_with_field_context(field: str) -> None:
+    solver = _solver()
+    valid = _increments(solver)
+    values = {
+        "initial_step": valid.initial_step,
+        "minimum_step": valid.minimum_step,
+        "maximum_step": valid.maximum_step,
+        "adaptive": valid.adaptive,
+        "max_steps": valid.max_steps,
+        "max_step_retries": valid.max_step_retries,
+        "must_points": valid.must_points,
+    }
+    values[field] = 10**5000
+
+    with pytest.raises(solver.SolverPolicyValidationError, match=field):
+        solver.TimeIncrementPolicy(**values)
+
+
 def test_time_increment_is_immutable_and_projection_isolated() -> None:
     solver = _solver()
     value = _increments(solver, must_points=[Quantity(1, "s")])
