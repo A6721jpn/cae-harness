@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Callable
+from dataclasses import fields, is_dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +11,7 @@ import pytest
 from febio_cae.application.service import RegisteredCaseService
 from febio_cae.domain import (
     AsPlaced,
+    AttemptRecord,
     BodyId,
     Budget,
     CaseRevision,
@@ -19,8 +21,10 @@ from febio_cae.domain import (
     DofState,
     EvaluationRequest,
     EvidenceRef,
+    ExecutionBundle,
     FaceId,
     FaceMeasurement,
+    FileEntry,
     FrameId,
     GeometryBodyFact,
     GeometryInspection,
@@ -46,6 +50,7 @@ from febio_cae.domain import (
     RigidPrimitive,
     RigidToolIntent,
     RigidTransform,
+    RunState,
     SelectionRef,
     SolidSupport,
     SolverControl,
@@ -69,6 +74,12 @@ from febio_cae.domain.compatibility import (
 from febio_cae.domain.contact import Frictionless
 from febio_cae.domain.partial_case_spec import PartialCaseSpec
 from febio_cae.domain.ports import PortError, PortErrorCategory, TrustedOwnerContext
+from febio_cae.domain.results import (
+    OutputObservation,
+    ReadResult,
+    ReadStatus,
+    ResultManifest,
+)
 from febio_cae.domain.selection import ResolutionSnapshot
 from febio_cae.domain.spatial import ProperRotation
 from febio_cae.storage.registry import (
@@ -149,6 +160,7 @@ def complete_spec(*, solver_digest: str | None = None) -> CaseSpec:
         world,
         WholeBodyRule(part),
     )
+
     tool_selection = SelectionRef(
         "tool-contact",
         "tool_contact_surface",
@@ -342,6 +354,31 @@ def complete_spec(*, solver_digest: str | None = None) -> CaseSpec:
     )
 
 
+def _with_unregistered_nested_evidence(value: Any) -> Any:
+    if isinstance(value, EvidenceRef):
+        return EvidenceRef(
+            value.schema_version,
+            value.source_kind,
+            "unregistered-physical",
+            value.target_field,
+            "9" * 64,
+        )
+    if isinstance(value, tuple):
+        return tuple(_with_unregistered_nested_evidence(item) for item in value)
+    if isinstance(value, list):
+        return [_with_unregistered_nested_evidence(item) for item in value]
+    if is_dataclass(value):
+        return replace(
+            value,
+            **{
+                item.name: _with_unregistered_nested_evidence(getattr(value, item.name))
+                for item in fields(value)
+                if item.init
+            },
+        )
+    return value
+
+
 class SyntheticGeometry:
     def inspect(
         self, request: GeometryInspectionRequest, source: SourceAssetContent
@@ -495,6 +532,17 @@ def test_validation_rejects_unverified_profile_capability(tmp_path: Path) -> Non
     assert any(d.field == "solver_policy.profile" for d in result.diagnostics)
 
 
+def test_validation_rejects_unregistered_nested_physical_evidence(tmp_path: Path) -> None:
+    service, created, _ = _created(tmp_path)
+    spec = _with_unregistered_nested_evidence(complete_spec())
+    _populate_complete(service, created, spec)
+
+    result = service.validate_case(created.case_id)
+
+    assert result.status != "VALIDATED"
+    assert any(d.field == "evidence" for d in result.diagnostics)
+
+
 def test_synthetic_validated_freeze_publishes_immutable_revision(tmp_path: Path) -> None:
     service, created, _ = _created(tmp_path)
     _populate_complete(service, created)
@@ -542,3 +590,140 @@ def test_duplicate_owner_claim_is_rejected(tmp_path: Path) -> None:
     storage.claim(owner)
     with pytest.raises(PortError):
         storage.claim(owner)
+
+
+def test_cas_loser_is_not_recovered_as_registered_revision(tmp_path: Path) -> None:
+    service, created, _ = _created(tmp_path)
+    _populate_complete(service, created)
+    spec = complete_spec()
+    failing: CaseStorage
+    draft = service.current_draft(created.case_id)
+    advancer = CaseStorage(tmp_path / "case")
+
+    def gate(point: str) -> None:
+        if point == "after_file_replace":
+            advancer.set_draft(
+                replace(
+                    draft,
+                    draft_id="draft-advance",
+                    generation=draft.generation + 1,
+                ),
+                expected_generation=draft.generation,
+            )
+            raise InjectedStorageFailure(point)
+
+    failing = CaseStorage(tmp_path / "case", failure_injector=gate)
+    revision = CaseRevision(
+        created.case_id,
+        "cas-loser",
+        None,
+        None,
+        spec,
+        (_evidence("case_revision.spec"),),
+    )
+    with pytest.raises(InjectedStorageFailure):
+        failing.register_revision_if_current(revision, expected_generation=draft.generation)
+    with pytest.raises(StorageConflictError):
+        failing.get_revision(created.case_id, revision.revision_id)
+
+    reopened = CaseStorage(tmp_path / "case")
+    with pytest.raises(StorageConflictError):
+        reopened.get_revision(created.case_id, revision.revision_id)
+    assert reopened.current_draft(created.case_id).generation == draft.generation + 1
+
+
+def test_duplicate_revision_registration_preserves_original_bytes(tmp_path: Path) -> None:
+    service, created, _ = _created(tmp_path)
+    _populate_complete(service, created)
+    storage = CaseStorage(tmp_path / "case")
+    spec = complete_spec()
+    first = CaseRevision(
+        created.case_id,
+        "fixed-revision",
+        None,
+        None,
+        spec,
+        (_evidence("case_revision.first"),),
+    )
+    second = CaseRevision(
+        created.case_id,
+        "fixed-revision",
+        None,
+        None,
+        spec,
+        (_evidence("case_revision.second"),),
+    )
+    storage.register_revision(first)
+
+    with pytest.raises(StorageConflictError):
+        storage.register_revision(second)
+    assert storage.get_revision(created.case_id, first.revision_id).to_bytes() == first.to_bytes()
+
+    reopened = CaseStorage(tmp_path / "case")
+    assert reopened.get_revision(created.case_id, first.revision_id).to_bytes() == first.to_bytes()
+
+
+def test_owner_scope_and_manifest_files_are_registered_before_publication(
+    tmp_path: Path,
+) -> None:
+    _service, created, _ = _created(tmp_path)
+    storage = CaseStorage(tmp_path / "case")
+    entry = FileEntry("outputs/result.dat", hashlib.sha256(b"result").hexdigest(), 6, "output")
+    bundle = ExecutionBundle(
+        "bundle-1",
+        created.case_id,
+        "revision-1",
+        "a" * 64,
+        "b" * 64,
+        "solver",
+        ToolIdentity("solver", "1", "c" * 64),
+        (entry,),
+        ("solver",),
+        str(tmp_path),
+        1,
+        (),
+    )
+    attempt = AttemptRecord(
+        "attempt-1",
+        "run-1",
+        created.case_id,
+        "revision-1",
+        0,
+        bundle.bundle_digest,
+        RunState.SUCCEEDED,
+        None,
+        (),
+    )
+    owner = TrustedOwnerContext(created.case_id, "run-1", "attempt-1", 0)
+    storage.claim(owner)
+    wrong_attempt = AttemptRecord(
+        "attempt-2",
+        "run-1",
+        created.case_id,
+        "revision-1",
+        99,
+        bundle.bundle_digest,
+        RunState.SUCCEEDED,
+        None,
+        (),
+    )
+    with pytest.raises(PortError):
+        storage.validate(owner, wrong_attempt)
+    storage.validate(owner, attempt)
+    manifest = ResultManifest(
+        "manifest-1",
+        attempt.attempt_id,
+        bundle.bundle_digest,
+        (entry,),
+        ReadResult(
+            ReadStatus.VALIDATED,
+            ToolIdentity("reader", "1", "d" * 64),
+            (OutputObservation("output", "node", "scalar", "mm", FrameId("World"), "measure", 0),),
+            (),
+        ),
+    )
+    foreign_owner = TrustedOwnerContext("other-case", "run-1", "attempt-1", 0)
+    with pytest.raises(PortError):
+        storage.publish_manifest(foreign_owner, manifest)
+    with pytest.raises(PortError):
+        storage.publish_manifest(owner, manifest)
