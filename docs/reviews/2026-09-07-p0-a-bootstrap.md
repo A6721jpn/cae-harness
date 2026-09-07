@@ -15,7 +15,7 @@
 | R3 test-only SHA | `e7483f93538a4bd6eae1fd586ba31ed12b251c38` |
 | R3 production fix SHA | `2622e722c5f0cc2334e90f5965f6dd0950d1a17d` |
 | prior R2 product candidate SHA | `30023b86974b54866c40686f9471c06d0f06ef5b` |
-| final product candidate SHA | `2622e722c5f0cc2334e90f5965f6dd0950d1a17d` |
+| R3 final product candidate SHA | `2622e722c5f0cc2334e90f5965f6dd0950d1a17d` |
 | remote | `https://github.com/A6721jpn/cae-harness.git` |
 | remote状態 | `REMOTE_CONFIGURED` |
 | remote `V2` SHA | `0cc803a6c5a568172662592e5ec932b9c7d09112`（R3開始前の観測値。R3では再取得せず、pushもしていない） |
