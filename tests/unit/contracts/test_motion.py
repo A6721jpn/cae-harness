@@ -308,6 +308,35 @@ def test_motion_profile_from_dict_rejects_swapped_physical_field_evidence(
         motion.MotionProfile.from_dict(payload)
 
 
+@pytest.mark.parametrize(
+    ("field", "wrong_target"),
+    [
+        ("direction_evidence", "motion.initial_reference_point"),
+        ("initial_reference_point_evidence", "motion.history"),
+        ("history_evidence", "motion.direction"),
+    ],
+)
+def test_motion_profile_constructor_rejects_misbound_physical_field_evidence(
+    field: str,
+    wrong_target: str,
+) -> None:
+    motion = _motion()
+    valid = _profile(motion)
+    values: dict[str, Any] = {
+        "direction": valid.direction,
+        "initial_reference_point": valid.initial_reference_point,
+        "samples": valid.samples,
+        "applicability": valid.applicability,
+        "direction_evidence": valid.direction_evidence,
+        "initial_reference_point_evidence": valid.initial_reference_point_evidence,
+        "history_evidence": valid.history_evidence,
+    }
+    values[field] = _evidence(wrong_target, "f")
+
+    with pytest.raises(ValueError):
+        motion.MotionProfile(**values)
+
+
 def test_motion_profile_evidence_is_field_bound_and_changes_canonical_bytes() -> None:
     motion = _motion()
     profile = _profile(motion)
