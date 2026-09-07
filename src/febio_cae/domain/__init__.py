@@ -3,8 +3,10 @@
 from .artifacts import (
     ArtifactValidationError,
     FileEntry,
+    GeometryBodyFact,
     GeometryInspection,
     GeometryInspectionRequest,
+    GeometrySelectionRequest,
     MeshArtifact,
     MeshElement,
     MeshFace,
@@ -12,7 +14,12 @@ from .artifacts import (
     MeshProvenance,
     MeshQualityRecord,
     MeshSet,
+    ResolvedFileContent,
+    SourceAssetContent,
     SourceAssetRef,
+    TET10_CORNER_NODE_POSITIONS,
+    TET10_EDGE_NODE_POSITIONS,
+    TET10_FACE_NODE_POSITIONS,
 )
 from .budget import Budget, BudgetValidationError
 from .canonical import SCHEMA_VERSION, CanonicalizationError, canonical_bytes
@@ -21,7 +28,12 @@ from .case_patch import CasePatch, CasePatchEdit, CasePatchValidationError
 from .case_revision import CaseRevision, CaseRevisionValidationError
 from .case_spec import CaseSpec, CaseSpecValidationError
 from .codec import CodecError, decode_record, encode_record
-from .comparison import ComparisonAxis, ComparisonSpec, ComparisonValidationError
+from .comparison import (
+    ComparisonAxis,
+    ComparisonInterval,
+    ComparisonSpec,
+    ComparisonValidationError,
+)
 from .compatibility import (
     CapabilityRef,
     CapabilityStatus,
@@ -98,8 +110,10 @@ from .ports import (
     PreviewPort,
     QualityPort,
     ReconcileResult,
+    ResultDataPort,
     ResultReaderPort,
     RunnerPort,
+    SourceAssetResolverPort,
     TrustedOwnerContext,
 )
 from .preview import PreviewReceipt, PreviewRequest, PreviewValidationError
@@ -114,10 +128,12 @@ from .results import (
     AssessmentStatus,
     CriterionAssessment,
     MeasuredValue,
+    NumericResultData,
     OutputObservation,
     QualityAssessment,
     ReadResult,
     ReadStatus,
+    ResultDataRef,
     ResultManifest,
     ResultsValidationError,
 )
@@ -223,6 +239,7 @@ __all__ = [
     "CaseSpecValidationError",
     "CodecError",
     "ComparisonAxis",
+    "ComparisonInterval",
     "ComparisonSpec",
     "ComparisonValidationError",
     "CompatibilityProfile",
@@ -258,8 +275,10 @@ __all__ = [
     "FrictionIntent",
     "Frictionless",
     "GeometryId",
+    "GeometryBodyFact",
     "GeometryInspection",
     "GeometryInspectionRequest",
+    "GeometrySelectionRequest",
     "GeometryIntent",
     "GeometryPort",
     "GeometryValidationError",
@@ -272,6 +291,7 @@ __all__ = [
     "MaterialCandidate",
     "MaterialValidationError",
     "MeasuredValue",
+    "NumericResultData",
     "MeshArtifact",
     "MeshElement",
     "MeshFace",
@@ -322,6 +342,9 @@ __all__ = [
     "ReadStatus",
     "ReconcileResult",
     "ResolutionSnapshot",
+    "ResolvedFileContent",
+    "ResultDataPort",
+    "ResultDataRef",
     "ResultManifest",
     "ResultReaderPort",
     "ResultsValidationError",
@@ -347,7 +370,9 @@ __all__ = [
     "SolverControl",
     "SolverPolicy",
     "SolverPolicyValidationError",
+    "SourceAssetContent",
     "SourceAssetRef",
+    "SourceAssetResolverPort",
     "SpatialValidationError",
     "SpecifiedGap",
     "SupportCollection",
@@ -356,6 +381,9 @@ __all__ = [
     "SupportSet",
     "SupportValidationError",
     "TaskStatus",
+    "TET10_CORNER_NODE_POSITIONS",
+    "TET10_EDGE_NODE_POSITIONS",
+    "TET10_FACE_NODE_POSITIONS",
     "TimeIncrementPolicy",
     "ToolIdentity",
     "Translation3",

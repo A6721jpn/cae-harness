@@ -14,6 +14,7 @@ from febio_cae.domain import CaseRevision, FrameId
 try:
     from febio_cae.domain.artifacts import (
         FileEntry,
+        GeometryBodyFact,
         GeometryInspection,
         GeometryInspectionRequest,
         MeshArtifact,
@@ -261,6 +262,8 @@ def _manifest(attempt: Any, bundle: Any, profile: Any) -> Any:
             "a" * 64,
             "numeric-result-v1",
             "output/case.xplt",
+            bundle.bundle_digest,
+            attempt.attempt_id,
         )
     observation = OutputObservation(
         output_id="displacement",
@@ -313,9 +316,11 @@ def test_geometry_inspection_has_no_case_revision_dependency() -> None:
         "mm",
         ("part-body",),
         ("part-body",),
+        (GeometryBodyFact("part-body", 4, 1.0e-9),),
     )
     assert "revision" not in inspect.signature(type(request)).parameters
     assert inspection.source_asset == request.source_asset
+    assert inspection.body_facts[0].face_count == 4
 
 
 def test_mesh_artifact_validates_tet10_structure_and_detaches_sequences() -> None:
@@ -430,7 +435,17 @@ def test_comparison_freezes_identity_and_conditions() -> None:
         candidate_manifest_id="manifest-interface",
         intended_changes=("mesh refinement",),
         fixed_conditions=("material", "support", "motion"),
-        axes=(ComparisonAxis("force", "N", "part", "peak", "linear"),),
+        axes=(
+            ComparisonAxis(
+                "force",
+                "N",
+                "part",
+                "peak",
+                "maximum",
+                interval=ComparisonInterval("N", 0.0, 1.0),
+                interpolation="linear",
+            ),
+        ),
     )
     assert comparison.axes[0].unit == "N"
 
@@ -493,7 +508,12 @@ def test_file_identity_rejects_windows_lexical_forms_and_casefold_collisions(
     synthetic_case_spec: Any,
 ) -> None:
     _require_api()
-    for path in ("output/case.xplt:stream", "output/NUL.xplt", "output./case.xplt", "output /case.xplt"):
+    for path in (
+        "output/case.xplt:stream",
+        "output/NUL.xplt",
+        "output./case.xplt",
+        "output /case.xplt",
+    ):
         with pytest.raises(ValueError):
             FileEntry(path, "a" * 64, 1, "output")
     revision = case_revision(synthetic_case_spec)
@@ -511,9 +531,7 @@ def test_file_identity_rejects_windows_lexical_forms_and_casefold_collisions(
         )
 
 
-def _bundle_with_files(
-    revision: CaseRevision, mesh: Any, profile: Any, files: Any
-) -> Any:
+def _bundle_with_files(revision: CaseRevision, mesh: Any, profile: Any, files: Any) -> Any:
     return ExecutionBundle(
         bundle_id="bundle-casefold",
         case_id=revision.case_id,
@@ -610,13 +628,23 @@ def test_source_and_numeric_data_contracts_carry_actual_resolved_values() -> Non
     )
     data = NumericResultData(
         reference=reference,
-        output_id="displacement",
-        value_type="VEC3F",
-        unit="m",
-        frame=FrameId("World"),
-        state_ids=(0, 1),
-        state_coordinates=(0.0, 1.0),
+        mapping=OutputMapping(
+            "displacement",
+            "displacement",
+            "node",
+            "VEC3F",
+            "m",
+            FrameId("World"),
+            1,
+            1,
+            "value",
+        ),
+        axis_id="time",
+        axis_unit="s",
+        axis_values=(0.0, 1.0),
+        entity_ids=("node-1",),
+        component_ids=("x", "y", "z"),
         values=((0.0, 0.0, 0.0), (0.1, 0.0, 0.0)),
     )
     assert data.values[1][0] == 0.1
-    assert data.state_coordinates == (0.0, 1.0)
+    assert data.axis_values == (0.0, 1.0)

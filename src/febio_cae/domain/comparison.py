@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
+import math
 
 from .canonical import canonical_bytes
 
@@ -44,6 +45,41 @@ def _texts(value: object, field_name: str, *, allow_empty: bool = False) -> tupl
     return result
 
 
+def _finite(value: object, field_name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ComparisonValidationError(f"{field_name} must be finite numeric data")
+    result = float(value)
+    if not math.isfinite(result):
+        raise ComparisonValidationError(f"{field_name} must be finite numeric data")
+    return result
+
+
+@dataclass(frozen=True, slots=True)
+class ComparisonInterval:
+    """One common finite interval used by both comparison runs."""
+
+    unit: str
+    lower: float
+    upper: float
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "unit", _text(self.unit, "unit"))
+        lower = _finite(self.lower, "lower")
+        upper = _finite(self.upper, "upper")
+        if lower >= upper:
+            raise ComparisonValidationError("interval lower bound must be less than upper bound")
+        object.__setattr__(self, "lower", lower)
+        object.__setattr__(self, "upper", upper)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "unit": self.unit,
+            "lower": self.lower,
+            "upper": self.upper,
+        }
+
+
 @dataclass(frozen=True, slots=True)
 class ComparisonAxis:
     axis_id: str
@@ -51,10 +87,20 @@ class ComparisonAxis:
     roi_id: str
     measure_id: str
     aggregation_id: str
+    interval: ComparisonInterval
+    interpolation: str
 
     def __post_init__(self) -> None:
         for field_name in ("axis_id", "unit", "roi_id", "measure_id", "aggregation_id"):
             object.__setattr__(self, field_name, _text(getattr(self, field_name), field_name))
+        if not isinstance(self.interval, ComparisonInterval):
+            raise ComparisonValidationError("interval must be a ComparisonInterval")
+        if self.interval.unit != self.unit:
+            raise ComparisonValidationError("interval unit must match axis unit")
+        interpolation = _text(self.interpolation, "interpolation").lower()
+        if interpolation not in {"linear", "nearest", "step"}:
+            raise ComparisonValidationError("unsupported interpolation method")
+        object.__setattr__(self, "interpolation", interpolation)
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -64,6 +110,8 @@ class ComparisonAxis:
             "roi_id": self.roi_id,
             "measure_id": self.measure_id,
             "aggregation_id": self.aggregation_id,
+            "interval": self.interval.to_dict(),
+            "interpolation": self.interpolation,
         }
 
 
@@ -119,6 +167,7 @@ class ComparisonSpec:
 __all__ = [
     "SCHEMA_VERSION",
     "ComparisonAxis",
+    "ComparisonInterval",
     "ComparisonSpec",
     "ComparisonValidationError",
 ]

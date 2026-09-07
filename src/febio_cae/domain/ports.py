@@ -7,7 +7,16 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Protocol, runtime_checkable
 
-from .artifacts import GeometryInspection, GeometryInspectionRequest, MeshArtifact
+from .artifacts import (
+    GeometryInspection,
+    GeometryInspectionRequest,
+    GeometrySelectionRequest,
+    FileEntry,
+    MeshArtifact,
+    ResolvedFileContent,
+    SourceAssetContent,
+    SourceAssetRef,
+)
 from .budget import Budget
 from .case_draft import CaseDraft
 from .case_revision import CaseRevision
@@ -15,7 +24,8 @@ from .compatibility import CompatibilityProfile
 from .evidence import EvidenceRef
 from .execution import AttemptRecord, ExecutionBundle
 from .preview import PreviewReceipt, PreviewRequest
-from .results import QualityAssessment, ResultManifest
+from .results import NumericResultData, QualityAssessment, ResultDataRef, ResultManifest
+from .selection import ResolutionSnapshot
 
 
 class PortErrorCategory(str, Enum):
@@ -83,9 +93,22 @@ class ReconcileResult:
 
 
 @runtime_checkable
+class SourceAssetResolverPort(Protocol):
+    def resolve(self, source_asset: SourceAssetRef) -> SourceAssetContent:
+        """Resolve and digest-verify bytes for a registered source identity."""
+
+
+@runtime_checkable
 class GeometryPort(Protocol):
-    def inspect(self, request: GeometryInspectionRequest) -> GeometryInspection:
+    def inspect(
+        self, request: GeometryInspectionRequest, source: SourceAssetContent
+    ) -> GeometryInspection:
         """Inspect a registered source asset before a CaseRevision exists."""
+
+    def resolve_selection(
+        self, request: GeometrySelectionRequest, source: SourceAssetContent
+    ) -> ResolutionSnapshot:
+        """Resolve typed geometry selection facts without assigning physical meaning."""
 
 
 @runtime_checkable
@@ -132,6 +155,20 @@ class ResultReaderPort(Protocol):
 
 
 @runtime_checkable
+class ResultDataPort(Protocol):
+    def resolve_file(
+        self, entry: FileEntry, bundle: ExecutionBundle, attempt: AttemptRecord
+    ) -> ResolvedFileContent:
+        """Resolve one bundle/attempt file and verify its registered digest and size."""
+
+    def resolve(self, reference: ResultDataRef) -> NumericResultData:
+        """Resolve one fixed data reference into validated numeric state/value data."""
+
+    def resolve_manifest_output(self, manifest_id: str, output_id: str) -> NumericResultData:
+        """Resolve data for one output of a comparison or result manifest."""
+
+
+@runtime_checkable
 class QualityPort(Protocol):
     def assess(
         self,
@@ -139,6 +176,7 @@ class QualityPort(Protocol):
         revision: CaseRevision,
         mesh: MeshArtifact,
         profile: CompatibilityProfile,
+        data: ResultDataPort,
     ) -> QualityAssessment:
         """Create a separate quality record; do not mutate run state."""
 
@@ -198,6 +236,8 @@ __all__ = [
     "QualityPort",
     "ReconcileResult",
     "ResultReaderPort",
+    "ResultDataPort",
     "RunnerPort",
+    "SourceAssetResolverPort",
     "TrustedOwnerContext",
 ]

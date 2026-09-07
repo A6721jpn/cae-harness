@@ -10,13 +10,39 @@ from dataclasses import dataclass, field
 from typing import Final
 
 from .canonical import canonical_bytes
+from .selection import SelectionRef
 from .spatial import FrameId
 
 SCHEMA_VERSION = "1"
 TET10_NODE_ORDER_ID: Final[str] = "tet10-canonical-v1"
 TET10_FACE_ORDER_ID: Final[str] = "tet10-face-canonical-v1"
+TET10_CORNER_NODE_POSITIONS: Final[tuple[int, ...]] = (0, 1, 2, 3)
+TET10_EDGE_NODE_POSITIONS: Final[tuple[tuple[int, int], ...]] = (
+    (0, 1),
+    (1, 2),
+    (2, 0),
+    (0, 3),
+    (1, 3),
+    (2, 3),
+)
+TET10_FACE_NODE_POSITIONS: Final[tuple[tuple[int, ...], ...]] = (
+    (0, 1, 2, 4, 5, 6),
+    (0, 1, 3, 4, 7, 8),
+    (1, 2, 3, 5, 8, 9),
+    (0, 2, 3, 6, 7, 9),
+)
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _DIGEST_FIELDS = frozenset({"content_digest", "inspection_digest", "mesh_recipe_digest"})
+_WINDOWS_DEVICE_NAMES = frozenset(
+    {
+        "CON",
+        "PRN",
+        "AUX",
+        "NUL",
+        *(f"COM{index}" for index in range(1, 10)),
+        *(f"LPT{index}" for index in range(1, 10)),
+    }
+)
 
 
 class ArtifactValidationError(ValueError):
@@ -110,6 +136,22 @@ class SourceAssetRef:
 
 
 @dataclass(frozen=True, slots=True)
+class SourceAssetContent:
+    """Resolved source bytes bound to the registered source digest."""
+
+    source_asset: SourceAssetRef
+    content: bytes
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.source_asset, SourceAssetRef):
+            raise ArtifactValidationError("source_asset must be a SourceAssetRef")
+        if not isinstance(self.content, bytes):
+            raise ArtifactValidationError("content must be bytes")
+        if hashlib.sha256(self.content).hexdigest() != self.source_asset.content_digest:
+            raise ArtifactValidationError("content digest does not match source_asset")
+
+
+@dataclass(frozen=True, slots=True)
 class GeometryInspectionRequest:
     """Geometry-only inspection request with no physical CaseRevision dependency."""
 
@@ -136,6 +178,55 @@ class GeometryInspectionRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class GeometrySelectionRequest:
+    """Request resolution of a typed selection against one registered source."""
+
+    source_asset: SourceAssetRef
+    selection: SelectionRef
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.source_asset, SourceAssetRef):
+            raise ArtifactValidationError("source_asset must be a SourceAssetRef")
+        if not isinstance(self.selection, SelectionRef):
+            raise ArtifactValidationError("selection must be a SelectionRef")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "source_asset": self.source_asset.to_dict(),
+            "selection": self.selection.to_dict(),
+        }
+
+    def to_bytes(self) -> bytes:
+        return canonical_bytes(self.to_dict())
+
+
+@dataclass(frozen=True, slots=True)
+class GeometryBodyFact:
+    """Structural face/volume facts returned by geometry inspection."""
+
+    body_id: str
+    face_count: int
+    volume_si: float
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "body_id", _text(self.body_id, "body_id"))
+        object.__setattr__(self, "face_count", _positive_int(self.face_count, "face_count"))
+        volume = _finite(self.volume_si, "volume_si")
+        if volume <= 0.0:
+            raise ArtifactValidationError("volume_si must be positive")
+        object.__setattr__(self, "volume_si", volume)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "body_id": self.body_id,
+            "face_count": self.face_count,
+            "volume_si": self.volume_si,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class GeometryInspection:
     """Geometry-only inspection result; it does not assign physical meaning."""
 
@@ -144,6 +235,7 @@ class GeometryInspection:
     declared_unit: str
     body_ids: Sequence[str]
     closed_solid_body_ids: Sequence[str]
+    body_facts: Sequence[GeometryBodyFact] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.source_asset, SourceAssetRef):
@@ -158,8 +250,16 @@ class GeometryInspection:
         )
         if not set(closed).issubset(bodies):
             raise ArtifactValidationError("closed_solid_body_ids must be a subset of body_ids")
+        facts = tuple(self.body_facts)
+        if any(not isinstance(item, GeometryBodyFact) for item in facts):
+            raise ArtifactValidationError("body_facts contains an invalid value")
+        if len({item.body_id for item in facts}) != len(facts):
+            raise ArtifactValidationError("body_facts must not contain duplicate body IDs")
+        if any(item.body_id not in bodies for item in facts):
+            raise ArtifactValidationError("body_facts references an unknown body")
         object.__setattr__(self, "body_ids", bodies)
         object.__setattr__(self, "closed_solid_body_ids", closed)
+        object.__setattr__(self, "body_facts", facts)
 
     @property
     def body_count(self) -> int:
@@ -173,6 +273,7 @@ class GeometryInspection:
             "declared_unit": self.declared_unit,
             "body_ids": list(self.body_ids),
             "closed_solid_body_ids": list(self.closed_solid_body_ids),
+            "body_facts": [item.to_dict() for item in self.body_facts],
         }
 
     def to_bytes(self) -> bytes:
@@ -218,6 +319,7 @@ class MeshElement:
     element_id: int
     element_type: str
     node_ids: Sequence[int]
+    body_id: str
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "element_id", _positive_int(self.element_id, "element_id"))
@@ -229,6 +331,7 @@ class MeshElement:
         if len(node_ids) != 10:
             raise ArtifactValidationError("tet10 node_ids must contain exactly 10 nodes")
         object.__setattr__(self, "node_ids", node_ids)
+        object.__setattr__(self, "body_id", _text(self.body_id, "body_id"))
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -236,6 +339,7 @@ class MeshElement:
             "element_id": self.element_id,
             "element_type": self.element_type,
             "node_ids": list(self.node_ids),
+            "body_id": self.body_id,
         }
 
 
@@ -287,7 +391,8 @@ class MeshSet:
     set_id: str
     kind: str
     body_id: str
-    member_ids: Sequence[int]
+    member_ids: Sequence[int | str]
+    source_selection_digest: str
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "set_id", _text(self.set_id, "set_id"))
@@ -296,7 +401,26 @@ class MeshSet:
             raise ArtifactValidationError("mesh set kind must be node, element, face, or body")
         object.__setattr__(self, "kind", kind)
         object.__setattr__(self, "body_id", _text(self.body_id, "body_id"))
-        object.__setattr__(self, "member_ids", _tuple_int(self.member_ids, "member_ids"))
+        if isinstance(self.member_ids, (str, bytes, bytearray)) or not isinstance(
+            self.member_ids, Sequence
+        ):
+            raise ArtifactValidationError("member_ids must be a sequence")
+        if kind in {"node", "element"}:
+            members: tuple[int | str, ...] = tuple(
+                _positive_int(item, "member_ids[]") for item in self.member_ids
+            )
+        else:
+            members = tuple(_text(item, "member_ids[]") for item in self.member_ids)
+        if not members:
+            raise ArtifactValidationError("member_ids must not be empty")
+        if len(set(members)) != len(members):
+            raise ArtifactValidationError("member_ids must not contain duplicate values")
+        object.__setattr__(self, "member_ids", members)
+        object.__setattr__(
+            self,
+            "source_selection_digest",
+            _digest(self.source_selection_digest, "source_selection_digest"),
+        )
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -305,6 +429,7 @@ class MeshSet:
             "kind": self.kind,
             "body_id": self.body_id,
             "member_ids": list(self.member_ids),
+            "source_selection_digest": self.source_selection_digest,
         }
 
 
@@ -382,6 +507,12 @@ class MeshProvenance:
         object.__setattr__(
             self, "face_ordering_id", _text(self.face_ordering_id, "face_ordering_id")
         )
+        if self.node_ordering_id != TET10_NODE_ORDER_ID:
+            raise ArtifactValidationError("node_ordering_id is not the supported Tet10 projection")
+        if self.face_ordering_id != TET10_FACE_ORDER_ID:
+            raise ArtifactValidationError("face_ordering_id is not the supported Tet10 projection")
+        if len(set(self.source_selection_digests)) != len(self.source_selection_digests):
+            raise ArtifactValidationError("source_selection_digests must not contain duplicates")
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -411,13 +542,27 @@ class FileEntry:
         path = _text(self.logical_path, "logical_path")
         if "\\" in path or path.startswith(("/", "//")):
             raise ArtifactValidationError("logical_path must use relative POSIX separators")
-        if re.match(r"^[A-Za-z]:", path) or ":" in path.split("/", 1)[0]:
-            raise ArtifactValidationError("logical_path must not be drive-qualified")
+        if ":" in path:
+            raise ArtifactValidationError(
+                "logical_path must not contain a drive or stream separator"
+            )
         parts = path.split("/")
         if any(not part or part in {".", ".."} for part in parts):
             raise ArtifactValidationError(
                 "logical_path contains an ambiguous or escaping component"
             )
+        for part in parts:
+            if part != part.rstrip(" ."):
+                raise ArtifactValidationError(
+                    "logical_path components must not end with a space or period"
+                )
+            if any(character in part for character in '<>"|?*'):
+                raise ArtifactValidationError("logical_path contains a Windows-invalid character")
+            device_name = part.split(".", 1)[0].upper()
+            if device_name in _WINDOWS_DEVICE_NAMES:
+                raise ArtifactValidationError(
+                    "logical_path contains a reserved Windows device name"
+                )
         object.__setattr__(self, "logical_path", path)
         object.__setattr__(self, "digest", _digest(self.digest, "digest"))
         if (
@@ -436,6 +581,27 @@ class FileEntry:
             "size_bytes": self.size_bytes,
             "role": self.role,
         }
+
+    def to_bytes(self) -> bytes:
+        return canonical_bytes(self.to_dict())
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedFileContent:
+    """Bytes for one registered logical file, verified against its FileEntry."""
+
+    entry: FileEntry
+    content: bytes
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.entry, FileEntry):
+            raise ArtifactValidationError("entry must be a FileEntry")
+        if not isinstance(self.content, bytes):
+            raise ArtifactValidationError("content must be bytes")
+        if len(self.content) != self.entry.size_bytes:
+            raise ArtifactValidationError("content size does not match FileEntry")
+        if hashlib.sha256(self.content).hexdigest() != self.entry.digest:
+            raise ArtifactValidationError("content digest does not match FileEntry")
 
 
 @dataclass(frozen=True, slots=True)
@@ -485,28 +651,71 @@ class MeshArtifact:
                 raise ArtifactValidationError(f"{name} contains duplicate IDs")
         node_ids = {item.node_id for item in nodes}
         element_ids = {item.element_id for item in elements}
+        body_ids = set(self.provenance.source_body_ids)
+        selection_digests = set(self.provenance.source_selection_digests)
+        if any(item.body_id not in body_ids for item in elements):
+            raise ArtifactValidationError("element references an unknown body")
+        if any(item.body_id not in body_ids for item in faces):
+            raise ArtifactValidationError("face references an unknown body")
+        if any(item.body_id not in body_ids for item in sets):
+            raise ArtifactValidationError("mesh set references an unknown body")
+        if any(item.source_selection_digest not in selection_digests for item in sets):
+            raise ArtifactValidationError("mesh set references an unknown source selection")
         for element in elements:
             if any(node_id not in node_ids for node_id in element.node_ids):
                 raise ArtifactValidationError("element references an unknown node")
+        element_by_id = {item.element_id: item for item in elements}
+        node_bodies: dict[int, set[str]] = {}
+        for element in elements:
+            for node_id in element.node_ids:
+                node_bodies.setdefault(node_id, set()).add(element.body_id)
         for face in faces:
             if any(node_id not in node_ids for node_id in face.node_ids):
                 raise ArtifactValidationError("face references an unknown node")
             if any(element_id not in element_ids for element_id in face.adjacent_element_ids):
                 raise ArtifactValidationError("face references an unknown element")
-        for item in sets:
-            if item.kind == "node" and any(member not in node_ids for member in item.member_ids):
-                raise ArtifactValidationError("node set references an unknown node")
-            if item.kind == "element" and any(
-                member not in element_ids for member in item.member_ids
+            expected_first: tuple[int, ...] | None = None
+            for adjacent_element_id, local_face_id in zip(
+                face.adjacent_element_ids, face.local_face_ids, strict=True
             ):
-                raise ArtifactValidationError("element set references an unknown element")
-            if item.kind == "face" and any(
-                member not in {face_id for face_id in (face.face_id for face in faces)}
-                for member in item.member_ids
-            ):
-                raise ArtifactValidationError(
-                    "face set member IDs must be resolved by a face set adapter"
+                if local_face_id >= len(TET10_FACE_NODE_POSITIONS):
+                    raise ArtifactValidationError("face references an unknown local face")
+                element = element_by_id[adjacent_element_id]
+                expected = tuple(
+                    element.node_ids[position]
+                    for position in TET10_FACE_NODE_POSITIONS[local_face_id]
                 )
+                if element.body_id != face.body_id:
+                    raise ArtifactValidationError("face crosses element body ownership")
+                if expected_first is None:
+                    expected_first = expected
+                    if tuple(face.node_ids) != expected:
+                        raise ArtifactValidationError(
+                            "face node order does not match the canonical oriented face table"
+                        )
+                elif set(face.node_ids) != set(expected):
+                    raise ArtifactValidationError(
+                        "face nodes do not match the adjacent element face"
+                    )
+        face_by_id = {item.face_id: item for item in faces}
+        for item in sets:
+            if item.kind == "node":
+                if any(member not in node_ids for member in item.member_ids):
+                    raise ArtifactValidationError("node set references an unknown node")
+                if any(item.body_id not in node_bodies[member] for member in item.member_ids):
+                    raise ArtifactValidationError("node set crosses body ownership")
+            elif item.kind == "element":
+                if any(member not in element_ids for member in item.member_ids):
+                    raise ArtifactValidationError("element set references an unknown element")
+                if any(element_by_id[member].body_id != item.body_id for member in item.member_ids):
+                    raise ArtifactValidationError("element set crosses body ownership")
+            elif item.kind == "face":
+                if any(member not in face_by_id for member in item.member_ids):
+                    raise ArtifactValidationError("face set references an unknown face")
+                if any(face_by_id[member].body_id != item.body_id for member in item.member_ids):
+                    raise ArtifactValidationError("face set crosses body ownership")
+            elif any(member not in body_ids for member in item.member_ids):
+                raise ArtifactValidationError("body set references an unknown body")
         object.__setattr__(self, "nodes", nodes)
         object.__setattr__(self, "elements", elements)
         object.__setattr__(self, "faces", faces)
@@ -540,12 +749,17 @@ class MeshArtifact:
 
 __all__ = [
     "SCHEMA_VERSION",
+    "TET10_CORNER_NODE_POSITIONS",
+    "TET10_EDGE_NODE_POSITIONS",
+    "TET10_FACE_NODE_POSITIONS",
     "TET10_FACE_ORDER_ID",
     "TET10_NODE_ORDER_ID",
     "ArtifactValidationError",
     "FileEntry",
+    "GeometryBodyFact",
     "GeometryInspection",
     "GeometryInspectionRequest",
+    "GeometrySelectionRequest",
     "MeshArtifact",
     "MeshElement",
     "MeshFace",
@@ -553,5 +767,7 @@ __all__ = [
     "MeshProvenance",
     "MeshQualityRecord",
     "MeshSet",
+    "ResolvedFileContent",
+    "SourceAssetContent",
     "SourceAssetRef",
 ]

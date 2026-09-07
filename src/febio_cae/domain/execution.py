@@ -139,8 +139,10 @@ class ExecutionBundle:
         files = tuple(self.files)
         if not files or any(not isinstance(item, FileEntry) for item in files):
             raise ExecutionValidationError("files must be a non-empty sequence of FileEntry values")
-        if len({item.logical_path for item in files}) != len(files):
-            raise ExecutionValidationError("files must not contain duplicate logical paths")
+        if len({item.logical_path.casefold() for item in files}) != len(files):
+            raise ExecutionValidationError(
+                "files must not contain duplicate case-insensitive logical paths"
+            )
         object.__setattr__(self, "files", tuple(sorted(files, key=lambda item: item.logical_path)))
         if isinstance(self.argv, (str, bytes, bytearray)) or not isinstance(self.argv, Sequence):
             raise ExecutionValidationError("argv must be a sequence")

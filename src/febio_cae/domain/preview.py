@@ -78,6 +78,9 @@ class PreviewRequest:
             "variables": list(self.variables),
         }
 
+    def to_bytes(self) -> bytes:
+        return canonical_bytes(self.to_dict())
+
 
 @dataclass(frozen=True, slots=True)
 class PreviewReceipt:
@@ -111,6 +114,8 @@ class PreviewReceipt:
                 isinstance(item, bool) or not isinstance(item, int) or item < 0 for item in states
             ):
                 raise PreviewValidationError(f"{field_name} must contain nonnegative integers")
+            if len(set(states)) != len(states):
+                raise PreviewValidationError(f"{field_name} must not contain duplicates")
             object.__setattr__(self, field_name, states)
         for field_name in ("requested_variables", "observed_variables"):
             value = getattr(self, field_name)
@@ -137,8 +142,22 @@ class PreviewReceipt:
         observed_state_ids: Sequence[int] | None = None,
         observed_variables: Sequence[str] | None = None,
     ) -> PreviewReceipt:
-        states = self.requested_state_ids if observed_state_ids is None else observed_state_ids
-        variables = self.requested_variables if observed_variables is None else observed_variables
+        if observed_state_ids is None:
+            if not self.observed_state_ids:
+                raise PreviewValidationError(
+                    "confirmed preview receipts require explicit observed state IDs and confirmation evidence"
+                )
+            states = self.observed_state_ids
+        else:
+            states = observed_state_ids
+        if observed_variables is None:
+            if not self.observed_variables:
+                raise PreviewValidationError(
+                    "confirmed preview receipts require explicit observed variables and confirmation evidence"
+                )
+            variables = self.observed_variables
+        else:
+            variables = observed_variables
         return PreviewReceipt(
             receipt_id=self.receipt_id,
             manifest_id=self.manifest_id,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 import re
 from collections.abc import Sequence
@@ -10,7 +11,7 @@ from enum import Enum
 
 from .artifacts import FileEntry
 from .canonical import canonical_bytes
-from .compatibility import ToolIdentity
+from .compatibility import OutputMapping, ToolIdentity
 from .spatial import FrameId
 
 SCHEMA_VERSION = "1"
@@ -53,6 +54,16 @@ def _sequence(value: object, field_name: str) -> tuple[object, ...]:
     return tuple(value)
 
 
+def _logical_path(value: object, field_name: str) -> str:
+    result = _text(value, field_name)
+    if "\\" in result or result.startswith("/") or ":" in result:
+        raise ResultsValidationError(f"{field_name} must be a relative logical path")
+    parts = result.split("/")
+    if any(not part or part in {".", ".."} for part in parts):
+        raise ResultsValidationError(f"{field_name} contains an ambiguous path component")
+    return result
+
+
 class ReadStatus(str, Enum):
     VALIDATED = "VALIDATED"
     UNVERIFIED = "UNVERIFIED"
@@ -67,6 +78,126 @@ class AssessmentStatus(str, Enum):
 
 
 @dataclass(frozen=True, slots=True)
+class ResultDataRef:
+    """Fixed identity for one decoded numeric result payload."""
+
+    data_id: str
+    content_digest: str
+    codec_id: str
+    logical_path: str
+    bundle_digest: str | None = None
+    attempt_id: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "data_id", _text(self.data_id, "data_id"))
+        object.__setattr__(self, "content_digest", _digest(self.content_digest, "content_digest"))
+        object.__setattr__(self, "codec_id", _text(self.codec_id, "codec_id"))
+        object.__setattr__(self, "logical_path", _logical_path(self.logical_path, "logical_path"))
+        if (self.bundle_digest is None) != (self.attempt_id is None):
+            raise ResultsValidationError("bundle_digest and attempt_id must be supplied together")
+        if self.bundle_digest is not None:
+            object.__setattr__(self, "bundle_digest", _digest(self.bundle_digest, "bundle_digest"))
+            object.__setattr__(self, "attempt_id", _text(self.attempt_id, "attempt_id"))
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "data_id": self.data_id,
+            "content_digest": self.content_digest,
+            "codec_id": self.codec_id,
+            "logical_path": self.logical_path,
+            "bundle_digest": self.bundle_digest,
+            "attempt_id": self.attempt_id,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class NumericResultData:
+    """Decoded numeric states owned by a ResultDataPort."""
+
+    reference: ResultDataRef
+    mapping: OutputMapping
+    axis_id: str
+    axis_unit: str
+    axis_values: Sequence[float]
+    entity_ids: Sequence[str]
+    component_ids: Sequence[str]
+    values: Sequence[Sequence[float]]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.reference, ResultDataRef):
+            raise ResultsValidationError("reference must be a ResultDataRef")
+        if not isinstance(self.mapping, OutputMapping):
+            raise ResultsValidationError("mapping must be an OutputMapping")
+        object.__setattr__(self, "axis_id", _text(self.axis_id, "axis_id"))
+        object.__setattr__(self, "axis_unit", _text(self.axis_unit, "axis_unit"))
+        axis_values = tuple(
+            _finite(item, "axis_values[]") for item in _sequence(self.axis_values, "axis_values")
+        )
+        if not axis_values:
+            raise ResultsValidationError("axis_values must not be empty")
+        if any(current <= previous for previous, current in zip(axis_values, axis_values[1:])):
+            raise ResultsValidationError("axis_values must be strictly increasing")
+        entity_ids = tuple(
+            _text(item, "entity_ids[]") for item in _sequence(self.entity_ids, "entity_ids")
+        )
+        component_ids = tuple(
+            _text(item, "component_ids[]")
+            for item in _sequence(self.component_ids, "component_ids")
+        )
+        if not entity_ids or not component_ids:
+            raise ResultsValidationError("entity_ids and component_ids must not be empty")
+        if len(set(entity_ids)) != len(entity_ids):
+            raise ResultsValidationError("entity_ids must not contain duplicates")
+        if len(set(component_ids)) != len(component_ids):
+            raise ResultsValidationError("component_ids must not contain duplicates")
+        rows_raw = _sequence(self.values, "values")
+        if len(rows_raw) != len(axis_values):
+            raise ResultsValidationError("values must align with axis_values")
+        rows: list[tuple[float, ...]] = []
+        for row in rows_raw:
+            row_values = tuple(_finite(item, "values[]") for item in _sequence(row, "values[]"))
+            expected_width = len(entity_ids) * len(component_ids)
+            if len(row_values) != expected_width:
+                raise ResultsValidationError(
+                    "numeric result rows must match entity/component mapping width"
+                )
+            rows.append(row_values)
+        object.__setattr__(self, "axis_values", axis_values)
+        object.__setattr__(self, "entity_ids", entity_ids)
+        object.__setattr__(self, "component_ids", component_ids)
+        object.__setattr__(self, "values", tuple(rows))
+
+    def _content_projection(self) -> dict[str, object]:
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "reference": {
+                "data_id": self.reference.data_id,
+                "codec_id": self.reference.codec_id,
+                "logical_path": self.reference.logical_path,
+            },
+            "mapping": self.mapping.to_dict(),
+            "axis_id": self.axis_id,
+            "axis_unit": self.axis_unit,
+            "axis_values": list(self.axis_values),
+            "entity_ids": list(self.entity_ids),
+            "component_ids": list(self.component_ids),
+            "values": [list(row) for row in self.values],
+        }
+
+    @property
+    def expected_content_digest(self) -> str:
+        return hashlib.sha256(canonical_bytes(self._content_projection())).hexdigest()
+
+    def verify_content_digest(self) -> None:
+        if self.reference.content_digest != self.expected_content_digest:
+            raise ResultsValidationError("numeric result content digest does not match payload")
+
+    def to_dict(self) -> dict[str, object]:
+        return self._content_projection() | {"content_digest": self.reference.content_digest}
+
+
+@dataclass(frozen=True, slots=True)
 class OutputObservation:
     output_id: str
     location: str
@@ -75,6 +206,7 @@ class OutputObservation:
     frame: FrameId
     measure_id: str
     state_count: int
+    data_ref: ResultDataRef | None = None
 
     def __post_init__(self) -> None:
         for field_name in ("output_id", "location", "value_type", "unit", "measure_id"):
@@ -87,6 +219,8 @@ class OutputObservation:
             or self.state_count < 0
         ):
             raise ResultsValidationError("state_count must be a nonnegative integer")
+        if self.data_ref is not None and not isinstance(self.data_ref, ResultDataRef):
+            raise ResultsValidationError("data_ref must be a ResultDataRef or None")
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -98,6 +232,7 @@ class OutputObservation:
             "frame": self.frame.value,
             "measure_id": self.measure_id,
             "state_count": self.state_count,
+            "data_ref": None if self.data_ref is None else self.data_ref.to_dict(),
         }
 
 
@@ -153,8 +288,8 @@ class ResultManifest:
         files = tuple(self.files)
         if not files or any(not isinstance(item, FileEntry) for item in files):
             raise ResultsValidationError("files must be a non-empty sequence of FileEntry values")
-        if len({item.logical_path for item in files}) != len(files):
-            raise ResultsValidationError("files contains duplicate logical paths")
+        if len({item.logical_path.casefold() for item in files}) != len(files):
+            raise ResultsValidationError("files contains duplicate case-insensitive logical paths")
         if not isinstance(self.read_result, ReadResult):
             raise ResultsValidationError("read_result must be a ReadResult")
         object.__setattr__(self, "files", tuple(sorted(files, key=lambda item: item.logical_path)))
@@ -268,10 +403,12 @@ __all__ = [
     "AssessmentStatus",
     "CriterionAssessment",
     "MeasuredValue",
+    "NumericResultData",
     "OutputObservation",
     "QualityAssessment",
     "ReadResult",
     "ReadStatus",
     "ResultManifest",
+    "ResultDataRef",
     "ResultsValidationError",
 ]
