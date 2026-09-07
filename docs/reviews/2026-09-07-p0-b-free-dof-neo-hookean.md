@@ -27,7 +27,7 @@ The only tracked change from this study is this Markdown report. No real CAE dat
 | Evidence | Bytes | SHA-256 |
 |---|---:|---|
 | copied accepted `source-cube-tet10.msh` | 20191 | `42D60B90AE8F5DCB63CEB979499D90E72C1809CD948C7F177EDF2D313E6CFA3E` |
-| `prepared-v2/template-free-dof.feb` | 29562 | `BDB5442CF3BAD270A025C917AB92E5C076FE11E9C28E201A942A0C5BF5514363` |
+| `prepared-v2/template-free-dof.feb` | 29377 | `BDB5442CF3BAD270A025C917AB92E5C076FE11E9C28E201A942A0C5BF5514363` |
 | `prepared-v2/mesh-oracle.json` | — | `7DE207D7F89BC948E3551ABA44C0DEC9844C24698520D742281E54321461379C` |
 | `prepared-v2/oracle.json` | — | `68C35C1309FD7BA4945C9CF302FDE7FA929C22ADBB843EE828882726239E095E` |
 | `prepared-v2/oracle-high-precision.json` | — | `7551C2655188E9164925BD55842658E63A6F4E453B8FEA363D88CF1A34A893A6` |
@@ -62,11 +62,11 @@ For each mapped element, the study checked ten distinct existing node tags, all 
 | Internal faces | `158` (derived from the `400` tetrahedral face incidences and `84` boundary faces) |
 | Coordinate bounds | `[0, 0.01]^3 m` |
 
-Two offline connectivity mutations were intentionally rejected before any solver launch: swapping a midside pair returned exit `1` with `Tet10 midpoint error exceeds 1e-12 m`; an orientation-preserving midside remap with an inverted corner order returned exit `1` with `non-positive Tet10 determinant`. The wrapper’s expected-negative-probe command returned exit `0` because both negative child validations failed as required. No mutated input was sent to FEBio.
+Two offline connectivity mutations were intentionally rejected before any solver launch: swapping a midside pair returned exit `1` with `Tet10 midpoint error exceeds 1e-12 m`; an orientation-preserving midside remap with an inverted corner order returned exit `1` with `non-positive Tet10 determinant`. The first negative-probe helper invocation was itself a failed setup run because the inverted-corner child did not produce the expected error fragment; a later corrected invocation returned exit `0` because both negative child validations failed as required. No mutated input was sent to FEBio.
 
 ## 4. Free-DOF contract, material, and analytic reference
 
-The fresh XML preflight found `693` total displacement DOFs, `148` constrained node-component pairs, and `545` free DOFs. There were `61` wholly free interior nodes (`171` through `231` in the emitted node IDs). The only displacement boundary conditions were:
+The accepted attempt-02 XML preflight found `693` total displacement DOFs, `148` constrained node-component pairs, and `545` free DOFs. There were `61` wholly free interior nodes (`171` through `231` in the emitted node IDs). These `545`/`61` values qualify attempt 02 only: attempt 01 passed a digit-token preflight but its wrapped native NodeSet serialization did not preserve the same effective component selections. The only intended displacement boundary conditions were:
 
 | Node set | Prescribed component | Value at load factor `s` |
 |---|---|---:|
@@ -75,7 +75,9 @@ The fresh XML preflight found `693` total displacement DOFs, `148` constrained n
 | `y0` | `uy` | `0` |
 | `z0` | `uz` | `0` |
 
-Every other component remained free. The material was the FEBio `neo-Hookean` type with `E=1e6 Pa`, `nu=0.3`, ten equal static steps from `s=0` to `s=1`, and no density, contact, rigid body, or prescribed tangential components. The [official neo-Hookean feature reference](https://febiosoftware.github.io/febio-feature-manual/features/solid_material_neo-hookean/) supplies the material vocabulary and the `E`/`v` parameterization. The [official prescribed-displacement reference](https://febiosoftware.github.io/febio-feature-manual/features/solid_bc_prescribed_displacement/) supplies the node-set/DOF/value vocabulary; zero-valued prescribed displacement was used so the native reaction output was requested on those support components.
+Every other component remained free. The material was the FEBio `neo-Hookean` type with `E=1e6 Pa`, `nu=0.3`, ten equal static steps from `s=0` to `s=1`, and no contact, rigid body, or prescribed tangential components. The XML omitted density; the FEBio 4.12 log reported runtime default `density=1`, which is relevant here only within the static, no-body-force scope. The [official neo-Hookean feature reference](https://febiosoftware.github.io/febio-feature-manual/features/solid_material_neo-hookean/) supplies the material vocabulary and the `E`/`v` parameterization; that page identifies itself as FEBio 4.13, while this native run was FEBio 4.12.0, so it does not establish cross-version or product compatibility. The [official prescribed-displacement reference](https://febiosoftware.github.io/febio-feature-manual/features/solid_bc_prescribed_displacement/) supplies the node-set/DOF/value vocabulary; zero-valued prescribed displacement was used so the native reaction output was requested on those support components.
+
+The accepted attempt-02 FEBio log recorded `analysis=STATIC`, `time_steps=10`, `step_size=0.1`, `plot_zero_state=yes`, `plot_level=PLOT_MAJOR_ITRS`, `output_level=OUTPUT_MAJOR_ITRS`, `plot_stride=1`, `output_stride=1`, and no automatic time stepper. Its solver profile recorded `dtol=0.001`, `etol=0.01`, `rtol=0`, `min_residual=1e-20`, `max_refs=50`, `reform_each_time_step=yes`, `diverge_reform=yes`, and Pardiso. Integration choices and other FEBio defaults not exposed by this input/log pair remain unverified; no such default is inferred here.
 
 The independent reference used:
 
@@ -87,7 +89,9 @@ F      = diag(a,b,b)
 J      = a*b^2
 ```
 
-At the final `a=0.999`, `b` is the positive root of `mu*(b^2-1)+lambda*ln(a*b^2)=0`. The frozen floating-point oracle recorded `b=1.0003001591042167`, `sigma_xx=-1000.17268579658 Pa`, `xL=-0.100077319778249 N`, and `x0=+0.100077319778249 N`. A post-run 80-digit Decimal cross-check found `b=1.000300159104216465...`, residual `-1.0907e-73 Pa`, and a force difference of only `2.09e-14 N` from the frozen float oracle. The reported native gates use the frozen oracle; the high-precision result is a numerical cross-check, not a post-hoc tolerance change.
+At the final `a=0.999`, `b` is the positive root of `mu*(b^2-1)+lambda*ln(a*b^2)=0`. The frozen floating-point oracle recorded `b=1.0003001591042167`, `sigma_xx=-1000.17268579658 Pa`, `xL=-0.100077319778249 N`, and `x0=+0.100077319778249 N`. On every nonzero step its bisection reached the `200`-iteration cap; at the final step the residual was `3.049365204788046e-10 Pa`, above its declared `1e-13 Pa` stopping threshold, and the script emitted no convergence flag. Therefore this report does not call the frozen float oracle converged. A post-run 80-digit Decimal cross-check found `b=1.000300159104216465...`, residual `-1.0907e-73 Pa`, and a force difference of only `2.09e-14 N` from the frozen float oracle. The reported native gates use the frozen oracle; the high-precision result is a numerical cross-check, not a post-hoc tolerance change or a claim of native solver convergence.
+
+The force expression uses the current deformed x-face area: `sigma_xx*b^2*L^2`. Equivalently, with `P=J*sigma*F^-T`, `F=diag(a,b,b)`, and `J=a*b^2`, `Pxx=b^2*sigma_xx`, so the reference-area form `Pxx*L^2` is identical. This is an area/traction identity, not an additional solver assumption.
 
 Frozen thresholds, set before native output was collected, were:
 
@@ -102,14 +106,14 @@ Frozen thresholds, set before native output was collected, were:
 
 ## 5. Native attempt ledger
 
-Both FEBio attempts used unique directories, absolute input/output paths, `-noappend -noconfig`, a `120 s` per-attempt bound, and environment thread limits `OMP_NUM_THREADS=2`, `MKL_NUM_THREADS=2`, `OPENBLAS_NUM_THREADS=2`, and `NUMEXPR_NUM_THREADS=2`. The wrapper observed only the owned direct child; it does not claim descendant enumeration or actual thread count.
+Both FEBio attempts used unique directories, absolute input/output paths, `-noappend -noconfig`, a `120 s` per-attempt bound, and environment thread limits `OMP_NUM_THREADS=2`, `MKL_NUM_THREADS=2`, `OPENBLAS_NUM_THREADS=2`, and `NUMEXPR_NUM_THREADS=2`. The wrapper observed only the owned direct child; it does not claim descendant enumeration or actual thread count. It recorded parent-clock launch intervals and child PIDs, but did not capture an OS process-creation timestamp.
 
 | Attempt | Process exit | Normal termination | Direct final rows | Result |
 |---|---:|---|---:|---|
-| `attempt-01-febio` | `0` | yes | `219` nodes / `95` elements | **failed observation**: FEBio skipped the first requested ID on each wrapped output-selection line; retained and not accepted |
+| `attempt-01-febio` | `0` | yes | `219` nodes / `95` elements | **failed observation**: the wrapped serialization affected all five NodeSet lists and both logfile-selection lists; effective native constraints and output IDs were incomplete |
 | `attempt-02-febio` | `0` | yes | `231` nodes / `100` elements | accepted bounded observation |
 
-Attempt 01 is intentionally not presented as success. Its solver completed normally, but its direct logfile had incomplete ID sets and the analysis exited `1`. The input-generation defect was corrected in a fresh template by making each FEBio logfile-selection list one physical line; no material, mesh, BC, analytic reference, executable, or frozen numeric tolerance changed.
+Attempt 01 is intentionally not presented as success. Its solver completed normally, but its wrapped comma-separated serialization affected all five NodeSet lists as well as both logfile-selection lists. The effective native constraints therefore differed from the intended lists: for example, node `65` on `x0` reported `ux=-1.6279045917e-6 m` instead of zero, and node `86` on `xL` reported `ux=-8.40359765413e-6 m` instead of `-1e-5 m`; nodes `47`, `68`, `89`, `107`, `131`, and `149` showed the analogous first-continuation-ID problem on other prescribed components. The retained `analysis.json` rejects complete IDs, displacement, stress, and reaction gates, and exits `1`. The fresh attempt-02 template repaired the shared NodeSet/logfile serialization in a new input; it retained the same mesh, intended material/BC contract, analytic reference, executable, and frozen numeric thresholds. The `545` free-DOF / `61` wholly-free-node observation is therefore qualified to attempt 02, not retroactively assigned to attempt 01.
 
 The accepted attempt’s exact argv was:
 
@@ -153,31 +157,40 @@ The XPLT is presence- and hash-recorded only. No XPLT reader, dictionary/state v
 
 ## 7. Immutability and prior-study preservation
 
-The launch inputs and all pre-launch evidence were frozen with the Windows `ReadOnly` attribute and hashed. The final verification covered three manifests: `25` files before attempt 01, `44` files before attempt 02, and `60` files in the final sweep. `freeze-verification-final.json` reports zero missing files, zero size mismatches, zero hash mismatches, and every recorded file still `ReadOnly`.
+The launch inputs and pre-launch evidence were frozen with the Windows `ReadOnly` attribute and hashed. This is accidental-write protection, not OS immutability or a security/ownership protocol. The historical freeze snapshots covered `25` files before attempt 01, `44` files before attempt 02, and `60` files in the final sweep. Their recorded comparisons report zero missing files, size mismatches, or hash mismatches, and every file in each recorded set was `ReadOnly` when checked. The two final verification records were created after the 60-file capture, so that count is not a claim that every later-created record was frozen.
 
-The before/after prior-study manifest compared `3,190` files across the ten existing ignored verification studies, including content hashes and Windows attributes. The comparison passed exactly; prior ignored studies were not modified. The source mesh copy retained the accepted SHA-256 shown above.
+The chronology does not satisfy the stronger immediate-verification requirement. The 25-file capture was at `2026-09-07T09:07:55.400681+00:00`, followed by attempt-01's parent-clock interval `2026-09-07T09:08:06.766509+00:00` to `2026-09-07T09:08:07.032509+00:00`; the 44-file capture was at `2026-09-07T09:11:05.453423+00:00`, followed by attempt-02's parent-clock interval `2026-09-07T09:11:14.662923+00:00` to `2026-09-07T09:11:14.938924+00:00`. The freezer captured current hashes and attributes but did not compare every file against an earlier expected hash. The launcher checked the input `ReadOnly` bit and four output destinations for absence, not all expected frozen hashes. The first full expected-hash/attribute comparison was after both launches (`freeze-verification.json`, captured at `2026-09-07T09:14:07.362791+00:00`). The attempt records' before/after `ReadOnly` fields are payload fields assembled around the run; a separate pre-launch input guard exists, but those fields are not independent temporal samples. No OS process-creation timestamp was captured; the stored PID and parent-clock timestamps must not be promoted to one.
+
+The correction audit under `.local/verification/P0B-free-dof-neo-hookean-correction-01/correction-audit.json` captured the retained original study before and after this report edit and found zero byte, hash, size, or Windows-attribute mismatches. The before/after prior-study manifest compared `3,190` files across the ten existing ignored verification studies, including content hashes and Windows attributes. That comparison also passed exactly; prior ignored studies were not modified. The source mesh copy retained the accepted SHA-256 shown above.
 
 ## 8. Exact commands and gate results
 
-All commands were run from the repository root with Python 3.12 and absolute paths inside the ignored study root. The preparation and negative validation commands returned:
+The orchestration commands were run from the repository root with Python 3.12 and absolute paths inside the ignored study root; each native child cwd is retained in its attempt record. The exact original command inputs and outputs, source event IDs, source ordinals, timestamps/time kinds, retained native argv/cwd records, counts, and exits are preserved in the ignored `.local/verification/P0B-free-dof-neo-hookean-correction-01/original-provenance.json` manifest. It contains `23` selected original command/output pairs from the source session archive; the lines below identify the relevant stages without replacing the full records:
 
 ```text
-capture_prior_manifest.py                         exit 0; 3190 prior files captured
-prepare_free_dof.py                              exit 0; 231 nodes, 100 Tet10, 545 free DOFs
-negative_probes.py                                exit 0; both expected child validators exit 1
-prepare_attempt.py (attempt-01)                  exit 0; XML preflight, 545 free DOFs, outputs absent
-freeze_launch.py (before attempt-01)             exit 0; 25 files ReadOnly
-run_native_attempt.py (attempt-01)               wrapper exit 0; FEBio exit 0; normal termination
-analyze_native_attempt_v2.py (attempt-01)         exit 1; incomplete 219/231 and 95/100 output rejected
-prepare_free_dof_v2.py                            exit 0; formatting-only fresh template
-prepare_attempt.py (attempt-02)                  exit 0; XML preflight, 545 free DOFs, outputs absent
-freeze_launch.py (before attempt-02)             exit 0; 44 files ReadOnly
-run_native_attempt.py (attempt-02)               wrapper exit 0; FEBio exit 0; normal termination
-analyze_native_attempt_v2.py (attempt-02)         exit 0; all frozen numeric gates true
-verify_freeze.py                                  exit 0; all recorded hashes/attributes matched
-final_audit.py                                    exit 0; all six preservation/attempt checks true
-freeze_launch.py (final)                         exit 0; 60 files ReadOnly
-verify_freeze.py (final)                         exit 0; three manifests, zero mismatches
+event 7259 -> 7262  prepare_free_dof.py first run                 exit 1; helper setup failure: node coordinate outside cube bounds
+event 7280 -> 7283  prepare_free_dof.py second run                exit 1; helper setup failure: unexpected boundary triangle count 84
+event 7335 -> 7338  prepare_free_dof.py corrected run             exit 0; 231 nodes, 100 Tet10, 545 free DOFs
+event 7342 -> 7345  negative_probes.py initial run                wrapper exit 1; child exits invert_corner=1 and swap_midpoint=1, but the expected invert-corner fragment was not observed (not a successful negative gate)
+event 7358 -> 7361  negative_probes.py corrected run              wrapper exit 0; both expected child validators exit 1
+event 7405 -> 7408  prepare_attempt.py attempt 01                 exit 0; 545 free DOFs, outputs absent
+event 7412 -> 7415  helper py_compile before attempt 01           compile exit 0
+event 7419 -> 7422  freeze_launch.py before attempt 01           exit 0; current-hash/attribute capture, 25 files
+event 7426 -> 7429  run_native_attempt.py attempt 01              wrapper exit 0; FEBio child exit 0, normal termination, four solver artifacts
+event 7433 -> 7436  analyze_native_attempt.py attempt 01          analysis exit 1; original helper KeyError, no accepted analysis output
+event 7502 -> 7505  prepare_free_dof_v2.py                      exit 0; 231 nodes, 100 Tet10, 545 XML-token free DOFs
+event 7509 -> 7512  prepare_attempt.py attempt 02                 exit 0; 545 free DOFs, outputs absent
+event 7516 -> 7519  py_compile plus freeze_launch.py              compile exit 1, freeze exit 1; ReadOnly pyc replacement failure
+event 7523 -> 7526  ReadOnly pycache cleanup                      tool completed; setup cleanup before the later syntax check (no explicit child exit marker)
+event 7530 -> 7533  syntax check plus freeze_launch.py             syntax exit 0, freeze exit 0; 44-file capture
+event 7537 -> 7540  run_native_attempt.py attempt 02              wrapper exit 0; FEBio child exit 0, normal termination, four solver artifacts
+event 7544 -> 7547  analyze_native_attempt_v2.py attempt 02       analysis exit 0; all numeric gates true
+event 7553 -> 7556  inline 80-digit Decimal check                 tool completed; high-precision cross-check printed (no explicit child exit marker)
+event 7571 -> 7574  oracle_high_precision.py                      exit 0; recorded residual and force difference
+event 7585 -> 7588  capture_prior_manifest.py                     exit 0; 3190 prior files captured
+event 7599 -> 7602  verify_freeze.py                              verify exit 0; first full 25/44 hash comparison after both launches
+event 7606 -> 7609  final_audit.py                                exit 0; preservation and attempt checks true
+event 7615 -> 7618  final freeze plus verification                freeze/verify exit 0; historical 60-file final sweep
 ```
 
 The repository product gates were not run for this documentation-only native observation: `python -m pytest`, Ruff format/check, mypy, build, installed smoke, official FBS, Studio, real-model E2E, and BottomFrame E2E remain unverified. They must not be inferred from this synthetic result.
