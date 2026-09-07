@@ -18,6 +18,7 @@ This is synthetic/local evidence. It is not evidence of a native FEBio control v
 | P1-B9 production gate-correction SHA | `23efd9823d00c86805772d8cfbd81edba23ff6a4` |
 | P1-B9 R1 production review-correction SHA | `05886260b7c42ef05248fb2848d8ae169c4f5dbd` |
 | final production candidate | `05886260b7c42ef05248fb2848d8ae169c4f5dbd` |
+| R2 clean focused verification SHA | `6d31c45603574ef03dfa48a8db894e66273326c2` |
 | authorized remote | `https://github.com/A6721jpn/cae-harness.git` |
 | remote state | `REMOTE_CONFIGURED` |
 | push/integration | not performed by this worker |
@@ -68,11 +69,20 @@ The smallest correction commit `23efd9823d00c86805772d8cfbd81edba23ff6a4` only f
 
 ### Independent whole-review correction
 
-The independent whole review of candidate `23efd9823d00c86805772d8cfbd81edba23ff6a4` found one Low finding: the shared canonical projection guard rejected oversized `max_steps` and `max_step_retries` correctly but did not identify the offending field. It did not find a value-acceptance defect. The review correction was limited to `tests/unit/contracts/test_solver_policy.py` and `src/febio_cae/domain/solver_policy.py`.
+The independent whole review of report candidate `cb4de6ab3ac191240f246ea178456cd932b88d75` (whose production parent was `23efd9823d00c86805772d8cfbd81edba23ff6a4`) found one Low finding: the shared canonical projection guard rejected oversized `max_steps` and `max_step_retries` correctly but did not identify the offending field. It did not find a value-acceptance defect. The review correction was limited to `tests/unit/contracts/test_solver_policy.py` and `src/febio_cae/domain/solver_policy.py`.
 
 The clean test-only correction commit is `0fe8cd3706c673b8c82ecfa21c54b00455279ae9`. `P1-B9-R1-red-01` ran the new parameterized field-context assertions at that test-only commit, collected 93 tests, passed 91, failed 2, and exited `1`. The failures were the intended missing-behavior failures; there were no collection, setup, or environment failures.
 
-Production correction commit `05886260b7c42ef05248fb2848d8ae169c4f5dbd` adds field-specific canonical preflights for both count fields and preserves the aggregate error phrase. The clean focused `P1-B9-R1-green-01` passed 93 tests in 0.10 seconds, exit `0`.
+Production correction commit `05886260b7c42ef05248fb2848d8ae169c4f5dbd` adds field-specific canonical preflights for both count fields and preserves the aggregate error phrase. The focused `P1-B9-R1-green-01` passed 93 tests in 0.10 seconds, exit `0`, but its exact metadata records `head_before=head_after=0fe8cd3706c673b8c82ecfa21c54b00455279ae9`, `dirty_before=dirty_after="M src/febio_cae/domain/solver_policy.py"`, and UTC `2026-09-07T12:46:59.303662Z` through `2026-09-07T12:46:59.810910Z`; it was not a clean production-candidate run. The one new clean focused verification, `P1-B9-R2-focused-01`, ran from clean report commit `6d31c45603574ef03dfa48a8db894e66273326c2` with empty dirty state, passed 93 tests in 0.10 seconds, and exited `0`.
+
+### Focused verification records
+
+The R1 focused run below is retained exactly as executed before the production correction commit. The R2 focused run is the new clean verification from the current report commit and is separate from the clean `0588626` full-gate records.
+
+| Record | Exact command | Result |
+|---|---|---|
+| `P1-B9-R1-green-01` | `C:/Users/backo/AppData/Local/Programs/Python/Python312/python.exe -m pytest tests/unit/contracts/test_solver_policy.py --basetemp C:/Users/backo/.codex/worktrees/8dd5/CAE-harness/.local/verification/P1-B9-R1-green-01` | 93 passed in 0.10s, exit 0; HEAD `0fe8cd3706c673b8c82ecfa21c54b00455279ae9`, source dirty before/after |
+| `P1-B9-R2-focused-01` | `C:/Users/backo/AppData/Local/Programs/Python/Python312/python.exe -m pytest tests/unit/contracts/test_solver_policy.py --basetemp C:/Users/backo/.codex/worktrees/8dd5/CAE-harness/.local/verification/P1-B9-R2-focused-01` | 93 passed in 0.10s, exit 0; clean HEAD `6d31c45603574ef03dfa48a8db894e66273326c2` |
 
 ## Initial candidate local gates (pre-review correction)
 
@@ -90,13 +100,12 @@ The initial candidate records below ran at clean production candidate `23efd9823
 
 The earlier `P1-B9-gate-*-01` records remain preserved, including the two failed correction gates. The initial candidate's corrected `-02` suite/gates remain historical evidence; the R1 corrected-candidate suite/gates below are the current acceptance evidence. All suite evidence is synthetic/local unit and component evidence only.
 
-## R1 corrected-candidate local gates
+## R1 corrected-candidate full gates
 
-All records below ran at clean production candidate `05886260b7c42ef05248fb2848d8ae169c4f5dbd`, with empty `dirty_before` and `dirty_after`.
+All full-suite, static, scanner, and build records below ran at clean production candidate `05886260b7c42ef05248fb2848d8ae169c4f5dbd`, with empty `dirty_before` and `dirty_after`. The focused `P1-B9-R1-green-01` record is intentionally kept in the separate focused-verification table above.
 
 | Record | Exact command | Result |
 |---|---|---|
-| `P1-B9-R1-green-01` | `C:/Users/backo/AppData/Local/Programs/Python/Python312/python.exe -m pytest tests/unit/contracts/test_solver_policy.py --basetemp C:/Users/backo/.codex/worktrees/8dd5/CAE-harness/.local/verification/P1-B9-R1-green-01` | 93 passed in 0.10s, exit 0 |
 | `P1-B9-R1-gate-pytest-01` | `C:/Users/backo/AppData/Local/Programs/Python/Python312/python.exe -m pytest --basetemp C:/Users/backo/.codex/worktrees/8dd5/CAE-harness/.local/verification/P1-B9-R1-gate-pytest-01` | 605 passed in 16.03s, exit 0 |
 | `P1-B9-R1-gate-format-01` | `C:/Users/backo/AppData/Local/Programs/Python/Python312/python.exe -m ruff format --check .` | 65 files already formatted, exit 0 |
 | `P1-B9-R1-gate-lint-01` | `C:/Users/backo/AppData/Local/Programs/Python/Python312/python.exe -m ruff check .` | all checks passed, exit 0 |
@@ -152,12 +161,17 @@ Installed smoke is package/import evidence only. It does not establish profile r
 
 ## Report-stage postchecks
 
-After the final report text was complete, only this report was staged. The staged checks retain expanded argv, cwd, Python runner, UTC timestamps, staged dirty state, raw output paths, and production candidate `05886260b7c42ef05248fb2848d8ae169c4f5dbd` in their metadata records.
+After the R1 report text was complete, only this report was staged. The R1 staged checks retain expanded argv, cwd, Python runner, UTC timestamps, staged dirty state, raw output paths, and production candidate `05886260b7c42ef05248fb2848d8ae169c4f5dbd` in their metadata records.
 
 | Record | Result |
 |---|---|
 | `P1-B9-R1-report-diff-check-01` | direct `git diff --cached --check`; exit 0 |
 | `P1-B9-R1-report-scanner-01` | `scripts/scan_cae_data.py --root .`; PASS with 67 files checked, 0 diagnostics, exit 0 |
+
+The R2 report-only correction was staged from clean report commit `6d31c45603574ef03dfa48a8db894e66273326c2`; only this report was dirty/staged during the new checks.
+
+| `P1-B9-R2-report-diff-check-01` | direct `git diff --cached --check`; exit 0 |
+| `P1-B9-R2-report-scanner-01` | `scripts/scan_cae_data.py --root .`; PASS with 67 files checked, 0 diagnostics, exit 0 |
 
 ## Unverified items and remaining sequence
 
