@@ -299,10 +299,7 @@ def test_mesh_policy_preserves_required_fields_and_canonical_projection() -> Non
     assert [item["refinement_id"] for item in payload["local_refinements"]] == ["local-A"]
     assert payload["quality_profile"]["purpose"] == "mesh_quality"
     assert payload["max_refinements"] == 2
-    assert value.to_bytes() == canonical_bytes(
-        payload,
-        unordered_paths=[("local_refinements", "0", "selection", "rule", "face_ids")],
-    )
+    assert value.to_bytes() == canonical_bytes(payload)
 
 
 def test_mesh_policy_requires_all_fields_and_rejects_unknown_fields() -> None:
