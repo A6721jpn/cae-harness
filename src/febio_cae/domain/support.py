@@ -135,12 +135,15 @@ class SolidSupport:
             self.transform.to_bytes()
 
     def to_dict(self) -> dict[str, object]:
+        frame_evidence = self.frame_evidence
+        if not isinstance(frame_evidence, EvidenceRef):
+            raise SupportValidationError("frame_evidence must be an EvidenceRef")
         return {
             "schema_version": SCHEMA_VERSION,
             "support_id": self.support_id.value,
             "selection": self.selection.to_dict(),
             "frame": self.frame.value,
-            "frame_evidence": self.frame_evidence.to_dict(),
+            "frame_evidence": frame_evidence.to_dict(),
             "x": self.x.to_dict(),
             "y": self.y.to_dict(),
             "z": self.z.to_dict(),
