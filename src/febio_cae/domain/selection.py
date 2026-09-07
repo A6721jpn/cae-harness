@@ -14,6 +14,7 @@ from .units import Dimension, Quantity
 
 SCHEMA_VERSION = "1"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_ROLE_EVIDENCE_TARGET_FIELDS = frozenset({"selection.role"})
 
 
 class SelectionValidationError(ValueError):
@@ -276,6 +277,10 @@ class SelectionRef:
         )
         if not isinstance(self.role_evidence, EvidenceRef):
             raise SelectionValidationError("role_evidence must be an EvidenceRef")
+        if self.role_evidence.target_field not in _ROLE_EVIDENCE_TARGET_FIELDS:
+            raise SelectionValidationError(
+                "role_evidence must target the explicit selection.role field"
+            )
         if not isinstance(self.body_id, BodyId) or not isinstance(self.frame, FrameId):
             raise SelectionValidationError("body_id and frame must be typed spatial IDs")
         if not isinstance(
@@ -303,6 +308,13 @@ class SelectionRef:
                 or self.resolution.frame != self.frame
             ):
                 raise SelectionValidationError("resolution context must match SelectionRef")
+            if isinstance(self.rule, FaceSetRule):
+                rule_face_ids = {face_id.value for face_id in self.rule.face_ids}
+                resolution_face_ids = {face.face_id.value for face in self.resolution.faces}
+                if rule_face_ids != resolution_face_ids:
+                    raise SelectionValidationError(
+                        "explicit face rule and resolution must contain the same face IDs"
+                    )
 
     @property
     def stated_role(self) -> str:
@@ -326,7 +338,12 @@ class SelectionRef:
         }
 
     def to_bytes(self) -> bytes:
-        return canonical_bytes(self.to_dict())
+        unordered_paths: list[tuple[str, ...]] = []
+        if isinstance(self.rule, FaceSetRule):
+            unordered_paths.append(("rule", "face_ids"))
+        if self.resolution is not None:
+            unordered_paths.append(("resolution", "faces"))
+        return canonical_bytes(self.to_dict(), unordered_paths=unordered_paths)
 
 
 __all__ = [

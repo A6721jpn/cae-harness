@@ -158,12 +158,16 @@ class UnitDirection:
             _finite_float(value, field)
             for field, value in (("x", self.x), ("y", self.y), ("z", self.z))
         )
-        norm = math.hypot(math.hypot(components[0], components[1]), components[2])
+        scale = max(abs(component) for component in components)
+        if not math.isfinite(scale) or scale == 0.0:
+            raise SpatialValidationError("direction must be finite and nonzero")
+        scaled = tuple(component / scale for component in components)
+        norm = math.hypot(math.hypot(scaled[0], scaled[1]), scaled[2])
         if not math.isfinite(norm) or norm == 0.0:
             raise SpatialValidationError("direction must be finite and nonzero")
-        object.__setattr__(self, "x", components[0] / norm)
-        object.__setattr__(self, "y", components[1] / norm)
-        object.__setattr__(self, "z", components[2] / norm)
+        object.__setattr__(self, "x", scaled[0] / norm)
+        object.__setattr__(self, "y", scaled[1] / norm)
+        object.__setattr__(self, "z", scaled[2] / norm)
 
     def to_dict(self) -> dict[str, object]:
         return {
