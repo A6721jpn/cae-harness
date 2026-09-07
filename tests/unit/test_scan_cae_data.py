@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
@@ -89,9 +90,7 @@ def test_boundary_scan_rejects_non_git_root(tmp_path: Path) -> None:
     assert completed.returncode == 4, completed.stderr
     payload = json.loads(completed.stdout)
     assert payload["status"] == "INCOMPLETE"
-    assert any(
-        issue["code"] == "GIT_TRACKING_UNAVAILABLE" for issue in payload["issues"]
-    )
+    assert any(issue["code"] == "GIT_TRACKING_UNAVAILABLE" for issue in payload["issues"])
 
 
 def test_boundary_scan_rejects_when_git_is_unavailable(tmp_path: Path) -> None:
@@ -105,9 +104,7 @@ def test_boundary_scan_rejects_when_git_is_unavailable(tmp_path: Path) -> None:
     assert completed.returncode == 4, completed.stderr
     payload = json.loads(completed.stdout)
     assert payload["status"] == "INCOMPLETE"
-    assert any(
-        issue["code"] == "GIT_TRACKING_UNAVAILABLE" for issue in payload["issues"]
-    )
+    assert any(issue["code"] == "GIT_TRACKING_UNAVAILABLE" for issue in payload["issues"])
 
 
 def test_boundary_scan_inspects_staged_febio_xml_even_if_worktree_is_benign(
@@ -137,9 +134,7 @@ def test_boundary_scan_rejects_staged_private_key_content(tmp_path: Path) -> Non
     _init_git_repo(tmp_path)
     candidate = tmp_path / "notes.txt"
     candidate.write_text(
-        "-----BEGIN PRIVATE KEY-----\n"
-        + ("A" * 96)
-        + "\n-----END PRIVATE KEY-----\n",
+        "-----BEGIN PRIVATE KEY-----\n" + ("A" * 96) + "\n-----END PRIVATE KEY-----\n",
         encoding="ascii",
     )
     subprocess.run(["git", "-C", str(tmp_path), "add", "notes.txt"], check=True)
@@ -173,12 +168,19 @@ def test_boundary_scan_allows_benign_documentation_mentions(tmp_path: Path) -> N
     assert payload["issues"] == []
 
 
-def test_boundary_scan_reports_filesystem_read_errors(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_boundary_scan_reports_filesystem_read_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     _init_git_repo(tmp_path)
 
-    def failing_walk(*args: object, **kwargs: object):
-        onerror = kwargs["onerror"]
-        assert callable(onerror)
+    def failing_walk(
+        root: Path,
+        *,
+        topdown: bool,
+        followlinks: bool,
+        onerror: Callable[[OSError], None],
+    ) -> Iterator[tuple[str, list[str], list[str]]]:
+        del root, topdown, followlinks
         onerror(PermissionError(13, "permission denied", str(tmp_path / "blocked")))
         yield str(tmp_path), [], []
 
@@ -186,8 +188,10 @@ def test_boundary_scan_reports_filesystem_read_errors(tmp_path: Path, monkeypatc
     report = scanner_module.scan_root(tmp_path)
 
     assert report["status"] == "INCOMPLETE"
+    issues = report["issues"]
+    assert isinstance(issues, list)
     assert any(
-        issue["code"] == "FILESYSTEM_READ_ERROR" for issue in report["issues"]
+        isinstance(issue, dict) and issue.get("code") == "FILESYSTEM_READ_ERROR" for issue in issues
     )
 
 
@@ -207,6 +211,8 @@ def test_boundary_scan_rejects_reparse_points_without_traversal(
     report = scanner_module.scan_root(tmp_path)
 
     assert report["status"] == "INCOMPLETE"
+    issues = report["issues"]
+    assert isinstance(issues, list)
     assert any(
-        issue["code"] == "UNSAFE_REPARSE_POINT" for issue in report["issues"]
+        isinstance(issue, dict) and issue.get("code") == "UNSAFE_REPARSE_POINT" for issue in issues
     )
