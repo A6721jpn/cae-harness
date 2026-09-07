@@ -179,12 +179,14 @@ production `6044b97f33554c3d7545c0e1082d1117ba08dca4`後、test format-only corr
 
 | record | exact command | 結果 | raw |
 |---|---|---|---|
-| `P0-A-r4-gate-pytest-03` | `C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe -m pytest --basetemp C:\Users\backo\.codex\worktrees\8dd5\CAE-harness\.local\verification\P0-A-r4-gate-pytest-03` | 25 passed / exit 0 | `.local/coordination/runs/P0-A-r4-gate-pytest-03/{metadata.json,stdout.bin,stderr.bin}` |
+| `P0-A-r4-gate-pytest-03` | `C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe -m pytest --basetemp C:\Users\backo\.codex\worktrees\8dd5\CAE-harness\.local\verification\P0-A-r4-gate-pytest-03` | 34 passed / exit 0 | `.local/coordination/runs/P0-A-r4-gate-pytest-03/{metadata.json,stdout.bin,stderr.bin}` |
 | `P0-A-r4-gate-format-03` | `C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe -m ruff format --check .` | 15 files already formatted / exit 0 | `.local/coordination/runs/P0-A-r4-gate-format-03/{metadata.json,stdout.bin,stderr.bin}` |
 | `P0-A-r4-gate-lint-03` | `C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe -m ruff check .` | All checks passed / exit 0 | `.local/coordination/runs/P0-A-r4-gate-lint-03/{metadata.json,stdout.bin,stderr.bin}` |
 | `P0-A-r4-gate-mypy-03` | `C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe -m mypy src tests` | Success, no issues, 8 source files / exit 0 | `.local/coordination/runs/P0-A-r4-gate-mypy-03/{metadata.json,stdout.bin,stderr.bin}` |
 | `P0-A-r4-gate-scanner-03` | `C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe scripts/scan_cae_data.py --root .` | `PASS`, 17 filesystem files, 17 Git-index files, 0 issues / exit 0 | `.local/coordination/runs/P0-A-r4-gate-scanner-03/{metadata.json,stdout.bin,stderr.bin}` |
 | `P0-A-r4-gate-build-02` | `C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe -m build` | sdist and wheel built / exit 0 | `.local/coordination/runs/P0-A-r4-gate-build-02/{metadata.json,stdout.bin,stderr.bin}` |
+
+R4 formatの履歴では、`P0-A-r4-gate-format-01`（HEAD `6044b97f33554c3d7545c0e1082d1117ba08dca4`）と`P0-A-r4-gate-format-02`（HEAD `c672bc34af121de280959ebcdc39b263ccb2b163`）がいずれもexit 1であり、各rawは`.local/coordination/runs/<record>/{metadata.json,stdout.bin,stderr.bin}`にある。srcの機能は変えずにtest-format-only correction `afcd6e2d98e86d0762ef1ae23576052990d0a9e4`を適用した後、`P0-A-r4-gate-format-03`は15 files already formatted / exit 0となった。
 
 ### R4 installed smoke
 
