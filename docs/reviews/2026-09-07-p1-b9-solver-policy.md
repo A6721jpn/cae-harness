@@ -13,9 +13,11 @@ This is synthetic/local evidence. It is not evidence of a native FEBio control v
 | Working branch | `codex/p1-b9-solver-policy` |
 | Accepted integrated P1-B8 base | `4688275b236c5bc1ddc5978b85187b8337ea8b3b` |
 | P1-B9 test-only contract SHA | `0c267e904e45ac69ddf0b1a69851781440bab2cf` |
+| P1-B9 R1 test-only review-correction SHA | `0fe8cd3706c673b8c82ecfa21c54b00455279ae9` |
 | first P1-B9 production SHA | `978da8116f060ecf6a85f0c2409963d79bee1a5b` |
 | P1-B9 production gate-correction SHA | `23efd9823d00c86805772d8cfbd81edba23ff6a4` |
-| final production candidate | `23efd9823d00c86805772d8cfbd81edba23ff6a4` |
+| P1-B9 R1 production review-correction SHA | `05886260b7c42ef05248fb2848d8ae169c4f5dbd` |
+| final production candidate | `05886260b7c42ef05248fb2848d8ae169c4f5dbd` |
 | authorized remote | `https://github.com/A6721jpn/cae-harness.git` |
 | remote state | `REMOTE_CONFIGURED` |
 | push/integration | not performed by this worker |
@@ -33,7 +35,7 @@ The planning note records only documentary FEBio references for convergence norm
 - `SolverControl` is immutable and requires a strict ASCII identifier beginning with a letter or underscore, followed by ASCII letters, digits, or underscores. Its value is exactly a `Quantity`, integer excluding `bool`, or `bool`; raw floats, strings, containers, and arbitrary objects are rejected. Signed values and explicit zero remain structural data. Canonical projection tags `quantity`, `integer`, or `boolean`, preserving distinctions such as integer `1`, `True`, and `Quantity(1, "1")`; quantities use shared SI projection.
 - `TimeIncrementPolicy` requires explicit positive time quantities for `initial_step`, `minimum_step`, and `maximum_step`, strict `bool` `adaptive`, strict integer `max_steps >= 1`, strict integer `max_step_retries >= 0`, and an explicit possibly-empty immutable `must_points` tuple. It enforces minimum <= initial <= maximum in SI, nonnegative strictly increasing must-points with no duplicates, and equivalent SI canonical identity. It does not create a start/final time, default, or replacement physical history.
 - `SolverPolicy` requires an existing `NumericalProfileRef` with `purpose="solver"`, a nonempty immutable semantic control set sorted by control name with duplicate names rejected, a `TimeIncrementPolicy`, and an explicit possibly-empty ordered immutable retry-recipe tuple. Retry IDs use the same identifier grammar, preserve order and repetition, and carry no execution permission.
-- All three constructors force complete canonical projection and wrap nested canonical/SI failures with field context. Large integers within the shared JSON contract remain exact; values beyond that boundary are rejected at construction. No resolver, registry, native capability, retry executor, Budget accounting, CaseSpec aggregation, or readiness checker is introduced.
+- All three constructors force complete canonical projection and wrap nested canonical/SI failures with field context. `max_steps` and `max_step_retries` perform field-specific canonical preflights before the aggregate projection guard, so oversized values identify the offending count while retaining the aggregate compatibility wording. Large integers within the shared JSON contract remain exact; values beyond that boundary are rejected at construction. No resolver, registry, native capability, retry executor, Budget accounting, CaseSpec aggregation, or readiness checker is introduced.
 
 ## Test-first RED / GREEN chronology
 
@@ -64,9 +66,17 @@ The first clean full-gate run preserved two failures. `P1-B9-gate-lint-01` exite
 
 The smallest correction commit `23efd9823d00c86805772d8cfbd81edba23ff6a4` only fixes the export order and adds the runtime-validation narrowing cast. Correction checks `P1-B9-fix-format-01`, `P1-B9-fix-lint-01`, and `P1-B9-fix-mypy-01` all exited `0`. The fresh clean focused GREEN `P1-B9-green-02` then passed 91 tests in 0.11 seconds, exit `0`.
 
-## Final local gates
+### Independent whole-review correction
 
-All final records below ran at clean production candidate `23efd9823d00c86805772d8cfbd81edba23ff6a4`, with empty `dirty_before` and `dirty_after`.
+The independent whole review of candidate `23efd9823d00c86805772d8cfbd81edba23ff6a4` found one Low finding: the shared canonical projection guard rejected oversized `max_steps` and `max_step_retries` correctly but did not identify the offending field. It did not find a value-acceptance defect. The review correction was limited to `tests/unit/contracts/test_solver_policy.py` and `src/febio_cae/domain/solver_policy.py`.
+
+The clean test-only correction commit is `0fe8cd3706c673b8c82ecfa21c54b00455279ae9`. `P1-B9-R1-red-01` ran the new parameterized field-context assertions at that test-only commit, collected 93 tests, passed 91, failed 2, and exited `1`. The failures were the intended missing-behavior failures; there were no collection, setup, or environment failures.
+
+Production correction commit `05886260b7c42ef05248fb2848d8ae169c4f5dbd` adds field-specific canonical preflights for both count fields and preserves the aggregate error phrase. The clean focused `P1-B9-R1-green-01` passed 93 tests in 0.10 seconds, exit `0`.
+
+## Initial candidate local gates (pre-review correction)
+
+The initial candidate records below ran at clean production candidate `23efd9823d00c86805772d8cfbd81edba23ff6a4`, with empty `dirty_before` and `dirty_after`; they remain historical evidence for the reviewed predecessor.
 
 | Record | Exact command | Result |
 |---|---|---|
@@ -78,11 +88,25 @@ All final records below ran at clean production candidate `23efd9823d00c86805772
 | `P1-B9-gate-scanner-02` | `C:/Users/backo/AppData/Local/Programs/Python/Python312/python.exe scripts/scan_cae_data.py --root .` | PASS; 66 files checked, 0 diagnostics, exit 0 |
 | `P1-B9-gate-build-02` | `C:/Users/backo/AppData/Local/Programs/Python/Python312/python.exe -m build` | sdist and wheel built, exit 0 |
 
-The earlier `P1-B9-gate-*-01` records remain preserved, including the two failed correction gates. Only the corrected `-02` suite/gates are final acceptance evidence. The suite is synthetic/local unit and component evidence only.
+The earlier `P1-B9-gate-*-01` records remain preserved, including the two failed correction gates. The initial candidate's corrected `-02` suite/gates remain historical evidence; the R1 corrected-candidate suite/gates below are the current acceptance evidence. All suite evidence is synthetic/local unit and component evidence only.
 
-## Wheel and outside-checkout installed smoke
+## R1 corrected-candidate local gates
 
-The wheel built at final production candidate `23efd9823d00c86805772d8cfbd81edba23ff6a4` was:
+All records below ran at clean production candidate `05886260b7c42ef05248fb2848d8ae169c4f5dbd`, with empty `dirty_before` and `dirty_after`.
+
+| Record | Exact command | Result |
+|---|---|---|
+| `P1-B9-R1-green-01` | `C:/Users/backo/AppData/Local/Programs/Python/Python312/python.exe -m pytest tests/unit/contracts/test_solver_policy.py --basetemp C:/Users/backo/.codex/worktrees/8dd5/CAE-harness/.local/verification/P1-B9-R1-green-01` | 93 passed in 0.10s, exit 0 |
+| `P1-B9-R1-gate-pytest-01` | `C:/Users/backo/AppData/Local/Programs/Python/Python312/python.exe -m pytest --basetemp C:/Users/backo/.codex/worktrees/8dd5/CAE-harness/.local/verification/P1-B9-R1-gate-pytest-01` | 605 passed in 16.03s, exit 0 |
+| `P1-B9-R1-gate-format-01` | `C:/Users/backo/AppData/Local/Programs/Python/Python312/python.exe -m ruff format --check .` | 65 files already formatted, exit 0 |
+| `P1-B9-R1-gate-lint-01` | `C:/Users/backo/AppData/Local/Programs/Python/Python312/python.exe -m ruff check .` | all checks passed, exit 0 |
+| `P1-B9-R1-gate-mypy-01` | `C:/Users/backo/AppData/Local/Programs/Python/Python312/python.exe -m mypy src tests` | no issues in 39 source files, exit 0 |
+| `P1-B9-R1-gate-scanner-01` | `C:/Users/backo/AppData/Local/Programs/Python/Python312/python.exe scripts/scan_cae_data.py --root .` | PASS; 67 files checked, 0 diagnostics, exit 0 |
+| `P1-B9-R1-gate-build-01` | `C:/Users/backo/AppData/Local/Programs/Python/Python312/python.exe -m build` | sdist and wheel built, exit 0 |
+
+## Initial candidate wheel and outside-checkout installed smoke
+
+The wheel built at the initial candidate `23efd9823d00c86805772d8cfbd81edba23ff6a4` was:
 
 ```text
 Wheel: C:\Users\backo\.codex\worktrees\8dd5\CAE-harness\dist\febio_cae-0.1.0-py3-none-any.whl
@@ -103,14 +127,37 @@ A fresh Python 3.12 venv was created outside the checkout at `C:\Users\backo\App
 
 Installed smoke is package/import evidence only. It does not establish profile registration, native control support, solver launch permission, retry execution, or real-model success.
 
-## Report-stage postchecks
+## R1 corrected-candidate wheel and outside-checkout installed smoke
 
-After the final report text was complete, only this report was staged. The staged checks retain expanded argv, cwd, Python runner, UTC timestamps, staged dirty state, raw output paths, and production candidate `23efd9823d00c86805772d8cfbd81edba23ff6a4` in their metadata records.
+The wheel built at corrected production candidate `05886260b7c42ef05248fb2848d8ae169c4f5dbd` was:
+
+```text
+Wheel: C:\Users\backo\.codex\worktrees\8dd5\CAE-harness\dist\febio_cae-0.1.0-py3-none-any.whl
+SHA-256: ad970fbf86e6f5f27536ab0664162eabbbb957c59409c3ff159f5ac96f5b7d43
+Size: 45408 bytes
+```
+
+A fresh Python 3.12 venv was created outside the checkout at `C:\Users\backo\AppData\Local\Temp\cae-harness-P1-B9-R1-installed-01`. Outside-cwd records used the actual checkout as `git-workdir`. `P1-B9-R1-installed-outside-preflight-01` is preserved as a malformed probe with exit `1` and is not acceptance evidence; corrected preflight record `P1-B9-R1-installed-outside-preflight-02` exited `0` before the venv was created. All subsequent R1 installed records below exited `0`.
 
 | Record | Result |
 |---|---|
-| `P1-B9-report-diff-check-final-01` | direct `git diff --cached --check`; exit 0 |
-| `P1-B9-report-scanner-final-01` | `scripts/scan_cae_data.py --root .`; PASS with 67 files checked, 0 diagnostics, exit 0 |
+| `P1-B9-R1-installed-wheel-hash-01` | SHA-256 and 45,408-byte size above |
+| `P1-B9-R1-installed-outside-preflight-02` | fresh outside root absent |
+| `P1-B9-R1-installed-outside-venv-01` | new Python 3.12 venv |
+| `P1-B9-R1-installed-outside-pip-01` | exact wheel installed offline with `--no-index --disable-pip-version-check --no-cache-dir --no-deps` |
+| `P1-B9-R1-installed-outside-cli-01` | `febio-cae 0.1.0` |
+| `P1-B9-R1-installed-outside-import-01` | isolated `-I`; version `0.1.0`; identities for all four new package/module exports; synthetic solver policy projection; all module origins under the external venv and outside the checkout |
+
+Installed smoke is package/import evidence only. It does not establish profile registration, native control support, solver launch permission, retry execution, or real-model success.
+
+## Report-stage postchecks
+
+After the final report text was complete, only this report was staged. The staged checks retain expanded argv, cwd, Python runner, UTC timestamps, staged dirty state, raw output paths, and production candidate `05886260b7c42ef05248fb2848d8ae169c4f5dbd` in their metadata records.
+
+| Record | Result |
+|---|---|
+| `P1-B9-R1-report-diff-check-01` | direct `git diff --cached --check`; exit 0 |
+| `P1-B9-R1-report-scanner-01` | `scripts/scan_cae_data.py --root .`; PASS with 67 files checked, 0 diagnostics, exit 0 |
 
 ## Unverified items and remaining sequence
 
