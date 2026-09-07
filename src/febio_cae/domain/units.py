@@ -22,6 +22,10 @@ class DimensionMismatchError(UnitError):
     """Raised when quantities with different physical dimensions are converted."""
 
 
+class QuantityRangeError(UnitError):
+    """Raised when a quantity conversion cannot preserve a finite value."""
+
+
 @dataclass(frozen=True, slots=True)
 class Dimension:
     length: int = 0
@@ -79,6 +83,18 @@ def _validate_value(value: object) -> Numeric:
     return value
 
 
+def _scaled_value(value: Numeric, scale: float) -> float:
+    try:
+        scaled = float(value) * scale
+    except OverflowError as error:
+        raise QuantityRangeError("quantity conversion is outside finite range") from error
+    if not math.isfinite(scaled):
+        raise QuantityRangeError("quantity conversion is outside finite range")
+    if value != 0 and scaled == 0.0:
+        raise QuantityRangeError("quantity conversion underflows a nonzero value to zero")
+    return 0.0 if scaled == 0.0 else scaled
+
+
 @dataclass(frozen=True, slots=True)
 class Quantity:
     value: Numeric
@@ -94,10 +110,7 @@ class Quantity:
 
     def to_si(self) -> Quantity:
         definition = unit_definition(self.unit)
-        if definition.scale_to_si == 1.0:
-            value = self.value
-        else:
-            value = self.value * definition.scale_to_si
+        value = _scaled_value(self.value, definition.scale_to_si)
         return Quantity(value, definition.si_symbol)
 
     def convert_to(self, target_unit: str) -> Quantity:
@@ -108,10 +121,7 @@ class Quantity:
                 f"cannot convert {source.symbol} ({source.dimension}) to "
                 f"{target.symbol} ({target.dimension})"
             )
-        if source.scale_to_si == target.scale_to_si:
-            value = self.value
-        else:
-            value = self.value * source.scale_to_si / target.scale_to_si
+        value = _scaled_value(self.value, source.scale_to_si / target.scale_to_si)
         return Quantity(value, target.symbol)
 
 
@@ -120,6 +130,7 @@ __all__ = [
     "Dimension",
     "DimensionMismatchError",
     "Quantity",
+    "QuantityRangeError",
     "UnitDefinition",
     "UnitError",
     "UnknownUnitError",

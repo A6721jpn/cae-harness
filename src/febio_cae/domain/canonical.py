@@ -34,6 +34,7 @@ def canonical_bytes(
 
     unordered = _normalise_paths(unordered_paths, "unordered_paths")
     unique_ids = _normalise_paths(unique_id_paths, "unique_id_paths")
+    _validate_declared_collection_paths(value, unordered | unique_ids)
     normalised = _normalise(value, (), unordered, unique_ids)
     return _encode(normalised)
 
@@ -82,6 +83,32 @@ def _normalise(
             normalised_items.sort(key=_encode)
         return normalised_items
     raise CanonicalizationError(f"unsupported canonical value type: {type(value).__name__}")
+
+
+def _validate_declared_collection_paths(value: object, paths: frozenset[Path]) -> None:
+    for path in paths:
+        target = value
+        for part in path:
+            if isinstance(target, Mapping):
+                if part not in target:
+                    raise CanonicalizationError(
+                        f"declared collection path does not resolve: {path!r}"
+                    )
+                target = target[part]
+                continue
+            if isinstance(target, list) and part.isascii() and part.isdecimal():
+                index = int(part)
+                if str(index) != part or index >= len(target):
+                    raise CanonicalizationError(
+                        f"declared collection path does not resolve: {path!r}"
+                    )
+                target = target[index]
+                continue
+            raise CanonicalizationError(f"declared collection path does not resolve: {path!r}")
+        if not isinstance(target, list):
+            raise CanonicalizationError(
+                f"declared collection path must resolve to a list: {path!r}"
+            )
 
 
 def _validate_unique_ids(items: list[JsonValue]) -> None:
