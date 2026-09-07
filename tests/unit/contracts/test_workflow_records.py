@@ -56,6 +56,14 @@ try:
         ReadStatus,
         ResultManifest,
     )
+
+    ARTIFACTS_API: Any = True
+    COMPATIBILITY_API: Any = True
+    COMPARISON_API: Any = True
+    EXECUTION_API: Any = True
+    LIFECYCLE_API: Any = True
+    PREVIEW_API: Any = True
+    RESULTS_API: Any = True
 except ImportError:
     FileEntry = None
     GeometryInspection = None
@@ -198,7 +206,7 @@ def _bundle(revision: CaseRevision, mesh: Any, profile: Any) -> Any:
 def _attempt(bundle: Any, revision: CaseRevision) -> Any:
     process = ProcessIdentity(
         executable="febio4.exe",
-        executable_digest="g" * 64,
+        executable_digest="6" * 64,
         argv=bundle.argv,
         cwd=bundle.cwd,
         thread_count=bundle.thread_count,
@@ -237,7 +245,7 @@ def _manifest(attempt: Any, bundle: Any, profile: Any) -> Any:
         manifest_id="manifest-interface",
         attempt_id=attempt.attempt_id,
         bundle_digest=bundle.bundle_digest,
-        files=(FileEntry("output/case.xplt", "h" * 64, 256, "xplt"),),
+        files=(FileEntry("output/case.xplt", "9" * 64, 256, "xplt"),),
         read_result=read_result,
     )
 
@@ -259,12 +267,12 @@ def test_workflow_record_api_is_available() -> None:
 def test_geometry_inspection_has_no_case_revision_dependency() -> None:
     _require_api()
     request = GeometryInspectionRequest(
-        SourceAssetRef("step-source", "i" * 64, "model/step"),
+        SourceAssetRef("step-source", "1" * 64, "model/step"),
         requested_body_ids=(),
     )
     inspection = GeometryInspection(
         request.source_asset,
-        "j" * 64,
+        "2" * 64,
         "mm",
         ("part-body",),
         ("part-body",),
@@ -363,8 +371,8 @@ def test_preview_requires_confirmation_evidence_for_confirmed_state() -> None:
     receipt = PreviewReceipt(
         receipt_id="receipt-interface",
         manifest_id=request.manifest_id,
-        xplt_digest="h" * 64,
-        studio=ToolIdentity("febio-studio", "3.1.0", "k" * 64),
+        xplt_digest="8" * 64,
+        studio=ToolIdentity("febio-studio", "3.1.0", "b" * 64),
         status=PreviewStatus.REQUESTED,
         requested_state_ids=request.state_ids,
         requested_variables=request.variables,
