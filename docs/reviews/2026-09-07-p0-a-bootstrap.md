@@ -1,8 +1,8 @@
 # P0-A bootstrap verification
 
-日付: 2026-09-07  
-対象: FEBio CAE Harness V2 の P0-A（Python 3.12 headless CLI bootstrap）  
-判定範囲: version、doctor、CAEデータ境界スキャナー、wheel配布、installed smoke  
+日付: 2026-09-07
+対象: FEBio CAE Harness V2 の P0-A（Python 3.12 headless CLI bootstrap）
+判定範囲: version、doctor、CAEデータ境界スキャナー、wheel配布、installed smoke
 
 この記録はP0-Aの合成・ローカル証拠であり、実FEBio、公式FBS、FEBio Studio、Gmsh、実モデルの成功証拠ではない。製品仕様の決定元は設計仕様書と実装・検証計画であり、本書は証拠と未検証事項だけを記録する。
 
