@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections.abc import Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
@@ -57,7 +58,7 @@ def _require_reason(value: object) -> str:
         raise QualityPolicyValidationError(
             "applicability_reason must be a non-empty string without surrounding whitespace"
         )
-    if any(ord(character) < 32 for character in value):
+    if any(unicodedata.category(character) == "Cc" for character in value):
         raise QualityPolicyValidationError("applicability_reason contains a control character")
     return value
 
