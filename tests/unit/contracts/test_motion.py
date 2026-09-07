@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import math
 from dataclasses import FrozenInstanceError
 from types import ModuleType
 from typing import Any
