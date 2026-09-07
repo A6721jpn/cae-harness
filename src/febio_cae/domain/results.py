@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from enum import Enum
 from itertools import pairwise
 
-from .artifacts import FileEntry
+from .artifacts import FileEntry, validate_logical_path
 from .canonical import canonical_bytes
 from .compatibility import OutputMapping, ToolIdentity
 from .spatial import FrameId
@@ -55,16 +55,6 @@ def _sequence(value: object, field_name: str) -> tuple[object, ...]:
     return tuple(value)
 
 
-def _logical_path(value: object, field_name: str) -> str:
-    result = _text(value, field_name)
-    if "\\" in result or result.startswith("/") or ":" in result:
-        raise ResultsValidationError(f"{field_name} must be a relative logical path")
-    parts = result.split("/")
-    if any(not part or part in {".", ".."} for part in parts):
-        raise ResultsValidationError(f"{field_name} contains an ambiguous path component")
-    return result
-
-
 class ReadStatus(str, Enum):
     VALIDATED = "VALIDATED"
     UNVERIFIED = "UNVERIFIED"
@@ -93,7 +83,11 @@ class ResultDataRef:
         object.__setattr__(self, "data_id", _text(self.data_id, "data_id"))
         object.__setattr__(self, "content_digest", _digest(self.content_digest, "content_digest"))
         object.__setattr__(self, "codec_id", _text(self.codec_id, "codec_id"))
-        object.__setattr__(self, "logical_path", _logical_path(self.logical_path, "logical_path"))
+        object.__setattr__(
+            self,
+            "logical_path",
+            validate_logical_path(self.logical_path, "logical_path", ResultsValidationError),
+        )
         if (self.bundle_digest is None) != (self.attempt_id is None):
             raise ResultsValidationError("bundle_digest and attempt_id must be supplied together")
         if self.bundle_digest is not None:
@@ -110,6 +104,9 @@ class ResultDataRef:
             "bundle_digest": self.bundle_digest,
             "attempt_id": self.attempt_id,
         }
+
+    def to_bytes(self) -> bytes:
+        return canonical_bytes(self.to_dict())
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,8 +132,8 @@ class NumericResultData:
         axis_values = tuple(
             _finite(item, "axis_values[]") for item in _sequence(self.axis_values, "axis_values")
         )
-        if not axis_values:
-            raise ResultsValidationError("axis_values must not be empty")
+        if len(axis_values) < 2:
+            raise ResultsValidationError("axis_values must contain at least two states")
         if any(current <= previous for previous, current in pairwise(axis_values)):
             raise ResultsValidationError("axis_values must be strictly increasing")
         entity_ids = tuple(
@@ -173,9 +170,12 @@ class NumericResultData:
         return {
             "schema_version": SCHEMA_VERSION,
             "reference": {
+                "schema_version": SCHEMA_VERSION,
                 "data_id": self.reference.data_id,
                 "codec_id": self.reference.codec_id,
                 "logical_path": self.reference.logical_path,
+                "bundle_digest": self.reference.bundle_digest,
+                "attempt_id": self.reference.attempt_id,
             },
             "mapping": self.mapping.to_dict(),
             "axis_id": self.axis_id,
@@ -196,6 +196,9 @@ class NumericResultData:
 
     def to_dict(self) -> dict[str, object]:
         return self._content_projection() | {"content_digest": self.reference.content_digest}
+
+    def to_bytes(self) -> bytes:
+        return canonical_bytes(self.to_dict())
 
 
 @dataclass(frozen=True, slots=True)

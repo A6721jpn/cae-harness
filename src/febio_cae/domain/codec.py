@@ -78,6 +78,7 @@ from .results import (
     AssessmentStatus,
     CriterionAssessment,
     MeasuredValue,
+    NumericResultData,
     OutputObservation,
     QualityAssessment,
     ReadResult,
@@ -1678,6 +1679,117 @@ def _result_data_ref(value: object, field: str) -> ResultDataRef:
     )
 
 
+def _output_mapping(value: object, field: str) -> OutputMapping:
+    payload = _mapping(
+        value,
+        {
+            "schema_version",
+            "canonical_id",
+            "native_name",
+            "location",
+            "value_type",
+            "unit",
+            "frame",
+            "raw_sign",
+            "canonical_sign",
+            "measure_id",
+        },
+        field,
+    )
+    _schema(payload, field)
+    return OutputMapping(
+        _text(payload["canonical_id"], f"{field}.canonical_id"),
+        _text(payload["native_name"], f"{field}.native_name"),
+        _text(payload["location"], f"{field}.location"),
+        _text(payload["value_type"], f"{field}.value_type"),
+        _text(payload["unit"], f"{field}.unit"),
+        _frame(payload["frame"], f"{field}.frame"),
+        _integer(payload["raw_sign"], f"{field}.raw_sign"),
+        _integer(payload["canonical_sign"], f"{field}.canonical_sign"),
+        _text(payload["measure_id"], f"{field}.measure_id"),
+    )
+
+
+def _numeric_result_data(value: object, field: str) -> NumericResultData:
+    payload = _mapping(
+        value,
+        {
+            "schema_version",
+            "reference",
+            "mapping",
+            "axis_id",
+            "axis_unit",
+            "axis_values",
+            "entity_ids",
+            "component_ids",
+            "values",
+            "content_digest",
+        },
+        field,
+    )
+    _schema(payload, field)
+    reference_payload = _mapping(
+        payload["reference"],
+        {
+            "schema_version",
+            "data_id",
+            "codec_id",
+            "logical_path",
+            "bundle_digest",
+            "attempt_id",
+        },
+        f"{field}.reference",
+    )
+    _schema(reference_payload, f"{field}.reference")
+    codec_id = _text(reference_payload["codec_id"], f"{field}.reference.codec_id")
+    if codec_id != "numeric-result-v1":
+        _fail(f"{field}.reference.codec_id", "must be numeric-result-v1")
+    reference = ResultDataRef(
+        _text(reference_payload["data_id"], f"{field}.reference.data_id"),
+        _digest(payload["content_digest"], f"{field}.content_digest"),
+        codec_id,
+        _text(reference_payload["logical_path"], f"{field}.reference.logical_path"),
+        None
+        if reference_payload["bundle_digest"] is None
+        else _digest(reference_payload["bundle_digest"], f"{field}.reference.bundle_digest"),
+        None
+        if reference_payload["attempt_id"] is None
+        else _text(reference_payload["attempt_id"], f"{field}.reference.attempt_id"),
+    )
+    result = NumericResultData(
+        reference=reference,
+        mapping=_output_mapping(payload["mapping"], f"{field}.mapping"),
+        axis_id=_text(payload["axis_id"], f"{field}.axis_id"),
+        axis_unit=_text(payload["axis_unit"], f"{field}.axis_unit"),
+        axis_values=tuple(
+            _number(item, f"{field}.axis_values[{index}]")
+            for index, item in enumerate(_sequence(payload["axis_values"], f"{field}.axis_values"))
+        ),
+        entity_ids=tuple(
+            _text(item, f"{field}.entity_ids[{index}]")
+            for index, item in enumerate(_sequence(payload["entity_ids"], f"{field}.entity_ids"))
+        ),
+        component_ids=tuple(
+            _text(item, f"{field}.component_ids[{index}]")
+            for index, item in enumerate(
+                _sequence(payload["component_ids"], f"{field}.component_ids")
+            )
+        ),
+        values=tuple(
+            tuple(
+                _number(item, f"{field}.values[{row_index}][{column_index}]")
+                for column_index, item in enumerate(
+                    _sequence(row, f"{field}.values[{row_index}]")
+                )
+            )
+            for row_index, row in enumerate(_sequence(payload["values"], f"{field}.values"))
+        ),
+    )
+    if result.expected_content_digest != reference.content_digest:
+        _fail(field, "content_digest does not match payload")
+    return result
+
+
 def _observation(value: object, field: str) -> OutputObservation:
     payload = _mapping(
         value,
@@ -2190,6 +2302,8 @@ _DECODERS: dict[type[object], Any] = {
     CompatibilityProfile: _compatibility,
     ExecutionBundle: _bundle,
     AttemptRecord: _attempt,
+    ResultDataRef: _result_data_ref,
+    NumericResultData: _numeric_result_data,
     ResultManifest: _manifest,
     QualityAssessment: _quality,
     PreviewRequest: _preview_request,
