@@ -1,5 +1,6 @@
 """P1-A domain contract foundations owned by the common-contract worker."""
 
+from .budget import Budget, BudgetValidationError
 from .canonical import SCHEMA_VERSION, CanonicalizationError, canonical_bytes
 from .contact import (
     ArrangementIntent,
@@ -95,6 +96,8 @@ __all__ = [
     "ArrangementIntent",
     "AsPlaced",
     "BodyId",
+    "Budget",
+    "BudgetValidationError",
     "CanonicalizationError",
     "CompressibleNeoHookean",
     "ContactId",
