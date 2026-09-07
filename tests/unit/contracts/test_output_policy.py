@@ -451,7 +451,7 @@ def test_evaluation_request_rejects_missing_and_extra_fields() -> None:
         [Quantity(1, "s"), Quantity(1000, "ms")],
         [Quantity(0, "m"), Quantity(1, "s")],
         [Quantity(0, "s"), Quantity(10**309, "s")],
-        [Quantity(0, "s"), Quantity(1e-320, "ms")],
+        [Quantity(0, "s"), Quantity(1e-321, "ms")],
     ],
 )
 def test_evaluation_request_rejects_invalid_state_times(state_times: object) -> None:
@@ -644,7 +644,7 @@ def test_output_policy_accepts_equivalent_time_units_and_preserves_display_inten
         [Quantity(1, "s"), Quantity(0, "s")],
         [Quantity(0, "m"), Quantity(1, "s")],
         [Quantity(0, "s"), Quantity(10**309, "s")],
-        [Quantity(0, "s"), Quantity(1e-320, "ms")],
+        [Quantity(0, "s"), Quantity(1e-321, "ms")],
     ],
 )
 def test_output_policy_rejects_invalid_saved_time_values(saved_times: object) -> None:
