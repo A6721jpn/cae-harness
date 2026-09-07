@@ -679,6 +679,159 @@ def test_mesh_requires_opposite_oriented_interior_face_pair() -> None:
         )
 
 
+def _cyclic_neighbor_mesh(
+    corner_order: tuple[str, str, str, str],
+    shared_local_face: int,
+    *,
+    second_node_ids: tuple[int, ...] | None = None,
+) -> tuple[Any, tuple[int, ...]]:
+    coordinates = {
+        "A": (0.0, 0.0, 0.0),
+        "B": (1.0, 0.0, 0.0),
+        "C": (0.0, 1.0, 0.0),
+        "D1": (0.0, 0.0, 1.0),
+        "D2": (0.0, 0.0, -1.0),
+        "AB": (0.5, 0.0, 0.0),
+        "BC": (0.5, 0.5, 0.0),
+        "CA": (0.0, 0.5, 0.0),
+        "AD1": (0.0, 0.0, 0.5),
+        "BD1": (0.5, 0.0, 0.5),
+        "CD1": (0.0, 0.5, 0.5),
+        "AD2": (0.0, 0.0, -0.5),
+        "BD2": (0.5, 0.0, -0.5),
+        "CD2": (0.0, 0.5, -0.5),
+    }
+    node_ids = {
+        "A": 1,
+        "B": 2,
+        "C": 3,
+        "D1": 4,
+        "AB": 5,
+        "BC": 6,
+        "CA": 7,
+        "AD1": 8,
+        "BD1": 9,
+        "CD1": 10,
+        "D2": 11,
+        "AD2": 12,
+        "BD2": 13,
+        "CD2": 14,
+    }
+    edge_node_names = {
+        frozenset(("A", "B")): "AB",
+        frozenset(("B", "C")): "BC",
+        frozenset(("C", "A")): "CA",
+    }
+
+    def element_nodes(corners: tuple[str, str, str, str]) -> tuple[int, ...]:
+        mids: list[int] = []
+        for left, right in TET10_EDGE_NODE_POSITIONS:
+            edge = frozenset((corners[left], corners[right]))
+            midpoint_name = edge_node_names.get(edge)
+            if midpoint_name is None:
+                midpoint_name = "".join((corners[left], corners[right]))
+            mids.append(node_ids[midpoint_name])
+        return tuple(node_ids[item] for item in corners) + tuple(mids)
+
+    first_nodes = element_nodes(("A", "B", "C", "D1"))
+    second_nodes = second_node_ids or element_nodes(corner_order)
+    first = MeshElement(1, "tet10", first_nodes, "body-a")
+    second = MeshElement(2, "tet10", second_nodes, "body-a")
+    provenance = MeshProvenance(
+        "a" * 64,
+        ("body-a",),
+        ("b" * 64,),
+        "c" * 64,
+        "gmsh",
+        "4.12.0",
+        "tet10-gmsh-febio-v1",
+        "tet10-canonical-v1",
+        "tet10-face-canonical-v1",
+    )
+    shared = MeshFace(
+        "interior",
+        "body-a",
+        (1, 3, 2, 7, 6, 5),
+        (1, 2),
+        (0, shared_local_face),
+    )
+    mesh = MeshArtifact(
+        "cyclic-interior-pair",
+        FrameId("World"),
+        provenance,
+        tuple(
+            MeshNode(node_id, coordinates[name])
+            for name, node_id in sorted(node_ids.items(), key=lambda item: item[1])
+        ),
+        (first, second),
+        (MeshFace("boundary", "body-a", (1, 2, 4, 5, 9, 8), (1,), (1,)), shared),
+        (
+            MeshSet("body", "body", "body-a", ("body-a",), "b" * 64),
+            MeshSet("elements", "element", "body-a", (1, 2), "b" * 64),
+            MeshSet("faces", "face", "body-a", ("interior",), "b" * 64),
+        ),
+        (MeshQualityRecord("jacobian", 0.5, "1", 0.0, AssessmentStatus.PASS, "synthetic"),),
+    )
+    return mesh, second_nodes
+
+
+@pytest.mark.parametrize(
+    ("corner_order", "shared_local_face", "expected_shared_face"),
+    (
+        (("A", "B", "D2", "C"), 1, (1, 2, 3, 5, 6, 7)),
+        (("B", "A", "C", "D2"), 0, (2, 3, 1, 6, 7, 5)),
+        (("C", "D2", "B", "A"), 3, (3, 1, 2, 7, 5, 6)),
+    ),
+)
+def test_mesh_accepts_all_cyclically_rotated_opposite_interior_face_cycles(
+    corner_order: tuple[str, str, str, str],
+    shared_local_face: int,
+    expected_shared_face: tuple[int, ...],
+) -> None:
+    _require_repair_api()
+    mesh, second_nodes = _cyclic_neighbor_mesh(corner_order, shared_local_face)
+    node_coordinates = {node.node_id: node.coordinates_si for node in mesh.nodes}
+    a, b, c, d = (node_coordinates[node_id] for node_id in second_nodes[:4])
+    determinant = (
+        (b[0] - a[0])
+        * ((c[1] - a[1]) * (d[2] - a[2]) - (c[2] - a[2]) * (d[1] - a[1]))
+        - (b[1] - a[1])
+        * ((c[0] - a[0]) * (d[2] - a[2]) - (c[2] - a[2]) * (d[0] - a[0]))
+        + (b[2] - a[2])
+        * ((c[0] - a[0]) * (d[1] - a[1]) - (c[1] - a[1]) * (d[0] - a[0]))
+    )
+    assert determinant > 0.0
+    assert tuple(
+        second_nodes[position]
+        for position in TET10_FACE_NODE_POSITIONS[shared_local_face]
+    ) == expected_shared_face
+    assert mesh.faces[1].node_ids == (1, 3, 2, 7, 6, 5)
+
+
+def test_mesh_keeps_interior_face_rejections_for_same_facing_wrong_midside_and_unknown_node() -> None:
+    _require_repair_api()
+    valid_mesh, valid_second_nodes = _cyclic_neighbor_mesh(("B", "A", "C", "D2"), 0)
+    with pytest.raises(ValueError, match="opposite|orientation"):
+        _cyclic_neighbor_mesh(("A", "B", "C", "D2"), 0)
+    wrong_midside = list(valid_second_nodes)
+    wrong_midside[4], wrong_midside[5] = wrong_midside[5], wrong_midside[4]
+    with pytest.raises(ValueError, match="opposite|orientation"):
+        _cyclic_neighbor_mesh(
+            ("B", "A", "C", "D2"),
+            0,
+            second_node_ids=tuple(wrong_midside),
+        )
+    unknown_node = list(valid_second_nodes)
+    unknown_node[0] = 99
+    with pytest.raises(ValueError, match="unknown node"):
+        _cyclic_neighbor_mesh(
+            ("B", "A", "C", "D2"),
+            0,
+            second_node_ids=tuple(unknown_node),
+        )
+    assert valid_mesh.faces[1].adjacent_element_ids == (1, 2)
+
+
 def test_file_identity_rejects_windows_lexical_forms_and_casefold_collisions(
     synthetic_case_spec: Any,
 ) -> None:

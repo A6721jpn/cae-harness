@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from typing import Any, cast
 
 import pytest
@@ -21,6 +22,7 @@ from febio_cae.domain import (
     OutputMapping,
     PartialCaseSpec,
     PreviewRequest,
+    Quantity,
     ResultDataRef,
 )
 
@@ -226,6 +228,61 @@ def test_numeric_codec_rejects_wrong_schema_codec_digest_shape_and_nonfinite() -
     bad_number["values"][0][0] = float("nan")
     with pytest.raises(CodecError, match="finite|NaN"):
         decode_record(json.dumps(bad_number), NumericResultData)
+
+
+def test_single_state_numeric_codec_round_trips_for_complete_single_state_output_policy(
+    synthetic_case_spec: Any,
+) -> None:
+    _require_codec()
+    single_state = Quantity(2, "s")
+    outputs = replace(
+        synthetic_case_spec.outputs,
+        saved_times=(single_state,),
+        evaluations=tuple(
+            replace(evaluation, state_times=(single_state,))
+            for evaluation in synthetic_case_spec.outputs.evaluations
+        ),
+    )
+    complete_case = replace(synthetic_case_spec, outputs=outputs)
+    assert complete_case.outputs.saved_times == (single_state,)
+    assert all(
+        evaluation.state_times == (single_state,)
+        for evaluation in complete_case.outputs.evaluations
+    )
+
+    seed = NumericResultData(
+        reference=ResultDataRef(
+            "single-state-data",
+            "0" * 64,
+            "numeric-result-v1",
+            "output/case.xplt",
+            "b" * 64,
+            "attempt-interface",
+        ),
+        mapping=_numeric_data().mapping,
+        axis_id="time",
+        axis_unit="s",
+        axis_values=(2.0,),
+        entity_ids=("node-1", "node-2"),
+        component_ids=("x", "y", "z"),
+        values=((0.2, 0.0, 0.0, 1.2, 0.0, 0.0),),
+    )
+    numeric = replace(
+        seed,
+        reference=ResultDataRef(
+            "single-state-data",
+            seed.expected_content_digest,
+            "numeric-result-v1",
+            "output/case.xplt",
+            "b" * 64,
+            "attempt-interface",
+        ),
+    )
+    restored = decode_record(encode_record(numeric), NumericResultData)
+    assert restored.to_bytes() == numeric.to_bytes()
+    assert restored.axis_values == (2.0,)
+    assert restored.values == ((0.2, 0.0, 0.0, 1.2, 0.0, 0.0),)
+    restored.verify_content_digest()
 
 
 def test_manifest_codec_reuses_strong_result_reference_path_rule() -> None:
