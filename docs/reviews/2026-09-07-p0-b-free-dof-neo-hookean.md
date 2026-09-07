@@ -1,9 +1,9 @@
 # P0-B native free-DOF compressible neo-Hookean observation
 
-Date: 2026-09-07  
-Repository: `https://github.com/A6721jpn/cae-harness.git` (`REMOTE_CONFIGURED`)  
-Integration branch: `V2`  
-Worker branch: `codex/p0-b-free-dof-patch`  
+Date: 2026-09-07
+Repository: `https://github.com/A6721jpn/cae-harness.git` (`REMOTE_CONFIGURED`)
+Integration branch: `V2`
+Worker branch: `codex/p0-b-free-dof-patch`
 Clean base: `9f361893b7966f583dc8b06e1c69e70baa9ae6c1`
 
 ## 1. Bounded result
