@@ -618,6 +618,7 @@ def test_case_spec_rejects_contact_part_identity_mismatch() -> None:
 
 @pytest.mark.parametrize("field", ["rigid_tool", "contact", "motion"])
 def test_case_spec_rejects_common_frame_mismatch(field: str) -> None:
+    changed: Any
     if field == "rigid_tool":
         tool = _rigid_tool()
         primitive = RigidPrimitive(
@@ -721,6 +722,7 @@ def test_case_spec_rejects_unrelated_or_noncommon_frame_selection_in_every_colle
     owner: str,
 ) -> None:
     unrelated = _output_selection(geometry_digest="c" * 64, body_id=BodyId("other-body"))
+    kwargs: dict[str, object]
     if owner == "mesh":
         changed = _mesh(local_refinements=[LocalRefinement("bad", unrelated, Quantity(1, "mm"))])
         kwargs = {"mesh_policy": changed}
