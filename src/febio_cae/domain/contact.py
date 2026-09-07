@@ -208,7 +208,10 @@ class ContactIntent:
             raise ContactValidationError("part_surface role must be 'part_contact_surface'")
         if self.tool_surface.stated_role != "tool_contact_surface":
             raise ContactValidationError("tool_surface role must be 'tool_contact_surface'")
-        if self.part_surface.body_id == self.tool_surface.body_id:
+        if (
+            self.part_surface.source_geometry_digest == self.tool_surface.source_geometry_digest
+            and self.part_surface.body_id == self.tool_surface.body_id
+        ):
             raise ContactValidationError("part_surface and tool_surface must use distinct bodies")
         if not isinstance(self.pair_frame, FrameId):
             raise ContactValidationError("pair_frame must be a FrameId")
