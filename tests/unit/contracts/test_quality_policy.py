@@ -264,6 +264,31 @@ def test_quality_criterion_requires_explicit_clean_applicability_reason(reason: 
         _criterion(applicability_reason=reason)
 
 
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "Required\x00criterion",
+        "Required\x7fcriterion",
+        "Required\x80criterion",
+        "Required\x85criterion",
+        "Required\x9fcriterion",
+    ],
+)
+def test_quality_criterion_rejects_c0_del_and_c1_control_characters(reason: str) -> None:
+    evidence = _evidence(target_field="quality_policy.criteria.equilibrium")
+
+    with pytest.raises(_quality().QualityPolicyValidationError, match="applicability_reason"):
+        _criterion(applicability_reason=reason, evidence=evidence)
+
+
+def test_quality_criterion_preserves_ordinary_unicode_applicability_reason() -> None:
+    reason = "解析条件 — convergence étape 1"
+    criterion = _criterion(applicability_reason=reason)
+
+    assert criterion.applicability_reason == reason
+    assert criterion.to_dict()["applicability_reason"] == reason
+
+
 def test_quality_criterion_requires_exact_dynamic_evidence_target() -> None:
     unrelated = _evidence(target_field="quality_policy.criteria.other_criterion")
 
