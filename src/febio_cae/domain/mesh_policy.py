@@ -5,7 +5,6 @@ from __future__ import annotations
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import cast
 
 from .canonical import canonical_bytes
 from .selection import FaceSetRule, SelectionRef
@@ -175,9 +174,7 @@ class MeshPolicy:
                 identifier for identifier in set(identifiers) if identifiers.count(identifier) > 1
             )
             raise MeshPolicyValidationError(f"duplicate refinement_id: {duplicates[0]}")
-        ordered = tuple(
-            sorted(cast(tuple[LocalRefinement, ...], copied), key=lambda item: item.refinement_id)
-        )
+        ordered = tuple(sorted(copied, key=lambda item: item.refinement_id))
         for item in ordered:
             if item.size.to_si().value > global_size.to_si().value:
                 raise MeshPolicyValidationError(
