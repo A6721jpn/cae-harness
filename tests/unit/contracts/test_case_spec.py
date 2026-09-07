@@ -611,7 +611,7 @@ def test_case_spec_rejects_contact_part_identity_mismatch() -> None:
     with pytest.raises(_case().CaseSpecValidationError, match="contact.part_surface"):
         _case_value(
             contact=_contact(
-                part_surface=_part_selection(geometry_digest=TOOL_DIGEST, body_id=TOOL_BODY)
+                part_surface=_part_selection(geometry_digest="c" * 64, body_id=BodyId("other-part"))
             )
         )
 
@@ -781,13 +781,21 @@ def test_case_spec_rejects_selection_with_declared_identity_but_wrong_common_fra
         display_unit="mm",
         evidence=_evidence("outputs.requests.request_bad_frame", "n"),
     )
+    base_output = _output()
     with pytest.raises(_case().CaseSpecValidationError, match="selection"):
-        _case_value(outputs=_output(requests=[request]))
+        _case_value(
+            outputs=OutputPolicy(
+                profile=base_output.profile,
+                requests=[*base_output.requests, request],
+                saved_times=base_output.saved_times,
+                evaluations=base_output.evaluations,
+            )
+        )
 
 
 def test_case_spec_rejects_missing_quality_evaluation_reference() -> None:
     with pytest.raises(_case().CaseSpecValidationError, match="evaluation"):
-        _case_value(quality_policy=_quality(evaluation_ids=("missing-evaluation",)))
+        _case_value(quality_policy=_quality(evaluation_ids=("missing_evaluation",)))
 
 
 def test_case_spec_accepts_si_equivalent_saved_times_and_rejects_out_of_interval() -> None:
@@ -798,7 +806,12 @@ def test_case_spec_accepts_si_equivalent_saved_times_and_rejects_out_of_interval
             outputs=OutputPolicy(
                 profile=case.outputs.profile,
                 requests=case.outputs.requests,
-                saved_times=[Quantity(0, "s"), Quantity(1, "s"), Quantity(2, "s")],
+                saved_times=[
+                    Quantity(0, "s"),
+                    Quantity(1, "s"),
+                    Quantity(2, "s"),
+                    Quantity(3, "s"),
+                ],
                 evaluations=case.outputs.evaluations,
             )
         )
