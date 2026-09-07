@@ -6,6 +6,15 @@ from typing import Any
 
 import pytest
 
+from febio_cae.adapters.geometry import (
+    BACKEND_TET10_ORDER_ID,
+    BackendError,
+    BackendErrorCategory,
+    GmshOCCBackend,
+    GmshOCCConfig,
+    InitialContactPlacement,
+    StepGeometryMeshAdapter,
+)
 from febio_cae.domain import (
     BodyId,
     CaseRevision,
@@ -28,25 +37,6 @@ from febio_cae.domain import (
     UnitDirection,
     WholeBodyRule,
 )
-
-try:
-    from febio_cae.adapters.geometry import (
-        BACKEND_TET10_ORDER_ID,
-        BackendError,
-        BackendErrorCategory,
-        GmshOCCBackend,
-        GmshOCCConfig,
-        InitialContactPlacement,
-        StepGeometryMeshAdapter,
-    )
-except ImportError:
-    BACKEND_TET10_ORDER_ID: Any = None
-    BackendError: Any = None
-    BackendErrorCategory: Any = None
-    GmshOCCBackend: Any = None
-    GmshOCCConfig: Any = None
-    InitialContactPlacement: Any = None
-    StepGeometryMeshAdapter: Any = None
 
 
 def _evidence(target_field: str, seed: str) -> Any:
@@ -480,8 +470,6 @@ def test_initial_contact_placement_requires_unique_explicit_targets(
 def test_gmsh_backend_has_explicit_configuration_and_structured_missing_environment(
     source_content: Any,
 ) -> None:
-    if GmshOCCConfig is None:
-        pytest.skip("geometry adapter API is not implemented")
     config = GmshOCCConfig(
         module_name="module-that-is-not-installed",
         expected_version="4.15.2",

@@ -5,6 +5,18 @@ from typing import Any
 
 import pytest
 
+from febio_cae.adapters.geometry import (
+    BACKEND_TET10_ORDER_ID,
+    BackendBody,
+    BackendElement,
+    BackendFace,
+    BackendInspection,
+    BackendMesh,
+    BackendMeshFace,
+    BackendNode,
+    GeometryMeshBackend,
+    StepGeometryMeshAdapter,
+)
 from febio_cae.domain import (
     AsPlaced,
     BodyId,
@@ -56,27 +68,7 @@ from febio_cae.domain import (
 from febio_cae.domain.ports import MeshingPort
 from febio_cae.domain.spatial import ProperRotation
 
-try:
-    from febio_cae.adapters.geometry import (
-        BACKEND_TET10_ORDER_ID,
-        BackendBody,
-        BackendElement,
-        BackendFace,
-        BackendInspection,
-        BackendMesh,
-        BackendMeshFace,
-        BackendNode,
-        GeometryMeshBackend,
-        StepGeometryMeshAdapter,
-    )
-
-    API_AVAILABLE = True
-except ImportError:
-    API_AVAILABLE = False
-    BACKEND_TET10_ORDER_ID = "tet10-backend-v1"
-    BackendBody = BackendElement = BackendFace = BackendInspection = Any  # type: ignore[assignment]
-    BackendMesh = BackendMeshFace = BackendNode = Any  # type: ignore[assignment]
-    GeometryMeshBackend = StepGeometryMeshAdapter = Any  # type: ignore[assignment]
+API_AVAILABLE = True
 
 
 WORLD = FrameId("World")
@@ -442,11 +434,11 @@ def make_case_spec(inspection_digest: str, *, primitive: RigidPrimitive | None =
         element_type="tet10",
         global_size=Quantity(2, "mm"),
         local_refinements=(),
-        quality_profile=NumericalProfileRef("mesh-profile", "mesh_quality", "c" * 64),
+        quality_profile=NumericalProfileRef("mesh_profile", "mesh_quality", "c" * 64),
         max_refinements=0,
     )
     solver_policy = SolverPolicy(
-        profile=NumericalProfileRef("solver-profile", "solver", "d" * 64),
+        profile=NumericalProfileRef("solver_profile", "solver", "d" * 64),
         controls=(SolverControl("alpha", 1),),
         increments=TimeIncrementPolicy(
             initial_step=Quantity(100, "ms"),
@@ -457,13 +449,13 @@ def make_case_spec(inspection_digest: str, *, primitive: RigidPrimitive | None =
             max_step_retries=2,
             must_points=(Quantity(0, "s"),),
         ),
-        retry_recipe_ids=("retry-primary",),
+        retry_recipe_ids=("retry_primary",),
     )
     output_policy = OutputPolicy(
-        profile=NumericalProfileRef("outputs-profile", "outputs", "e" * 64),
+        profile=NumericalProfileRef("outputs_profile", "outputs", "e" * 64),
         requests=(
             OutputRequest(
-                request_id="request-part",
+                request_id="request_part",
                 quantity_id="displacement",
                 measure_id="max",
                 component_id="z",
@@ -471,10 +463,10 @@ def make_case_spec(inspection_digest: str, *, primitive: RigidPrimitive | None =
                 selection=part_output,
                 frame=WORLD,
                 display_unit="mm",
-                evidence=_evidence("outputs.requests.request-part", "output-part"),
+                evidence=_evidence("outputs.requests.request_part", "output-part"),
             ),
             OutputRequest(
-                request_id="request-tool",
+                request_id="request_tool",
                 quantity_id="contact_force",
                 measure_id="max",
                 component_id="z",
@@ -482,39 +474,39 @@ def make_case_spec(inspection_digest: str, *, primitive: RigidPrimitive | None =
                 selection=tool_output,
                 frame=WORLD,
                 display_unit="N",
-                evidence=_evidence("outputs.requests.request-tool", "output-tool"),
+                evidence=_evidence("outputs.requests.request_tool", "output-tool"),
             ),
         ),
         saved_times=(Quantity(0, "s"), Quantity(1, "s")),
         evaluations=(
             EvaluationRequest(
-                evaluation_id="evaluation-part",
-                output_request_id="request-part",
+                evaluation_id="evaluation_part",
+                output_request_id="request_part",
                 aggregation_id="peak",
                 selection=part_output,
                 state_times=(Quantity(0, "s"), Quantity(1, "s")),
-                evidence=_evidence("outputs.evaluations.evaluation-part", "evaluation-part"),
+                evidence=_evidence("outputs.evaluations.evaluation_part", "evaluation-part"),
             ),
             EvaluationRequest(
-                evaluation_id="evaluation-tool",
-                output_request_id="request-tool",
+                evaluation_id="evaluation_tool",
+                output_request_id="request_tool",
                 aggregation_id="peak",
                 selection=tool_output,
                 state_times=(Quantity(0, "s"), Quantity(1, "s")),
-                evidence=_evidence("outputs.evaluations.evaluation-tool", "evaluation-tool"),
+                evidence=_evidence("outputs.evaluations.evaluation_tool", "evaluation-tool"),
             ),
         ),
     )
     quality_policy = QualityPolicy(
-        profile=NumericalProfileRef("quality-profile", "quality", "f" * 64),
+        profile=NumericalProfileRef("quality_profile", "quality", "f" * 64),
         criteria=(
             QualityCriterion(
-                criterion_id="criterion-main",
-                metric_id="residual-norm",
-                evaluation_ids=("evaluation-part", "evaluation-tool"),
-                thresholds=(QualityThreshold("absolute-tolerance", Quantity(1, "MPa")),),
+                criterion_id="criterion_main",
+                metric_id="residual_norm",
+                evaluation_ids=("evaluation_part", "evaluation_tool"),
+                thresholds=(QualityThreshold("absolute_tolerance", Quantity(1, "MPa")),),
                 applicability_reason="Synthetic structural quality criterion.",
-                evidence=_evidence("quality_policy.criteria.criterion-main", "quality"),
+                evidence=_evidence("quality_policy.criteria.criterion_main", "quality"),
             ),
         ),
     )
