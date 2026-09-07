@@ -12,7 +12,7 @@ from febio_cae.domain.evidence import EvidenceRef
 from febio_cae.domain.partial_case_spec import PartialCaseSpec
 
 
-def _service_types():
+def _service_types() -> tuple[Any, Any, Any]:
     from febio_cae.application.service import (
         ConcurrentUpdateError,
         RegisteredCaseService,

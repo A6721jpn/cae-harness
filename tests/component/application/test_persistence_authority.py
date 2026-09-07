@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -20,7 +22,9 @@ from febio_cae.domain import (
     FrameId,
     GeometryBodyFact,
     GeometryInspection,
+    GeometryInspectionRequest,
     GeometryIntent,
+    GeometrySelectionRequest,
     IsotropicLinearElastic,
     MaterialApplicability,
     MeshPolicy,
@@ -52,6 +56,7 @@ from febio_cae.domain import (
     UnitDirection,
     WholeBodyRule,
 )
+from febio_cae.domain.artifacts import SourceAssetContent
 from febio_cae.domain.compatibility import (
     CapabilityRef,
     CapabilityStatus,
@@ -62,6 +67,7 @@ from febio_cae.domain.compatibility import (
 from febio_cae.domain.contact import Frictionless
 from febio_cae.domain.partial_case_spec import PartialCaseSpec
 from febio_cae.domain.ports import PortError, TrustedOwnerContext
+from febio_cae.domain.selection import ResolutionSnapshot
 from febio_cae.domain.spatial import ProperRotation
 from febio_cae.storage.registry import (
     CaseStorage,
@@ -288,7 +294,9 @@ def complete_spec() -> CaseSpec:
 
 
 class SyntheticGeometry:
-    def inspect(self, request, source):
+    def inspect(
+        self, request: GeometryInspectionRequest, source: SourceAssetContent
+    ) -> GeometryInspection:
         return GeometryInspection(
             request.source_asset,
             INSPECTION_DIGEST,
@@ -297,6 +305,11 @@ class SyntheticGeometry:
             ("part",),
             (GeometryBodyFact("part", 1, 1.0),),
         )
+
+    def resolve_selection(
+        self, request: GeometrySelectionRequest, source: SourceAssetContent
+    ) -> ResolutionSnapshot:
+        raise NotImplementedError
 
 
 class SyntheticProfiles:
@@ -333,7 +346,11 @@ class SyntheticProfiles:
         )
 
 
-def _created(tmp_path: Path, *, failure_injector=None):
+def _created(
+    tmp_path: Path,
+    *,
+    failure_injector: Callable[[str], None] | None = None,
+) -> tuple[RegisteredCaseService, Any, CaseStorage]:
     source = tmp_path / "source.step"
     source.write_bytes(CAD_BYTES)
     service = RegisteredCaseService(
@@ -370,6 +387,7 @@ def test_synthetic_validated_freeze_publishes_immutable_revision(tmp_path: Path)
     assert service.validate_case(created.case_id).status == "VALIDATED"
     result = service.freeze_case(created.case_id)
     assert result.status == "FROZEN"
+    assert result.revision_id is not None
     assert service.get_revision(created.case_id, result.revision_id).spec_digest
     assert draft.generation == 1
 
@@ -404,9 +422,11 @@ def test_revision_publication_recovers_after_each_boundary(tmp_path: Path, bound
         expected_generation=0,
         evidence=(_evidence("case_revision.spec"),),
     )
-    gate = lambda point: (
-        (_ for _ in ()).throw(InjectedStorageFailure(point)) if point == boundary else None
-    )
+
+    def gate(point: str) -> None:
+        if point == boundary:
+            raise InjectedStorageFailure(point)
+
     failing = CaseStorage(tmp_path / "case", failure_injector=gate)
     draft = failing.current_draft(created.case_id)
     revision = CaseRevision(

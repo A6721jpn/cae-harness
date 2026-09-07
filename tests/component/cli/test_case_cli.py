@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 from febio_cae.cli.main import main
 
 
 def test_case_cli_create_inspect_and_spec_use_registered_state(
-    tmp_path: Path, monkeypatch, capsys
+    tmp_path: Path, monkeypatch: Any, capsys: Any
 ) -> None:
     monkeypatch.setenv("FEBIO_CAE_STATE_DIR", str(tmp_path / "state"))
     cad_path = tmp_path / "source.step"
@@ -84,7 +85,7 @@ def test_case_cli_create_inspect_and_spec_use_registered_state(
 
 
 def test_case_cli_validate_is_honest_about_unavailable_native_capabilities(
-    tmp_path: Path, monkeypatch, capsys
+    tmp_path: Path, monkeypatch: Any, capsys: Any
 ) -> None:
     monkeypatch.setenv("FEBIO_CAE_STATE_DIR", str(tmp_path / "state"))
     cad_path = tmp_path / "source.step"

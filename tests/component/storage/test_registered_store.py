@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from febio_cae.domain.ports import PortError, PortErrorCategory
 
 
-def _service_type():
+def _service_type() -> Any:
     from febio_cae.application.service import RegisteredCaseService
 
     return RegisteredCaseService
