@@ -126,7 +126,29 @@ Gmsh returned element type `11`, name `Tetrahedron 10`, dimension `3`, order `2`
 
 The returned reference coordinates independently identify four corner nodes and six midpoint nodes with relations `(0,1)`, `(1,2)`, `(0,2)`, `(0,3)`, `(2,3)`, and `(1,3)`. The minimum sampled `minDetJac` was `0.012991555090983535`; the minimum signed inverted condition number was `0.2614095200149805`. Both exceed the frozen positive threshold `1e-12`.
 
-The curved-element physical midpoint deviations are retained in the result record as diagnostics; they are not treated as a universal straight-edge or FEBio mapping rule. The Tet10 tuple is not the FEBio Tet10 mapping, and no universal orientation, face conversion, or curved-element interoperability claim is made.
+The earlier saved `physical_midpoint_deviation_first_element` values in the original Gmsh result are invalid and are explicitly superseded. The original helper built `node_map` with `flat_node_coords[index:index+3]` instead of `flat_node_coords[3*index:3*index+3]`; those six values were coordinate-indexing artifacts, not physical curved-element deviations. The original result file and native artifacts remain unchanged.
+
+An independent, no-Gmsh, no-native reanalysis parsed the saved ASCII MSH 4.1 artifact directly:
+
+```text
+C:\Users\backo\.codex\worktrees\e081\CAE-harness\.local\verification\P0B-gmsh-reanalysis-02\reanalysis-result.json
+Input SHA-256: 740C794E8DBAF94C2B44901ED283CAD4F13832D3D629052AB153B3D30B29F5EE
+Result SHA-256: 080AE4DD21B4E19D6E43F70F441C075BE54EB5F6F2CDF02EFC67054C9F165D6B
+Provenance extract SHA-256: 637DB07B4CA00BE63FBBC43D3BD29E980199C3450B2E9EBDD631BC2BFBDF4350
+C:\Users\backo\.codex\worktrees\e081\CAE-harness\.local\verification\P0B-gmsh-reanalysis-02\reanalysis-record.json
+Record SHA-256: A16E92166D945480C448E3B0E1B0ECBEA9F218F652AFBEE98E52A93CB94A0160
+```
+
+The expanded child command recorded in that immutable record is:
+
+```text
+C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe -X utf8 C:\Users\backo\.codex\worktrees\e081\CAE-harness\.local\verification\P0B-gmsh-reanalysis-02\parse_saved_msh.py C:\Users\backo\.codex\worktrees\e081\CAE-harness\.local\verification\P0B-gmsh-observation-01\attempt-03-tet10-mesh\sphere-tet10.msh
+exit: 0
+stdout SHA-256: 080AE4DD21B4E19D6E43F70F441C075BE54EB5F6F2CDF02EFC67054C9F165D6B
+stderr bytes: 0; SHA-256: E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855
+```
+
+The reanalysis strictly parsed `2,127` nodes, `1,709` elements, and type-11 Tet10 count `1,222`; the first Tet10 node tags matched the saved native result record. The corrected six midpoint deviations are `6.280369834735101e-16`, `6.304854800243424e-16`, `8.881784197001252e-16`, `0`, `4.440892098500626e-16`, and `6.280369834735101e-16`, with maximum `8.881784197001252e-16`. All nodes remain within the sphere radius: maximum radius `1.5000000000000009` about center `(1.25, -2, 0.75)`. The direct Gmsh quality API fields are unaffected by this saved-file indexing bug; the Tet10 tuple is still not the FEBio Tet10 mapping, and no universal orientation, face conversion, or curved-element interoperability claim is made.
 
 The mesh artifact is:
 
@@ -140,7 +162,7 @@ SHA-256: 740C794E8DBAF94C2B44901ED283CAD4F13832D3D629052AB153B3D30B29F5EE
 Completed for this documentation-only native observation:
 
 ```text
-python C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe scripts\scan_cae_data.py --root .   # PASS, exit 0
+& 'C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe' -X utf8 scripts\scan_cae_data.py --root .   # PASS, exit 0
 git diff --check                                                                                # exit 0
 local Markdown-link audit                                                                       # exit 0
 provenance raw-line/object/hash verification                                                    # PASS
