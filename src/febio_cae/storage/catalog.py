@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
+import stat
 from pathlib import Path
 
 
@@ -32,6 +33,17 @@ def _connect(path: Path) -> sqlite3.Connection:
     return connection
 
 
+def _is_reparse(path: Path) -> bool:
+    try:
+        mode = path.lstat().st_mode
+        if stat.S_ISLNK(mode):
+            return True
+        attributes = getattr(path.lstat(), "st_file_attributes", 0)
+        return bool(attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+    except FileNotFoundError:
+        return False
+
+
 class CaseCatalog:
     """Persist case roots; callers never resolve an arbitrary ID as a path."""
 
@@ -52,6 +64,8 @@ class CaseCatalog:
     def register(self, case_id: str, case_root: Path, created_at: str) -> None:
         validate_case_id(case_id)
         root = case_root.absolute()
+        if not root.is_dir() or _is_reparse(root):
+            raise CaseCatalogError("registered case root is unavailable or is a reparse point")
         with _connect(self.path) as connection:
             try:
                 connection.execute("BEGIN IMMEDIATE")
@@ -76,8 +90,10 @@ class CaseCatalog:
         if row is None:
             raise CaseCatalogError(f"unknown registered case: {case_id}")
         root = Path(str(row["case_root"])).absolute()
-        if not root.is_dir() or root.is_symlink():
-            raise CaseCatalogError("registered case root is unavailable or is a link")
+        if not root.is_dir() or _is_reparse(root):
+            raise CaseCatalogError(
+                "registered case root is unavailable or is a link or reparse point"
+            )
         return root
 
 

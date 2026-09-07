@@ -29,7 +29,7 @@ from febio_cae.domain.ports import (
     TrustedOwnerContext,
 )
 from febio_cae.domain.questions import IssuedQuestion
-from febio_cae.domain.results import NumericResultData, ResultDataRef, ResultManifest
+from febio_cae.domain.results import NumericResultData, ReadStatus, ResultDataRef, ResultManifest
 
 from .catalog import validate_case_id
 
@@ -158,9 +158,10 @@ class CaseStorage:
         self, root: Path | str, *, failure_injector: FailureInjector | None = None
     ) -> None:
         self.root = Path(root).absolute()
-        if not self.root.is_dir() or self.root.is_symlink():
+        if not self.root.is_dir() or _is_reparse(self.root):
             raise StorageIntegrityError("registered case root is unavailable")
         self.registry_path = self.root / "registry.sqlite3"
+        _assert_no_links(self.registry_path, self.root)
         self.failure_injector = failure_injector
         self._initialize_schema()
         self._recover_publications()
@@ -295,6 +296,8 @@ class CaseStorage:
                     relative_path TEXT NOT NULL,
                     payload BLOB NOT NULL,
                     state TEXT NOT NULL,
+                    expected_generation INTEGER,
+                    expected_draft_id TEXT,
                     created_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS owners (
@@ -315,10 +318,43 @@ class CaseStorage:
                 );
                 """
             )
+            for column, definition in (
+                ("expected_generation", "INTEGER"),
+                ("expected_draft_id", "TEXT"),
+            ):
+                try:
+                    connection.execute(f"ALTER TABLE publications ADD COLUMN {column} {definition}")
+                except sqlite3.OperationalError as error:
+                    if "duplicate column name" not in str(error).casefold():
+                        raise
 
     def _fault(self, boundary: str) -> None:
         if self.failure_injector is not None:
             self.failure_injector(boundary)
+
+    def _discard_prepared_publication(
+        self, transaction_id: str, relative: str, payload: bytes
+    ) -> None:
+        target = _owned_path(self.root, relative)
+        if target.exists():
+            if target.read_bytes() != payload:
+                raise StorageIntegrityError(
+                    f"publication target does not match prepared bytes: {relative}"
+                )
+            target.unlink()
+        temporary = target.with_name(f".{target.name}.{transaction_id}.tmp")
+        if temporary.exists():
+            temporary.unlink()
+        with _connect(self.registry_path) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                connection.execute(
+                    "DELETE FROM publications WHERE transaction_id=?", (transaction_id,)
+                )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
 
     def _recover_publications(self) -> None:
         with _connect(self.registry_path) as connection:
@@ -339,30 +375,67 @@ class CaseStorage:
                             (row["transaction_id"],),
                         )
                         continue
+                    revision = decode_record(payload, CaseRevision)
+                    expected_generation = row["expected_generation"]
+                    if expected_generation is not None:
+                        current = self._case_row(connection, revision.case_id)
+                        if current["current_generation"] != expected_generation or (
+                            row["expected_draft_id"] is not None
+                            and current["current_draft_id"] != row["expected_draft_id"]
+                        ):
+                            if final.exists():
+                                if final.read_bytes() != payload:
+                                    raise StorageIntegrityError(
+                                        f"publication target does not match prepared bytes: {relative}"
+                                    )
+                                final.unlink()
+                            temporary = final.with_name(
+                                f".{final.name}.{row['transaction_id']}.tmp"
+                            )
+                            if temporary.exists():
+                                temporary.unlink()
+                            connection.execute(
+                                "DELETE FROM publications WHERE transaction_id=?",
+                                (row["transaction_id"],),
+                            )
+                            continue
                     if final.exists():
                         if final.read_bytes() != payload:
                             raise StorageIntegrityError(
                                 f"publication target does not match prepared bytes: {relative}"
                             )
-                        revision = decode_record(payload, CaseRevision)
-                        connection.execute(
-                            """
-                            INSERT OR IGNORE INTO revisions(
-                                revision_id,case_id,parent_revision_id,parent_spec_digest,
-                                spec_digest,payload,relative_path,created_at
-                            ) VALUES(?,?,?,?,?,?,?,?)
-                            """,
-                            (
-                                revision.revision_id,
-                                revision.case_id,
-                                revision.parent_revision_id,
-                                revision.parent_spec_digest,
-                                revision.spec_digest,
-                                payload,
-                                relative,
-                                str(row["created_at"]),
-                            ),
-                        )
+                        try:
+                            connection.execute(
+                                """
+                                INSERT INTO revisions(
+                                    revision_id,case_id,parent_revision_id,parent_spec_digest,
+                                    spec_digest,payload,relative_path,created_at
+                                ) VALUES(?,?,?,?,?,?,?,?)
+                                """,
+                                (
+                                    revision.revision_id,
+                                    revision.case_id,
+                                    revision.parent_revision_id,
+                                    revision.parent_spec_digest,
+                                    revision.spec_digest,
+                                    payload,
+                                    relative,
+                                    str(row["created_at"]),
+                                ),
+                            )
+                        except sqlite3.IntegrityError as error:
+                            existing = connection.execute(
+                                "SELECT payload,relative_path FROM revisions WHERE revision_id=?",
+                                (revision.revision_id,),
+                            ).fetchone()
+                            if (
+                                existing is None
+                                or bytes(existing["payload"]) != payload
+                                or str(existing["relative_path"]) != relative
+                            ):
+                                raise StorageIntegrityError(
+                                    "prepared revision conflicts with an existing registered revision"
+                                ) from error
                     temporary = final.with_name(f".{final.name}.{row['transaction_id']}.tmp")
                     if temporary.exists():
                         temporary.unlink()
@@ -550,6 +623,7 @@ class CaseStorage:
         payload = encode_record(revision)
         relative = f"cases/{revision.case_id}/revisions/{revision.revision_id}/revision.json"
         transaction_id = uuid.uuid4().hex[:12]
+        duplicate = False
         with _connect(self.registry_path) as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
@@ -559,26 +633,63 @@ class CaseStorage:
                     and current["current_generation"] != expected_generation
                 ):
                     raise StorageConflictError("draft changed before freeze")
-                connection.execute(
+                existing = connection.execute(
                     """
-                    INSERT INTO publications(
-                        transaction_id,kind,record_id,relative_path,payload,state,created_at
-                    ) VALUES(?,?,?,?,?,?,?)
+                    SELECT revision_id,relative_path,payload
+                    FROM revisions
+                    WHERE revision_id=? OR relative_path=?
+                    LIMIT 1
                     """,
-                    (
-                        transaction_id,
-                        "revision",
-                        revision.revision_id,
-                        relative,
-                        payload,
-                        "PREPARED",
-                        _now(),
-                    ),
-                )
+                    (revision.revision_id, relative),
+                ).fetchone()
+                if existing is not None:
+                    if (
+                        existing["revision_id"] != revision.revision_id
+                        or existing["relative_path"] != relative
+                        or bytes(existing["payload"]) != payload
+                    ):
+                        raise StorageConflictError(
+                            "revision identity is already registered with different bytes"
+                        )
+                    duplicate = True
+                else:
+                    target = _owned_path(self.root, relative)
+                    if target.exists():
+                        raise StorageConflictError(
+                            "revision target already exists without a matching registry record"
+                        )
+                    expected_draft_id = (
+                        str(current["current_draft_id"])
+                        if expected_generation is not None
+                        else None
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO publications(
+                            transaction_id,kind,record_id,relative_path,payload,state,
+                            expected_generation,expected_draft_id,created_at
+                        ) VALUES(?,?,?,?,?,?,?,?,?)
+                        """,
+                        (
+                            transaction_id,
+                            "revision",
+                            revision.revision_id,
+                            relative,
+                            payload,
+                            "PREPARED",
+                            expected_generation,
+                            expected_draft_id,
+                            _now(),
+                        ),
+                    )
                 connection.commit()
             except Exception:
                 connection.rollback()
                 raise
+        if duplicate:
+            if _read_owned(self.root, relative) != payload:
+                raise StorageIntegrityError("registered revision file does not match SQLite")
+            return revision
         self._fault("after_prepare")
         target = _owned_path(self.root, relative)
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -597,7 +708,10 @@ class CaseStorage:
             try:
                 if expected_generation is not None:
                     current = self._case_row(connection, revision.case_id)
-                    if current["current_generation"] != expected_generation:
+                    if (
+                        current["current_generation"] != expected_generation
+                        or current["current_draft_id"] != expected_draft_id
+                    ):
                         raise StorageConflictError("draft changed before revision finalization")
                 connection.execute(
                     """
@@ -622,6 +736,10 @@ class CaseStorage:
                     (transaction_id,),
                 )
                 connection.commit()
+            except StorageConflictError:
+                connection.rollback()
+                self._discard_prepared_publication(transaction_id, relative, payload)
+                raise
             except Exception:
                 connection.rollback()
                 raise
@@ -759,34 +877,95 @@ class CaseStorage:
         return owner
 
     def validate(self, owner: TrustedOwnerContext, attempt: AttemptRecord) -> TrustedOwnerContext:
-        if attempt.case_id != owner.case_id or attempt.run_id != owner.run_id:
+        if owner.case_id != self._case_id():
+            raise PortError(PortErrorCategory.CONFLICT, "owner case is not this registered case")
+        if (
+            attempt.case_id != owner.case_id
+            or attempt.run_id != owner.run_id
+            or attempt.attempt_id != owner.attempt_id
+            or attempt.owner_generation != owner.owner_generation
+        ):
             raise PortError(
                 PortErrorCategory.CONFLICT, "attempt is outside the trusted owner scope"
             )
         with _connect(self.registry_path) as connection:
             row = connection.execute(
-                "SELECT * FROM owners WHERE run_id=? AND attempt_id=?",
-                (owner.run_id, owner.attempt_id),
+                """
+                SELECT * FROM owners
+                WHERE case_id=? AND run_id=? AND attempt_id=? AND owner_generation=?
+                """,
+                (owner.case_id, owner.run_id, owner.attempt_id, owner.owner_generation),
             ).fetchone()
-        if row is None or row["owner_generation"] != owner.owner_generation:
+        if row is None:
             raise PortError(PortErrorCategory.CONFLICT, "owner claim is not registered")
+        with _connect(self.registry_path) as connection:
+            connection.execute(
+                "UPDATE owners SET payload=? WHERE run_id=?",
+                (encode_record(attempt), owner.run_id),
+            )
         return owner
 
     def publish_manifest(
         self, owner: TrustedOwnerContext, manifest: ResultManifest
     ) -> ResultManifest:
+        if owner.case_id != self._case_id():
+            raise PortError(PortErrorCategory.CONFLICT, "owner case is not this registered case")
         if manifest.attempt_id != owner.attempt_id:
             raise PortError(PortErrorCategory.CONFLICT, "manifest attempt is outside owner scope")
+        if manifest.read_result.status is not ReadStatus.VALIDATED:
+            raise PortError(PortErrorCategory.INTEGRITY, "manifest read result is not validated")
         payload = encode_record(manifest)
         with _connect(self.registry_path) as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
                 row = connection.execute(
-                    "SELECT 1 FROM owners WHERE run_id=? AND attempt_id=? AND owner_generation=?",
-                    (owner.run_id, owner.attempt_id, owner.owner_generation),
+                    """
+                    SELECT * FROM owners
+                    WHERE case_id=? AND run_id=? AND attempt_id=? AND owner_generation=?
+                    """,
+                    (owner.case_id, owner.run_id, owner.attempt_id, owner.owner_generation),
                 ).fetchone()
                 if row is None:
                     raise PortError(PortErrorCategory.CONFLICT, "owner claim is not registered")
+                try:
+                    attempt = decode_record(bytes(row["payload"]), AttemptRecord)
+                except Exception as error:
+                    raise PortError(
+                        PortErrorCategory.CONFLICT,
+                        "owner has no validated registered attempt",
+                    ) from error
+                if (
+                    attempt.case_id != owner.case_id
+                    or attempt.run_id != owner.run_id
+                    or attempt.attempt_id != owner.attempt_id
+                    or attempt.owner_generation != owner.owner_generation
+                ):
+                    raise PortError(
+                        PortErrorCategory.CONFLICT,
+                        "registered attempt is outside the trusted owner scope",
+                    )
+                if manifest.bundle_digest != attempt.bundle_digest:
+                    raise PortError(
+                        PortErrorCategory.INTEGRITY,
+                        "manifest bundle is not the registered attempt bundle",
+                    )
+                for entry in manifest.files:
+                    relative = (
+                        f"cases/{attempt.case_id}/runs/{attempt.run_id}/attempts/"
+                        f"{attempt.attempt_id}/{entry.logical_path}"
+                    )
+                    try:
+                        content = _read_owned(self.root, relative)
+                    except StorageIntegrityError as error:
+                        raise PortError(PortErrorCategory.INTEGRITY, str(error)) from error
+                    if (
+                        len(content) != entry.size_bytes
+                        or hashlib.sha256(content).hexdigest() != entry.digest
+                    ):
+                        raise PortError(
+                            PortErrorCategory.INTEGRITY,
+                            f"manifest file bytes do not match the registered output: {entry.logical_path}",
+                        )
                 connection.execute(
                     "INSERT INTO manifests(manifest_id,attempt_id,payload) VALUES(?,?,?)",
                     (manifest.manifest_id, manifest.attempt_id, payload),

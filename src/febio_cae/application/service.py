@@ -6,7 +6,7 @@ import hashlib
 import stat
 import uuid
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, is_dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -133,6 +133,23 @@ def _registered_selections(values: PartialCaseSpec) -> tuple[SelectionRef, ...]:
         selections.extend(item.selection for item in values.outputs.requests)
         selections.extend(item.selection for item in values.outputs.evaluations)
     return tuple(selections)
+
+
+def _nested_evidence(values: PartialCaseSpec) -> tuple[EvidenceRef, ...]:
+    found: list[EvidenceRef] = []
+
+    def visit(value: object) -> None:
+        if isinstance(value, EvidenceRef):
+            found.append(value)
+        elif isinstance(value, (tuple, list)):
+            for item in value:
+                visit(item)
+        elif is_dataclass(value):
+            for item in fields(value):
+                visit(getattr(value, item.name))
+
+    visit(values)
+    return tuple(found)
 
 
 class RegisteredCaseService:
@@ -437,21 +454,35 @@ class RegisteredCaseService:
         storage = self._storage(case_id)
         draft = storage.current_draft(case_id)
         diagnostics: list[ServiceDiagnostic] = []
-        try:
-            for evidence in draft.evidence:
+        for evidence in (*draft.evidence, *_nested_evidence(draft.values)):
+            try:
                 asset = storage.source_asset(evidence.reference)
-                if asset.content_digest != evidence.content_digest:
+                if storage.source_kind(evidence.reference) != evidence.source_kind:
                     diagnostics.append(
                         _diagnostic(
                             ServiceErrorCategory.INTEGRITY,
-                            f"evidence source {evidence.reference!r} has a stale digest",
-                            evidence.target_field,
+                            f"evidence target {evidence.target_field!r} has a mismatched source kind",
+                            "evidence",
+                        )
+                    )
+                elif asset.content_digest != evidence.content_digest:
+                    diagnostics.append(
+                        _diagnostic(
+                            ServiceErrorCategory.INTEGRITY,
+                            f"evidence target {evidence.target_field!r} has a stale source digest",
+                            "evidence",
                         )
                     )
                 else:
                     storage.resolve_source(asset)
-        except (StorageConflictError, PortError) as error:
-            diagnostics.append(_diagnostic(ServiceErrorCategory.INTEGRITY, str(error), "evidence"))
+            except (StorageConflictError, PortError) as error:
+                diagnostics.append(
+                    _diagnostic(
+                        ServiceErrorCategory.INTEGRITY,
+                        f"evidence target {evidence.target_field!r} is not registered: {error}",
+                        "evidence",
+                    )
+                )
 
         if draft.parent_revision_id is not None:
             try:
