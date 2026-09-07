@@ -798,22 +798,21 @@ def test_mesh_accepts_all_cyclically_rotated_opposite_interior_face_cycles(
     node_coordinates = {node.node_id: node.coordinates_si for node in mesh.nodes}
     a, b, c, d = (node_coordinates[node_id] for node_id in second_nodes[:4])
     determinant = (
-        (b[0] - a[0])
-        * ((c[1] - a[1]) * (d[2] - a[2]) - (c[2] - a[2]) * (d[1] - a[1]))
-        - (b[1] - a[1])
-        * ((c[0] - a[0]) * (d[2] - a[2]) - (c[2] - a[2]) * (d[0] - a[0]))
-        + (b[2] - a[2])
-        * ((c[0] - a[0]) * (d[1] - a[1]) - (c[1] - a[1]) * (d[0] - a[0]))
+        (b[0] - a[0]) * ((c[1] - a[1]) * (d[2] - a[2]) - (c[2] - a[2]) * (d[1] - a[1]))
+        - (b[1] - a[1]) * ((c[0] - a[0]) * (d[2] - a[2]) - (c[2] - a[2]) * (d[0] - a[0]))
+        + (b[2] - a[2]) * ((c[0] - a[0]) * (d[1] - a[1]) - (c[1] - a[1]) * (d[0] - a[0]))
     )
     assert determinant > 0.0
-    assert tuple(
-        second_nodes[position]
-        for position in TET10_FACE_NODE_POSITIONS[shared_local_face]
-    ) == expected_shared_face
+    assert (
+        tuple(second_nodes[position] for position in TET10_FACE_NODE_POSITIONS[shared_local_face])
+        == expected_shared_face
+    )
     assert mesh.faces[1].node_ids == (1, 3, 2, 7, 6, 5)
 
 
-def test_mesh_keeps_interior_face_rejections_for_same_facing_wrong_midside_and_unknown_node() -> None:
+def test_mesh_keeps_interior_face_rejections_for_same_facing_wrong_midside_and_unknown_node() -> (
+    None
+):
     _require_repair_api()
     valid_mesh, valid_second_nodes = _cyclic_neighbor_mesh(("A", "C", "B", "D2"), 0)
     with pytest.raises(ValueError, match="opposite|orientation"):
