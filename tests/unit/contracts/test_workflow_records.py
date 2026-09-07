@@ -721,6 +721,12 @@ def _cyclic_neighbor_mesh(
         frozenset(("A", "B")): "AB",
         frozenset(("B", "C")): "BC",
         frozenset(("C", "A")): "CA",
+        frozenset(("A", "D1")): "AD1",
+        frozenset(("B", "D1")): "BD1",
+        frozenset(("C", "D1")): "CD1",
+        frozenset(("A", "D2")): "AD2",
+        frozenset(("B", "D2")): "BD2",
+        frozenset(("C", "D2")): "CD2",
     }
 
     def element_nodes(corners: tuple[str, str, str, str]) -> tuple[int, ...]:
@@ -728,8 +734,7 @@ def _cyclic_neighbor_mesh(
         for left, right in TET10_EDGE_NODE_POSITIONS:
             edge = frozenset((corners[left], corners[right]))
             midpoint_name = edge_node_names.get(edge)
-            if midpoint_name is None:
-                midpoint_name = "".join((corners[left], corners[right]))
+            assert midpoint_name is not None
             mids.append(node_ids[midpoint_name])
         return tuple(node_ids[item] for item in corners) + tuple(mids)
 
