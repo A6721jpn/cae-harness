@@ -33,12 +33,12 @@ def _spatial() -> ModuleType:
     return SPATIAL_MODULE
 
 
-def _evidence(seed: str = "a") -> EvidenceRef:
+def _evidence(seed: str = "a", *, target_field: str = "selection.role") -> EvidenceRef:
     return EvidenceRef(
         schema_version="1",
         source_kind="registered_document",
         reference="SelectionSource:1",
-        target_field="selection.role",
+        target_field=target_field,
         content_digest=seed * 64,
     )
 
@@ -174,7 +174,7 @@ def test_selection_ref_canonicalizes_face_set_member_order() -> None:
         return selection.SelectionRef(
             name="ordered-face-selection",
             role="contact_surface",
-            role_evidence=_evidence("face-order"),
+            role_evidence=_evidence("f"),
             geometry_digest=digest,
             body_id=body,
             frame=frame,
@@ -183,7 +183,7 @@ def test_selection_ref_canonicalizes_face_set_member_order() -> None:
                 body,
                 frame,
                 [spatial.FaceId(name) for name in face_names],
-                _evidence("face-rule"),
+                _evidence("e"),
             ),
         )
 
@@ -219,7 +219,7 @@ def test_selection_ref_canonicalizes_resolution_face_member_order() -> None:
         return selection.SelectionRef(
             name="resolved-face-selection",
             role="contact_surface",
-            role_evidence=_evidence("resolution-order"),
+            role_evidence=_evidence("d"),
             geometry_digest=digest,
             body_id=body,
             frame=frame,
@@ -245,7 +245,7 @@ def test_explicit_face_rule_requires_exact_resolution_face_identity_set(
         body,
         frame,
         [spatial.FaceId("face-A")],
-        _evidence("explicit-rule"),
+        _evidence("c"),
     )
     resolution = selection.ResolutionSnapshot(
         digest,
@@ -270,7 +270,7 @@ def test_explicit_face_rule_requires_exact_resolution_face_identity_set(
         selection.SelectionRef(
             name="mismatched-face-resolution",
             role="contact_surface",
-            role_evidence=_evidence("explicit-resolution"),
+            role_evidence=_evidence("b"),
             geometry_digest=digest,
             body_id=body,
             frame=frame,
@@ -287,7 +287,7 @@ def test_selection_role_evidence_requires_selection_role_target() -> None:
         selection.SelectionRef(
             name="wrong-role-evidence-target",
             role="contact_surface",
-            role_evidence=_evidence("material.density"),
+            role_evidence=_evidence(target_field="material.density"),
             geometry_digest=digest,
             body_id=body,
             frame=frame,
