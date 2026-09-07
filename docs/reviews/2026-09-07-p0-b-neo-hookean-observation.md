@@ -48,14 +48,31 @@ C:\Users\backo\.codex\worktrees\e081\CAE-harness\.local\verification\P0B-neo-hoo
 SHA-256: E34C225C6883D3B29A73D9010DAB5CF15C82547286FFB752A81A890A9492F164
 ```
 
-It was marked read-only after validation. The bounded original command-event extract is:
+It was marked read-only after validation. The earlier bounded command-event extract is
+preserved unchanged for traceability, but its event-time claims and the chronology
+sentence previously copied from it are superseded as inaccurate provenance evidence:
 
 ```text
 C:\Users\backo\.codex\worktrees\e081\CAE-harness\.local\verification\P0B-neo-hookean-observation-01\preflight-event-extract.json
 SHA-256: 07243FE07AF9F97CD1977FAACDFD5070AD35A7F2A049B13C8B13F9C274B052CD
 ```
 
-That extract records the preflight write command at `06:40:23.868707Z`, JSON/hash/read-only validation at `06:40:31.787391Z` with result observed at `06:40:38.338412Z`, and the first native command only at `06:44:05.528429Z` (process start `06:44:06.789381Z`). The JSON contains a manually entered `created_utc` value of `2026-09-07T06:45:00Z`; that value is inaccurate and is explicitly not used as chronology evidence. The original preflight bytes and hash are preserved unchanged.
+Use the corrected, source-backed extract below for provenance. It retains the selected
+original JSONL records byte-for-byte and as parsed objects, with source ordinals, source
+field paths, raw-line hashes, response-item recording times, command-event fields, and
+the native child start parsed from the original attempt output. It also verifies that
+the FileChange content and the current immutable preflight bytes match. The corrected
+extract deliberately keeps these time classes separate; this report does not duplicate
+their derived timestamps.
+
+```text
+C:\Users\backo\.codex\worktrees\e081\CAE-harness\.local\verification\P0B-neo-hookean-observation-01\preflight-provenance-extract-02.json
+SHA-256: 93B471430846D03F2DC37106B6DB0AE914B218F46829F2B1A547F5EB1D385451
+```
+
+The JSON contains a manually entered `created_utc` value in the preserved preflight
+bytes; that value remains explicitly excluded from chronology evidence. The original
+preflight bytes and hash remain unchanged.
 
 The constitutive model is defined by the manual's
 
