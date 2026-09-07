@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import cast
 
 from .canonical import canonical_bytes
 from .mesh_policy import NumericalProfileRef
@@ -188,7 +189,7 @@ class SolverPolicy:
             raise SolverPolicyValidationError("controls must be nonempty")
         if any(not isinstance(control, SolverControl) for control in raw_controls):
             raise SolverPolicyValidationError("controls contains an invalid SolverControl")
-        controls = tuple(raw_controls)
+        controls = cast(tuple[SolverControl, ...], tuple(raw_controls))
         names = [control.name for control in controls]
         if len(set(names)) != len(names):
             duplicates = sorted(name for name in set(names) if names.count(name) > 1)
