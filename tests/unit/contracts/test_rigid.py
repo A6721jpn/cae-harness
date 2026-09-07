@@ -107,7 +107,7 @@ def _primitive(
             _evidence("rigid_tool.model", "a") if model_evidence is None else model_evidence
         ),
         placement_evidence=(
-            _evidence("rigid_tool.placement", "z")
+            _evidence("rigid_tool.placement", "e")
             if placement_evidence is None
             else placement_evidence
         ),
