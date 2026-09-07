@@ -35,6 +35,12 @@ from .output_policy import (
     OutputPolicyValidationError,
     OutputRequest,
 )
+from .quality_policy import (
+    QualityCriterion,
+    QualityPolicy,
+    QualityPolicyValidationError,
+    QualityThreshold,
+)
 from .rigid import RigidPrimitive, RigidValidationError
 from .rigid_kinematics import (
     DofComponent,
@@ -165,6 +171,10 @@ __all__ = [
     "OutputRequest",
     "Point3",
     "ProperRotation",
+    "QualityCriterion",
+    "QualityPolicy",
+    "QualityPolicyValidationError",
+    "QualityThreshold",
     "Quantity",
     "ResolutionSnapshot",
     "RigidDOFComponent",
