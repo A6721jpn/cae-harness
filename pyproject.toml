@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "febio-cae"
+version = "0.1.0"
+description = "Headless FEBio CAE harness bootstrap"
+requires-python = ">=3.12,<3.13"
+dependencies = []
+
+[project.scripts]
+febio-cae = "febio_cae.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests/unit", "tests/component"]
+pythonpath = ["src"]
+markers = [
+    "febio: requires an installed FEBio solver or FEBio-native capability",
+    "llm: requires an LLM integration capability",
+    "native: requires an installed native application or executable",
+    "e2e: end-to-end verification outside the standard local testpaths",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.mypy]
+python_version = "3.12"
+check_untyped_defs = true
+disallow_untyped_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_configs = true
