@@ -81,7 +81,7 @@ def synthetic_case_spec() -> CaseSpec:
     part_selection = SelectionRef(
         name="part-contact",
         role="part_contact_surface",
-        role_evidence=_evidence("selection.part.role", "a"),
+        role_evidence=_evidence("selection.role", "a"),
         geometry_digest=PART_DIGEST,
         body_id=PART_BODY,
         frame=WORLD,
@@ -90,7 +90,7 @@ def synthetic_case_spec() -> CaseSpec:
     tool_selection = SelectionRef(
         name="tool-contact",
         role="tool_contact_surface",
-        role_evidence=_evidence("selection.tool.role", "b"),
+        role_evidence=_evidence("selection.role", "b"),
         geometry_digest=TOOL_DIGEST,
         body_id=TOOL_BODY,
         frame=WORLD,
@@ -99,7 +99,7 @@ def synthetic_case_spec() -> CaseSpec:
     output_part = SelectionRef(
         name="part-output",
         role="output_region",
-        role_evidence=_evidence("selection.output_part.role", "c"),
+        role_evidence=_evidence("selection.role", "c"),
         geometry_digest=PART_DIGEST,
         body_id=PART_BODY,
         frame=WORLD,
@@ -108,7 +108,7 @@ def synthetic_case_spec() -> CaseSpec:
     output_tool = SelectionRef(
         name="tool-output",
         role="output_region",
-        role_evidence=_evidence("selection.output_tool.role", "d"),
+        role_evidence=_evidence("selection.role", "d"),
         geometry_digest=TOOL_DIGEST,
         body_id=TOOL_BODY,
         frame=WORLD,
@@ -144,7 +144,7 @@ def synthetic_case_spec() -> CaseSpec:
         selection=SelectionRef(
             name="support-region",
             role="support_surface",
-            role_evidence=_evidence("selection.support.role", "m"),
+            role_evidence=_evidence("selection.role", "m"),
             geometry_digest=PART_DIGEST,
             body_id=PART_BODY,
             frame=WORLD,
