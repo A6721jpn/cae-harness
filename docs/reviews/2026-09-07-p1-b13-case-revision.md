@@ -51,15 +51,21 @@ The initial test-only commit was followed by two narrowly scoped test correction
 - `6b4a2cb` corrected five fixture role-evidence targets from child-specific names to the existing public `selection.role` target. The first attempted RED, `P1-B13-red-01`, is therefore invalid setup evidence: it collected 74 items but ended with `1 failed, 73 errors` because the fixture failed before the intended API boundary.
 - `27c36f5` corrected two test helper parameter-name collisions that prevented the wrong-spec cases from reaching the constructor. It did not change the contract assertions.
 
+The genuine availability RED is anchored to clean `6b4a2cb309685b1b77710fd3da5e90a93ac69944` after the fixture correction. The later `27c36f5b5721c95be4eddd1eb5e4c19df15fd110` helper repair happened after the initial production implementation had begun; it is a test-helper correction and does not retroactively become preimplementation RED evidence.
+
 | Record | Exact command/result | Exit | Attribution |
 |---|---|---:|---|
 | `P1-B13-red-preflight-01` | fresh `.../.local/verification/P1-B13-red-01` absent | 0 | preflight only |
 | `P1-B13-red-01` | `C:/Users/backo/AppData/Local/Programs/Python/Python312/python.exe -m pytest tests/unit/contracts/test_case_revision.py --basetemp C:/Users/backo/.codex/worktrees/8dd5/CAE-harness/.local/verification/P1-B13-red-01`; 74 collected, `1 failed, 73 errors` | 1 | invalid RED: fixture setup error in role-evidence targets |
 | `P1-B13-red-preflight-02` | fresh `.../.local/verification/P1-B13-red-02` absent | 0 | preflight only |
-| `P1-B13-red-02` | same focused command with `.../P1-B13-red-02`; `1 failed, 73 skipped` in 0.38s; only the intended API-availability assertion failed | 1 | valid availability RED; no collection/setup/environment failure |
+| `P1-B13-red-02` | same focused command with `.../P1-B13-red-02` at clean `6b4a2cb`; `1 failed, 73 skipped` in 0.38s; only the intended API-availability assertion failed | 1 | valid availability RED; no collection/setup/environment failure |
 | `P1-B13-green-01` | focused command at dirty production source after the initial implementation; `6 failed, 68 passed` | 1 | preserved: five helper collisions plus frozen `spec_digest` assignment behavior |
 | `P1-B13-green-02` | focused command after the first helper correction; `5 failed, 69 passed` | 1 | preserved: remaining `_revision_kwargs` helper collision |
 | `P1-B13-green-03` | focused command at test-only SHA `27c36f5`, with source changes dirty; `74 passed` in 0.35s | 0 | focused GREEN |
+
+The `green-01` and `green-02` nonpassing records remain preserved exactly as above: they are post-initial-implementation correction evidence, not preimplementation RED evidence.
+
+The initial test-only static setup also remains recorded separately. `P1-B13-test-lint-01` exited 1 on the import-order diagnostic; `P1-B13-test-lint-fix-01` exited 0 after the formatter/import-order recovery, and `P1-B13-test-lint-02` exited 0. `P1-B13-test-format-fix-01` reformatted the two new test files and `P1-B13-test-format-02` then exited 0. These are setup/static corrections, not product-test failures.
 
 The focused contract covers mandatory omissions, identifier and Unicode boundaries, parent pairing/self-parent/digest shape, wrong spec/evidence types, duplicate and order-independent evidence, canonical content/digest identity, changed nested content, SI/child semantic-set equivalence, record-versus-content identity, exact hashlib agreement, self-hash exclusion, frozen storage, detached caller/projection behavior, and equal parent/current content digests.
 
@@ -101,6 +107,24 @@ Size: 55863 bytes
 
 The installed smoke proves packaging, import provenance, public export identity, and one synthetic canonical CaseRevision construction only. It does not establish profile registration, native variable support, solver launch, result-reader compatibility, physical unit or ROI correctness, result completeness, quality assessment, official FBS, FEBio Studio, or real-model success.
 
+## Report-only checks
+
+After the original report text was complete, only the report was staged at dirty HEAD `00e172cc773f376fea227c8eeef30eedec508053`. The report-only checks passed separately from the clean production scanner:
+
+| Record | Result | Exit |
+|---|---|---:|
+| `P1-B13-report-diff-check-01` | staged `git diff --cached --check`; report was the only staged path | 0 |
+| `P1-B13-report-scanner-01` | staged-report scan PASS, 80 indexed/tracked files, 0 diagnostics | 0 |
+
+The clean production `P1-B13-gate-scanner-01` remains distinct at 79 indexed/tracked files and zero diagnostics.
+
+For this report-only attribution correction, the final-text checks ran with cwd `C:\Users\backo\.codex\worktrees\8dd5\CAE-harness`, HEAD `c1da1743407a3a7412b3843b982c819c010c7e43`, and `dirty_before`/`dirty_after` exactly `M  docs/reviews/2026-09-07-p1-b13-case-revision.md` (only this report staged):
+
+| Record | Result | Exit |
+|---|---|---:|
+| `P1-B13-R1-report-diff-check-02` | staged `git diff --cached --check`; report was the only staged path | 0 |
+| `P1-B13-R1-report-scanner-02` | staged-report scan PASS, 80 indexed/tracked files, 0 diagnostics | 0 |
+
 ## Unverified items and handoff boundary
 
 - Revision registration, parent existence/case membership, draft-generation freshness, evidence lookup and freshness, capability validation, freezing, READY recomputation, compilation, solver execution, and result receipts remain later services or unverified.
@@ -108,4 +132,4 @@ The installed smoke proves packaging, import provenance, public export identity,
 - The focused and full tests are synthetic contract tests. Passing results do not establish physical correctness, material/load/contact meaning, numerical compatibility, or execution readiness.
 - No schema freeze, integration, push, or product-completion claim is made by this slice.
 
-Next sequence: independent exact whole review of clean candidate `00e172cc773f376fea227c8eeef30eedec508053`; after whole-review acceptance, PM-only integration into `V2` followed by fresh post-integration gates. This worker will not integrate, push, access native helpers, access real `02_CAE` data, or access BottomFrame.
+Next sequence: independent exact whole review of the final clean report-bearing descendant of production candidate `00e172cc773f376fea227c8eeef30eedec508053`, including all five tracked paths; after whole-review acceptance, PM-only integration into `V2` followed by fresh post-integration gates. This worker will not integrate, push, access native helpers, access real `02_CAE` data, or access BottomFrame.
