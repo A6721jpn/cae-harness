@@ -7,7 +7,7 @@ import math
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Final
+from typing import Final, NoReturn
 
 from .canonical import canonical_bytes
 from .selection import SelectionRef
@@ -26,10 +26,10 @@ TET10_EDGE_NODE_POSITIONS: Final[tuple[tuple[int, int], ...]] = (
     (2, 3),
 )
 TET10_FACE_NODE_POSITIONS: Final[tuple[tuple[int, ...], ...]] = (
-    (0, 1, 2, 4, 5, 6),
-    (0, 1, 3, 4, 7, 8),
-    (1, 2, 3, 5, 8, 9),
-    (0, 2, 3, 6, 7, 9),
+    (0, 2, 1, 6, 5, 4),
+    (0, 1, 3, 4, 8, 7),
+    (1, 2, 3, 5, 9, 8),
+    (0, 3, 2, 7, 9, 6),
 )
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _DIGEST_FIELDS = frozenset({"content_digest", "inspection_digest", "mesh_recipe_digest"})
@@ -104,6 +104,38 @@ def _tuple_int(value: object, field_name: str, *, allow_empty: bool = False) -> 
     if len(set(result)) != len(result):
         raise ArtifactValidationError(f"{field_name} must not contain duplicate values")
     return result
+
+
+def validate_logical_path(
+    value: object,
+    field_name: str = "logical_path",
+    error_type: type[ValueError] = ArtifactValidationError,
+) -> str:
+    """Validate one relative POSIX logical path with Windows-safe lexical rules."""
+
+    def invalid(message: str) -> NoReturn:
+        raise error_type(f"{field_name} {message}")
+
+    if not isinstance(value, str) or not value or value != value.strip():
+        invalid("must be non-empty text without surrounding whitespace")
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        invalid("contains a control character")
+    if "\\" in value or value.startswith("/"):
+        invalid("must use relative POSIX separators")
+    if ":" in value:
+        invalid("must not contain a drive or stream separator")
+    parts = value.split("/")
+    if any(not part or part in {".", ".."} for part in parts):
+        invalid("contains an ambiguous or escaping component")
+    for part in parts:
+        if part != part.rstrip(" ."):
+            invalid("components must not end with a space or period")
+        if any(character in part for character in '<>"|?*'):
+            invalid("contains a Windows-invalid character")
+        device_name = part.split(".", 1)[0].upper()
+        if device_name in _WINDOWS_DEVICE_NAMES:
+            invalid("contains a reserved Windows device name")
+    return value
 
 
 def _sha_projection(value: object) -> bytes:
@@ -361,6 +393,8 @@ class MeshFace:
             raise ArtifactValidationError("tet10 face node_ids must contain exactly 6 nodes")
         object.__setattr__(self, "node_ids", node_ids)
         elements = _tuple_int(self.adjacent_element_ids, "adjacent_element_ids")
+        if len(elements) > 2:
+            raise ArtifactValidationError("a mesh face may have at most two adjacent elements")
         object.__setattr__(self, "adjacent_element_ids", elements)
         if isinstance(self.local_face_ids, (str, bytes, bytearray)) or not isinstance(
             self.local_face_ids, Sequence
@@ -539,31 +573,7 @@ class FileEntry:
     role: str
 
     def __post_init__(self) -> None:
-        path = _text(self.logical_path, "logical_path")
-        if "\\" in path or path.startswith(("/", "//")):
-            raise ArtifactValidationError("logical_path must use relative POSIX separators")
-        if ":" in path:
-            raise ArtifactValidationError(
-                "logical_path must not contain a drive or stream separator"
-            )
-        parts = path.split("/")
-        if any(not part or part in {".", ".."} for part in parts):
-            raise ArtifactValidationError(
-                "logical_path contains an ambiguous or escaping component"
-            )
-        for part in parts:
-            if part != part.rstrip(" ."):
-                raise ArtifactValidationError(
-                    "logical_path components must not end with a space or period"
-                )
-            if any(character in part for character in '<>"|?*'):
-                raise ArtifactValidationError("logical_path contains a Windows-invalid character")
-            device_name = part.split(".", 1)[0].upper()
-            if device_name in _WINDOWS_DEVICE_NAMES:
-                raise ArtifactValidationError(
-                    "logical_path contains a reserved Windows device name"
-                )
-        object.__setattr__(self, "logical_path", path)
+        object.__setattr__(self, "logical_path", validate_logical_path(self.logical_path))
         object.__setattr__(self, "digest", _digest(self.digest, "digest"))
         if (
             isinstance(self.size_bytes, bool)
@@ -693,17 +703,32 @@ class MeshArtifact:
                         raise ArtifactValidationError(
                             "face node order does not match the canonical oriented face table"
                         )
-                elif set(face.node_ids) != set(expected):
-                    raise ArtifactValidationError(
-                        "face nodes do not match the adjacent element face"
+                else:
+                    assert expected_first is not None
+                    opposite = (
+                        expected_first[0],
+                        expected_first[2],
+                        expected_first[1],
+                        expected_first[5],
+                        expected_first[4],
+                        expected_first[3],
                     )
+                    if expected != opposite:
+                        raise ArtifactValidationError(
+                            "interior face adjacent elements must use opposite orientation"
+                        )
         face_by_id = {item.face_id: item for item in faces}
         for item in sets:
             if item.kind == "node":
                 for member in item.member_ids:
                     if not isinstance(member, int) or member not in node_ids:
                         raise ArtifactValidationError("node set references an unknown node")
-                    if item.body_id not in node_bodies[member]:
+                    owners = node_bodies.get(member)
+                    if owners is None:
+                        raise ArtifactValidationError(
+                            "node set references a node without element body ownership"
+                        )
+                    if item.body_id not in owners:
                         raise ArtifactValidationError("node set crosses body ownership")
             elif item.kind == "element":
                 for member in item.member_ids:
@@ -718,6 +743,10 @@ class MeshArtifact:
                     if face_by_id[member].body_id != item.body_id:
                         raise ArtifactValidationError("face set crosses body ownership")
             else:
+                if item.body_id not in item.member_ids:
+                    raise ArtifactValidationError(
+                        "body set body_id must be included in its membership"
+                    )
                 for member in item.member_ids:
                     if not isinstance(member, str) or member not in body_ids:
                         raise ArtifactValidationError("body set references an unknown body")
@@ -775,4 +804,5 @@ __all__ = [
     "ResolvedFileContent",
     "SourceAssetContent",
     "SourceAssetRef",
+    "validate_logical_path",
 ]

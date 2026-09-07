@@ -20,6 +20,7 @@ from .artifacts import (
     ResolvedFileContent,
     SourceAssetContent,
     SourceAssetRef,
+    validate_logical_path,
 )
 from .budget import Budget, BudgetValidationError
 from .canonical import SCHEMA_VERSION, CanonicalizationError, canonical_bytes
@@ -375,6 +376,7 @@ __all__ = [
     "SolverPolicyValidationError",
     "SourceAssetContent",
     "SourceAssetRef",
+    "validate_logical_path",
     "SourceAssetResolverPort",
     "SpatialValidationError",
     "SpecifiedGap",
