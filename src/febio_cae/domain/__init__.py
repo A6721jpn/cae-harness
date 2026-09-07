@@ -61,6 +61,12 @@ from .selection import (
     SelectionValidationError,
     WholeBodyRule,
 )
+from .solver_policy import (
+    SolverControl,
+    SolverPolicy,
+    SolverPolicyValidationError,
+    TimeIncrementPolicy,
+)
 from .spatial import (
     ORTHOGONALITY_TOLERANCE,
     BodyId,
@@ -165,6 +171,9 @@ __all__ = [
     "SelectionRef",
     "SelectionValidationError",
     "SolidSupport",
+    "SolverControl",
+    "SolverPolicy",
+    "SolverPolicyValidationError",
     "SpatialValidationError",
     "SpecifiedGap",
     "SupportCollection",
@@ -172,6 +181,7 @@ __all__ = [
     "SupportId",
     "SupportSet",
     "SupportValidationError",
+    "TimeIncrementPolicy",
     "Translation3",
     "UnitDefinition",
     "UnitDirection",
