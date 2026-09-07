@@ -138,15 +138,15 @@ def _profile() -> NumericalProfileRef:
 
 def _request_kwargs(
     *,
-    request_id: str = "displacement_top",
-    quantity_id: str = "displacement",
-    measure_id: str = "component",
-    component_id: str = "z",
-    location: str = "node",
-    selection: Any | None = None,
-    frame: Any | None = None,
-    display_unit: str = "mm",
-    evidence: EvidenceRef | None = None,
+    request_id: object = "displacement_top",
+    quantity_id: object = "displacement",
+    measure_id: object = "component",
+    component_id: object = "z",
+    location: object = "node",
+    selection: object | None = None,
+    frame: object | None = None,
+    display_unit: object = "mm",
+    evidence: object | None = None,
 ) -> dict[str, object]:
     _, _, default_frame, _ = _context()
     return {
@@ -172,12 +172,12 @@ def _request(**kwargs: object) -> Any:
 
 def _evaluation_kwargs(
     *,
-    evaluation_id: str = "peak_displacement",
-    output_request_id: str = "displacement_top",
-    aggregation_id: str = "maximum",
-    selection: Any | None = None,
+    evaluation_id: object = "peak_displacement",
+    output_request_id: object = "displacement_top",
+    aggregation_id: object = "maximum",
+    selection: object | None = None,
     state_times: object = (Quantity(0, "s"), Quantity(1, "s")),
-    evidence: EvidenceRef | None = None,
+    evidence: object | None = None,
 ) -> dict[str, object]:
     return {
         "evaluation_id": evaluation_id,
