@@ -58,4 +58,4 @@ class EvidenceRef:
         }
 
 
-__all__ = ["EvidenceRef", "SCHEMA_VERSION", "SUPPORTED_SOURCE_KINDS"]
+__all__ = ["SCHEMA_VERSION", "SUPPORTED_SOURCE_KINDS", "EvidenceRef"]

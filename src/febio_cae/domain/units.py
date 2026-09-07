@@ -6,9 +6,8 @@ import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import TypeAlias
 
-Numeric: TypeAlias = int | float
+type Numeric = int | float
 
 
 class UnitError(ValueError):
@@ -117,10 +116,10 @@ class Quantity:
 
 
 __all__ = [
+    "SUPPORTED_UNITS",
     "Dimension",
     "DimensionMismatchError",
     "Quantity",
-    "SUPPORTED_UNITS",
     "UnitDefinition",
     "UnitError",
     "UnknownUnitError",

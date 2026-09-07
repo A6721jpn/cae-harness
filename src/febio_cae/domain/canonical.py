@@ -5,13 +5,12 @@ from __future__ import annotations
 import json
 import math
 from collections.abc import Iterable, Mapping, Sequence
-from typing import TypeAlias
 
 SCHEMA_VERSION = "1"
 
-JsonScalar: TypeAlias = None | bool | int | float | str
-JsonValue: TypeAlias = JsonScalar | list["JsonValue"] | dict[str, "JsonValue"]
-Path: TypeAlias = tuple[str, ...]
+type JsonScalar = None | bool | int | float | str
+type JsonValue = JsonScalar | list["JsonValue"] | dict[str, "JsonValue"]
+type Path = tuple[str, ...]
 
 
 class CanonicalizationError(ValueError):
@@ -88,11 +87,15 @@ def _normalise(
 def _validate_unique_ids(items: list[JsonValue]) -> None:
     seen: set[str] = set()
     for item in items:
-        if not isinstance(item, dict) or not isinstance(item.get("id"), str) or not item["id"]:
+        if not isinstance(item, dict):
             raise CanonicalizationError(
                 "declared unique-id collections require non-empty string ids"
             )
-        identifier = item["id"]
+        identifier = item.get("id")
+        if not isinstance(identifier, str) or not identifier:
+            raise CanonicalizationError(
+                "declared unique-id collections require non-empty string ids"
+            )
         if identifier in seen:
             raise CanonicalizationError(f"duplicate id in declared collection: {identifier!r}")
         seen.add(identifier)
@@ -112,4 +115,4 @@ def _encode(value: JsonValue) -> bytes:
     return encoded.encode("utf-8")
 
 
-__all__ = ["CanonicalizationError", "JsonValue", "SCHEMA_VERSION", "canonical_bytes"]
+__all__ = ["SCHEMA_VERSION", "CanonicalizationError", "JsonValue", "canonical_bytes"]

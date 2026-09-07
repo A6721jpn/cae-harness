@@ -82,6 +82,7 @@ def test_evidence_ref_rejects_unresolved_or_invalid_fields(field: str, value: ob
 
 def test_evidence_ref_accepts_registered_source_kinds_but_not_confidence() -> None:
     EvidenceRef = _evidence_type()
+    assert EVIDENCE_MODULE is not None
     allowed = set(EVIDENCE_MODULE.SUPPORTED_SOURCE_KINDS)
     assert {"user_instruction", "registered_document", "registered_material"} <= allowed
     for source_kind in allowed:

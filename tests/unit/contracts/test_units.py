@@ -42,6 +42,7 @@ def test_quantity_converts_supported_length_and_pressure_units() -> None:
 
 def test_supported_registry_retains_derived_dimensions() -> None:
     _quantity_type()
+    assert UNITS_MODULE is not None
     definitions = UNITS_MODULE.SUPPORTED_UNITS
 
     assert {"m", "mm", "m2", "mm2", "m3", "mm3", "s", "ms", "N", "Pa", "MPa", "1"} <= set(
