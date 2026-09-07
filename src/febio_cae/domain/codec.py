@@ -15,8 +15,10 @@ from typing import Any, Literal, NoReturn, cast
 
 from .artifacts import (
     FileEntry,
+    GeometryBodyFact,
     GeometryInspection,
     GeometryInspectionRequest,
+    GeometrySelectionRequest,
     MeshArtifact,
     MeshElement,
     MeshFace,
@@ -32,7 +34,7 @@ from .case_draft import CaseDraft
 from .case_patch import CasePatch, CasePatchEdit
 from .case_revision import CaseRevision
 from .case_spec import CaseSpec
-from .comparison import ComparisonAxis, ComparisonSpec
+from .comparison import ComparisonAxis, ComparisonInterval, ComparisonSpec
 from .compatibility import (
     CapabilityRef,
     CapabilityStatus,
@@ -79,6 +81,7 @@ from .results import (
     QualityAssessment,
     ReadResult,
     ReadStatus,
+    ResultDataRef,
     ResultManifest,
 )
 from .rigid import RigidPrimitive
@@ -110,6 +113,7 @@ from .spatial import (
 )
 from .support import SolidSupport, SupportComponent, SupportId, SupportSet
 from .units import Quantity
+from .questions import IssuedQuestion
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _TARGET = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*(?:\.[A-Za-z_][A-Za-z0-9_-]*)*$")
@@ -663,19 +667,34 @@ def _contact(value: object, field: str) -> ContactIntent:
         field,
     )
     _schema(payload, field)
-    friction_payload = _mapping(
-        payload["friction"],
-        set(payload["friction"].keys()) if isinstance(payload["friction"], Mapping) else set(),
-        f"{field}.friction",
-    )
-    _schema(friction_payload, f"{field}.friction")
-    friction_kind = _text(friction_payload.get("kind"), f"{field}.friction.kind")
+    friction_value = payload["friction"]
+    if not isinstance(friction_value, Mapping):
+        _fail(f"{field}.friction", "must be an object")
+    friction_kind = _text(friction_value.get("kind"), f"{field}.friction.kind")
     friction: Frictionless | CoulombFriction
     if friction_kind == "frictionless":
+        friction_payload = _mapping(
+            friction_value,
+            {"schema_version", "kind", "model_evidence"},
+            f"{field}.friction",
+        )
+        _schema(friction_payload, f"{field}.friction")
         friction = Frictionless(
             _evidence(friction_payload["model_evidence"], f"{field}.friction.model_evidence")
         )
     elif friction_kind == "coulomb":
+        friction_payload = _mapping(
+            friction_value,
+            {
+                "schema_version",
+                "kind",
+                "coefficient",
+                "model_evidence",
+                "coefficient_evidence",
+            },
+            f"{field}.friction",
+        )
+        _schema(friction_payload, f"{field}.friction")
         friction = CoulombFriction(
             _quantity(friction_payload["coefficient"], f"{field}.friction.coefficient"),
             _evidence(friction_payload["model_evidence"], f"{field}.friction.model_evidence"),
@@ -685,17 +704,18 @@ def _contact(value: object, field: str) -> ContactIntent:
         )
     else:
         _fail(f"{field}.friction", "unsupported kind")
-    arrangement_payload = _mapping(
-        payload["arrangement"],
-        set(payload["arrangement"].keys())
-        if isinstance(payload["arrangement"], Mapping)
-        else set(),
-        f"{field}.arrangement",
-    )
-    _schema(arrangement_payload, f"{field}.arrangement")
-    arrangement_kind = _text(arrangement_payload.get("kind"), f"{field}.arrangement.kind")
+    arrangement_value = payload["arrangement"]
+    if not isinstance(arrangement_value, Mapping):
+        _fail(f"{field}.arrangement", "must be an object")
+    arrangement_kind = _text(arrangement_value.get("kind"), f"{field}.arrangement.kind")
     arrangement: AsPlaced | SpecifiedGap
     if arrangement_kind == "as_placed":
+        arrangement_payload = _mapping(
+            arrangement_value,
+            {"schema_version", "kind", "arrangement_evidence"},
+            f"{field}.arrangement",
+        )
+        _schema(arrangement_payload, f"{field}.arrangement")
         arrangement = AsPlaced(
             _evidence(
                 arrangement_payload["arrangement_evidence"],
@@ -703,6 +723,20 @@ def _contact(value: object, field: str) -> ContactIntent:
             )
         )
     elif arrangement_kind == "specified_gap":
+        arrangement_payload = _mapping(
+            arrangement_value,
+            {
+                "schema_version",
+                "kind",
+                "gap",
+                "direction",
+                "arrangement_evidence",
+                "gap_evidence",
+                "direction_evidence",
+            },
+            f"{field}.arrangement",
+        )
+        _schema(arrangement_payload, f"{field}.arrangement")
         arrangement = SpecifiedGap(
             _quantity(arrangement_payload["gap"], f"{field}.arrangement.gap"),
             _direction(arrangement_payload["direction"], f"{field}.arrangement.direction"),
@@ -1254,7 +1288,7 @@ def _mesh_artifact(value: object, field: str) -> MeshArtifact:
     ):
         item_payload = _mapping(
             item,
-            {"schema_version", "element_id", "element_type", "node_ids"},
+            {"schema_version", "element_id", "element_type", "node_ids", "body_id"},
             f"{field}.elements[{index}]",
         )
         _schema(item_payload, f"{field}.elements[{index}]")
@@ -1266,6 +1300,7 @@ def _mesh_artifact(value: object, field: str) -> MeshArtifact:
                     _integer(node, "node_id", 1)
                     for node in _sequence(item_payload["node_ids"], "node_ids", allow_empty=False)
                 ),
+                _text(item_payload["body_id"], "body_id"),
             )
         )
     faces: list[MeshFace] = []
@@ -1311,21 +1346,37 @@ def _mesh_artifact(value: object, field: str) -> MeshArtifact:
     for index, item in enumerate(_sequence(payload["sets"], f"{field}.sets")):
         item_payload = _mapping(
             item,
-            {"schema_version", "set_id", "kind", "body_id", "member_ids"},
+            {
+                "schema_version",
+                "set_id",
+                "kind",
+                "body_id",
+                "member_ids",
+                "source_selection_digest",
+            },
             f"{field}.sets[{index}]",
         )
         _schema(item_payload, f"{field}.sets[{index}]")
+        kind = _text(item_payload["kind"], "kind").lower()
+        if kind in {"node", "element"}:
+            members: tuple[int | str, ...] = tuple(
+                _integer(member, "member_id", 1)
+                for member in _sequence(item_payload["member_ids"], "member_ids", allow_empty=False)
+            )
+        elif kind in {"face", "body"}:
+            members = tuple(
+                _text(member, "member_id")
+                for member in _sequence(item_payload["member_ids"], "member_ids", allow_empty=False)
+            )
+        else:
+            _fail(f"{field}.sets[{index}].kind", "unsupported mesh set kind")
         sets.append(
             MeshSet(
                 _text(item_payload["set_id"], "set_id"),
-                _text(item_payload["kind"], "kind"),
+                kind,
                 _text(item_payload["body_id"], "body_id"),
-                tuple(
-                    _integer(member, "member_id", 1)
-                    for member in _sequence(
-                        item_payload["member_ids"], "member_ids", allow_empty=False
-                    )
-                ),
+                members,
+                _digest(item_payload["source_selection_digest"], "source_selection_digest"),
             )
         )
     quality: list[MeshQualityRecord] = []
@@ -1598,6 +1649,35 @@ def _attempt(value: object, field: str) -> AttemptRecord:
     )
 
 
+def _result_data_ref(value: object, field: str) -> ResultDataRef:
+    payload = _mapping(
+        value,
+        {
+            "schema_version",
+            "data_id",
+            "content_digest",
+            "codec_id",
+            "logical_path",
+            "bundle_digest",
+            "attempt_id",
+        },
+        field,
+    )
+    _schema(payload, field)
+    return ResultDataRef(
+        _text(payload["data_id"], f"{field}.data_id"),
+        _digest(payload["content_digest"], f"{field}.content_digest"),
+        _text(payload["codec_id"], f"{field}.codec_id"),
+        _text(payload["logical_path"], f"{field}.logical_path"),
+        None
+        if payload["bundle_digest"] is None
+        else _digest(payload["bundle_digest"], f"{field}.bundle_digest"),
+        None
+        if payload["attempt_id"] is None
+        else _text(payload["attempt_id"], f"{field}.attempt_id"),
+    )
+
+
 def _observation(value: object, field: str) -> OutputObservation:
     payload = _mapping(
         value,
@@ -1610,10 +1690,16 @@ def _observation(value: object, field: str) -> OutputObservation:
             "frame",
             "measure_id",
             "state_count",
+            "data_ref",
         },
         field,
     )
     _schema(payload, field)
+    data_ref = (
+        None
+        if payload["data_ref"] is None
+        else _result_data_ref(payload["data_ref"], f"{field}.data_ref")
+    )
     return OutputObservation(
         _text(payload["output_id"], "output_id"),
         _text(payload["location"], "location"),
@@ -1622,6 +1708,7 @@ def _observation(value: object, field: str) -> OutputObservation:
         _frame(payload["frame"], "frame"),
         _text(payload["measure_id"], "measure_id"),
         _integer(payload["state_count"], "state_count", 0),
+        data_ref,
     )
 
 
@@ -1815,10 +1902,25 @@ def _comparison(value: object, field: str) -> ComparisonSpec:
     for index, raw in enumerate(_sequence(payload["axes"], "axes", allow_empty=False)):
         item = _mapping(
             raw,
-            {"schema_version", "axis_id", "unit", "roi_id", "measure_id", "aggregation_id"},
+            {
+                "schema_version",
+                "axis_id",
+                "unit",
+                "roi_id",
+                "measure_id",
+                "aggregation_id",
+                "interval",
+                "interpolation",
+            },
             f"axes[{index}]",
         )
         _schema(item, f"axes[{index}]")
+        interval_payload = _mapping(
+            item["interval"],
+            {"schema_version", "unit", "lower", "upper"},
+            f"axes[{index}].interval",
+        )
+        _schema(interval_payload, f"axes[{index}].interval")
         axes.append(
             ComparisonAxis(
                 _text(item["axis_id"], "axis_id"),
@@ -1826,6 +1928,12 @@ def _comparison(value: object, field: str) -> ComparisonSpec:
                 _text(item["roi_id"], "roi_id"),
                 _text(item["measure_id"], "measure_id"),
                 _text(item["aggregation_id"], "aggregation_id"),
+                ComparisonInterval(
+                    _text(interval_payload["unit"], "interval.unit"),
+                    _number(interval_payload["lower"], "interval.lower"),
+                    _number(interval_payload["upper"], "interval.upper"),
+                ),
+                _text(item["interpolation"], "interpolation"),
             )
         )
     return ComparisonSpec(
@@ -1912,7 +2020,12 @@ def _patch(value: object, field: str) -> CasePatch:
         }.get(field_name)
         if decoder is None:
             _fail(f"edits[{index}].field", "unsupported patch field")
-        item_value = None if not present else decoder(item["value"], f"edits[{index}].value")
+        if not present:
+            if item["value"] is not None:
+                _fail(f"edits[{index}].value", "absent edits must carry value=None")
+            item_value = None
+        else:
+            item_value = decoder(item["value"], f"edits[{index}].value")
         edits.append(CasePatchEdit(field_name, item_value, present))
     return CasePatch(
         _text(payload["parent_revision_id"], "parent_revision_id"),
@@ -2007,6 +2120,15 @@ def _inspection_request(value: object, field: str) -> GeometryInspectionRequest:
     )
 
 
+def _selection_request(value: object, field: str) -> GeometrySelectionRequest:
+    payload = _mapping(value, {"schema_version", "source_asset", "selection"}, field)
+    _schema(payload, field)
+    return GeometrySelectionRequest(
+        _source_asset(payload["source_asset"], f"{field}.source_asset"),
+        _selection(payload["selection"], f"{field}.selection"),
+    )
+
+
 def _inspection(value: object, field: str) -> GeometryInspection:
     payload = _mapping(
         value,
@@ -2017,10 +2139,26 @@ def _inspection(value: object, field: str) -> GeometryInspection:
             "declared_unit",
             "body_ids",
             "closed_solid_body_ids",
+            "body_facts",
         },
         field,
     )
     _schema(payload, field)
+    body_facts: list[GeometryBodyFact] = []
+    for index, raw in enumerate(_sequence(payload["body_facts"], "body_facts")):
+        fact = _mapping(
+            raw,
+            {"schema_version", "body_id", "face_count", "volume_si"},
+            f"{field}.body_facts[{index}]",
+        )
+        _schema(fact, f"{field}.body_facts[{index}]")
+        body_facts.append(
+            GeometryBodyFact(
+                _text(fact["body_id"], "body_id"),
+                _integer(fact["face_count"], "face_count", 1),
+                _number(fact["volume_si"], "volume_si"),
+            )
+        )
     return GeometryInspection(
         _source_asset(payload["source_asset"], "source_asset"),
         _digest(payload["inspection_digest"], "inspection_digest"),
@@ -2033,6 +2171,7 @@ def _inspection(value: object, field: str) -> GeometryInspection:
             _text(item, "closed_body_id")
             for item in _sequence(payload["closed_solid_body_ids"], "closed_solid_body_ids")
         ),
+        tuple(body_facts),
     )
 
 
@@ -2044,6 +2183,7 @@ _DECODERS: dict[type[object], Any] = {
     GeometryIntent: _geometry,
     MeshArtifact: _mesh_artifact,
     GeometryInspectionRequest: _inspection_request,
+    GeometrySelectionRequest: _selection_request,
     GeometryInspection: _inspection,
     SourceAssetRef: _source_asset,
     FileEntry: _file_entry,
@@ -2056,6 +2196,8 @@ _DECODERS: dict[type[object], Any] = {
     PreviewReceipt: _preview,
     ComparisonSpec: _comparison,
     CasePatch: _patch,
+    IssuedQuestion: _question,
+    OperationStatus: _operation_status,
 }
 
 
