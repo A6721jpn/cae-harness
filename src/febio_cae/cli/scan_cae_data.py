@@ -100,7 +100,7 @@ _ENCRYPTED_RSA_PEM = re.compile(
 )
 _STEP_START = b"ISO-10303-21;"
 _STEP_END = b"END-ISO-10303-21;"
-_XPLT_MAGIC = b"BEF\x00\x00\x00\x01"
+_XPLT_MAGIC = b"BEF\x00\x00\x00\x00\x01"
 _SUPPORTED_XML_ENCODINGS = frozenset({"utf-8", "utf8", "utf-16", "utf16", "utf-16-le", "utf-16-be"})
 
 
@@ -273,7 +273,7 @@ def _read_git_blob(root: Path, object_id: str) -> tuple[bytes | None, str | None
 
 
 def _xml_candidate(content: bytes) -> bool:
-    prefix = content[:512].lstrip(b" \t\r\n")
+    prefix = content.lstrip(b" \t\r\n")
     return prefix.startswith(
         (
             b"\xef\xbb\xbf",
@@ -284,6 +284,8 @@ def _xml_candidate(content: bytes) -> bool:
             b"<?xml",
             b"<?",
             b"<!--",
+            b"<!DOCTYPE",
+            b"<![CDATA[",
             b"<febio_spec",
             b"<\x00?\x00",
             b"\x00<\x00?",
