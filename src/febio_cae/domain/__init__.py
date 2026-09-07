@@ -29,6 +29,12 @@ from .mesh_policy import (
     NumericalProfileRef,
 )
 from .motion import MotionApplicability, MotionProfile, MotionSample, MotionValidationError
+from .output_policy import (
+    EvaluationRequest,
+    OutputPolicy,
+    OutputPolicyValidationError,
+    OutputRequest,
+)
 from .rigid import RigidPrimitive, RigidValidationError
 from .rigid_kinematics import (
     DofComponent,
@@ -125,6 +131,7 @@ __all__ = [
     "DofComponent",
     "DofSpecification",
     "DofState",
+    "EvaluationRequest",
     "EvidenceRef",
     "ExplicitFaceRule",
     "FaceId",
@@ -153,6 +160,9 @@ __all__ = [
     "NamedAttributeRule",
     "NumericalProfileRef",
     "OpaqueId",
+    "OutputPolicy",
+    "OutputPolicyValidationError",
+    "OutputRequest",
     "Point3",
     "ProperRotation",
     "Quantity",
