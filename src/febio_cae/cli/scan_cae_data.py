@@ -72,11 +72,20 @@ def _normalise_parts(relative_path: str) -> tuple[str, ...]:
 
 
 def _is_excluded(relative_path: str) -> bool:
-    parts = _normalise_parts(relative_path)
-    return any(
-        part in EXCLUDED_DIRECTORIES or part.endswith(".egg-info") or part.startswith(".venv-")
-        for part in parts
-    )
+    return _excluded_component(relative_path) is not None
+
+
+def _excluded_component(relative_path: str) -> str | None:
+    for original, normalised in zip(
+        relative_path.replace("\\", "/").split("/"), _normalise_parts(relative_path), strict=True
+    ):
+        if (
+            normalised in EXCLUDED_DIRECTORIES
+            or normalised.endswith(".egg-info")
+            or normalised.startswith(".venv-")
+        ):
+            return original
+    return None
 
 
 def _relative_path(root: Path, path: Path) -> str:
@@ -152,7 +161,7 @@ def _scan_filesystem(root: Path) -> tuple[tuple[ScanIssue, ...], int, tuple[str,
                 directory if relative_current == "." else f"{relative_current}/{directory}"
             )
             if _is_excluded(relative_directory):
-                excluded_paths.add(relative_directory.split("/", maxsplit=1)[0])
+                excluded_paths.add(_excluded_component(relative_directory) or relative_directory)
             if directory.casefold() == "02_cae":
                 issue = _issue_for_path(relative_directory)
                 if issue:
@@ -170,7 +179,7 @@ def _scan_filesystem(root: Path) -> tuple[tuple[ScanIssue, ...], int, tuple[str,
                 filename if relative_current == "." else f"{relative_current}/{filename}"
             )
             if _is_excluded(relative_file):
-                excluded_paths.add(relative_file.split("/", maxsplit=1)[0])
+                excluded_paths.add(_excluded_component(relative_file) or relative_file)
                 continue
             checked_files += 1
             issue = _issue_for_path(relative_file)
