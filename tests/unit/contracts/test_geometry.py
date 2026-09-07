@@ -232,9 +232,9 @@ def test_each_evidence_role_changes_canonical_bytes(field: str) -> None:
     geometry = _geometry()
     baseline = _value(geometry).to_bytes()
     target = {
-        "body_evidence": _evidence("geometry.body_id", "z"),
-        "unit_evidence": _evidence("geometry.step_unit", "z"),
-        "placement_evidence": _evidence("geometry.placement", "z"),
+        "body_evidence": _evidence("geometry.body_id", "0"),
+        "unit_evidence": _evidence("geometry.step_unit", "0"),
+        "placement_evidence": _evidence("geometry.placement", "0"),
     }
     changed = _value(geometry, **{field: target[field]}).to_bytes()
     assert changed != baseline
