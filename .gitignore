@@ -1,0 +1,42 @@
+# Python and local verification environments
+__pycache__/
+*.py[cod]
+.venv/
+.venv-*/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+.local/
+
+# Runtime case data is external to the source repository.
+02_CAE/
+*.step
+*.stp
+*.STEP
+*.STP
+*.feb
+*.xplt
+*.fs2
+*.fbs
+*.f3d
+*.sldprt
+*.sldasm
+*.dmp
+*.log
+*.sqlite
+*.sqlite3
+*.sqlite3-*
+
+# Credentials and machine-local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials*.json
+token*.json
