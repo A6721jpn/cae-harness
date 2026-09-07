@@ -139,7 +139,7 @@ The fresh R1 venv was created outside the checkout at `C:\Users\backo\AppData\Lo
 | `P1-B3-R1-installed-outside-venv-01` | new Python 3.12 venv, exit 0 |
 | `P1-B3-R1-installed-outside-pip-01` | wheel installed with `--no-index --disable-pip-version-check --no-cache-dir --no-deps`, exit 0 |
 | `P1-B3-R1-installed-outside-cli-01` | `febio-cae 0.1.0`, exit 0 |
-| `P1-B3-R1-installed-outside-import-01` | `-I`, `isolated=1`, version `0.1.0`, and `RigidPrimitive`/`SupportId` imports asserted; all origins were under the outside venv site-packages and outside the checkout, exit 0 |
+| `P1-B3-R1-installed-outside-import-01` | `-I`, `isolated=1`, version `0.1.0`, and `SolidSupport`/`SupportId` imports asserted; all origins were under the outside venv site-packages and outside the checkout, exit 0 |
 
 The first in-checkout `P1-B3-R1-installed-import-01` record is intentionally retained as a failed diagnostic: its venv was under `.local` inside the checkout, so the origin assertion correctly failed. It is not used as R1 success evidence. Raw records are under `.local/coordination/runs/`.
 
