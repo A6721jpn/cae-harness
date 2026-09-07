@@ -10,6 +10,7 @@ from .material import (
     MaterialValidationError,
 )
 from .motion import MotionApplicability, MotionProfile, MotionSample, MotionValidationError
+from .rigid import RigidPrimitive, RigidValidationError
 from .selection import (
     CoordinatePredicate,
     CoordinatePredicateRule,
@@ -37,6 +38,14 @@ from .spatial import (
     SpatialValidationError,
     Translation3,
     UnitDirection,
+)
+from .support import (
+    SolidSupport,
+    SupportCollection,
+    SupportComponent,
+    SupportId,
+    SupportSet,
+    SupportValidationError,
 )
 from .units import (
     SUPPORTED_UNITS,
@@ -84,10 +93,18 @@ __all__ = [
     "ProperRotation",
     "Quantity",
     "ResolutionSnapshot",
+    "RigidPrimitive",
     "RigidTransform",
+    "RigidValidationError",
     "SelectionRef",
     "SelectionValidationError",
+    "SolidSupport",
     "SpatialValidationError",
+    "SupportCollection",
+    "SupportComponent",
+    "SupportId",
+    "SupportSet",
+    "SupportValidationError",
     "Translation3",
     "UnitDefinition",
     "UnitDirection",
