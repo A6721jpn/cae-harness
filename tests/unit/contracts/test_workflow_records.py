@@ -1,3 +1,5 @@
+# mypy: disable-error-code="no-redef,assignment,misc"
+
 from __future__ import annotations
 
 import hashlib
