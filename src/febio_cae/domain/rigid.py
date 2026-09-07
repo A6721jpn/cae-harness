@@ -89,7 +89,18 @@ def _require_dimension_evidence(
 
 @dataclass(frozen=True, slots=True)
 class RigidPrimitive:
-    """One sphere, cylinder, or box with explicit placement and provenance."""
+    """One sphere, cylinder, or box with explicit placement and provenance.
+
+    Geometry is defined in the primitive's local coordinates: a sphere is
+    centered at the local origin with radius ``radius``; a cylinder is centered
+    at the local origin, aligned to local ``z``, extends from ``-height / 2``
+    to ``+height / 2`` in ``z``, and has radius ``radius`` in local ``x/y``;
+    and a box is centered at the local origin with length along ``x``, width
+    along ``y``, height along ``z``, and half-extents ``length / 2``,
+    ``width / 2``, and ``height / 2``.  This primitive alone does not declare
+    six-degree-of-freedom constraints, contact, a complete ``rigid_tool``, or
+    a ``CaseSpec``; placement is explicit and no pose is inferred.
+    """
 
     kind: str
     body_id: BodyId

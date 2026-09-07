@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import cast
 
 from .canonical import canonical_bytes
 from .evidence import EvidenceRef
-from .selection import FaceSetRule, SelectionRef
+from .selection import SelectionRef
 from .spatial import FrameId, OpaqueId, RigidTransform
 
 SCHEMA_VERSION = "1"
@@ -21,15 +23,11 @@ class SupportValidationError(ValueError):
     """Raised when explicit support intent is structurally invalid."""
 
 
-def _selection_unordered_paths(
-    selection: SelectionRef, prefix: tuple[str, ...]
-) -> list[tuple[str, ...]]:
-    paths: list[tuple[str, ...]] = []
-    if isinstance(selection.rule, FaceSetRule):
-        paths.append(prefix + ("rule", "face_ids"))
-    if selection.resolution is not None:
-        paths.append(prefix + ("resolution", "faces"))
-    return paths
+def _canonical_selection_projection(selection: SelectionRef) -> dict[str, object]:
+    projected = json.loads(selection.to_bytes().decode("utf-8"))
+    if not isinstance(projected, dict):
+        raise SupportValidationError("canonical selection projection must be an object")
+    return cast(dict[str, object], projected)
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,7 +139,7 @@ class SolidSupport:
         return {
             "schema_version": SCHEMA_VERSION,
             "support_id": self.support_id.value,
-            "selection": self.selection.to_dict(),
+            "selection": _canonical_selection_projection(self.selection),
             "frame": self.frame.value,
             "frame_evidence": frame_evidence.to_dict(),
             "x": self.x.to_dict(),
@@ -154,8 +152,7 @@ class SolidSupport:
         }
 
     def to_bytes(self) -> bytes:
-        unordered_paths = _selection_unordered_paths(self.selection, ("selection",))
-        return canonical_bytes(self.to_dict(), unordered_paths=unordered_paths)
+        return canonical_bytes(self.to_dict())
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,12 +183,7 @@ class SupportSet:
         }
 
     def to_bytes(self) -> bytes:
-        unordered_paths: list[tuple[str, ...]] = []
-        for index, support in enumerate(self.supports):
-            unordered_paths.extend(
-                _selection_unordered_paths(support.selection, ("supports", str(index), "selection"))
-            )
-        return canonical_bytes(self.to_dict(), unordered_paths=unordered_paths)
+        return canonical_bytes(self.to_dict())
 
 
 SupportCollection = SupportSet
