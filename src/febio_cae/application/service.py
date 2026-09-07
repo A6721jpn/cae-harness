@@ -10,12 +10,17 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from febio_cae.domain.artifacts import GeometryInspectionRequest, SourceAssetContent, SourceAssetRef
+from febio_cae.domain.artifacts import (
+    GeometryInspectionRequest,
+    GeometrySelectionRequest,
+    SourceAssetContent,
+    SourceAssetRef,
+)
 from febio_cae.domain.canonical import canonical_bytes
 from febio_cae.domain.case_draft import CaseDraft
 from febio_cae.domain.case_patch import CasePatch
 from febio_cae.domain.case_revision import CaseRevision
-from febio_cae.domain.compatibility import CompatibilityProfile
+from febio_cae.domain.compatibility import CapabilityStatus, CompatibilityProfile
 from febio_cae.domain.evidence import EvidenceRef
 from febio_cae.domain.lifecycle import ServiceDiagnostic, ServiceErrorCategory
 from febio_cae.domain.partial_case_spec import PartialCaseSpec
@@ -26,6 +31,7 @@ from febio_cae.domain.ports import (
     PortErrorCategory,
 )
 from febio_cae.domain.questions import IssuedQuestion
+from febio_cae.domain.selection import ResolutionSnapshot, SelectionRef
 from febio_cae.storage.catalog import CaseCatalog, CaseCatalogError
 from febio_cae.storage.profiles import SQLiteCompatibilityRegistry
 from febio_cae.storage.registry import (
@@ -111,6 +117,22 @@ def _diagnostic(
 
 def _service_category(category: PortErrorCategory) -> ServiceErrorCategory:
     return ServiceErrorCategory(category.value)
+
+
+def _registered_selections(values: PartialCaseSpec) -> tuple[SelectionRef, ...]:
+    selections: list[SelectionRef] = []
+    if values.support is not None:
+        selections.extend(item.selection for item in values.support.supports)
+    if values.rigid_tool is not None:
+        selections.append(values.rigid_tool.contact_surface)
+    if values.contact is not None:
+        selections.extend((values.contact.part_surface, values.contact.tool_surface))
+    if values.mesh_policy is not None:
+        selections.extend(item.selection for item in values.mesh_policy.local_refinements)
+    if values.outputs is not None:
+        selections.extend(item.selection for item in values.outputs.requests)
+        selections.extend(item.selection for item in values.outputs.evaluations)
+    return tuple(selections)
 
 
 class RegisteredCaseService:
@@ -503,6 +525,35 @@ class RegisteredCaseService:
                             "geometry.body_id",
                         )
                     )
+                for selection in _registered_selections(draft.values):
+                    try:
+                        resolved = self.geometry.resolve_selection(
+                            GeometrySelectionRequest(source_ref, selection), source
+                        )
+                        if not isinstance(resolved, ResolutionSnapshot) or (
+                            resolved.geometry_digest != selection.geometry_digest
+                            or resolved.body_id != selection.body_id
+                            or resolved.frame != selection.frame
+                        ):
+                            diagnostics.append(
+                                _diagnostic(
+                                    ServiceErrorCategory.INTEGRITY,
+                                    "geometry selection resolution does not match the registered selection context",
+                                    "selection",
+                                )
+                            )
+                    except NotImplementedError as error:
+                        diagnostics.append(
+                            _diagnostic(
+                                ServiceErrorCategory.UNSUPPORTED_CAPABILITY,
+                                f"registered geometry selection resolution is unavailable: {error}",
+                                "selection",
+                            )
+                        )
+                    except PortError as error:
+                        diagnostics.append(
+                            _diagnostic(_service_category(error.category), str(error), "selection")
+                        )
             except PortError as error:
                 diagnostics.append(
                     _diagnostic(_service_category(error.category), str(error), "geometry")
@@ -544,6 +595,15 @@ class RegisteredCaseService:
                 field, profile_ref = request
                 try:
                     profile = self.compatibility.get_profile(profile_ref.profile_id)
+                    if not isinstance(profile, CompatibilityProfile):
+                        diagnostics.append(
+                            _diagnostic(
+                                ServiceErrorCategory.INTEGRITY,
+                                "compatibility registry returned an invalid profile record",
+                                field,
+                            )
+                        )
+                        continue
                     if profile.profile_id != profile_ref.profile_id:
                         diagnostics.append(
                             _diagnostic(
@@ -552,6 +612,23 @@ class RegisteredCaseService:
                                 field,
                             )
                         )
+                    if hashlib.sha256(profile.to_bytes()).hexdigest() != profile_ref.record_digest:
+                        diagnostics.append(
+                            _diagnostic(
+                                ServiceErrorCategory.INTEGRITY,
+                                "profile record digest does not match the registered profile",
+                                field,
+                            )
+                        )
+                    for capability in profile.capabilities:
+                        if capability.status is not CapabilityStatus.SUPPORTED:
+                            diagnostics.append(
+                                _diagnostic(
+                                    ServiceErrorCategory.UNSUPPORTED_CAPABILITY,
+                                    f"profile capability {capability.capability_id!r} is {capability.status.value}",
+                                    field,
+                                )
+                            )
                 except PortError as error:
                     diagnostics.append(
                         _diagnostic(_service_category(error.category), str(error), field)
