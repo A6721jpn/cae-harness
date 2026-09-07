@@ -18,6 +18,12 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests/unit", "tests/component"]
 pythonpath = ["src"]
+markers = [
+    "febio: requires an installed FEBio solver or FEBio-native capability",
+    "llm: requires an LLM integration capability",
+    "native: requires an installed native application or executable",
+    "e2e: end-to-end verification outside the standard local testpaths",
+]
 
 [tool.ruff]
 line-length = 100

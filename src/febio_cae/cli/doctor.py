@@ -139,11 +139,17 @@ def doctor_payload() -> dict[str, object]:
                     "message": state.message,
                 }
             )
+            next_actions.append(
+                f"Verify {state.label} with a native compatibility probe at {state.path}."
+            )
 
     return {
         "schema_version": "1",
         "status": "UNAVAILABLE" if missing else "UNVERIFIED",
         "version": __version__,
+        "case_id": None,
+        "revision_id": None,
+        "run_id": None,
         "capabilities": {state.name: asdict(state) for state in states},
         "diagnostics": diagnostics,
         "next_actions": next_actions,
@@ -151,9 +157,24 @@ def doctor_payload() -> dict[str, object]:
 
 
 def run_doctor(*, json_output: bool) -> int:
-    """Print the structured capability report and return its CLI exit code."""
+    """Print the capability report and return a nonzero code until it is verified."""
 
-    del json_output  # Both modes use the same stable machine-readable contract in P0.
     payload = doctor_payload()
-    print(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
-    return 4 if payload["status"] == "UNAVAILABLE" else 0
+    if json_output:
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+    else:
+        print(f"FEBio CAE doctor {payload['version']}")
+        print(f"Status: {payload['status']}")
+        capabilities = payload["capabilities"]
+        assert isinstance(capabilities, dict)
+        for capability in capabilities.values():
+            assert isinstance(capability, dict)
+            path = capability["path"] or "(not found)"
+            print(f"- {capability['label']}: {capability['status']} [{path}]")
+        next_actions = payload["next_actions"]
+        assert isinstance(next_actions, list)
+        if next_actions:
+            print("Next actions:")
+            for action in next_actions:
+                print(f"  - {action}")
+    return 4 if payload["status"] != "READY" else 0
