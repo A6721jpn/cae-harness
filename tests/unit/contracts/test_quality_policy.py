@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import re
 from dataclasses import FrozenInstanceError
 from types import ModuleType
 from typing import Any
@@ -18,6 +19,7 @@ def _optional_module(name: str) -> ModuleType | None:
 
 
 QUALITY_MODULE = _optional_module("febio_cae.domain.quality_policy")
+_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def _quality() -> ModuleType:
@@ -70,6 +72,11 @@ def _criterion_kwargs(
     applicability_reason: object = "Required for the synthetic quality profile",
     evidence: object = None,
 ) -> dict[str, object]:
+    evidence_criterion_id = (
+        criterion_id
+        if isinstance(criterion_id, str) and _IDENTIFIER.fullmatch(criterion_id)
+        else "equilibrium"
+    )
     return {
         "criterion_id": criterion_id,
         "metric_id": metric_id,
@@ -77,7 +84,7 @@ def _criterion_kwargs(
         "thresholds": [_threshold()] if thresholds is None else thresholds,
         "applicability_reason": applicability_reason,
         "evidence": (
-            _evidence(target_field=f"quality_policy.criteria.{criterion_id}")
+            _evidence(target_field=f"quality_policy.criteria.{evidence_criterion_id}")
             if evidence is None
             else evidence
         ),
