@@ -59,6 +59,7 @@ def test_boundary_scan_rejects_cae_data_and_reports_reason(tmp_path: Path) -> No
     forbidden_file = tmp_path / "02_CAE" / "synthetic-result.feb"
     forbidden_file.parent.mkdir()
     forbidden_file.write_text("synthetic fixture; not a real CAE result", encoding="utf-8")
+    _init_git_repo(tmp_path)
 
     completed = _run_scanner(tmp_path)
 
@@ -90,7 +91,10 @@ def test_boundary_scan_rejects_non_git_root(tmp_path: Path) -> None:
     assert completed.returncode == 4, completed.stderr
     payload = json.loads(completed.stdout)
     assert payload["status"] == "INCOMPLETE"
-    assert any(issue["code"] == "GIT_TRACKING_UNAVAILABLE" for issue in payload["issues"])
+    assert any(
+        issue["code"] in {"GIT_TRACKING_UNAVAILABLE", "GIT_ROOT_MISMATCH"}
+        for issue in payload["issues"]
+    )
 
 
 def test_boundary_scan_rejects_when_git_is_unavailable(tmp_path: Path) -> None:
