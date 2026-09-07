@@ -129,9 +129,7 @@ def _dofs(
         ry=_component(rigid, "ry", states.get("ry", "fixed"), "e"),
         rz=_component(rigid, "rz", states.get("rz", "fixed"), "f"),
         frame_evidence=(
-            _evidence("rigid_tool.frame", "7")
-            if frame_evidence is None
-            else frame_evidence
+            _evidence("rigid_tool.frame", "7") if frame_evidence is None else frame_evidence
         ),
     )
 
@@ -281,6 +279,7 @@ def test_dof_evidence_is_bound_to_each_exact_component(axis: str, wrong_target: 
     with pytest.raises(ValueError):
         rigid.RigidDofSpecification(**values)
 
+
 def test_dof_component_wrong_target_is_rejected_when_bound_to_specification_axis() -> None:
     rigid = _kinematics()
     components = {
@@ -348,7 +347,9 @@ def test_rigid_tool_composes_primitive_contact_selection_and_dofs_in_common_targ
     ],
     ids=["wrong-role", "wrong-body", "wrong-frame"],
 )
-def test_rigid_tool_rejects_contact_selection_role_body_and_frame_mismatches(bad_surface: Any) -> None:
+def test_rigid_tool_rejects_contact_selection_role_body_and_frame_mismatches(
+    bad_surface: Any,
+) -> None:
     rigid = _kinematics()
     with pytest.raises(ValueError):
         _tool(rigid, contact_surface=bad_surface)
@@ -436,7 +437,9 @@ def test_rigid_tool_forces_nested_canonical_totality_at_construction() -> None:
         _tool(rigid, primitive=bad_primitive)
 
 
-def test_check_axis_aligned_indentation_accepts_prescribed_nonzero_and_fixed_zero_components() -> None:
+def test_check_axis_aligned_indentation_accepts_prescribed_nonzero_and_fixed_zero_components() -> (
+    None
+):
     rigid = _kinematics()
     tool = _tool(rigid, dofs=_dofs(rigid, states={"x": "prescribed"}))
     result = rigid.check_translational_indentation_compatibility(tool, _motion())
