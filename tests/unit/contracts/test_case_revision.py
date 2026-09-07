@@ -43,13 +43,13 @@ def _evidence(
     )
 
 
-def _revision_kwargs(spec: Any, **overrides: object) -> dict[str, object]:
+def _revision_kwargs(case_spec: Any, **overrides: object) -> dict[str, object]:
     values: dict[str, object] = {
         "case_id": "case_alpha",
         "revision_id": "revision_001",
         "parent_revision_id": None,
         "parent_spec_digest": None,
-        "spec": spec,
+        "spec": case_spec,
         "evidence": [
             _evidence("case_revision.source_a", "source-a"),
             _evidence("case_revision.source_b", "source-b"),
@@ -59,8 +59,8 @@ def _revision_kwargs(spec: Any, **overrides: object) -> dict[str, object]:
     return values
 
 
-def _value(spec: Any, **overrides: object) -> Any:
-    return _revision().CaseRevision(**_revision_kwargs(spec, **overrides))
+def _value(case_spec: Any, **overrides: object) -> Any:
+    return _revision().CaseRevision(**_revision_kwargs(case_spec, **overrides))
 
 
 def test_case_revision_api_is_available() -> None:
