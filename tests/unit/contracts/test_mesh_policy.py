@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import importlib
-import re
 from dataclasses import FrozenInstanceError
 from types import ModuleType
 from typing import Any
@@ -497,7 +496,7 @@ def test_mesh_policy_preserves_large_but_serializable_count_identity() -> None:
 
 
 def test_mesh_policy_rejects_nested_invalid_unicode_and_accepts_unicode_identity() -> None:
-    mesh = _mesh()
+    _mesh()
     with pytest.raises(ValueError):
         _profile(profile_id="profile\x00bad")
 
