@@ -14,9 +14,11 @@
 - V2 has an independent history containing only the new V2 design and implementation.
   Do not reuse or inspect legacy CAE Harness code, tests, schemas, releases, branches,
   worktrees, or case assets. Limit fetches and integration to V2 and its development branches.
-- The development PM is `gpt-6-astra` / `high`, implementation workers are independent
+- The development PM is `gpt-6-astra` / `medium`, implementation workers are independent
   `gpt-5.6-luna` / `max` tasks created and continued through the Luna Spawn skill, and
   the code reviewer is an independent `gpt-6-astra` / `medium` task.
+- Message model settings belong to the destination task. Use Luna/max only when
+  creating or continuing a worker; reports to the PM preserve Astra/medium.
 - The PM owns scope and integration. Workers own assigned implementation files. The
   reviewer inspects exact commits read-only and reports findings to the PM. Only the PM
   integrates reviewed, clean, passing changes into V2 and pushes V2 without force.
