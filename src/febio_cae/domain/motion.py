@@ -262,6 +262,12 @@ class MotionProfile:
             raise MotionValidationError("direction must be a UnitDirection")
         if not isinstance(self.initial_reference_point, Point3):
             raise MotionValidationError("initial_reference_point must be a Point3")
+        for coordinate in (
+            self.initial_reference_point.x,
+            self.initial_reference_point.y,
+            self.initial_reference_point.z,
+        ):
+            coordinate.to_si()
         if self.direction.frame != self.initial_reference_point.frame:
             raise MotionValidationError(
                 "direction and initial_reference_point must use the same frame"
