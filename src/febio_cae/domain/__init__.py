@@ -1,6 +1,17 @@
 """P1-A domain contract foundations owned by the common-contract worker."""
 
 from .canonical import SCHEMA_VERSION, CanonicalizationError, canonical_bytes
+from .contact import (
+    ArrangementIntent,
+    AsPlaced,
+    ContactId,
+    ContactIntent,
+    ContactValidationError,
+    CoulombFriction,
+    FrictionIntent,
+    Frictionless,
+    SpecifiedGap,
+)
 from .evidence import SUPPORTED_SOURCE_KINDS, EvidenceRef
 from .material import (
     CompressibleNeoHookean,
@@ -63,11 +74,17 @@ __all__ = [
     "SCHEMA_VERSION",
     "SUPPORTED_SOURCE_KINDS",
     "SUPPORTED_UNITS",
+    "ArrangementIntent",
+    "AsPlaced",
     "BodyId",
     "CanonicalizationError",
     "CompressibleNeoHookean",
+    "ContactId",
+    "ContactIntent",
+    "ContactValidationError",
     "CoordinatePredicate",
     "CoordinatePredicateRule",
+    "CoulombFriction",
     "Dimension",
     "DimensionMismatchError",
     "Direction3",
@@ -78,6 +95,8 @@ __all__ = [
     "FaceSelectionRule",
     "FaceSetRule",
     "FrameId",
+    "FrictionIntent",
+    "Frictionless",
     "GeometryId",
     "IsotropicLinearElastic",
     "MaterialApplicability",
@@ -100,6 +119,7 @@ __all__ = [
     "SelectionValidationError",
     "SolidSupport",
     "SpatialValidationError",
+    "SpecifiedGap",
     "SupportCollection",
     "SupportComponent",
     "SupportId",
