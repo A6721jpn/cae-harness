@@ -8,9 +8,9 @@ Clean base: `9c172eee38c13efd4c07da0e0699cc711a8d8cad`
 
 ## 1. Bounded result
 
-> `P0-B SYNTHETIC GMSH->FEBio TET10 MAPPING AND ALL-NODE-PRESCRIBED SI NEO-HOOKEAN OBSERVATION RECORDED; PRODUCT/GM-02/FB-01/FBS/XPLT-READER/STUDIO/FREE-DOF/REAL-MODEL COMPATIBILITY UNVERIFIED`
+> `P0-B SYNTHETIC GMSH->FEBio TET10 SOURCE-BACKED CANDIDATE MAPPING AND ALL-NODE-PRESCRIBED SI NEO-HOOKEAN OBSERVATION RECORDED; PRODUCT/GM-02/FB-01/FBS/XPLT-READER/STUDIO/FREE-DOF/REAL-MODEL COMPATIBILITY UNVERIFIED`
 
-An independent ignored study generated a straight-sided `0.01 m` OCC cube through the task-local Gmsh 4.15.2 Python API, derived the FEBio Tet10 permutation from the actual Gmsh local coordinates and the primary FEBio quadratic-tetrahedron manual coordinates, validated connectivity and oriented boundary faces, compiled one SI-unit FEBio input, and ran one all-node-prescribed affine neo-Hookean patch through the installed FEBio 4.12.0 executable.
+An independent ignored study generated a straight-sided `0.01 m` OCC cube through the task-local Gmsh 4.15.2 Python API, derived the FEBio Tet10 permutation from the actual Gmsh local coordinates and the primary FEBio quadratic-tetrahedron manual's numbered shape-function associations, validated connectivity and oriented boundary faces, compiled one SI-unit FEBio input, and ran one all-node-prescribed affine neo-Hookean patch through the installed FEBio 4.12.0 executable.
 
 This is a mathematical native software observation. It is not a product adapter, full `GM-02`/`FB-01` acceptance, free-DOF equilibrium, contact, rigid-body, FBS, XPLT-reader, Studio, real-model, or `02_CAE` result.
 
@@ -24,7 +24,7 @@ All new scripts, input, MSH, direct logs, solver log, XPLT, JSON records, and ra
 C:\Users\backo\.codex\worktrees\e081\CAE-harness\.local\verification\P0B-gmsh-febio-mapping-01
 ```
 
-The only tracked change from this study is this report. The frozen preflight and final FEBio launch records are:
+The only tracked change from this study is this report. The recorded preflight and final FEBio launch records are:
 
 | Evidence | SHA-256 |
 |---|---|
@@ -49,6 +49,8 @@ The direct FEBio files were resolved beside the absolute input by FEBio and were
 | `attempt-05-febio/febio.log` | 9801 | `D78DE75F79FEAD5CCE273506AF35E23EACB934BC42F25E2803467445AFA3E665` |
 | `attempt-05-febio/febio.xplt` | 39815 | `54226EA0CF7701D8DD662197DD3E062D7DEF6295E1F1DAB33437F2C7D2B7D69E` |
 
+The original evidence did not meet the work-order read-only-protection procedure. A post-run filesystem audit found `0` of `61` files under the study root carrying the Windows `ReadOnly` attribute, including `preflight.json`, `launch-preflight.json`, `prepared/cube-tet10.feb`, the original helper scripts, and the attempt records. A static audit of the retained helper and record files found no `chmod`, `attrib`, or equivalent read-only operation. These hashes establish byte identity at their capture points; they do not establish write protection or immutability. No evidence here shows that the input changed or that the native run failed for this reason. This correction does not alter attributes retroactively and makes no historical read-only-compliance claim.
+
 ## 3. Preflight and source-backed mapping
 
 The working convention is explicitly SI: coordinates and length are metres, stress and energy density are pascals, force is newtons, and energy is joules. The synthetic geometry is `OCC addBox(0,0,0,L,L,L)` with `L=0.01`, origin `(0,0,0)`, and no STEP/default-unit dependency.
@@ -65,7 +67,7 @@ The native identities captured before launch were:
 
 The Gmsh mesh settings were `MeshSizeMin=MeshSizeMax=0.005 m`, 3D algorithm `1`, order `2`, `SecondOrderIncomplete=0`, and `SecondOrderLinear=1`. The final mesh had `231` nodes and `100` type-11 Tet10 elements; the type-count record was exactly `{"11":100}`.
 
-The primary sources used for the independent mapping record are the [Gmsh reference manual](https://gmsh.info/doc/texinfo/gmsh.html) and the [FEBio Theory Manual, quadratic tetrahedral elements](https://help.febio.org/docs/FEBioTheory-4-7/TM47-Subsection-4.1.4.html). The FEBio page states that the element has four corner nodes and six edge-midpoint nodes; its 11-point Lobatto coordinates enumerate the four corners followed by the six edges `(1-2, 2-3, 3-1, 1-4, 2-4, 3-4)`. The separately authored [new-V2 neo-Hookean observation](2026-09-07-p0-b-neo-hookean-observation.md) supplies an additional native observation of this supported input order; its mesh was not copied into this study.
+The primary sources used for the independent mapping record are the [Gmsh reference manual](https://gmsh.info/doc/texinfo/gmsh.html) and the [FEBio Theory Manual, quadratic tetrahedral elements](https://help.febio.org/docs/FEBioTheory-4-7/TM47-Subsection-4.1.4.html). The FEBio page states that the element has four corner nodes and six edge-midpoint nodes. Its rendered area-coordinate definitions are `t1=1-r-s-t`, `t2=r`, `t3=s`, and `t4=t`; its numbered shape functions are `H_i=t_i(2t_i-1)` for `i=1..4`, followed by `H5=4t1t2`, `H6=4t2t3`, `H7=4t3t1`, `H8=4t1t4`, `H9=4t2t4`, and `H10=4t3t4`. Those numbered shape functions establish the candidate FEBio edge order `(1-2, 2-3, 3-1, 1-4, 2-4, 3-4)`. The 11-point Gauss-Lobatto table is an integration-rule table and is not used as connectivity-node-order proof. The exact source/event extraction for this correction is retained in ignored `P0B-gmsh-febio-mapping-correction-02/source-audit.json` with SHA-256 `E9579131DA19E0616209BAF2C99C8EFCDB4E01A58685679250BAF039EFD6CF7C`. The separately authored [new-V2 neo-Hookean observation](2026-09-07-p0-b-neo-hookean-observation.md) supplies an additional native observation of this supported candidate order; its mesh was not copied into this study.
 
 The actual Gmsh type-11 local coordinates were:
 
@@ -75,25 +77,25 @@ The actual Gmsh type-11 local coordinates were:
 (0,0.5,0.5), (0.5,0,0.5)
 ```
 
-Therefore the explicit position permutation used to emit FEBio order was:
+Therefore the explicit candidate position permutation used to emit FEBio order was:
 
 ```text
 FEBio position <- Gmsh position: [0, 1, 2, 3, 4, 5, 6, 7, 9, 8]
 ```
 
-The last two Gmsh midside positions are exchanged relative to the FEBio primary edge order. The mapping was derived from coordinates, not from node numbers or nearest-neighbour inference.
+The last two Gmsh midside positions are exchanged relative to the FEBio edge order above. The mapping was derived from coordinates, not from node numbers or nearest-neighbour inference.
 
 Validation results before FEBio launch:
 
 - all `100/100` mapped elements had ten distinct existing node tags;
-- all six midside relations passed with maximum error `1.939479807224432e-18 m` against the frozen `1e-12 m` bound;
-- all corner determinants were positive, with minimum `3.124999999999998e-08 m^3` against the frozen `1e-18 m^3` bound;
+- all six midside relations passed with maximum error `1.939479807224432e-18 m` against the recorded `1e-12 m` bound;
+- all corner determinants were positive, with minimum `3.124999999999998e-08 m^3` against the recorded `1e-18 m^3` bound;
 - a negative in-memory mutation that swapped two mapped corner entries was rejected with five validator errors; `solver_launched_for_mutation=false`;
 - full incidence contained `158` internal faces and `84` boundary triangles, with `14` triangles on each named cube face;
 - each named face area was `0.0001 m^2`; face node groups were nonempty with `37` nodes each and the body group contained all `231` nodes;
 - the intentionally nonexistent physical group `2/999999` was recorded as `missing`, with the native API error preserved and `fallback_used=false`.
 
-The first three Gmsh attempts are retained as failures. Correction records document an observed Gmsh bounding-box enclosure, the installed two-value `getNodesForPhysicalGroup` return shape, and the expected nonexistent-group exception. These corrections changed no geometry, mesh setting, mapping, analytic reference, acceptance tolerance, executable, or budget.
+The first three Gmsh attempts are retained as failures. After attempt-01 observed about `1e-7 m` of Gmsh bounding-box enclosure padding, its face-label classifier criterion of `1e-10 m` was changed only for face classification to `max(L*1e-8, 1e-6 m)` before the next native attempt. The midpoint `1e-12 m`, boundary-area relative `1e-9`, and positive-corner determinant `1e-18 m^3` acceptance criteria were unchanged; no claim is made that all thresholds were unchanged. The correction records also document the installed two-value `getNodesForPhysicalGroup` return shape and the expected nonexistent-group exception. No geometry, mesh setting, mapping, analytic reference, executable, or native-attempt budget was changed.
 
 ## 4. FEBio input and analytic reference
 
@@ -143,7 +145,7 @@ C:\Program Files\FEBioStudio\bin\febio4.exe
 
 ## 6. Direct numeric observation
 
-The direct requested node and element files contained both state `0` and final state `1`, with exact node/element ID sets (`231` nodes and `100` elements). The final state passed every frozen observation criterion:
+The direct requested node and element files contained both state `0` and final state `1`, with exact node/element ID sets (`231` nodes and `100` elements). The final state passed every recorded observation criterion:
 
 | Metric | Observation |
 |---|---:|
@@ -166,19 +168,19 @@ The bounded commands were run from the repository root with the absolute Python 
 
 ```powershell
 & 'C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe' -X utf8 .local\verification\P0B-gmsh-febio-mapping-01\prepare_preflight.py
-# exit 0; PREFLIGHT_FROZEN
+# exit 0; PREFLIGHT_FROZEN (record label; no read-only claim)
 
 & 'C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe' -X utf8 .local\verification\P0B-gmsh-febio-mapping-01\build_febio.py
 # exit 0; 231 nodes / 100 Tet10; negative mutation rejected
 
 & 'C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe' -X utf8 .local\verification\P0B-gmsh-febio-mapping-01\freeze_launch.py
-# exit 0; FEBIO_LAUNCH_PREFLIGHT_FROZEN
+# exit 0; FEBIO_LAUNCH_PREFLIGHT_FROZEN (record label; no read-only claim)
 
 & 'C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe' -X utf8 .local\verification\P0B-gmsh-febio-mapping-01\record_direct_outputs.py
 # exit 0; DIRECT_OUTPUTS_HASHED
 
 & 'C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe' -X utf8 .local\verification\P0B-gmsh-febio-mapping-01\analyze_febio.py
-# exit 0; all frozen observation criteria true
+# exit 0; all recorded observation criteria true
 ```
 
 The owned-native wrapper was used for every Gmsh/FEBio child with `--timeout-seconds 120`, unique output directories, and raw stream capture. Product `pytest`, Ruff, mypy, build, installed smoke, official FBS, Studio, and real-model gates were not run because this is a documentation-only bounded native observation; those gates remain unverified, not passed.
@@ -186,8 +188,10 @@ The owned-native wrapper was used for every Gmsh/FEBio child with `--timeout-sec
 ## 8. Unverified boundaries
 
 - No Gmsh-to-product adapter or FEBio input adapter was changed or accepted.
+- The manual shape-function provenance supports the stated candidate Tet10 order; the native affine patch only corroborates bounded behavior and does not establish general compatibility.
 - The successful input was all-node-prescribed; it does not establish free-DOF equilibrium, support semantics, contact, rigid-body semantics, or solver robustness.
 - XPLT was generated and hashed only. No independent reader, FBS, compression, dictionary/state, or variable-semantic acceptance was performed.
 - FEBio Studio was not launched. No GUI, final-state viewer, or post-processing confirmation was performed.
 - No production material/profile claim, real CAD/model claim, `02_CAE` access, BottomFrame E2E, P0/P3/E2E gate, or product-ready declaration follows from this observation.
+- Historical read-only protection was not demonstrated; the retained hashes are content records, not immutable or OS-read-only guarantees.
 - No push or integration was performed. The next step is independent read-only review of this exact clean commit plus the ignored evidence hashes.
