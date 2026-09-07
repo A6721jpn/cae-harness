@@ -350,8 +350,9 @@ def test_contact_as_placed_requires_arrangement_evidence_and_has_no_gap_or_direc
 )
 def test_contact_specified_gap_evidence_is_field_bound(field: str, wrong_target: str) -> None:
     contact = _contact()
+    kwargs: dict[str, Any] = {field: _evidence(wrong_target, "z")}
     with pytest.raises(ValueError):
-        _specified_gap(contact, **{field: _evidence(wrong_target, "z")})
+        _specified_gap(contact, **kwargs)
 
 
 def test_contact_specified_gap_direction_must_use_pair_frame() -> None:
