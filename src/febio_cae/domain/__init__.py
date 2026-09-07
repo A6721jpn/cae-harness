@@ -376,7 +376,6 @@ __all__ = [
     "SolverPolicyValidationError",
     "SourceAssetContent",
     "SourceAssetRef",
-    "validate_logical_path",
     "SourceAssetResolverPort",
     "SpatialValidationError",
     "SpecifiedGap",
@@ -403,5 +402,6 @@ __all__ = [
     "require_transition",
     "transition_allowed",
     "unit_definition",
+    "validate_logical_path",
     "validate_translational_indentation_compatibility",
 ]

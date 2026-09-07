@@ -532,9 +532,7 @@ def test_tet10_face_table_has_outward_tri6_orientation_and_edge_midpoints() -> N
         opposite = next(index for index in range(4) if index not in corners)
         toward_opposite = subtract(coordinates[opposite], coordinates[corners[0]])
         assert dot(normal, toward_opposite) < 0.0
-        expected_edges = tuple(
-            (corners[index], corners[(index + 1) % 3]) for index in range(3)
-        )
+        expected_edges = tuple((corners[index], corners[(index + 1) % 3]) for index in range(3))
         for midpoint_position, edge in zip(face[3:], expected_edges, strict=True):
             midpoint = coordinates[midpoint_position]
             endpoints = (coordinates[edge[0]], coordinates[edge[1]])
@@ -595,8 +593,7 @@ def test_mesh_accepts_two_bodies_all_set_kinds_and_rejects_contradictory_ownersh
             nodes=mesh.nodes,
             elements=mesh.elements,
             faces=mesh.faces,
-            sets=mesh.sets
-            + (MeshSet("bad-body", "body", "body-a", ("body-b",), "b" * 64),),
+            sets=tuple(mesh.sets) + (MeshSet("bad-body", "body", "body-a", ("body-b",), "b" * 64),),
             quality_records=mesh.quality_records,
         )
     with pytest.raises(ValueError, match="node set|ownership"):
@@ -607,7 +604,7 @@ def test_mesh_accepts_two_bodies_all_set_kinds_and_rejects_contradictory_ownersh
             nodes=mesh.nodes,
             elements=mesh.elements,
             faces=mesh.faces,
-            sets=mesh.sets + (MeshSet("bad-node", "node", "body-a", (21,), "b" * 64),),
+            sets=tuple(mesh.sets) + (MeshSet("bad-node", "node", "body-a", (21,), "b" * 64),),
             quality_records=mesh.quality_records,
         )
 
@@ -646,9 +643,7 @@ def test_mesh_requires_opposite_oriented_interior_face_pair() -> None:
         (MeshQualityRecord("jacobian", 0.5, "1", 0.0, AssessmentStatus.PASS, "synthetic"),),
     )
     assert mesh.faces[1].adjacent_element_ids == (1, 2)
-    same_orientation = MeshElement(
-        2, "tet10", (1, 2, 3, 11, 5, 6, 7, 12, 13, 14), "body-a"
-    )
+    same_orientation = MeshElement(2, "tet10", (1, 2, 3, 11, 5, 6, 7, 12, 13, 14), "body-a")
     with pytest.raises(ValueError, match="opposite|orientation"):
         MeshArtifact(
             "same-pair",
@@ -667,9 +662,7 @@ def test_mesh_requires_opposite_oriented_interior_face_pair() -> None:
             provenance,
             nodes,
             (first, opposite),
-            (
-                MeshFace("overfull", "body-a", (1, 3, 2, 7, 6, 5), (1, 2, 1), (0, 0, 0)),
-            ),
+            (MeshFace("overfull", "body-a", (1, 3, 2, 7, 6, 5), (1, 2, 1), (0, 0, 0)),),
             sets,
             (MeshQualityRecord("jacobian", 0.5, "1", 0.0, AssessmentStatus.PASS, "synthetic"),),
         )

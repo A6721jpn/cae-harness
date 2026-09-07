@@ -17,8 +17,8 @@ from febio_cae.domain import (
     FrameId,
     IssuedQuestion,
     NumericResultData,
-    OutputMapping,
     OperationStatus,
+    OutputMapping,
     PartialCaseSpec,
     PreviewRequest,
     ResultDataRef,
@@ -236,6 +236,7 @@ def test_manifest_codec_reuses_strong_result_reference_path_rule() -> None:
         ReadStatus,
         ResultManifest,
     )
+
     manifest = ResultManifest(
         "manifest-interface",
         "attempt-interface",

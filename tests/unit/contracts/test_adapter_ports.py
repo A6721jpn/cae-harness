@@ -295,6 +295,10 @@ def test_connected_synthetic_consumer_reads_source_and_actual_numeric_states() -
     encoded_output = encode_record(output_numeric)
 
     class ResultResolver:
+        def __init__(self) -> None:
+            self._by_data_id = {"displacement-data": encoded_numeric}
+            self._by_manifest_output = {("manifest-interface", "displacement"): encoded_output}
+
         def resolve_file(self, entry: Any, bundle: Any, attempt: Any) -> Any:
             content = b"file-bytes"
             assert entry.logical_path == "output/case.xplt"
@@ -309,10 +313,9 @@ def test_connected_synthetic_consumer_reads_source_and_actual_numeric_states() -
         def resolve_manifest_output(self, manifest_id: str, output_id: str) -> Any:
             assert manifest_id == "manifest-interface"
             assert output_id == "displacement"
-            return decode_record(self._by_manifest_output[(manifest_id, output_id)], NumericResultData)
-
-        _by_data_id = {"displacement-data": encoded_numeric}
-        _by_manifest_output = {("manifest-interface", "displacement"): encoded_output}
+            return decode_record(
+                self._by_manifest_output[(manifest_id, output_id)], NumericResultData
+            )
 
     result_resolver = ResultResolver()
     assert isinstance(result_resolver, ResultDataPort)

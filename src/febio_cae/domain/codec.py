@@ -1778,9 +1778,7 @@ def _numeric_result_data(value: object, field: str) -> NumericResultData:
         values=tuple(
             tuple(
                 _number(item, f"{field}.values[{row_index}][{column_index}]")
-                for column_index, item in enumerate(
-                    _sequence(row, f"{field}.values[{row_index}]")
-                )
+                for column_index, item in enumerate(_sequence(row, f"{field}.values[{row_index}]"))
             )
             for row_index, row in enumerate(_sequence(payload["values"], f"{field}.values"))
         ),
