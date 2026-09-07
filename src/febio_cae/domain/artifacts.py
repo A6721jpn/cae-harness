@@ -704,7 +704,6 @@ class MeshArtifact:
                             "face node order does not match the canonical oriented face table"
                         )
                 else:
-                    assert expected_first is not None
                     opposite = (
                         expected_first[0],
                         expected_first[2],

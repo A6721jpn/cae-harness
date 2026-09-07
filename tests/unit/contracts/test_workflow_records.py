@@ -662,7 +662,7 @@ def test_mesh_requires_opposite_oriented_interior_face_pair() -> None:
             provenance,
             nodes,
             (first, opposite),
-            (MeshFace("overfull", "body-a", (1, 3, 2, 7, 6, 5), (1, 2, 1), (0, 0, 0)),),
+            (MeshFace("overfull", "body-a", (1, 3, 2, 7, 6, 5), (1, 2, 3), (0, 0, 0)),),
             sets,
             (MeshQualityRecord("jacobian", 0.5, "1", 0.0, AssessmentStatus.PASS, "synthetic"),),
         )

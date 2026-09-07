@@ -327,3 +327,23 @@ def test_connected_synthetic_consumer_reads_source_and_actual_numeric_states() -
     manifest_output = result_resolver.resolve_manifest_output("manifest-interface", "displacement")
     assert manifest_output.axis_values == (0.0, 1.0)
     assert manifest_output.reference.data_id == "manifest-displacement-data"
+
+    class QualityConsumer:
+        def assess(
+            self,
+            manifest: Any,
+            revision: Any,
+            mesh: Any,
+            profile: Any,
+            data: Any,
+        ) -> Any:
+            return (
+                data.resolve(data_ref),
+                data.resolve_manifest_output("manifest-interface", "displacement"),
+            )
+
+    quality_consumer = QualityConsumer()
+    assert isinstance(quality_consumer, QualityPort)
+    primary, related = quality_consumer.assess(None, None, None, None, result_resolver)
+    assert primary.values[1][0] == 0.2
+    assert related.reference.data_id == "manifest-displacement-data"
