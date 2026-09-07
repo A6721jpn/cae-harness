@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import importlib
+import math
+from dataclasses import asdict
 from types import ModuleType
 from typing import Any
 
 import pytest
+
+from febio_cae.domain import canonical_bytes
 
 
 def _optional_module(name: str) -> ModuleType | None:
@@ -78,3 +82,61 @@ def test_quantity_rejects_unknown_units_and_dimension_mismatch() -> None:
         Quantity(1, "inch")
     with pytest.raises(ValueError):
         Quantity(1, "mm").convert_to("MPa")
+
+
+@pytest.mark.parametrize(
+    ("first_value", "first_unit", "second_value", "second_unit"),
+    [
+        (1000, "mm", 1, "m"),
+        (1, "MPa", 1_000_000, "Pa"),
+        (0, "mm", 0.0, "m"),
+    ],
+)
+def test_equivalent_si_quantities_have_identical_canonical_bytes(
+    first_value: object,
+    first_unit: str,
+    second_value: object,
+    second_unit: str,
+) -> None:
+    Quantity = _quantity_type()
+    first = Quantity(first_value, first_unit)
+    second = Quantity(second_value, second_unit)
+
+    assert canonical_bytes(asdict(first.to_si())) == canonical_bytes(asdict(second.to_si()))
+
+
+@pytest.mark.parametrize(
+    ("value", "source_unit", "target_unit"),
+    [
+        (math.ulp(0.0), "mm", "m"),
+        (-math.ulp(0.0), "Pa", "MPa"),
+    ],
+)
+def test_nonzero_quantity_conversion_rejects_underflow_to_zero(
+    value: float, source_unit: str, target_unit: str
+) -> None:
+    Quantity = _quantity_type()
+
+    with pytest.raises(ValueError, match="underflow|range"):
+        Quantity(value, source_unit).convert_to(target_unit)
+
+
+def test_quantity_conversion_preserves_signed_values_and_real_zero() -> None:
+    Quantity = _quantity_type()
+
+    positive = Quantity(2, "mm").convert_to("m")
+    negative = Quantity(-2, "mm").convert_to("m")
+    zero = Quantity(0, "mm").convert_to("m")
+
+    assert positive.value == 0.002
+    assert negative.value == -0.002
+    assert zero.value == 0.0
+    assert positive.value != 0.0
+    assert negative.value != 0.0
+
+
+def test_quantity_conversion_rejects_unrepresentable_huge_integer() -> None:
+    Quantity = _quantity_type()
+
+    with pytest.raises(ValueError, match="range|finite"):
+        Quantity(10**1000, "m").to_si()

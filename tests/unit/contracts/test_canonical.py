@@ -89,3 +89,55 @@ def test_canonical_bytes_rejects_duplicate_ids_only_when_collection_is_declared(
     with pytest.raises(ValueError):
         canonical_bytes(duplicate_items, unique_id_paths=(("items",),))
     assert canonical_bytes({"history": duplicate_items["items"]})
+
+
+@pytest.mark.parametrize("control", ["unordered_paths", "unique_id_paths"])
+@pytest.mark.parametrize(
+    "value",
+    [
+        {},
+        {"members": None},
+        {"members": 0},
+        {"members": {"first": {"id": "duplicate"}, "second": {"id": "duplicate"}}},
+    ],
+)
+def test_declared_collection_paths_require_list_targets(control: str, value: object) -> None:
+    canonical_bytes = _canonical_bytes()
+
+    with pytest.raises(ValueError):
+        canonical_bytes(value, **{control: (("members",),)})
+
+
+def test_declared_collections_support_root_empty_and_nested_lists() -> None:
+    canonical_bytes = _canonical_bytes()
+
+    assert canonical_bytes([], unordered_paths=((),), unique_id_paths=((),)) == b"[]"
+    assert (
+        canonical_bytes(
+            {"outer": {"members": []}},
+            unordered_paths=(("outer", "members"),),
+            unique_id_paths=(("outer", "members"),),
+        )
+        == b'{"outer":{"members":[]}}'
+    )
+
+    nested = {"groups": [{"members": [{"id": "B"}, {"id": "A"}]}]}
+    assert (
+        canonical_bytes(
+            nested,
+            unordered_paths=(("groups", "0", "members"),),
+            unique_id_paths=(("groups", "0", "members"),),
+        )
+        == b'{"groups":[{"members":[{"id":"A"},{"id":"B"}]}]}'
+    )
+
+
+def test_declared_unique_collection_does_not_reorder_an_ordered_list() -> None:
+    canonical_bytes = _canonical_bytes()
+
+    encoded = canonical_bytes(
+        {"history": [{"id": "B"}, {"id": "A"}]},
+        unique_id_paths=(("history",),),
+    )
+
+    assert encoded == b'{"history":[{"id":"B"},{"id":"A"}]}'
