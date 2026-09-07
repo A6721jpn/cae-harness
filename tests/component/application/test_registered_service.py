@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -55,10 +56,10 @@ def test_question_can_be_consumed_once_and_is_generation_bound(tmp_path: Path) -
     draft = service.current_draft(case_id)
     evidence = EvidenceRef(
         "1",
-        "user_instruction",
-        "question-source",
+        "registered_document",
+        "cad",
         "material",
-        "0" * 64,
+        hashlib.sha256(b"step-content").hexdigest(),
     )
     question = service.issue_question(
         case_id,
