@@ -8,10 +8,10 @@ from enum import Enum
 from typing import Protocol, runtime_checkable
 
 from .artifacts import (
+    FileEntry,
     GeometryInspection,
     GeometryInspectionRequest,
     GeometrySelectionRequest,
-    FileEntry,
     MeshArtifact,
     ResolvedFileContent,
     SourceAssetContent,
@@ -235,8 +235,8 @@ __all__ = [
     "PreviewPort",
     "QualityPort",
     "ReconcileResult",
-    "ResultReaderPort",
     "ResultDataPort",
+    "ResultReaderPort",
     "RunnerPort",
     "SourceAssetResolverPort",
     "TrustedOwnerContext",

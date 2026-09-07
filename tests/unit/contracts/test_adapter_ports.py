@@ -113,10 +113,10 @@ def test_runner_exposes_poll_cancel_reconcile_boundaries() -> None:
 
 def test_ports_expose_injected_source_selection_and_result_data_resolution() -> None:
     assert REPAIR_PORTS_API is not None, "P1 source/result resolution ports are not available"
-    assert callable(getattr(SourceAssetResolverPort, "resolve"))
-    assert callable(getattr(GeometryPort, "resolve_selection"))
-    assert callable(getattr(ResultDataPort, "resolve"))
-    assert callable(getattr(ResultDataPort, "resolve_manifest_output"))
+    assert callable(SourceAssetResolverPort.resolve)
+    assert callable(GeometryPort.resolve_selection)
+    assert callable(ResultDataPort.resolve)
+    assert callable(ResultDataPort.resolve_manifest_output)
     assert "source" in inspect.signature(GeometryPort.inspect).parameters
     assert "data" in inspect.signature(QualityPort.assess).parameters
 

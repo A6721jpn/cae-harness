@@ -8,6 +8,7 @@ import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
+from itertools import pairwise
 
 from .artifacts import FileEntry
 from .canonical import canonical_bytes
@@ -136,7 +137,7 @@ class NumericResultData:
         )
         if not axis_values:
             raise ResultsValidationError("axis_values must not be empty")
-        if any(current <= previous for previous, current in zip(axis_values, axis_values[1:])):
+        if any(current <= previous for previous, current in pairwise(axis_values)):
             raise ResultsValidationError("axis_values must be strictly increasing")
         entity_ids = tuple(
             _text(item, "entity_ids[]") for item in _sequence(self.entity_ids, "entity_ids")
@@ -408,7 +409,7 @@ __all__ = [
     "QualityAssessment",
     "ReadResult",
     "ReadStatus",
-    "ResultManifest",
     "ResultDataRef",
+    "ResultManifest",
     "ResultsValidationError",
 ]

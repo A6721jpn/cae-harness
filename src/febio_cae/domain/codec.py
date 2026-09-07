@@ -73,6 +73,7 @@ from .output_policy import EvaluationRequest, OutputLocation, OutputPolicy, Outp
 from .partial_case_spec import PartialCaseSpec
 from .preview import PreviewReceipt, PreviewRequest
 from .quality_policy import QualityCriterion, QualityPolicy, QualityThreshold
+from .questions import IssuedQuestion
 from .results import (
     AssessmentStatus,
     CriterionAssessment,
@@ -113,7 +114,6 @@ from .spatial import (
 )
 from .support import SolidSupport, SupportComponent, SupportId, SupportSet
 from .units import Quantity
-from .questions import IssuedQuestion
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _TARGET = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*(?:\.[A-Za-z_][A-Za-z0-9_-]*)*$")

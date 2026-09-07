@@ -700,22 +700,27 @@ class MeshArtifact:
         face_by_id = {item.face_id: item for item in faces}
         for item in sets:
             if item.kind == "node":
-                if any(member not in node_ids for member in item.member_ids):
-                    raise ArtifactValidationError("node set references an unknown node")
-                if any(item.body_id not in node_bodies[member] for member in item.member_ids):
-                    raise ArtifactValidationError("node set crosses body ownership")
+                for member in item.member_ids:
+                    if not isinstance(member, int) or member not in node_ids:
+                        raise ArtifactValidationError("node set references an unknown node")
+                    if item.body_id not in node_bodies[member]:
+                        raise ArtifactValidationError("node set crosses body ownership")
             elif item.kind == "element":
-                if any(member not in element_ids for member in item.member_ids):
-                    raise ArtifactValidationError("element set references an unknown element")
-                if any(element_by_id[member].body_id != item.body_id for member in item.member_ids):
-                    raise ArtifactValidationError("element set crosses body ownership")
+                for member in item.member_ids:
+                    if not isinstance(member, int) or member not in element_ids:
+                        raise ArtifactValidationError("element set references an unknown element")
+                    if element_by_id[member].body_id != item.body_id:
+                        raise ArtifactValidationError("element set crosses body ownership")
             elif item.kind == "face":
-                if any(member not in face_by_id for member in item.member_ids):
-                    raise ArtifactValidationError("face set references an unknown face")
-                if any(face_by_id[member].body_id != item.body_id for member in item.member_ids):
-                    raise ArtifactValidationError("face set crosses body ownership")
-            elif any(member not in body_ids for member in item.member_ids):
-                raise ArtifactValidationError("body set references an unknown body")
+                for member in item.member_ids:
+                    if not isinstance(member, str) or member not in face_by_id:
+                        raise ArtifactValidationError("face set references an unknown face")
+                    if face_by_id[member].body_id != item.body_id:
+                        raise ArtifactValidationError("face set crosses body ownership")
+            else:
+                for member in item.member_ids:
+                    if not isinstance(member, str) or member not in body_ids:
+                        raise ArtifactValidationError("body set references an unknown body")
         object.__setattr__(self, "nodes", nodes)
         object.__setattr__(self, "elements", elements)
         object.__setattr__(self, "faces", faces)

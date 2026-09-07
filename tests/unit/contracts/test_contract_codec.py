@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from workflow_fixtures import case_revision, evidence
@@ -132,4 +132,4 @@ def test_codec_round_trips_all_declared_service_and_leaf_top_level_records() -> 
     )
     for record in records:
         restored = decode_record(encode_record(record), type(record))
-        assert restored.to_bytes() == record.to_bytes()
+        assert cast(Any, restored).to_bytes() == record.to_bytes()

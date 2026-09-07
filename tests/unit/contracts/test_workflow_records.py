@@ -116,11 +116,11 @@ except ImportError:
 
 try:
     from febio_cae.domain.artifacts import (
-        GeometrySelectionRequest,
-        SourceAssetContent,
         TET10_CORNER_NODE_POSITIONS,
         TET10_EDGE_NODE_POSITIONS,
         TET10_FACE_NODE_POSITIONS,
+        GeometrySelectionRequest,
+        SourceAssetContent,
     )
     from febio_cae.domain.results import NumericResultData, ResultDataRef
 
@@ -255,9 +255,9 @@ def _attempt(bundle: Any, revision: CaseRevision) -> Any:
 
 
 def _manifest(attempt: Any, bundle: Any, profile: Any) -> Any:
-    observation_kwargs: dict[str, object] = {}
+    data_ref: Any = None
     if ResultDataRef is not None:
-        observation_kwargs["data_ref"] = ResultDataRef(
+        data_ref = ResultDataRef(
             "displacement-data",
             "a" * 64,
             "numeric-result-v1",
@@ -273,7 +273,7 @@ def _manifest(attempt: Any, bundle: Any, profile: Any) -> Any:
         frame=FrameId("World"),
         measure_id="value",
         state_count=2,
-        **observation_kwargs,
+        data_ref=data_ref,
     )
     read_result = ReadResult(
         status=ReadStatus.VALIDATED,

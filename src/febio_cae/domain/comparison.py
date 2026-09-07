@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
-import math
 
 from .canonical import canonical_bytes
 
