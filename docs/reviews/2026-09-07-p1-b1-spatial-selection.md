@@ -161,4 +161,11 @@ Next task: PM should perform the independent exact-commit review, then integrate
 
 ## Report-stage postchecks
 
-After staging this R1 update, run `git diff --cached --check` and `C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe scripts/scan_cae_data.py --root .` through the capture runner as `P1-B1-r1-report-diff-check-01` and `P1-B1-r1-report-scanner-01`. Both must exit 0; the scanner should report 32 filesystem/index files and 0 issues after this report is staged. These postchecks are report-integrity evidence and do not replace the final code gates above.
+The report-stage postchecks were captured before this docs-only correction, at HEAD `a401c035b51634914b161acdfd9cf83b7b13dd0c` with only this report staged (`M  docs/reviews/2026-09-07-p1-b1-spatial-selection.md`). Both records retained the expanded command, cwd `C:\Users\backo\.codex\worktrees\8dd5\CAE-harness`, Python runner `C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe`, timestamps, staged dirty state, and raw output paths:
+
+| Record | Exact argv and captured result | Raw evidence |
+|---|---|---|
+| `P1-B1-r1-report-diff-check-01` | `git diff --cached --check`; started `2026-09-07T06:42:29.494624Z`, finished `2026-09-07T06:42:29.539624Z`, exit 0; HEAD before/after `a401c035b51634914b161acdfd9cf83b7b13dd0c`; staged dirty state before/after `M  docs/reviews/2026-09-07-p1-b1-spatial-selection.md` | `.local/coordination/runs/P1-B1-r1-report-diff-check-01/{metadata.json,stdout.bin,stderr.bin}` |
+| `P1-B1-r1-report-scanner-01` | `C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe scripts/scan_cae_data.py --root .`; started `2026-09-07T06:42:29.806786Z`, finished `2026-09-07T06:42:32.674675Z`, exit 0; PASS with 32 filesystem files, 32 index files, and 0 issues; HEAD before/after `a401c035b51634914b161acdfd9cf83b7b13dd0c`; staged dirty state before/after `M  docs/reviews/2026-09-07-p1-b1-spatial-selection.md` | `.local/coordination/runs/P1-B1-r1-report-scanner-01/{metadata.json,stdout.bin,stderr.bin}` |
+
+These records are evidence for the report state that was staged at that time; they do not claim execution on the clean code SHA or on this later docs-only commit. Product RED/GREEN and code gates were not rerun for this documentation correction.
