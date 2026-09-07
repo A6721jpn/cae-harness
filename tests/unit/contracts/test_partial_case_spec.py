@@ -112,15 +112,18 @@ def test_partial_case_spec_preserves_explicit_zero_values(synthetic_case_spec: A
 def test_partial_case_spec_conversion_propagates_existing_cross_child_error_without_mutation(
     synthetic_case_spec: Any,
 ) -> None:
-    from febio_cae.domain import FrameId
-
-    mismatched_contact = replace(
-        synthetic_case_spec.contact,
-        pair_frame=FrameId("MismatchedPairFrame"),
+    mismatched_quality = replace(
+        synthetic_case_spec.quality_policy,
+        criteria=[
+            replace(
+                synthetic_case_spec.quality_policy.criteria[0],
+                evaluation_ids=["missing_evaluation"],
+            )
+        ],
     )
-    partial = _partial(synthetic_case_spec, contact=mismatched_contact)
+    partial = _partial(synthetic_case_spec, quality_policy=mismatched_quality)
     before = partial.to_bytes()
-    with pytest.raises(CaseSpecValidationError, match="contact"):
+    with pytest.raises(CaseSpecValidationError, match="quality_policy"):
         partial.to_case_spec()
     assert partial.to_bytes() == before
     assert partial.unresolved_fields == ()
