@@ -2,6 +2,7 @@
 
 from .budget import Budget, BudgetValidationError
 from .canonical import SCHEMA_VERSION, CanonicalizationError, canonical_bytes
+from .case_draft import CaseDraft, CaseDraftValidationError
 from .case_revision import CaseRevision, CaseRevisionValidationError
 from .case_spec import CaseSpec, CaseSpecValidationError
 from .contact import (
@@ -37,6 +38,7 @@ from .output_policy import (
     OutputPolicyValidationError,
     OutputRequest,
 )
+from .partial_case_spec import PartialCaseSpec, PartialCaseSpecValidationError
 from .quality_policy import (
     QualityCriterion,
     QualityPolicy,
@@ -126,6 +128,8 @@ __all__ = [
     "Budget",
     "BudgetValidationError",
     "CanonicalizationError",
+    "CaseDraft",
+    "CaseDraftValidationError",
     "CaseRevision",
     "CaseRevisionValidationError",
     "CaseSpec",
@@ -175,6 +179,8 @@ __all__ = [
     "OutputPolicy",
     "OutputPolicyValidationError",
     "OutputRequest",
+    "PartialCaseSpec",
+    "PartialCaseSpecValidationError",
     "Point3",
     "ProperRotation",
     "QualityCriterion",
