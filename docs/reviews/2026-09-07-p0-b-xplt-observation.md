@@ -107,6 +107,28 @@ python -X utf8 .local\verification\P0B-xplt-observation-01\bounded_xplt_probe.py
 
 結果は`exit 0`、`accepted=true`、`blocks=137`である。mutationは同じscriptをmutation fileごとに新しいPython processで実行し、各回`--no-hash`、exit `2`とした。中断run、collection error、partial outputは合格件数に含めていない。
 
+### 4.2 Fresh process capture addendum / 完全process証跡
+
+上記のJSON出力だけに依存しない再現可能なcaptureを、元のreader・XPLT・mutation copyを変更せず、新しいignored directoryで実行した。parent runnerの実行コマンドは次であり、cwdは`C:\Users\backo\.codex\worktrees\e081\CAE-harness`である。
+
+```text
+C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe -X utf8 C:\Users\backo\.codex\worktrees\e081\CAE-harness\.local\verification\P0B-xplt-capture-02\capture_runner.py
+```
+
+完全なabsolute child argv、parent/childのUTC start/end、cwd、PID、actual process exit、timeout、raw stdout/stderr bytesとSHA-256、reader/helper/input/output fileのbytesとSHA-256、pre/post Git SHA・dirty stateは[capture-manifest.json](C:/Users/backo/.codex/worktrees/e081/CAE-harness/.local/verification/P0B-xplt-capture-02/capture-manifest.json)に保存した。manifest SHA-256は`C316485063D988861F7F9C78917624840AAEA0525E50C79ADC4B6132F98495B8`、capture runner SHA-256は`3EC065F0345BE56073653EB8BB8A5B2A80B884E14D0C672688615FC81ACEBE2D`、hash probe helper SHA-256は`C6700BBA72605F40556E7A5BC32600F2487ECD12382FF467A05876CC52351D1C`である。original readerは既存のSHA-256 `5772FC0F13AA52B8CD42E996CE7EC47630A6837A9A1B5DD931AA0B652BF535D7`から変更していない。
+
+capture parentは`2026-09-07T05:57:52.529Z`–`2026-09-07T05:57:53.701Z`、pre/post HEADはともに`b39d4d2cad15df99a927c914cbe4a2677bc996aa`、pre/post dirtyは`false`、capture summary exitは`0`だった。
+
+| probe group | count | child actual exit | child result | capture interpretation |
+|---|---:|---:|---|---|
+| normal full XPLT + direct text | `1` | `0` | `accepted=true`, `blocks=137` | expected success |
+| existing mutation copies with `--no-hash` | `6` | all `2` | truncation、bad magic、version、compression、unknown root/state tagを各JSONでreject | expected inner rejection; not capture failure |
+| changed expected hash | `1` | `2` | `HASH_MISMATCH`; actual input SHA `0B835386...F4094A4` vs deliberate `FF...FF` | expected inner rejection; not capture failure |
+
+normal childのraw stdout/stderr、6 mutation childのraw stdout/stderr、hash probeのraw stdout/stderrは各case recordから辿れる。mutationの各`--no-hash`は既存copyを入力にし、出力JSONだけをcapture directoryへ新規作成した。hash probeは新規helperからimmutable readerを正しく`sys.modules`へ登録してimportし、expected SHA-256だけをそのprocess内で`FF`×64へ置換した。
+
+このcaptureは、元のscopeどおり両stateをparseしたうえで数値比較はfinal stateだけを比較したnormal probeのprocess証跡を補うものであり、新しい物理・product compatibility claimを追加しない。
+
 ## 5. Published compatibility facts / 公開仕様との対応
 
 公式Appendix D.2.2は、最初のDWORDがFEBio identifier `0x00464542`で、identifierにはsize fieldが続かず、その後にroot、mesh、複数stateのblockが続くと説明する。D.2.1は各blockをidentifier、byte-size、payloadの3 fieldとして定義する。今回のreaderはこの境界を最初の入口として使用した。
