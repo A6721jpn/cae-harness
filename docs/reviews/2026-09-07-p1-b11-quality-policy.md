@@ -17,6 +17,9 @@ This is synthetic/local evidence. It is not evidence of an observed quality asse
 | P1-B11 test-only fixture correction SHA | `320ee4c7c8e4027c95d15e0f22596eb0ad661e82` |
 | P1-B11 first production SHA | `d7c92beae52535a361e65807b3a41e6c0862bbb6` |
 | P1-B11 final production candidate | `e156f0d0d5309df0c53018d497c62b7188a08c5a` |
+| P1-B11-R1 test-only correction SHA | `08733b05d385c4da179cec048bb7fbe4cd0876c8` |
+| P1-B11-R1 production correction SHA | `3e983e23903d22673f5aa90dabeb0706fb6c7d2e` |
+| P1-B11-R1 final production candidate | `3e983e23903d22673f5aa90dabeb0706fb6c7d2e` |
 | Authorized remote | `https://github.com/A6721jpn/cae-harness.git` |
 | Remote state | `REMOTE_CONFIGURED` |
 | Push/integration | not performed by this worker |
@@ -55,7 +58,7 @@ All public values are frozen dataclasses. Constructors copy caller sequences, re
 
 ## Test-first chronology and preserved failures
 
-The test-only contract was committed first as `9c9d24f60e746aca1223ccb510a3a77bbcee4b96`. A collection-time fixture correction was committed separately as `3ee0615744b020d91e12c95fc4ceeaf565f4fd4d`; a helper correction that kept invalid criterion identifiers independent from evidence-target construction was committed as `320ee4c7c8e4027c95d15e0f22596eb0ad661e82`. Production was then committed as `d7c92beae52535a361e65807b3a41e6c0862bbb6`, followed by the typing-only production correction `e156f0d0d5309df0c53018d497c62b7188a08c5a`.
+The test-only contract was committed first as `9c9d24f60e746aca1223ccb510a3a77bbcee4b96`. A collection-time fixture correction was committed separately as `3ee0615744b020d91e12c95fc4ceeaf565f4fd4d`; a helper correction that kept invalid criterion identifiers independent from evidence-target construction was committed as `320ee4c7c8e4027c95d15e0f22596eb0ad661e82`. Production was then committed as `d7c92beae52535a361e65807b3a41e6c0862bbb6`, followed by the typing-only production correction `e156f0d0d5309df0c53018d497c62b7188a08c5a`. The bounded R1 correction then added the test-only control-character coverage in `08733b05d385c4da179cec048bb7fbe4cd0876c8` and the production fix in `3e983e23903d22673f5aa90dabeb0706fb6c7d2e`.
 
 Every wrapper record preserves expanded argv, actual cwd, UTC timestamps, HEAD, dirty state, exit code, and raw stdout/stderr under `.local/coordination/runs/<record-id>/`. The failed records below remain nonpassing evidence.
 
@@ -66,9 +69,9 @@ Every wrapper record preserves expanded argv, actual cwd, UTC timestamps, HEAD, 
 | `P1-B11-test-draft-format-01` | `40cc47f948acb1814e1b6e385f2bd4825b545f1d`; `?? tests/unit/contracts/test_quality_policy.py` | 1 | Ruff reported the new test draft would be reformatted. `P1-B11-test-draft-format-fix-01` reformatted it; `P1-B11-test-draft-format-02` then passed. |
 | `P1-B11-red-01` | `9c9d24f60e746aca1223ccb510a3a77bbcee4b96`; clean | 2 | Pytest collected 0 and stopped during collection because a parameterization invoked the unavailable API and triggered `pytest.skip` outside a test. This is a setup/collection failure, not RED evidence. The collection correction was committed as `3ee0615744b020d91e12c95fc4ceeaf565f4fd4d`. |
 | `P1-B11-production-precommit-format-01` | `3ee0615744b020d91e12c95fc4ceeaf565f4fd4d`; `M src/febio_cae/domain/__init__.py`, `?? src/febio_cae/domain/quality_policy.py` | 1 | Ruff reported the package initializer needed formatting. `P1-B11-production-precommit-format-fix-01` corrected it; `P1-B11-production-precommit-format-02` then passed. |
-| `P1-B11-green-precommit-01` | `3ee0615744b020d91e12c95fc4ceeaf565f4fd4d`; `M src/febio_cae/domain/__init__.py`, `?? src/febio_cae/domain/quality_policy.py` | 1 | 66 passed and 4 fixture-helper cases failed because invalid criterion IDs caused the helper to construct invalid evidence targets before the production validator ran. The test-only fixture correction was committed as `320ee4c7c8e4027c95d15e0f22596eb0ad661e82`, after which `P1-B11-green-precommit-02` passed 70. |
+| `P1-B11-green-precommit-01` | `3ee0615744b020d91e12c95fc4ceeaf565f4fd4d`; `M src/febio_cae/domain/__init__.py`, `?? src/febio_cae/domain/quality_policy.py` | 1 | 66 passed and 4 fixture-helper cases failed because invalid criterion IDs caused the helper to construct invalid evidence targets before the production validator ran. |
 
-`P1-B11-test-draft-lint-01`, `P1-B11-production-precommit-lint-01`, `P1-B11-production-precommit-lint-02`, and the subsequent correction format/lint records exited 0. These setup and fixture corrections are preserved separately from the valid availability RED.
+`P1-B11-green-precommit-02` ran before the `320ee4c7c8e4027c95d15e0f22596eb0ad661e82` commit, at the same HEAD `3ee0615744b020d91e12c95fc4ceeaf565f4fd4d` with the test fixture and production files dirty; it passed 70. The helper correction was committed afterward. `P1-B11-test-draft-lint-01`, `P1-B11-production-precommit-lint-01`, `P1-B11-production-precommit-lint-02`, and the subsequent correction format/lint records exited 0. These setup and fixture corrections are preserved separately from the valid availability RED.
 
 ### Valid availability RED
 
@@ -80,11 +83,17 @@ C:/Users/backo/AppData/Local/Programs/Python/Python312/python.exe -m pytest test
 
 It collected 70 tests and exited `1`: one intentional API-availability assertion failure (`test_quality_policy_api_is_available`) and 69 skips. There was no collection, setup, or environment failure. This is availability RED, not semantic behavior RED.
 
+### P1-B11-R1 bounded correction
+
+The R1 test-only commit `08733b05d385c4da179cec048bb7fbe4cd0876c8` added coverage for C0, DEL, and C1 control characters in `applicability_reason`, plus ordinary Unicode preservation. `P1-B11-R1-red-01` ran from that clean test-only commit, collected 76 tests, and exited `1` with 72 passed and the 4 intended failures for DEL (`U+007F`) and C1 characters (`U+0080`, `U+0085`, `U+009F`); `U+0000` was already rejected by the prior canonical boundary. There was no collection, setup, or environment failure.
+
+The smallest production correction `3e983e23903d22673f5aa90dabeb0706fb6c7d2e` changes only `src/febio_cae/domain/quality_policy.py`: it uses Unicode category `Cc` to reject all control characters while preserving ordinary Unicode reasons. `P1-B11-R1-green-01` then passed all 76 focused tests on clean HEAD `3e983e23903d22673f5aa90dabeb0706fb6c7d2e`.
+
 ## Production correction and clean gates
 
-The first production candidate `d7c92beae52535a361e65807b3a41e6c0862bbb6` passed focused tests, format, lint, full pytest, and scanner, but `P1-B11-gate-mypy-01` exited `1` with four `attr-defined` errors because un-narrowed `object` collections were accessed as `QualityThreshold` and `QualityCriterion`. The smallest correction added explicit typed casts; correction format, lint, mypy, and focused records all exited 0. The final clean candidate is `e156f0d0d5309df0c53018d497c62b7188a08c5a`.
+The first production candidate `d7c92beae52535a361e65807b3a41e6c0862bbb6` passed focused tests, format, lint, full pytest, and scanner, but `P1-B11-gate-mypy-01` exited `1` with four `attr-defined` errors because un-narrowed `object` collections were accessed as `QualityThreshold` and `QualityCriterion`. The smallest correction added explicit typed casts; correction format, lint, mypy, and focused records all exited 0. The pre-R1 clean candidate was `e156f0d0d5309df0c53018d497c62b7188a08c5a`; the current R1 clean candidate is `3e983e23903d22673f5aa90dabeb0706fb6c7d2e`.
 
-All final gate commands below ran from clean HEAD `e156f0d0d5309df0c53018d497c62b7188a08c5a` with empty dirty state before and after.
+The pre-R1 gate commands below ran from clean HEAD `e156f0d0d5309df0c53018d497c62b7188a08c5a` with empty dirty state before and after.
 
 | Record | Exact command/result | Exit |
 |---|---|---:|
@@ -98,7 +107,21 @@ All final gate commands below ran from clean HEAD `e156f0d0d5309df0c53018d497c62
 
 The earlier `P1-B11-gate-mypy-01` failure at `d7c92beae52535a361e65807b3a41e6c0862bbb6` remains preserved and is not relabeled as a final pass.
 
-## Wheel and outside-checkout installed smoke
+### R1 fresh clean gates
+
+All R1 gate wrappers ran with clean HEAD `3e983e23903d22673f5aa90dabeb0706fb6c7d2e`, empty dirty state before and after, and fresh basetemp or output paths where applicable.
+
+| Record | Exact command/result | Exit |
+|---|---|---:|
+| `P1-B11-R1-green-01` | `C:/Users/backo/AppData/Local/Programs/Python/Python312/python.exe -m pytest tests/unit/contracts/test_quality_policy.py --basetemp C:/Users/backo/.codex/worktrees/8dd5/CAE-harness/.local/verification/P1-B11-R1-green-01`; 76 passed | 0 |
+| `P1-B11-R1-gate-pytest-01` | `C:/Users/backo/AppData/Local/Programs/Python/Python312/python.exe -m pytest --basetemp C:/Users/backo/.codex/worktrees/8dd5/CAE-harness/.local/verification/P1-B11-R1-gate-pytest-01`; 777 passed in 18.45s | 0 |
+| `P1-B11-R1-gate-format-01` | `C:/Users/backo/AppData/Local/Programs/Python/Python312/python.exe -m ruff format --check .`; 71 files already formatted | 0 |
+| `P1-B11-R1-gate-lint-01` | `C:/Users/backo/AppData/Local/Programs/Python/Python312/python.exe -m ruff check .`; all checks passed | 0 |
+| `P1-B11-R1-gate-mypy-01` | `C:/Users/backo/AppData/Local/Programs/Python/Python312/python.exe -m mypy src tests`; no issues in 43 source files | 0 |
+| `P1-B11-R1-gate-scanner-01` | `C:/Users/backo/AppData/Local/Programs/Python/Python312/python.exe scripts/scan_cae_data.py --root .`; PASS, 73 tracked/index files, 0 diagnostics | 0 |
+| `P1-B11-R1-gate-build-01` | `C:/Users/backo/AppData/Local/Programs/Python/Python312/python.exe -m build`; sdist and wheel built | 0 |
+
+## Prior candidate wheel and outside-checkout installed smoke
 
 The wheel produced by `P1-B11-gate-build-01` is:
 
@@ -120,14 +143,44 @@ Size: 51109 bytes
 
 Installed smoke proves packaging, import provenance, public export identity, and a synthetic quality-policy projection only. It does not establish profile registration, metric/parameter compatibility, observed quality status, native result-variable support, result-reader compatibility, physical applicability, solver execution, official FBS, FEBio Studio, or real-model success.
 
+## R1 fresh wheel and outside-checkout installed smoke
+
+The wheel produced by `P1-B11-R1-gate-build-01` is:
+
+```text
+Wheel: C:\Users\backo\.codex\worktrees\8dd5\CAE-harness\dist\febio_cae-0.1.0-py3-none-any.whl
+SHA-256: 99b9068f28abc1c1762561bb411daf8f84c599b09c706407249a2368aeac72ee
+Size: 51125 bytes
+```
+
+`P1-B11-R1-installed-preflight-01` verified that `C:\Users\backo\AppData\Local\Temp\cae-harness-P1-B11-R1-installed-01` did not exist. A fresh Python 3.12 venv was created there, outside both worktrees, and the exact wheel was installed offline.
+
+| Record | Result |
+|---|---|
+| `P1-B11-R1-wheel-hash-01` | exact wheel size and SHA-256 above; exit 0 |
+| `P1-B11-R1-installed-preflight-01` | fresh outside root absent; exit 0 |
+| `P1-B11-R1-installed-venv-01` | new Python 3.12 venv; exit 0 |
+| `P1-B11-R1-installed-pip-01` | exact wheel installed with `--no-index --disable-pip-version-check --no-cache-dir --no-deps`; exit 0 |
+| `P1-B11-R1-installed-cli-01` | `febio-cae 0.1.0`; exit 0 |
+| `P1-B11-R1-installed-import-01` | isolated `-I`; all four quality exports identical between `febio_cae.domain` and `quality_policy`; synthetic canonical policy projection succeeded with 740 bytes; all module origins under the external venv and outside both checkouts; exit 0 |
+
+The R1 installed smoke proves packaging, import provenance, public export identity, and a synthetic quality-policy projection only. It does not establish profile registration, metric/parameter compatibility, observed quality status, native result-variable support, result-reader compatibility, physical applicability, solver execution, official FBS, FEBio Studio, or real-model success.
+
 ## Report-stage checks and handoff
 
-After the final clean code candidate and gates, only this report was staged. The final staged checks are recorded after the report text was complete:
+For the pre-R1 report, only this report was staged after the clean code candidate and gates. Its staged checks were:
 
 | Record | Result at clean HEAD `e156f0d0d5309df0c53018d497c62b7188a08c5a` |
 |---|---|
 | `P1-B11-report-diff-check-01` | `git diff --cached --check`; exit 0 |
 | `P1-B11-report-scanner-01` | staged-report scan PASS; 73 indexed/tracked files, 0 diagnostics, exit 0 |
+
+For R1, only this report was staged after the R1 code gates and final report text was complete. The fresh staged checks ran at clean HEAD `3e983e23903d22673f5aa90dabeb0706fb6c7d2e`:
+
+| Record | Result |
+|---|---|
+| `P1-B11-R1-report-diff-check-03` | `git diff --cached --check`; exit 0 |
+| `P1-B11-R1-report-scanner-03` | staged-report scan PASS; 73 indexed/tracked files, 0 diagnostics, exit 0 |
 
 The report-only commit is separate from the test and production commits above. The final handoff must remain clean and contain exactly these four tracked paths relative to `40cc47f948acb1814e1b6e385f2bd4825b545f1d`: `src/febio_cae/domain/quality_policy.py`, `src/febio_cae/domain/__init__.py`, `tests/unit/contracts/test_quality_policy.py`, and this report. Coordination records, temporary venvs, build outputs, and real-data boundaries remain outside the tracked product change set.
 
