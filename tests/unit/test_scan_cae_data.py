@@ -6,12 +6,18 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
+from febio_cae.cli import scan_cae_data as scanner_module
+
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 SCANNER = REPOSITORY_ROOT / "scripts" / "scan_cae_data.py"
 
 
-def _run_scanner(root: Path) -> subprocess.CompletedProcess[str]:
-    environment = os.environ.copy()
+def _run_scanner(
+    root: Path, environment: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
+    environment = (environment or os.environ.copy()).copy()
     source_root = REPOSITORY_ROOT / "src"
     pythonpath = environment.get("PYTHONPATH")
     environment["PYTHONPATH"] = (
@@ -24,6 +30,15 @@ def _run_scanner(root: Path) -> subprocess.CompletedProcess[str]:
         capture_output=True,
         text=True,
         check=False,
+    )
+
+
+def _init_git_repo(root: Path) -> None:
+    subprocess.run(
+        ["git", "init", "--quiet", str(root)],
+        capture_output=True,
+        check=True,
+        text=True,
     )
 
 
@@ -57,6 +72,7 @@ def test_boundary_scan_excludes_local_execution_artifacts(tmp_path: Path) -> Non
     generated_file = tmp_path / ".local" / "verification" / "old-result.xplt"
     generated_file.parent.mkdir(parents=True)
     generated_file.write_text("synthetic local artifact", encoding="utf-8")
+    _init_git_repo(tmp_path)
 
     completed = _run_scanner(tmp_path)
 
@@ -65,3 +81,132 @@ def test_boundary_scan_excludes_local_execution_artifacts(tmp_path: Path) -> Non
     assert payload["status"] in {"PASS", "PASS_WITH_WARNINGS"}
     assert payload["issues"] == []
     assert ".local" in payload["excluded_paths"]
+
+
+def test_boundary_scan_rejects_non_git_root(tmp_path: Path) -> None:
+    completed = _run_scanner(tmp_path)
+
+    assert completed.returncode == 4, completed.stderr
+    payload = json.loads(completed.stdout)
+    assert payload["status"] == "INCOMPLETE"
+    assert any(
+        issue["code"] == "GIT_TRACKING_UNAVAILABLE" for issue in payload["issues"]
+    )
+
+
+def test_boundary_scan_rejects_when_git_is_unavailable(tmp_path: Path) -> None:
+    _init_git_repo(tmp_path)
+    (tmp_path / "README.md").write_text("synthetic", encoding="utf-8")
+    environment = os.environ.copy()
+    environment["PATH"] = ""
+
+    completed = _run_scanner(tmp_path, environment)
+
+    assert completed.returncode == 4, completed.stderr
+    payload = json.loads(completed.stdout)
+    assert payload["status"] == "INCOMPLETE"
+    assert any(
+        issue["code"] == "GIT_TRACKING_UNAVAILABLE" for issue in payload["issues"]
+    )
+
+
+def test_boundary_scan_inspects_staged_febio_xml_even_if_worktree_is_benign(
+    tmp_path: Path,
+) -> None:
+    _init_git_repo(tmp_path)
+    candidate = tmp_path / "notes.txt"
+    candidate.write_text(
+        '<?xml version="1.0"?><febio_spec version="4.0"></febio_spec>',
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "-C", str(tmp_path), "add", "notes.txt"], check=True)
+    candidate.write_text("ordinary engineering notes", encoding="utf-8")
+
+    completed = _run_scanner(tmp_path)
+
+    assert completed.returncode == 4, completed.stderr
+    payload = json.loads(completed.stdout)
+    assert payload["status"] == "REJECT"
+    assert any(
+        issue["code"] == "FORBIDDEN_CAE_CONTENT" and issue["path"] == "notes.txt"
+        for issue in payload["issues"]
+    )
+
+
+def test_boundary_scan_rejects_staged_private_key_content(tmp_path: Path) -> None:
+    _init_git_repo(tmp_path)
+    candidate = tmp_path / "notes.txt"
+    candidate.write_text(
+        "-----BEGIN PRIVATE KEY-----\n"
+        + ("A" * 96)
+        + "\n-----END PRIVATE KEY-----\n",
+        encoding="ascii",
+    )
+    subprocess.run(["git", "-C", str(tmp_path), "add", "notes.txt"], check=True)
+
+    completed = _run_scanner(tmp_path)
+
+    assert completed.returncode == 4, completed.stderr
+    payload = json.loads(completed.stdout)
+    assert payload["status"] == "REJECT"
+    assert any(
+        issue["code"] == "FORBIDDEN_SENSITIVE_CONTENT" and issue["path"] == "notes.txt"
+        for issue in payload["issues"]
+    )
+
+
+def test_boundary_scan_allows_benign_documentation_mentions(tmp_path: Path) -> None:
+    _init_git_repo(tmp_path)
+    candidate = tmp_path / "README.md"
+    candidate.write_text(
+        "This guide mentions <febio_spec> and -----BEGIN PRIVATE KEY----- "
+        "as prohibited examples, without a payload.",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "-C", str(tmp_path), "add", "README.md"], check=True)
+
+    completed = _run_scanner(tmp_path)
+
+    assert completed.returncode == 0, completed.stderr
+    payload = json.loads(completed.stdout)
+    assert payload["status"] == "PASS"
+    assert payload["issues"] == []
+
+
+def test_boundary_scan_reports_filesystem_read_errors(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _init_git_repo(tmp_path)
+
+    def failing_walk(*args: object, **kwargs: object):
+        onerror = kwargs["onerror"]
+        assert callable(onerror)
+        onerror(PermissionError(13, "permission denied", str(tmp_path / "blocked")))
+        yield str(tmp_path), [], []
+
+    monkeypatch.setattr(scanner_module.os, "walk", failing_walk)
+    report = scanner_module.scan_root(tmp_path)
+
+    assert report["status"] == "INCOMPLETE"
+    assert any(
+        issue["code"] == "FILESYSTEM_READ_ERROR" for issue in report["issues"]
+    )
+
+
+def test_boundary_scan_rejects_reparse_points_without_traversal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _init_git_repo(tmp_path)
+    reparse_directory = tmp_path / "junction-like"
+    reparse_directory.mkdir()
+    (reparse_directory / "hidden.feb").write_text("synthetic", encoding="utf-8")
+    monkeypatch.setattr(
+        scanner_module,
+        "_is_reparse_point",
+        lambda path: Path(path) == reparse_directory,
+    )
+
+    report = scanner_module.scan_root(tmp_path)
+
+    assert report["status"] == "INCOMPLETE"
+    assert any(
+        issue["code"] == "UNSAFE_REPARSE_POINT" for issue in report["issues"]
+    )
