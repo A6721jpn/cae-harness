@@ -20,6 +20,7 @@ def _optional_module(name: str) -> ModuleType | None:
 
 CONTACT_MODULE = _optional_module("febio_cae.domain.contact")
 SELECTION_MODULE = _optional_module("febio_cae.domain.selection")
+_MISSING = object()
 
 
 def _contact() -> ModuleType:
@@ -67,12 +68,12 @@ def _frictionless(contact: ModuleType) -> Any:
 def _coulomb(
     contact: ModuleType,
     *,
-    coefficient: Quantity | None = None,
+    coefficient: object = _MISSING,
     model_evidence: EvidenceRef | None = None,
     coefficient_evidence: EvidenceRef | None = None,
 ) -> Any:
     return contact.CoulombFriction(
-        coefficient=Quantity(0.25, "1") if coefficient is None else coefficient,
+        coefficient=Quantity(0.25, "1") if coefficient is _MISSING else coefficient,
         model_evidence=(
             _evidence("contact.friction_model", "d") if model_evidence is None else model_evidence
         ),
