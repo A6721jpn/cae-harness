@@ -712,7 +712,26 @@ class MeshArtifact:
                         expected_first[4],
                         expected_first[3],
                     )
-                    if expected != opposite:
+                    opposite_cycles = (
+                        opposite,
+                        (
+                            opposite[1],
+                            opposite[2],
+                            opposite[0],
+                            opposite[4],
+                            opposite[5],
+                            opposite[3],
+                        ),
+                        (
+                            opposite[2],
+                            opposite[0],
+                            opposite[1],
+                            opposite[5],
+                            opposite[3],
+                            opposite[4],
+                        ),
+                    )
+                    if expected not in opposite_cycles:
                         raise ArtifactValidationError(
                             "interior face adjacent elements must use opposite orientation"
                         )
