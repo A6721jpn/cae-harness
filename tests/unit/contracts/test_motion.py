@@ -241,3 +241,32 @@ def test_motion_applicability_requires_nonempty_statements() -> None:
             rate_independent_statement="rate-independent",
             rate_independent_evidence=_evidence("motion.rate_independent_applicability"),
         )
+
+
+def test_motion_profile_retains_evidence_for_each_physical_field() -> None:
+    motion = _motion()
+    payload = _profile(motion).to_dict()
+
+    assert {
+        "direction_evidence",
+        "initial_reference_point_evidence",
+        "history_evidence",
+    } <= set(payload)
+
+
+@pytest.mark.parametrize(
+    "vector",
+    [
+        (-4.169659670808031, -0.007757769290062555, -8.308205353086127),
+        (math.ulp(0.0), math.ulp(0.0), 0.0),
+        (1.0, 2.0, 3.0),
+    ],
+)
+def test_motion_profile_direction_roundtrip_preserves_canonical_bytes(
+    vector: tuple[float, float, float],
+) -> None:
+    motion = _motion()
+    profile = _profile(motion, direction=UnitDirection(FrameId("World"), *vector))
+    restored = motion.MotionProfile.from_dict(profile.to_dict())
+
+    assert restored.to_bytes() == profile.to_bytes()
