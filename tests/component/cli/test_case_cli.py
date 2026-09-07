@@ -14,17 +14,20 @@ def test_case_cli_create_inspect_and_spec_use_registered_state(
     cad_path.write_bytes(b"cli-step")
     case_root = tmp_path / "case-root"
 
-    assert main(
-        [
-            "case",
-            "create",
-            "--case-root",
-            str(case_root),
-            "--cad",
-            str(cad_path),
-            "--json",
-        ]
-    ) == 0
+    assert (
+        main(
+            [
+                "case",
+                "create",
+                "--case-root",
+                str(case_root),
+                "--cad",
+                str(cad_path),
+                "--json",
+            ]
+        )
+        == 0
+    )
     created = json.loads(capsys.readouterr().out)
     case_id = created["case_id"]
 
