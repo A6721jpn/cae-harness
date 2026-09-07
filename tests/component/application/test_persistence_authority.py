@@ -4,7 +4,7 @@ import hashlib
 from collections.abc import Callable
 from dataclasses import fields, is_dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -368,8 +368,9 @@ def _with_unregistered_nested_evidence(value: Any) -> Any:
     if isinstance(value, list):
         return [_with_unregistered_nested_evidence(item) for item in value]
     if is_dataclass(value):
+        dataclass_value = cast(Any, value)
         return replace(
-            value,
+            dataclass_value,
             **{
                 item.name: _with_unregistered_nested_evidence(getattr(value, item.name))
                 for item in fields(value)
