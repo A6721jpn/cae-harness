@@ -469,8 +469,8 @@ def test_mesh_contract_exposes_canonical_tet10_tables_and_nonempty_typed_sets() 
     )
     assert TET10_FACE_NODE_POSITIONS == (
         (0, 2, 1, 6, 5, 4),
-        (0, 1, 3, 4, 7, 8),
-        (1, 2, 3, 5, 8, 9),
+        (0, 1, 3, 4, 8, 7),
+        (1, 2, 3, 5, 9, 8),
         (0, 3, 2, 7, 9, 6),
     )
     mesh = _mesh()
