@@ -9,12 +9,15 @@ import pytest
 
 from febio_cae.domain import (
     BodyId,
+    CoordinatePredicate,
+    CoordinatePredicateRule,
     EvidenceRef,
     FaceId,
     FaceSetRule,
     FrameId,
     Quantity,
     SelectionRef,
+    UnitDirection,
     WholeBodyRule,
     canonical_bytes,
 )
@@ -53,6 +56,7 @@ def _selection(
     geometry_digest: str = "d" * 64,
     body_id: BodyId | None = None,
     frame: FrameId | None = None,
+    name: str = "part-selection",
 ) -> SelectionRef:
     body = BodyId("body-A") if body_id is None else body_id
     selected_frame = FrameId("World") if frame is None else frame
@@ -67,12 +71,37 @@ def _selection(
             provenance=_evidence("selection.faces", "b"),
         )
     return SelectionRef(
-        name="part-selection",
+        name=name,
         role="part",
         role_evidence=_evidence("selection.role", "c"),
         geometry_digest=geometry_digest,
         body_id=body,
         frame=selected_frame,
+        rule=rule,
+    )
+
+
+def _coordinate_selection(value: Quantity) -> SelectionRef:
+    body = BodyId("body-A")
+    frame = FrameId("World")
+    rule = CoordinatePredicateRule(
+        body_id=body,
+        frame=frame,
+        predicates=(
+            CoordinatePredicate(
+                axis=UnitDirection(frame=frame, x=1.0, y=0.0, z=0.0),
+                operator="eq",
+                value=value,
+            ),
+        ),
+    )
+    return SelectionRef(
+        name="part-selection",
+        role="part",
+        role_evidence=_evidence("selection.role", "c"),
+        geometry_digest="d" * 64,
+        body_id=body,
+        frame=frame,
         rule=rule,
     )
 
@@ -500,6 +529,45 @@ def test_mesh_policy_rejects_nested_invalid_unicode_and_accepts_unicode_identity
     unicode_profile = _profile(profile_id="品質-プロファイル")
     assert unicode_profile.profile_id == "品質-プロファイル"
     assert unicode_profile.to_bytes() != _profile().to_bytes()
+
+
+def test_numerical_profile_constructor_rejects_surrogate_id_at_canonical_boundary() -> None:
+    mesh = _mesh()
+    with pytest.raises(
+        mesh.MeshPolicyValidationError,
+        match="profile projection is not canonically serializable",
+    ):
+        _profile(profile_id="\ud800")
+
+
+def test_local_refinement_constructor_rejects_surrogate_selection_text_at_canonical_boundary() -> None:
+    mesh = _mesh()
+    selection = _selection(name="\ud800")
+    assert selection.name == "\ud800"
+
+    with pytest.raises(
+        mesh.MeshPolicyValidationError,
+        match="local refinement projection is not canonically serializable",
+    ):
+        _local(mesh, selection=selection)
+
+
+@pytest.mark.parametrize(
+    "bad_quantity",
+    [Quantity(10**400, "m"), Quantity(5e-324, "mm")],
+    ids=["overflow", "underflow"],
+)
+def test_local_refinement_constructor_rejects_non_si_nested_coordinate_quantity(
+    bad_quantity: Quantity,
+) -> None:
+    mesh = _mesh()
+    selection = _coordinate_selection(bad_quantity)
+
+    with pytest.raises(
+        mesh.MeshPolicyValidationError,
+        match="local refinement projection is not canonically serializable",
+    ):
+        _local(mesh, selection=selection)
 
 
 def test_mesh_policy_is_immutable_and_projection_isolated() -> None:
