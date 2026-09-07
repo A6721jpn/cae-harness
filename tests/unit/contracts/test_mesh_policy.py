@@ -540,7 +540,9 @@ def test_numerical_profile_constructor_rejects_surrogate_id_at_canonical_boundar
         _profile(profile_id="\ud800")
 
 
-def test_local_refinement_constructor_rejects_surrogate_selection_text_at_canonical_boundary() -> None:
+def test_local_refinement_constructor_rejects_surrogate_selection_text_at_canonical_boundary() -> (
+    None
+):
     mesh = _mesh()
     selection = _selection(name="\ud800")
     assert selection.name == "\ud800"
