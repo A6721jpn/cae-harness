@@ -53,6 +53,7 @@ try:
         AssessmentStatus,
         CriterionAssessment,
         MeasuredValue,
+        NumericResultData,
         OutputObservation,
         QualityAssessment,
         ReadResult,
@@ -171,7 +172,7 @@ def _mesh() -> Any:
         ),
         nodes=tuple(MeshNode(index, (float(index), 0.0, 0.0)) for index in range(1, 11)),
         elements=(MeshElement(1, "tet10", tuple(range(1, 11)), "part-body"),),
-        faces=(MeshFace("face-1", "part-body", (1, 2, 3, 5, 6, 7), (1,), (0,)),),
+        faces=(MeshFace("face-1", "part-body", (1, 3, 2, 7, 6, 5), (1,), (0,)),),
         sets=(
             MeshSet("body-set", "body", "part-body", ("part-body",), "b" * 64),
             MeshSet("face-set", "face", "part-body", ("face-1",), "b" * 64),
@@ -467,10 +468,10 @@ def test_mesh_contract_exposes_canonical_tet10_tables_and_nonempty_typed_sets() 
         (2, 3),
     )
     assert TET10_FACE_NODE_POSITIONS == (
-        (0, 1, 2, 4, 5, 6),
+        (0, 2, 1, 6, 5, 4),
         (0, 1, 3, 4, 7, 8),
         (1, 2, 3, 5, 8, 9),
-        (0, 2, 3, 6, 7, 9),
+        (0, 3, 2, 7, 9, 6),
     )
     mesh = _mesh()
     assert any(item.kind == "face" and item.member_ids == ("face-1",) for item in mesh.sets)
@@ -490,6 +491,187 @@ def test_mesh_rejects_cross_body_and_bad_oriented_face_references() -> None:
             faces=mesh.faces,
             sets=mesh.sets,
             quality_records=mesh.quality_records,
+        )
+
+
+def test_tet10_face_table_has_outward_tri6_orientation_and_edge_midpoints() -> None:
+    _require_repair_api()
+    coordinates = (
+        (0.0, 0.0, 0.0),
+        (2.0, 0.0, 0.0),
+        (0.0, 3.0, 0.0),
+        (0.0, 0.0, 5.0),
+        (1.0, 0.0, 0.0),
+        (1.0, 1.5, 0.0),
+        (0.0, 1.5, 0.0),
+        (0.0, 0.0, 2.5),
+        (1.0, 0.0, 2.5),
+        (0.0, 1.5, 2.5),
+    )
+    edges = TET10_EDGE_NODE_POSITIONS
+
+    def subtract(left: tuple[float, ...], right: tuple[float, ...]) -> tuple[float, ...]:
+        return tuple(a - b for a, b in zip(left, right, strict=True))
+
+    def cross(left: tuple[float, ...], right: tuple[float, ...]) -> tuple[float, ...]:
+        return (
+            left[1] * right[2] - left[2] * right[1],
+            left[2] * right[0] - left[0] * right[2],
+            left[0] * right[1] - left[1] * right[0],
+        )
+
+    def dot(left: tuple[float, ...], right: tuple[float, ...]) -> float:
+        return sum(a * b for a, b in zip(left, right, strict=True))
+
+    for face in TET10_FACE_NODE_POSITIONS:
+        corners = face[:3]
+        normal = cross(
+            subtract(coordinates[corners[1]], coordinates[corners[0]]),
+            subtract(coordinates[corners[2]], coordinates[corners[0]]),
+        )
+        opposite = next(index for index in range(4) if index not in corners)
+        toward_opposite = subtract(coordinates[opposite], coordinates[corners[0]])
+        assert dot(normal, toward_opposite) < 0.0
+        expected_edges = tuple(
+            (corners[index], corners[(index + 1) % 3]) for index in range(3)
+        )
+        for midpoint_position, edge in zip(face[3:], expected_edges, strict=True):
+            midpoint = coordinates[midpoint_position]
+            endpoints = (coordinates[edge[0]], coordinates[edge[1]])
+            assert midpoint == tuple((a + b) / 2.0 for a, b in zip(*endpoints, strict=True))
+            assert edge in edges or (edge[1], edge[0]) in edges
+
+
+def test_mesh_accepts_two_bodies_all_set_kinds_and_rejects_contradictory_ownership() -> None:
+    _require_repair_api()
+    provenance = MeshProvenance(
+        source_geometry_digest="a" * 64,
+        source_body_ids=("body-a", "body-b"),
+        source_selection_digests=("b" * 64, "c" * 64),
+        mesh_recipe_digest="d" * 64,
+        tool_id="gmsh",
+        tool_version="4.12.0",
+        mapping_id="tet10-gmsh-febio-v1",
+        node_ordering_id="tet10-canonical-v1",
+        face_ordering_id="tet10-face-canonical-v1",
+    )
+    nodes = tuple(MeshNode(index, (float(index), 0.0, 0.0)) for index in range(1, 22))
+    elements = (
+        MeshElement(1, "tet10", tuple(range(1, 11)), "body-a"),
+        MeshElement(2, "tet10", tuple(range(11, 21)), "body-b"),
+    )
+    faces = (
+        MeshFace("face-a", "body-a", (1, 3, 2, 7, 6, 5), (1,), (0,)),
+        MeshFace("face-b", "body-b", (11, 13, 12, 17, 16, 15), (2,), (0,)),
+    )
+    sets = (
+        MeshSet("nodes-a", "node", "body-a", (1,), "b" * 64),
+        MeshSet("elements-a", "element", "body-a", (1,), "b" * 64),
+        MeshSet("faces-a", "face", "body-a", ("face-a",), "b" * 64),
+        MeshSet("bodies-a", "body", "body-a", ("body-a",), "b" * 64),
+        MeshSet("nodes-b", "node", "body-b", (11,), "c" * 64),
+        MeshSet("elements-b", "element", "body-b", (2,), "c" * 64),
+        MeshSet("faces-b", "face", "body-b", ("face-b",), "c" * 64),
+        MeshSet("bodies-b", "body", "body-b", ("body-b",), "c" * 64),
+    )
+    mesh = MeshArtifact(
+        artifact_id="two-body-mesh",
+        frame=FrameId("World"),
+        provenance=provenance,
+        nodes=nodes,
+        elements=elements,
+        faces=faces,
+        sets=sets,
+        quality_records=(
+            MeshQualityRecord("jacobian", 0.5, "1", 0.0, AssessmentStatus.PASS, "synthetic"),
+        ),
+    )
+    assert {item.kind for item in mesh.sets} == {"node", "element", "face", "body"}
+    with pytest.raises(ValueError, match="body set|membership"):
+        MeshArtifact(
+            artifact_id="contradictory-body-set",
+            frame=mesh.frame,
+            provenance=mesh.provenance,
+            nodes=mesh.nodes,
+            elements=mesh.elements,
+            faces=mesh.faces,
+            sets=mesh.sets
+            + (MeshSet("bad-body", "body", "body-a", ("body-b",), "b" * 64),),
+            quality_records=mesh.quality_records,
+        )
+    with pytest.raises(ValueError, match="node set|ownership"):
+        MeshArtifact(
+            artifact_id="isolated-node-set",
+            frame=mesh.frame,
+            provenance=mesh.provenance,
+            nodes=mesh.nodes,
+            elements=mesh.elements,
+            faces=mesh.faces,
+            sets=mesh.sets + (MeshSet("bad-node", "node", "body-a", (21,), "b" * 64),),
+            quality_records=mesh.quality_records,
+        )
+
+
+def test_mesh_requires_opposite_oriented_interior_face_pair() -> None:
+    _require_repair_api()
+    provenance = MeshProvenance(
+        "a" * 64,
+        ("body-a",),
+        ("b" * 64,),
+        "c" * 64,
+        "gmsh",
+        "4.12.0",
+        "tet10-gmsh-febio-v1",
+        "tet10-canonical-v1",
+        "tet10-face-canonical-v1",
+    )
+    nodes = tuple(MeshNode(index, (float(index), 0.0, 0.0)) for index in range(1, 15))
+    first = MeshElement(1, "tet10", tuple(range(1, 11)), "body-a")
+    opposite = MeshElement(2, "tet10", (1, 3, 2, 11, 7, 6, 5, 12, 13, 14), "body-a")
+    boundary = MeshFace("boundary", "body-a", (1, 2, 4, 5, 9, 8), (1,), (1,))
+    interior = MeshFace("interior", "body-a", (1, 3, 2, 7, 6, 5), (1, 2), (0, 0))
+    sets = (
+        MeshSet("body", "body", "body-a", ("body-a",), "b" * 64),
+        MeshSet("element", "element", "body-a", (1,), "b" * 64),
+        MeshSet("face", "face", "body-a", ("interior",), "b" * 64),
+    )
+    mesh = MeshArtifact(
+        "interior-pair",
+        FrameId("World"),
+        provenance,
+        nodes,
+        (first, opposite),
+        (boundary, interior),
+        sets,
+        (MeshQualityRecord("jacobian", 0.5, "1", 0.0, AssessmentStatus.PASS, "synthetic"),),
+    )
+    assert mesh.faces[1].adjacent_element_ids == (1, 2)
+    same_orientation = MeshElement(
+        2, "tet10", (1, 2, 3, 11, 5, 6, 7, 12, 13, 14), "body-a"
+    )
+    with pytest.raises(ValueError, match="opposite|orientation"):
+        MeshArtifact(
+            "same-pair",
+            FrameId("World"),
+            provenance,
+            nodes,
+            (first, same_orientation),
+            (boundary, interior),
+            sets,
+            (MeshQualityRecord("jacobian", 0.5, "1", 0.0, AssessmentStatus.PASS, "synthetic"),),
+        )
+    with pytest.raises(ValueError, match="two|adjacent"):
+        MeshArtifact(
+            "too-many-adjacent",
+            FrameId("World"),
+            provenance,
+            nodes,
+            (first, opposite),
+            (
+                MeshFace("overfull", "body-a", (1, 3, 2, 7, 6, 5), (1, 2, 1), (0, 0, 0)),
+            ),
+            sets,
+            (MeshQualityRecord("jacobian", 0.5, "1", 0.0, AssessmentStatus.PASS, "synthetic"),),
         )
     with pytest.raises(ValueError, match="face|local|node"):
         MeshArtifact(
@@ -516,6 +698,8 @@ def test_file_identity_rejects_windows_lexical_forms_and_casefold_collisions(
     ):
         with pytest.raises(ValueError):
             FileEntry(path, "a" * 64, 1, "output")
+        with pytest.raises(ValueError):
+            ResultDataRef("data-interface", "a" * 64, "numeric-result-v1", path)
     revision = case_revision(synthetic_case_spec)
     mesh = _mesh()
     profile = _profile()
@@ -642,11 +826,11 @@ def test_source_and_numeric_data_contracts_carry_actual_resolved_values() -> Non
         axis_id="time",
         axis_unit="s",
         axis_values=(0.0, 1.0),
-        entity_ids=("node-1",),
+        entity_ids=("node-1", "node-2"),
         component_ids=("x", "y", "z"),
-        values=((0.0, 0.0, 0.0), (0.1, 0.0, 0.0)),
+        values=((0.0, 0.0, 0.0, 1.0, 1.0, 1.0), (0.1, 0.0, 0.0, 1.1, 0.0, 0.0)),
     )
-    assert data.values[1][0] == 0.1
+    assert data.values[1][3] == 1.1
     assert data.axis_values == (0.0, 1.0)
 
 

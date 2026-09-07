@@ -14,10 +14,14 @@ from febio_cae.domain import (
     CasePatchEdit,
     CaseRevision,
     FileEntry,
+    FrameId,
     IssuedQuestion,
+    NumericResultData,
+    OutputMapping,
     OperationStatus,
     PartialCaseSpec,
     PreviewRequest,
+    ResultDataRef,
 )
 
 try:
@@ -133,3 +137,138 @@ def test_codec_round_trips_all_declared_service_and_leaf_top_level_records() -> 
     for record in records:
         restored = decode_record(encode_record(record), type(record))
         assert cast(Any, restored).to_bytes() == record.to_bytes()
+
+
+def _numeric_data() -> NumericResultData:
+    seed = NumericResultData(
+        reference=ResultDataRef(
+            "numeric-data",
+            "0" * 64,
+            "numeric-result-v1",
+            "output/case.xplt",
+            "b" * 64,
+            "attempt-interface",
+        ),
+        mapping=OutputMapping(
+            "displacement",
+            "displacement",
+            "node",
+            "VEC3F",
+            "m",
+            FrameId("World"),
+            -1,
+            1,
+            "value",
+        ),
+        axis_id="time",
+        axis_unit="s",
+        axis_values=(0.0, 1.0),
+        entity_ids=("node-1", "node-2"),
+        component_ids=("x", "y", "z"),
+        values=((0.0, 0.0, 0.0, 1.0, 1.0, 1.0), (0.2, 0.0, 0.0, 1.2, 0.0, 0.0)),
+    )
+    reference = ResultDataRef(
+        "numeric-data",
+        seed.expected_content_digest,
+        "numeric-result-v1",
+        "output/case.xplt",
+        "b" * 64,
+        "attempt-interface",
+    )
+    return NumericResultData(
+        reference,
+        seed.mapping,
+        seed.axis_id,
+        seed.axis_unit,
+        seed.axis_values,
+        seed.entity_ids,
+        seed.component_ids,
+        seed.values,
+    )
+
+
+def test_numeric_result_and_reference_have_registered_strict_codecs() -> None:
+    _require_codec()
+    numeric = _numeric_data()
+    reference = numeric.reference
+    restored_reference = decode_record(encode_record(reference), ResultDataRef)
+    restored_numeric = decode_record(encode_record(numeric), NumericResultData)
+    assert restored_reference.to_bytes() == reference.to_bytes()
+    assert restored_numeric.to_bytes() == numeric.to_bytes()
+    assert restored_numeric.reference.bundle_digest == "b" * 64
+    assert restored_numeric.reference.attempt_id == "attempt-interface"
+    assert restored_numeric.mapping.raw_sign == -1
+    assert restored_numeric.values == numeric.values
+    numeric.verify_content_digest()
+
+
+def test_numeric_codec_rejects_wrong_schema_codec_digest_shape_and_nonfinite() -> None:
+    _require_codec()
+    numeric = _numeric_data()
+    encoded = json.loads(encode_record(numeric))
+    bad_schema = dict(encoded)
+    bad_schema["schema_version"] = "2"
+    with pytest.raises(CodecError, match="schema"):
+        decode_record(json.dumps(bad_schema), NumericResultData)
+    bad_codec = json.loads(json.dumps(encoded))
+    bad_codec["reference"]["codec_id"] = "other-v1"
+    with pytest.raises(CodecError, match="codec"):
+        decode_record(json.dumps(bad_codec), NumericResultData)
+    bad_digest = json.loads(json.dumps(encoded))
+    bad_digest["content_digest"] = "f" * 64
+    with pytest.raises(CodecError, match="digest"):
+        decode_record(json.dumps(bad_digest), NumericResultData)
+    bad_shape = json.loads(json.dumps(encoded))
+    bad_shape["values"][0].pop()
+    with pytest.raises(CodecError, match="width|mapping|numeric"):
+        decode_record(json.dumps(bad_shape), NumericResultData)
+    bad_number = json.loads(json.dumps(encoded))
+    bad_number["values"][0][0] = float("nan")
+    with pytest.raises(CodecError, match="finite|NaN"):
+        decode_record(json.dumps(bad_number), NumericResultData)
+
+
+def test_manifest_codec_reuses_strong_result_reference_path_rule() -> None:
+    _require_codec()
+    from febio_cae.domain.results import (
+        OutputObservation,
+        ReadResult,
+        ReadStatus,
+        ResultManifest,
+    )
+    manifest = ResultManifest(
+        "manifest-interface",
+        "attempt-interface",
+        "b" * 64,
+        (FileEntry("output/case.xplt", "a" * 64, 1, "xplt"),),
+        ReadResult(
+            ReadStatus.VALIDATED,
+            _reader := __import__("febio_cae.domain", fromlist=["ToolIdentity"]).ToolIdentity(
+                "reader", "1", "c" * 64
+            ),
+            (
+                OutputObservation(
+                    "displacement",
+                    "node",
+                    "VEC3F",
+                    "m",
+                    FrameId("World"),
+                    "value",
+                    2,
+                    ResultDataRef(
+                        "numeric-data",
+                        "d" * 64,
+                        "numeric-result-v1",
+                        "output/case.xplt",
+                        "b" * 64,
+                        "attempt-interface",
+                    ),
+                ),
+            ),
+            (),
+        ),
+    )
+    payload = json.loads(encode_record(manifest))
+    payload["read_result"]["observations"][0]["data_ref"]["logical_path"] = "output/NUL.xplt"
+    with pytest.raises(CodecError, match="logical_path|ambiguous|reserved"):
+        decode_record(json.dumps(payload), type(manifest))

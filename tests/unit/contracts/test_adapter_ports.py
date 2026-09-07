@@ -142,6 +142,7 @@ def test_connected_synthetic_consumer_reads_source_and_actual_numeric_states() -
         ResolutionSnapshot,
         SelectionRef,
     )
+    from febio_cae.domain.codec import decode_record, encode_record
 
     raw_source = b"registered-source"
     source_ref = __import__("febio_cae.domain", fromlist=["SourceAssetRef"]).SourceAssetRef(
@@ -234,9 +235,9 @@ def test_connected_synthetic_consumer_reads_source_and_actual_numeric_states() -
         axis_id="time",
         axis_unit="s",
         axis_values=(0.0, 1.0),
-        entity_ids=("node-1",),
+        entity_ids=("node-1", "node-2"),
         component_ids=("x", "y", "z"),
-        values=((0.0, 0.0, 0.0), (0.2, 0.0, 0.0)),
+        values=((0.0, 0.0, 0.0, 1.0, 1.0, 1.0), (0.2, 0.0, 0.0, 1.2, 0.0, 0.0)),
     )
     data_ref = ResultDataRef(
         "displacement-data",
@@ -256,6 +257,42 @@ def test_connected_synthetic_consumer_reads_source_and_actual_numeric_states() -
         component_ids=numeric_seed.component_ids,
         values=numeric_seed.values,
     )
+    output_seed = NumericResultData(
+        reference=ResultDataRef(
+            "manifest-displacement-data",
+            "0" * 64,
+            "numeric-result-v1",
+            "output/case.xplt",
+            "c" * 64,
+            "attempt-interface",
+        ),
+        mapping=numeric.mapping,
+        axis_id=numeric.axis_id,
+        axis_unit=numeric.axis_unit,
+        axis_values=numeric.axis_values,
+        entity_ids=numeric.entity_ids,
+        component_ids=numeric.component_ids,
+        values=numeric.values,
+    )
+    output_numeric = NumericResultData(
+        reference=ResultDataRef(
+            "manifest-displacement-data",
+            output_seed.expected_content_digest,
+            "numeric-result-v1",
+            "output/case.xplt",
+            "c" * 64,
+            "attempt-interface",
+        ),
+        mapping=output_seed.mapping,
+        axis_id=output_seed.axis_id,
+        axis_unit=output_seed.axis_unit,
+        axis_values=output_seed.axis_values,
+        entity_ids=output_seed.entity_ids,
+        component_ids=output_seed.component_ids,
+        values=output_seed.values,
+    )
+    encoded_numeric = encode_record(numeric)
+    encoded_output = encode_record(output_numeric)
 
     class ResultResolver:
         def resolve_file(self, entry: Any, bundle: Any, attempt: Any) -> Any:
@@ -265,13 +302,17 @@ def test_connected_synthetic_consumer_reads_source_and_actual_numeric_states() -
 
         def resolve(self, reference: Any) -> Any:
             assert reference == data_ref
-            numeric.verify_content_digest()
-            return numeric
+            restored = decode_record(self._by_data_id[reference.data_id], NumericResultData)
+            restored.verify_content_digest()
+            return restored
 
         def resolve_manifest_output(self, manifest_id: str, output_id: str) -> Any:
             assert manifest_id == "manifest-interface"
             assert output_id == "displacement"
-            return numeric
+            return decode_record(self._by_manifest_output[(manifest_id, output_id)], NumericResultData)
+
+        _by_data_id = {"displacement-data": encoded_numeric}
+        _by_manifest_output = {("manifest-interface", "displacement"): encoded_output}
 
     result_resolver = ResultResolver()
     assert isinstance(result_resolver, ResultDataPort)
@@ -280,6 +321,6 @@ def test_connected_synthetic_consumer_reads_source_and_actual_numeric_states() -
     )
     assert result_resolver.resolve_file(file_entry, None, None).content == b"file-bytes"
     assert result_resolver.resolve(data_ref).values[1][0] == 0.2
-    assert result_resolver.resolve_manifest_output(
-        "manifest-interface", "displacement"
-    ).axis_values == (0.0, 1.0)
+    manifest_output = result_resolver.resolve_manifest_output("manifest-interface", "displacement")
+    assert manifest_output.axis_values == (0.0, 1.0)
+    assert manifest_output.reference.data_id == "manifest-displacement-data"
