@@ -6,6 +6,7 @@ import re
 from collections.abc import Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
+from typing import cast
 
 from .canonical import canonical_bytes
 from .evidence import EvidenceRef
@@ -134,7 +135,7 @@ class QualityCriterion:
         raw_thresholds = _copy_sequence(self.thresholds, "thresholds")
         if any(not isinstance(item, QualityThreshold) for item in raw_thresholds):
             raise QualityPolicyValidationError("thresholds contains an invalid QualityThreshold")
-        thresholds = tuple(raw_thresholds)
+        thresholds = cast(tuple[QualityThreshold, ...], tuple(raw_thresholds))
         parameter_ids = [item.parameter_id for item in thresholds]
         if len(set(parameter_ids)) != len(parameter_ids):
             duplicate = min(
@@ -194,7 +195,7 @@ class QualityPolicy:
             raise QualityPolicyValidationError("criteria must be nonempty")
         if any(not isinstance(item, QualityCriterion) for item in raw_criteria):
             raise QualityPolicyValidationError("criteria contains an invalid QualityCriterion")
-        criteria = tuple(raw_criteria)
+        criteria = cast(tuple[QualityCriterion, ...], tuple(raw_criteria))
         criterion_ids = [item.criterion_id for item in criteria]
         if len(set(criterion_ids)) != len(criterion_ids):
             duplicate = min(
