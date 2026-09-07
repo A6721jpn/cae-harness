@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import re
 from dataclasses import FrozenInstanceError
 from types import ModuleType
 from typing import Any
@@ -215,8 +216,18 @@ def test_each_digest_role_changes_canonical_bytes(field: str) -> None:
 )
 def test_geometry_evidence_is_bound_to_exact_fields(field: str, wrong_target: str) -> None:
     geometry = _geometry()
-    with pytest.raises(ValueError):
-        _value(geometry, **{field: _evidence(wrong_target, "z")})
+    expected_target = {
+        "body_evidence": "geometry.body_id",
+        "unit_evidence": "geometry.step_unit",
+        "placement_evidence": "geometry.placement",
+    }[field]
+    wrong_evidence = _evidence(wrong_target, "0")
+
+    with pytest.raises(
+        geometry.GeometryValidationError,
+        match=rf"^{re.escape(field)} must target {re.escape(expected_target)}$",
+    ):
+        _value(geometry, **{field: wrong_evidence})
 
 
 @pytest.mark.parametrize("field", ["body_evidence", "unit_evidence", "placement_evidence"])
