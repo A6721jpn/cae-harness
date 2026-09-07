@@ -44,6 +44,7 @@ def _selection(
     role: str,
     body: BodyId | None = None,
     frame: FrameId | None = None,
+    geometry_digest: str = "a" * 64,
     rule: Any = None,
 ) -> Any:
     selection = SELECTION_MODULE
@@ -54,7 +55,7 @@ def _selection(
         name=f"{role}-selection",
         role=role,
         role_evidence=_evidence("selection.role", "a"),
-        geometry_digest="a" * 64,
+        geometry_digest=geometry_digest,
         body_id=body,
         frame=frame,
         rule=selection.WholeBodyRule(body) if rule is None else rule,
@@ -205,19 +206,53 @@ def test_contact_preserves_explicit_pair_roles_frames_evidence_and_canonical_byt
     assert value.to_bytes() == canonical_bytes(payload)
 
 
-def test_contact_allows_same_source_geometry_digest_but_rejects_body_collision() -> None:
+@pytest.mark.parametrize(
+    ("part_seed", "tool_seed", "part_body", "tool_body", "reject"),
+    [
+        ("a", "a", "body-1", "body-1", True),
+        ("a", "a", "body-1", "body-2", False),
+        ("a", "b", "body-1", "body-1", False),
+        ("a", "b", "body-1", "body-2", False),
+    ],
+    ids=[
+        "same-source-same-body-rejects",
+        "same-source-different-body-accepts",
+        "different-source-same-body-accepts",
+        "different-source-different-body-accepts",
+    ],
+)
+def test_contact_body_identity_is_scoped_to_source_geometry(
+    part_seed: str,
+    tool_seed: str,
+    part_body: str,
+    tool_body: str,
+    reject: bool,
+) -> None:
     contact = _contact()
-    value = _intent(contact)
-    assert value.part_surface.source_geometry_digest == value.tool_surface.source_geometry_digest
-
-    with pytest.raises(ValueError):
-        _intent(
-            contact,
-            tool_surface=_selection(
-                role="tool_contact_surface",
-                body=BodyId("part-body"),
-            ),
-        )
+    frame = FrameId("ContactFrame")
+    values = {
+        "part_surface": _selection(
+            role="part_contact_surface",
+            body=BodyId(part_body),
+            frame=frame,
+            geometry_digest=part_seed * 64,
+        ),
+        "tool_surface": _selection(
+            role="tool_contact_surface",
+            body=BodyId(tool_body),
+            frame=frame,
+            geometry_digest=tool_seed * 64,
+        ),
+    }
+    if reject:
+        with pytest.raises(ValueError):
+            _intent(contact, **values)
+    else:
+        value = _intent(contact, **values)
+        assert value.part_surface.body_id.value == part_body
+        assert value.tool_surface.body_id.value == tool_body
+        assert value.part_surface.source_geometry_digest == part_seed * 64
+        assert value.tool_surface.source_geometry_digest == tool_seed * 64
 
 
 def test_contact_requires_exact_part_and_tool_roles_and_matching_pair_frame() -> None:
