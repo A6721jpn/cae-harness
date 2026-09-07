@@ -422,6 +422,7 @@ def test_motion_profile_rejects_unrepresentable_initial_reference_coordinates(
         else:
             payload = _profile(motion).to_dict()
             payload["initial_reference_point"][coordinate]["value"] = quantity.value
+            payload["initial_reference_point"][coordinate]["unit"] = quantity.unit
             motion.MotionProfile.from_dict(payload)
 
     assert range_kind in {"overflow", "underflow"}
