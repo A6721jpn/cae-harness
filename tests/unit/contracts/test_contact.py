@@ -106,9 +106,9 @@ def _specified_gap(
             if arrangement_evidence is None
             else arrangement_evidence
         ),
-        gap_evidence=(_evidence("contact.gap", "g") if gap_evidence is None else gap_evidence),
+        gap_evidence=(_evidence("contact.gap", "1") if gap_evidence is None else gap_evidence),
         direction_evidence=(
-            _evidence("contact.direction", "h")
+            _evidence("contact.direction", "2")
             if direction_evidence is None
             else direction_evidence
         ),
@@ -153,7 +153,7 @@ def _intent_kwargs(
             else tool_surface_evidence
         ),
         "pair_frame_evidence": (
-            _evidence("contact.frame", "i") if pair_frame_evidence is None else pair_frame_evidence
+            _evidence("contact.frame", "3") if pair_frame_evidence is None else pair_frame_evidence
         ),
         "friction": _frictionless(contact) if friction is None else friction,
         "arrangement": _as_placed(contact) if arrangement is None else arrangement,
@@ -261,7 +261,7 @@ def test_contact_pair_and_frame_evidence_are_field_bound(
 ) -> None:
     contact = _contact()
     with pytest.raises(ValueError):
-        _intent(contact, **{field: _evidence(wrong_target, "z")})
+        _intent(contact, **{field: _evidence(wrong_target, "4")})
 
 
 def test_contact_friction_forms_preserve_frictionless_and_coulomb_zero_distinction() -> None:
@@ -294,9 +294,9 @@ def test_contact_coulomb_requires_dimensionless_nonnegative_coefficient_and_boun
             _coulomb(contact, coefficient=coefficient)  # type: ignore[arg-type]
 
     with pytest.raises(ValueError):
-        _coulomb(contact, model_evidence=_evidence("contact.friction_coefficient", "z"))
+        _coulomb(contact, model_evidence=_evidence("contact.friction_coefficient", "4"))
     with pytest.raises(ValueError):
-        _coulomb(contact, coefficient_evidence=_evidence("contact.friction_model", "z"))
+        _coulomb(contact, coefficient_evidence=_evidence("contact.friction_model", "4"))
     with pytest.raises((TypeError, ValueError)):
         _intent(contact, friction="penalty")
 
@@ -337,7 +337,7 @@ def test_contact_as_placed_requires_arrangement_evidence_and_has_no_gap_or_direc
     with pytest.raises(TypeError):
         contact.AsPlaced()  # type: ignore[call-arg]
     with pytest.raises(ValueError):
-        contact.AsPlaced(arrangement_evidence=_evidence("contact.gap", "z"))
+        contact.AsPlaced(arrangement_evidence=_evidence("contact.gap", "4"))
 
 
 @pytest.mark.parametrize(
@@ -350,7 +350,7 @@ def test_contact_as_placed_requires_arrangement_evidence_and_has_no_gap_or_direc
 )
 def test_contact_specified_gap_evidence_is_field_bound(field: str, wrong_target: str) -> None:
     contact = _contact()
-    kwargs: dict[str, Any] = {field: _evidence(wrong_target, "z")}
+    kwargs: dict[str, Any] = {field: _evidence(wrong_target, "4")}
     with pytest.raises(ValueError):
         _specified_gap(contact, **kwargs)
 
@@ -425,7 +425,7 @@ def test_contact_composes_selection_semantic_set_canonicalization() -> None:
             body_id=body,
             frame=frame,
             face_ids=[FaceId(face_id) for face_id in face_ids],
-            provenance=_evidence("selection.face_set", "j"),
+            provenance=_evidence("selection.face_set", "5"),
         )
         return _selection(
             role="part_contact_surface",
@@ -451,7 +451,7 @@ def test_contact_copies_nested_face_collections_and_is_immutable() -> None:
         body_id=body,
         frame=frame,
         face_ids=faces,
-        provenance=_evidence("selection.face_set", "j"),
+        provenance=_evidence("selection.face_set", "5"),
     )
     value = _intent(
         contact,
@@ -485,7 +485,7 @@ def test_contact_bytes_change_for_identity_evidence_and_pair_frame_changes() -> 
     changed_identity = _intent(contact, contact_id=contact.ContactId("contact-B"))
     changed_evidence = _intent(
         contact,
-        part_surface_evidence=_evidence("contact.part_surface", "z"),
+        part_surface_evidence=_evidence("contact.part_surface", "4"),
     )
     other_frame = FrameId("OtherFrame")
     changed_frame = _intent(
