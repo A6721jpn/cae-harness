@@ -46,7 +46,7 @@ The implementation deliberately stops before native or physical interpretation:
 
 All public values are frozen dataclasses. Constructors copy caller sequences, reject strings/bytes/mappings/sets where sequences are required, validate nested values and complete canonical serialization, and wrap structural/canonical failures as `OutputPolicyValidationError` with field context.
 
-- `OutputRequest` requires `request_id`, `quantity_id`, `measure_id`, and `component_id` to match the strict ASCII identifier grammar `[A-Za-z_][A-Za-z0-9_]*`. `location` is exactly one of `node`, `element`, `integration_point`, `face`, `surface`, or `rigid_body`. The selection and frame are existing trusted value types, `display_unit` must be a known shared unit symbol with its exact spelling retained, and evidence must target exactly `outputs.requests.<request_id>`.
+- `OutputRequest` requires `request_id`, `quantity_id`, `measure_id`, and `component_id` to match the strict ASCII identifier grammar `[A-Za-z_][A-Za-z0-9_]*`. `location` is exactly one of `node`, `element`, `integration_point`, `face`, `surface`, or `rigid_body`. The selection and frame are existing syntax-validated identity value types; registration and trust are resolved later. `display_unit` must be a known shared unit symbol with its exact spelling retained, and evidence must target exactly `outputs.requests.<request_id>`.
 - `EvaluationRequest` requires strict identifiers for `evaluation_id`, `output_request_id`, and `aggregation_id`; an existing `SelectionRef`; an explicit nonempty ordered sequence of nonnegative time `Quantity` values; and evidence targeting exactly `outputs.evaluations.<evaluation_id>`. Times are checked after shared SI conversion, so duplicate SI instants and non-increasing order are rejected while equivalent units retain their explicit input identity.
 - `OutputPolicy` requires an outputs-purpose `NumericalProfileRef`, at least one `OutputRequest`, explicit nonempty strictly increasing `saved_times`, and a possibly-empty sequence of `EvaluationRequest` values. Request and evaluation IDs must be unique and are canonically sorted by their own IDs. Every evaluation must reference a request; its selection must have the same `(geometry_digest, body_id)` pair as that request; and every evaluation state time must exist in `saved_times` after exact shared SI normalization.
 - Nested face and resolution collections retain the existing canonical unordered semantics. Ordered time arrays and exact display-unit spelling remain explicit intent. No geometric subset is inferred, no raw face numbers are compared across geometry revisions, and different requested/result frames are retained for later registered transform validation.
@@ -68,6 +68,20 @@ C:/Users/backo/AppData/Local/Programs/Python/Python312/python.exe -m pytest test
 ```
 
 It collected 96 tests and exited `1`: one intentional API-availability failure (`test_output_policy_api_is_available`) and 95 skips. There was no collection, setup, or environment failure. This is availability RED, not semantic behavioral evidence. The original stdout/stderr and metadata remain in the actual 4063 record directory.
+
+### Preserved intermediate failures and closure — actual 4063 evidence
+
+The original 31-record chronology also contains the following nonpassing intermediate checks. Their actual HEAD, dirty state, exit code, and raw streams are preserved; they are not silently counted as passing gates.
+
+| Record | Actual HEAD and dirty-before state | Exit | Raw failure | Subsequent closure |
+|---|---|---:|---|---|
+| `P1-B10-test-draft-format-01` | `f554ed0bdff24b43f230688f9d9e0a9b61a8ce8c`; `?? tests/unit/contracts/test_output_policy.py` | 1 | Ruff reported the draft test file would be reformatted at multiple locations. | `P1-B10-test-draft-format-fix-01` reformatted it; `P1-B10-test-draft-format-02` then verified one file already formatted, exit 0. |
+| `P1-B10-green-precommit-01` | `0106ae92f4394d86d3b7ee898f06ee471cac8e5f`; `M src/febio_cae/domain/__init__.py`, `?? src/febio_cae/domain/output_policy.py` | 1 | 94 passed and 2 intended time-boundary assertions failed because `1e-320 ms` was accepted instead of rejected. | Fixture correction commit `882b25638a8b050e53b67b3c028a0f411066b7be`; `P1-B10-green-precommit-02` passed 96, exit 0. |
+| `P1-B10-production-lint-01` | `882b25638a8b050e53b67b3c028a0f411066b7be`; `M src/febio_cae/domain/__init__.py`, `?? src/febio_cae/domain/output_policy.py` | 1 | Ruff reported unsorted `__all__`, the `Set` import alias rule, and two duplicate-ID `min`/`sorted` findings. | Production lint fixes were followed by `P1-B10-production-lint-02`, which isolated one import-order finding, then `P1-B10-production-lint-03` passed, exit 0. |
+| `P1-B10-production-lint-02` | `882b25638a8b050e53b67b3c028a0f411066b7be`; `M src/febio_cae/domain/__init__.py`, `M tests/unit/contracts/test_output_policy.py`, `?? src/febio_cae/domain/output_policy.py` | 1 | Ruff reported one unsorted import block in `output_policy.py`. | `P1-B10-production-lint-03` passed, exit 0; the final production candidate is `6ed0dc7bceaa373764e531ca18ee0d70e15a89c6`. |
+| `P1-B10-production-mypy-01` | `882b25638a8b050e53b67b3c028a0f411066b7be`; `M src/febio_cae/domain/__init__.py`, `?? src/febio_cae/domain/output_policy.py` | 1 | Mypy reported four fixture helper `dict[str, object]` argument-type errors at tests 170 and 197. | The typing fixture correction was later committed as `fd7eb6a12c66235b412c0f58161b5ab80806247b`; `P1-B10-production-mypy-02` and `-03` passed, exit 0, while retaining their recorded dirty test/source state. |
+
+Early wrapper attempts that reported a missing `run_command.py` were setup attempts pointed at the wrong 4063 path; they do not establish that the existing 8dd5 helper was absent and are not RED or gate evidence. The existing helper at `C:\Users\backo\.codex\worktrees\8dd5\CAE-harness\.local\coordination\run_command.py` was subsequently used for every isolated record.
 
 ### Actual 4063 production gates — preserved historical evidence
 
@@ -125,16 +139,24 @@ The installed smoke proves packaging, import provenance, public export identity,
 
 ## Report-stage checks and handoff
 
-The final report will be the only staged path. Direct staged checks are required after the text is complete:
+Before the first report-only commit, the report was the only staged path while HEAD remained the clean production candidate `6ed0dc7bceaa373764e531ca18ee0d70e15a89c6`. The staged diff and scanner records below therefore belong to `6ed0dc7bceaa373764e531ca18ee0d70e15a89c6`, not to the later report commit.
 
-| Required check | Record |
+| Record | Result at HEAD `6ed0dc7bceaa373764e531ca18ee0d70e15a89c6` |
 |---|---|
-| `git diff --cached --check` | `P1-B10-isolated-report-diff-check-03`; exit 0 |
-| `C:/Users/backo/AppData/Local/Programs/Python/Python312/python.exe scripts/scan_cae_data.py --root .` | `P1-B10-isolated-report-scanner-02`; PASS, 69 tracked files, 0 diagnostics, exit 0 |
+| `P1-B10-isolated-report-diff-check-01` | `git diff --cached --check` exited 2 because two Markdown hard-break spaces were reported as trailing whitespace; not passing evidence. |
+| `P1-B10-isolated-report-diff-check-02` | Corrected staged diff check exited 0 after those spaces were removed. |
+| `P1-B10-isolated-report-scanner-01` | PASS, 70 tracked files, 0 diagnostics, exit 0. |
+| `P1-B10-isolated-report-diff-check-03` | Final pre-commit staged diff check exited 0. |
+| `P1-B10-isolated-report-scanner-02` | PASS, 70 tracked files, 0 diagnostics, exit 0. |
 
-The first staged diff check, `P1-B10-isolated-report-diff-check-01`, exited `2` because two Markdown hard-break spaces were reported as trailing whitespace. Those spaces were removed; the corrected check is recorded separately as `P1-B10-isolated-report-diff-check-02`. The failed check is preserved and is not passing evidence.
+The first report-only commit was then created separately as `59bad9be0d05cc4111a954516afcabb783d3bbf3`. After the factual correction in this report, the final-text R1 checks below were run with the report again as the only staged path, at clean HEAD `59bad9be0d05cc4111a954516afcabb783d3bbf3`:
 
-The report-only commit must be separate from the four implementation/test commits above. The final handoff must be clean and contain exactly these four tracked P1-B10 paths relative to `f554ed0bdff24b43f230688f9d9e0a9b61a8ce8c`: `src/febio_cae/domain/output_policy.py`, `src/febio_cae/domain/__init__.py`, `tests/unit/contracts/test_output_policy.py`, and this report. Coordination records, temporary venvs, build outputs, and incident material remain outside the tracked product change set.
+| Record | Result at clean HEAD `59bad9be0d05cc4111a954516afcabb783d3bbf3` |
+|---|---|
+| `P1-B10-isolated-R1-report-diff-check-01` | Final staged `git diff --cached --check`; exit 0. |
+| `P1-B10-isolated-R1-report-scanner-01` | Final staged-report scan; PASS, 70 tracked files, 0 diagnostics, exit 0. |
+
+The correction commit following these R1 checks is report-only. The final handoff is clean and contains exactly these four tracked P1-B10 paths relative to `f554ed0bdff24b43f230688f9d9e0a9b61a8ce8c`: `src/febio_cae/domain/output_policy.py`, `src/febio_cae/domain/__init__.py`, `tests/unit/contracts/test_output_policy.py`, and this report. Coordination records, temporary venvs, build outputs, and incident material remain outside the tracked product change set.
 
 ## Unverified items and remaining sequence
 
