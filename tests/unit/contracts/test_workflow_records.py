@@ -648,3 +648,66 @@ def test_source_and_numeric_data_contracts_carry_actual_resolved_values() -> Non
     )
     assert data.values[1][0] == 0.1
     assert data.axis_values == (0.0, 1.0)
+
+
+def test_connected_artifact_to_preview_chain_round_trips_through_common_codec(
+    synthetic_case_spec: Any,
+) -> None:
+    _require_api()
+    from febio_cae.domain.codec import decode_record, encode_record
+
+    revision = case_revision(synthetic_case_spec)
+    mesh = _mesh()
+    profile = _profile()
+    bundle = _bundle(revision, mesh, profile)
+    attempt = _attempt(bundle, revision)
+    manifest = _manifest(attempt, bundle, profile)
+    assessment = QualityAssessment(
+        assessment_id="assessment-chain",
+        manifest_id=manifest.manifest_id,
+        policy_digest=hashlib.sha256(revision.spec.quality_policy.to_bytes()).hexdigest(),
+        criteria=(
+            CriterionAssessment(
+                criterion_id="numeric-data",
+                dimension="numeric",
+                status=AssessmentStatus.UNVERIFIED,
+                measured=(MeasuredValue("state-count", 2.0, "1"),),
+                reason="synthetic numeric data is structural only",
+            ),
+        ),
+        overall_status=AssessmentStatus.UNVERIFIED,
+    )
+    request = PreviewRequest("preview-chain", manifest.manifest_id, (0,), ("displacement",))
+    receipt = PreviewReceipt(
+        receipt_id="receipt-chain",
+        manifest_id=manifest.manifest_id,
+        xplt_digest="8" * 64,
+        studio=profile.reader,
+        status=PreviewStatus.REQUESTED,
+        requested_state_ids=request.state_ids,
+        requested_variables=request.variables,
+        observed_state_ids=(),
+        observed_variables=(),
+        confirmation_evidence=(),
+    )
+    comparison = ComparisonSpec(
+        comparison_id="comparison-chain",
+        baseline_manifest_id=manifest.manifest_id,
+        candidate_manifest_id=manifest.manifest_id,
+        intended_changes=("none",),
+        fixed_conditions=("material",),
+        axes=(
+            ComparisonAxis(
+                "time",
+                "s",
+                "part",
+                "value",
+                "maximum",
+                interval=ComparisonInterval("s", 0.0, 1.0),
+                interpolation="linear",
+            ),
+        ),
+    )
+    for record in (mesh, bundle, attempt, manifest, assessment, request, receipt, comparison):
+        restored = decode_record(encode_record(record), type(record))
+        assert restored.to_bytes() == record.to_bytes()
