@@ -165,6 +165,136 @@ def test_face_rule_copies_ids_and_requires_full_context() -> None:
         )
 
 
+def test_selection_ref_canonicalizes_face_set_member_order() -> None:
+    selection = _selection()
+    spatial = _spatial()
+    _, body, frame, digest = _context()
+
+    def reference(face_names: list[str]) -> Any:
+        return selection.SelectionRef(
+            name="ordered-face-selection",
+            role="contact_surface",
+            role_evidence=_evidence("face-order"),
+            geometry_digest=digest,
+            body_id=body,
+            frame=frame,
+            rule=selection.FaceSetRule(
+                digest,
+                body,
+                frame,
+                [spatial.FaceId(name) for name in face_names],
+                _evidence("face-rule"),
+            ),
+        )
+
+    assert reference(["face-A", "face-B"]).to_bytes() == reference(["face-B", "face-A"]).to_bytes()
+
+
+def test_selection_ref_canonicalizes_resolution_face_member_order() -> None:
+    selection = _selection()
+    spatial = _spatial()
+    _, body, frame, digest = _context()
+
+    def snapshot(face_names: list[str]) -> Any:
+        return selection.ResolutionSnapshot(
+            digest,
+            body,
+            frame,
+            [
+                selection.FaceMeasurement(
+                    spatial.FaceId(name),
+                    Quantity(1, "mm2"),
+                    spatial.Point3(
+                        frame,
+                        Quantity(0, "mm"),
+                        Quantity(0, "mm"),
+                        Quantity(0, "mm"),
+                    ),
+                )
+                for name in face_names
+            ],
+        )
+
+    def reference(resolution: Any) -> Any:
+        return selection.SelectionRef(
+            name="resolved-face-selection",
+            role="contact_surface",
+            role_evidence=_evidence("resolution-order"),
+            geometry_digest=digest,
+            body_id=body,
+            frame=frame,
+            rule=selection.NamedAttributeRule("contact"),
+            resolution=resolution,
+        )
+
+    assert (
+        reference(snapshot(["face-A", "face-B"])).to_bytes()
+        == reference(snapshot(["face-B", "face-A"])).to_bytes()
+    )
+
+
+@pytest.mark.parametrize("face_names", [["face-B"], ["face-A", "face-B"]])
+def test_explicit_face_rule_requires_exact_resolution_face_identity_set(
+    face_names: list[str],
+) -> None:
+    selection = _selection()
+    spatial = _spatial()
+    _, body, frame, digest = _context()
+    rule = selection.FaceSetRule(
+        digest,
+        body,
+        frame,
+        [spatial.FaceId("face-A")],
+        _evidence("explicit-rule"),
+    )
+    resolution = selection.ResolutionSnapshot(
+        digest,
+        body,
+        frame,
+        [
+            selection.FaceMeasurement(
+                spatial.FaceId(name),
+                Quantity(1, "mm2"),
+                spatial.Point3(
+                    frame,
+                    Quantity(0, "mm"),
+                    Quantity(0, "mm"),
+                    Quantity(0, "mm"),
+                ),
+            )
+            for name in face_names
+        ],
+    )
+
+    with pytest.raises(ValueError):
+        selection.SelectionRef(
+            name="mismatched-face-resolution",
+            role="contact_surface",
+            role_evidence=_evidence("explicit-resolution"),
+            geometry_digest=digest,
+            body_id=body,
+            frame=frame,
+            rule=rule,
+            resolution=resolution,
+        )
+
+
+def test_selection_role_evidence_requires_selection_role_target() -> None:
+    selection = _selection()
+    _, body, frame, digest = _context()
+
+    with pytest.raises(ValueError):
+        selection.SelectionRef(
+            name="wrong-role-evidence-target",
+            role="contact_surface",
+            role_evidence=_evidence("material.density"),
+            geometry_digest=digest,
+            body_id=body,
+            frame=frame,
+            rule=selection.NamedAttributeRule("contact"),
+        )
+
+
 def test_resolution_snapshot_copies_faces_and_requires_matching_si_measurements() -> None:
     selection = _selection()
     spatial = _spatial()

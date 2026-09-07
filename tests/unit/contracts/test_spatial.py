@@ -134,6 +134,23 @@ def test_unit_direction_normalizes_explicit_vector_in_its_explicit_frame() -> No
     assert direction.to_bytes() == canonical_bytes(direction.to_dict())
 
 
+@pytest.mark.parametrize(
+    "components",
+    [
+        (math.ulp(0.0), math.ulp(0.0), 0.0),
+        (math.ulp(0.0), math.ulp(0.0), math.ulp(0.0)),
+        (-math.ulp(0.0), math.ulp(0.0), 0.0),
+    ],
+)
+def test_unit_direction_stably_normalizes_subnormal_components(
+    components: tuple[float, float, float],
+) -> None:
+    spatial = _spatial()
+    direction = spatial.UnitDirection(spatial.FrameId("World"), *components)
+
+    assert math.hypot(direction.x, direction.y, direction.z) == pytest.approx(1.0, abs=1.0e-10)
+
+
 def test_proper_rotation_requires_orthogonal_positive_determinant_matrix() -> None:
     spatial = _spatial()
     accepted = spatial.ProperRotation([[1.0 + 4.0e-11, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
