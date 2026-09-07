@@ -2,6 +2,7 @@
 
 from .budget import Budget, BudgetValidationError
 from .canonical import SCHEMA_VERSION, CanonicalizationError, canonical_bytes
+from .case_revision import CaseRevision, CaseRevisionValidationError
 from .case_spec import CaseSpec, CaseSpecValidationError
 from .contact import (
     ArrangementIntent,
@@ -125,6 +126,8 @@ __all__ = [
     "Budget",
     "BudgetValidationError",
     "CanonicalizationError",
+    "CaseRevision",
+    "CaseRevisionValidationError",
     "CaseSpec",
     "CaseSpecValidationError",
     "CompressibleNeoHookean",
