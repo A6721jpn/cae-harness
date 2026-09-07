@@ -127,12 +127,13 @@ def test_coordinate_predicate_rule_requires_explicit_body_frame_axis_and_bounds(
         selection.CoordinatePredicate(axis, "unknown", Quantity(1, "mm"))
     with pytest.raises(ValueError):
         selection.CoordinatePredicate(axis, "between", Quantity(1, "mm"), None)
+    other_axis_predicate = selection.CoordinatePredicate(
+        spatial.UnitDirection(spatial.FrameId("Other"), 0, 0, 1),
+        "eq",
+        Quantity(1, "mm"),
+    )
     with pytest.raises(ValueError):
-        selection.CoordinatePredicate(
-            spatial.UnitDirection(spatial.FrameId("Other"), 0, 0, 1),
-            "eq",
-            Quantity(1, "mm"),
-        )
+        selection.CoordinatePredicateRule(body, frame, [other_axis_predicate])
 
 
 def test_face_rule_copies_ids_and_requires_full_context() -> None:
