@@ -1,13 +1,14 @@
-# P1 common interface freeze: R2 repaired whole-candidate handoff
+# P1 common interface freeze: R3 bounded repair handoff
 
 Date: 2026-09-08
 
-This is a clean, report-bearing R2 repair candidate for independent whole-candidate
+This is a clean, report-bearing R3 repair candidate for independent whole-candidate
 review. It is synthetic contract evidence, not P1 completion, execution authority,
 native capability, official FBS, FEBio Studio, real-model, `02_CAE`, or BottomFrame
-evidence. The preceding candidate `fff4daf0a028526f19a1eec66be411d35b5e389f`
-was rejected on H2, H5, and H6. This candidate closes those three finite findings
-with new RED/GREEN evidence and is not yet integrated or pushed.
+evidence. The preceding R2 candidate `a3ea6031972ac4123b5654ad363bd016b849c29b`
+was rejected only on cyclic interior-face orientation and the single-state numeric
+regression. This candidate repairs those finite findings, preserves the reviewed
+H5/H6 binding/path work, and is not yet integrated or pushed.
 
 ## Fixed Git boundary
 
@@ -16,24 +17,27 @@ with new RED/GREEN evidence and is not yet integrated or pushed.
 | Worker branch | `codex/p1-interface-freeze` |
 | Accepted integration base | `52745ef387f8c4466d9d7216bcf8e9532589b1b6` |
 | Rejected R1 candidate | `fff4daf0a028526f19a1eec66be411d35b5e389f` |
-| R2 test-only RED commit | `81b5888763b5bafa794d212f6477bdb6951cfe74` |
-| R2 test expectation correction | `e3073b9a9a5cc00b3d0ce2c9fb9a43a883db4d13` |
-| R2 mesh/path production commit | `bfab496b3df50f36efbd0a1e302d74c83180fe5f` |
-| R2 numeric codec production commit | `0a8e015bf59c7aa17a1696a3929d6016ea25efa9` |
-| R2 static/test cleanup commit | `60eea3385967d5579c8b271ff2c54930aca1572e` |
-| Final R2 code/test candidate before this report commit | `05a047267898061b05326f87d432b06640be19ef` |
-| Review ticket | `.local/coordination/p1-interface-review-02.md`, SHA256 `06ECDA4CACA56A957EFCA56B62FD74CF7FCB524C250A83095178CD05973C4F3B` |
+| Rejected R2 report-bearing candidate | `a3ea6031972ac4123b5654ad363bd016b849c29b` |
+| R3 test-only commit | `16693381ee251d2d719a2d38e158b67493ff44f9` |
+| R3 test-fixture correction commits | `9e63cf1a961d47cb09209d4d819974d9d753f86e`, `dd08ea93e3cd856a7f8e71240729cb1ae712e89a` |
+| R3 cyclic-face production commit | `2449748da4ee8799a8cd81391c567c91f12d1b6d` |
+| R3 single-state production commit | `015df77349a8b03170ed09eb1bff2d36498b5c9f` |
+| R3 format cleanup commit | `ede6abbc3542dbc79290a651a0bebba55557de43` |
+| Final R3 code/test candidate before this report commit | `ede6abbc3542dbc79290a651a0bebba55557de43` |
+| Review ticket | `.local/coordination/p1-interface-review-03.md`, SHA256 `FCF1B69B8549FCEF2F2156C61F68E6A619329A7B9F2372D7B49548A552964579` |
 | Authorized remote | `https://github.com/A6721jpn/cae-harness.git` |
 | Remote state | `REMOTE_CONFIGURED` |
 | Integration/push | not performed by this worker |
 
 The original H1/H3/H4/M1/M2/M3 findings remain closed within their reviewed
-scope. The R2 changes are limited to H2, H5, H6, their behavior-first tests, and
-this report. PM must still obtain a fresh independent whole-candidate review.
+scope. H5 and the original H6 serialization/binding findings remain closed from
+R2. The R3 changes are limited to the two review-03 findings, their behavior-first
+tests, and this report. PM must still obtain a fresh independent whole-candidate
+review.
 
-## R2 repair scope
+## Preserved R2 scope and R3 repair
 
-### H2 — oriented Tet10 boundary and ownership
+### H2 — oriented Tet10 boundary, cyclic interiors, and ownership
 
 `artifacts.py` now defines one uniform Tri6 convention: each face is ordered as
 three cyclic corners followed by the consecutive midside edges `(a,b)`, `(b,c)`,
@@ -47,15 +51,17 @@ three cyclic corners followed by the consecutive midside edges `(a,b)`, `(b,c)`,
 ~~~
 
 The R2 tests use independently specified nondegenerate coordinates to verify all
-four outward normal senses and every midside edge midpoint. A two-adjacent-element
-interior face must use the exact reverse orientation
-`(a,c,b,ca,bc,ab)` for the second element; a face may have at most two adjacent
-elements. MeshSet body membership now requires `body_id` to be included in a body
-set, and an isolated known node in a node set raises the domain validation error
-instead of leaking `KeyError`. The tests also construct a valid two-body mesh with
-nonempty node, element, face, and body sets, and reject contradictory ownership.
-These are structural checks only; they do not prove native Gmsh/FEBio mapping,
-Jacobian quality, or CAD correspondence.
+four outward normal senses and every midside edge midpoint. R3 keeps that table
+and extends the interior validator from one reversed tuple to all three cyclic
+rotations of `(a,c,b,ca,bc,ab)`: `(c,b,a,bc,ab,ca)` and
+`(b,a,c,ab,ca,bc)`. New tests construct positive-determinant neighboring
+tetrahedra with shared local-face indices `1`, `0`, and `3`, using independent
+edge midpoint nodes. Same-facing, wrong-midside, unknown-node, and over-two-
+adjacency cases remain rejected. MeshSet body membership remains the documented
+owner-inclusion rule, and an isolated known node in a node set raises the domain
+validation error instead of leaking `KeyError`. These are structural checks only;
+they do not prove native Gmsh/FEBio mapping, Jacobian quality, or CAD
+correspondence.
 
 ### H5 — one strong logical-path rule
 
@@ -79,15 +85,20 @@ entity and component ordering, and flattened values. Rows are state-major; each
 row is entity-major, then component-major. The top-level content digest hashes
 that projection without the digest field itself. Decoding rejects wrong schema or
 codec, unknown keys, malformed width/shape, nonfinite values, and content-digest
-mismatches; the constructor requires at least two increasing states and validates
-the entity/component width.
+mismatches; the constructor requires a nonempty state/row sequence, strictly
+increasing axis values when multiple states exist, and the entity/component width.
 
 R2 tests round-trip a payload with two states, two entities, and three components,
 preserve mapping location/frame/measure/sign/order semantics plus bundle/attempt
 binding, and reconstruct numeric records from encoded bytes in a resolver. The
 resolver uses separate data-ID and manifest/output lookup keys, and a synthetic
-QualityPort-shaped consumer reads both decoded records. The installed isolated
-consumer repeats that boundary from the wheel and confirms site-packages origins.
+QualityPort-shaped consumer reads both decoded records. R3 adds a public codec
+round-trip for one state tied to a complete `CaseSpec`/`OutputPolicy` with one
+saved time and one evaluation time. The installed isolated consumer reconstructs
+one-state and two-state payloads from encoded bytes, verifies their digests and
+binding, constructs a valid cyclic interior face, and confirms site-packages
+origins. Interpolation or other algorithm-specific sufficiency rules remain
+consumer-owned.
 
 The report wording is also corrected: protocol construction and actual encoded
 numeric consumption are evidence; `hasattr`-only inspection is not presented as
@@ -144,37 +155,48 @@ GUI, dependency, or real CAE data path was changed.
 
 ## Test-first evidence
 
-The R2 test-only commit was `81b5888`. The fresh RED record is
-`P1-IF-R2-red-01`:
+The R3 behavior-first test commits are `1669338`, `9e63cf1`, and `dd08ea9`.
+The first two recorded RED attempts are preserved but are not acceptance RED
+evidence because their newly added fixture helper still raised `KeyError` before
+the intended assertion:
+
+| Record | SHA | Result |
+|---|---|---|
+| `P1-IF-R3-red-01` | `16693381ee251d2d719a2d38e158b67493ff44f9` | 42 collected; 5 failed / 37 passed; exit 1; fixture helper errors preserved |
+| `P1-IF-R3-red-02` | `9e63cf1a961d47cb09209d4d819974d9d753f86e` | 42 collected; 4 failed / 38 passed; exit 1; baseline fixture correction still incomplete |
+
+After the fixture-only correction, `P1-IF-R3-red-03` at
+`dd08ea93e3cd856a7f8e71240729cb1ae712e89a` is the genuine behavioral RED:
 
 ~~~text
-C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe -m pytest tests/unit/contracts/test_workflow_records.py tests/unit/contracts/test_contract_codec.py tests/unit/contracts/test_adapter_ports.py --basetemp .local/verification/P1-IF-R2-red-01
+C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe -m pytest tests/unit/contracts/test_workflow_records.py tests/unit/contracts/test_contract_codec.py tests/unit/contracts/test_adapter_ports.py --basetemp .local/verification/P1-IF-R3-red-03
 ~~~
 
-It collected 37 tests, with 14 failures and 23 passes, and exited 1. The
-failures are the intended pre-production regressions for the new table/path/codec
-contract, not collection or environment failures. The final focused GREEN record
-is `P1-IF-R2-green-final-01` at the clean final candidate:
+It collected 42 tests, with 3 intended failures and 39 passes, and exited 1.
+The failures are the two cyclic face cases and the valid single-state numeric
+case; there were no collection, setup, or environment failures. The final focused
+GREEN record is `P1-IF-R3-green-final-01` at clean SHA
+`ede6abbc3542dbc79290a651a0bebba55557de43`:
 
 ~~~text
-C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe -m pytest tests/unit/contracts/test_workflow_records.py tests/unit/contracts/test_contract_codec.py tests/unit/contracts/test_adapter_ports.py --basetemp .local/verification/P1-IF-R2-green-final-01
+C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe -m pytest tests/unit/contracts/test_workflow_records.py tests/unit/contracts/test_contract_codec.py tests/unit/contracts/test_adapter_ports.py --basetemp .local/verification/P1-IF-R3-green-final-01
 ~~~
 
-It collected and passed 37 tests, exit 0.
+It collected and passed 42 tests, exit 0.
 
 ## Fresh clean local gates
 
-All final records below have clean before/after Git status at
-`05a047267898061b05326f87d432b06640be19ef`.
+All final records below have clean before/after Git status at the final code/test
+SHA `ede6abbc3542dbc79290a651a0bebba55557de43`.
 
 | Record | Exact command | Result |
 |---|---|---|
-| `P1-IF-R2-full-final-01` | `C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe -m pytest --basetemp .local/verification/P1-IF-R2-full-final-01` | 1,043 passed in 20.92 s, exit 0 |
-| `P1-IF-R2-format-final-02` | `C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe -m ruff format --check .` | 99 files already formatted, exit 0 |
-| `P1-IF-R2-lint-final-02` | `C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe -m ruff check .` | all checks passed, exit 0 |
-| `P1-IF-R2-mypy-final-02` | `C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe -m mypy src tests` | no issues in 67 source files, exit 0 |
-| `P1-IF-R2-scan-final-02` | `C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe scripts/scan_cae_data.py --root .` | PASS; 101 tracked/index files, 0 diagnostics, exit 0 |
-| `P1-IF-R2-build-final-02` | `C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe -m build` | sdist and wheel built, exit 0 |
+| `P1-IF-R3-full-final-01` | `C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe -m pytest --basetemp .local/verification/P1-IF-R3-full-final-01` | 1,048 passed in 22.39 s, exit 0 |
+| `P1-IF-R3-format-final-01` | `C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe -m ruff format --check .` | 99 files already formatted, exit 0 |
+| `P1-IF-R3-lint-final-01` | `C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe -m ruff check .` | all checks passed, exit 0 |
+| `P1-IF-R3-mypy-final-01` | `C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe -m mypy src tests` | no issues in 67 source files, exit 0 |
+| `P1-IF-R3-scan-final-01` | `C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe scripts/scan_cae_data.py --root .` | PASS; 101 tracked/index files, 0 diagnostics, exit 0 |
+| `P1-IF-R3-build-final-01` | `C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe -m build` | sdist and wheel built, exit 0 |
 
 ## Fresh wheel and installed smoke
 
@@ -182,41 +204,43 @@ The exact wheel built from the final code candidate is:
 
 ~~~text
 dist/febio_cae-0.1.0-py3-none-any.whl
-size: 101520 bytes
-SHA256: 5E9AB39E5EFAF2F7EF69DCAE04128D3432527D7BA8865852828699972F666E09
+size: 101600 bytes
+SHA256: 684F7078E3D8FE44150C87852401CF8B2191ADBEC8FE37959F54859D712C8624
 ~~~
 
 Fresh environment/install records:
 
 ~~~text
-C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe -m venv .local/verification/P1-IF-R2-wheel-venv-final-02
-C:\Users\backo\.codex\worktrees\8dd5\CAE-harness\.local\verification\P1-IF-R2-wheel-venv-final-02\Scripts\python.exe -I -m pip install --no-index --no-deps --force-reinstall C:\Users\backo\.codex\worktrees\8dd5\CAE-harness\dist\febio_cae-0.1.0-py3-none-any.whl
-C:\Users\backo\.codex\worktrees\8dd5\CAE-harness\.local\verification\P1-IF-R2-wheel-venv-final-02\Scripts\febio-cae.exe --version
+C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe -m venv .local/verification/P1-IF-R3-wheel-venv-final-01
+C:\Users\backo\.codex\worktrees\8dd5\CAE-harness\.local\verification\P1-IF-R3-wheel-venv-final-01\Scripts\python.exe -I -m pip install --no-index --no-deps --force-reinstall C:\Users\backo\.codex\worktrees\8dd5\CAE-harness\dist\febio_cae-0.1.0-py3-none-any.whl
+C:\Users\backo\.codex\worktrees\8dd5\CAE-harness\.local\verification\P1-IF-R3-wheel-venv-final-01\Scripts\febio-cae.exe --version
 ~~~
 
 The venv and offline wheel install exited 0. The executable ran from
-`.local/verification/P1-IF-R2-installed-cwd-final-02`, outside the source package
-directory, printed `febio-cae 0.1.0`, and exited 0 (`P1-IF-R2-cli-final-02`).
+`.local/verification/P1-IF-R3-installed-cwd-final-01`, outside the source package
+directory, printed `febio-cae 0.1.0`, and exited 0 (`P1-IF-R3-cli-final-01`).
 
-The isolated numeric consumer is `P1-IF-R2-installed-consumer-final-04`; its exact
-argv, cwd, unset `PYTHONPATH`/`PYTHONHOME`, Git SHA, and raw stream paths are in
-`.local/coordination/runs/P1-IF-R2-installed-consumer-final-04/metadata.json`.
+The isolated installed consumer is `P1-IF-R3-installed-consumer-final-01`; its
+exact argv, cwd, unset `PYTHONPATH`/`PYTHONHOME`, Git SHA, and raw stream paths are
+in `.local/coordination/runs/P1-IF-R3-installed-consumer-final-01/metadata.json`.
 It exited 0 with these raw outputs:
 
 ~~~text
 installed_origins=ok
-numeric_codec_bytes=744
-resolved_value=0.2
-related_output_id=manifest-output-data
+cyclic_face=ok
+single_roundtrip=ok states=1
+multi_roundtrip=ok states=2 value=0.2
+single_codec_bytes=717
 ~~~
 
 The script used `-I`, verified both imported module origins are in the fresh
-venv's `site-packages` and not the source `src` tree, encoded/decoded both
-`ResultDataRef` and `NumericResultData`, reconstructed the primary and related
-manifest/output records from bytes, verified the content digest/bundle/attempt
-binding, and passed the decoded port to a synthetic `QualityPort` consumer. This
-is synthetic package evidence, not native capability, durable storage, or physical
-numeric correctness.
+venv's `site-packages` and not the source `src` tree, constructed a positive
+cyclic interior Tet10 face with a different local-face index, encoded/decoded
+single-state and multi-state `NumericResultData` through the public codec, and
+resolved both from separate encoded payload maps through the public
+`ResultDataPort` seam. It verified content digests plus bundle/attempt binding.
+This is synthetic package evidence, not native capability, durable storage, or
+physical numeric correctness.
 
 ## Unverified boundaries and next task
 
@@ -228,6 +252,13 @@ enabled native compatibility profile, official FBS, or any real `02_CAE`/
 BottomFrame E2E. The Tet10 checks are mathematical/structural contract tests;
 they do not establish native Gmsh/FEBio ordering or Jacobian quality. Numeric
 codec and resolver checks do not establish a durable backend or a physical result.
+
+## Report-only integrity checks
+
+After the report commit, `P1-IF-R3-report-scan-final-01` reruns the CAE boundary
+scanner and `P1-IF-R3-report-diff-final-01` checks clean status, the exact 17-path
+delta from the accepted base, `git diff --check`, and the report byte/hash record.
+Both are report-integrity evidence only and are not product test counts.
 
 Next task: PM obtains an independent whole-candidate review of the exact
 report-bearing candidate, then PM-only integration into V2 and fresh integrated
