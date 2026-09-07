@@ -102,6 +102,89 @@ Installed smoke is package/import evidence only; it does not establish solver, F
 
 Next task: PM should perform the independent exact-commit review, then integrate only the reviewed clean commit sequence into `V2`.
 
+## R1 semantic remediation addendum
+
+Date: 2026-09-07
+
+This addendum records the PM-directed R1 remediation after the original P1-B2 candidate. It is still synthetic/local contract evidence only. It does not establish real FEBio, official FBS, FEBio Studio, native, real-model, `02_CAE`, or BottomFrame success.
+
+### R1 fixed Git boundary
+
+| Item | Value |
+|---|---|
+| R1 starting code/report SHA | `ec36169f6567edf77d2d8f372b0205b60fa24d04` |
+| R1 initial test-only SHA | `d3b29db488a57ea96315b7a0cf9cdcc65291973` |
+| R1 test correction SHA | `6589d03dce1778aecf532185896d1b36ca301092` |
+| R1 expanded test-only SHA | `3d1e84423a50b84a74d25f781255218e1da6a2c0` |
+| R1 target-binding test-only SHA | `97885b9bc6af9cee8a67bfe91148b15650d7224c` |
+| R1 production SHA | `d53d8579ccc96aca1296587d3503588c9107615c` |
+| R1 final code candidate | `d53d8579ccc96aca1296587d3503588c9107615c` |
+| authorized remote | `https://github.com/A6721jpn/cae-harness.git` |
+| remote state | `REMOTE_CONFIGURED` |
+| push/integration | not performed by this worker |
+
+The R1 test-only commits changed only `tests/unit/contracts/test_motion.py` and `tests/unit/contracts/test_spatial.py`. The production commit changed only `src/febio_cae/domain/motion.py` and `src/febio_cae/domain/spatial.py`.
+
+### R1 test-first evidence
+
+The initial clean R1 RED was captured at `6589d03dce1778aecf532185896d1b36ca301092`. The exact command was:
+
+```text
+C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe -m pytest tests/unit/contracts/test_motion.py tests/unit/contracts/test_spatial.py --basetemp C:\Users\backo\.codex\worktrees\8dd5\CAE-harness\.local\verification\P1-B2-R1-red-01
+```
+
+`P1-B2-R1-red-01` collected 41 tests, had 2 behavioral assertion failures and 39 passes, exit 1. The fresh-basetemp preflight exited 0; there were no collection, setup, `KeyError`, `AttributeError`, or `TypeError` failures. Raw evidence is `.local/coordination/runs/P1-B2-R1-red-01/{metadata.json,stdout.bin,stderr.bin}`.
+
+After the expanded regression set was committed at `3d1e84423a50b84a74d25f781255218e1da6a2c0`, `P1-B2-R1-red-02` collected 53 tests, with 25 failures and 28 passes, exit 1. This intentionally exposed the missing evidence constructor fields and missing `UnitDirection.from_dict`; it had no collection or environment failure. Raw evidence is `.local/coordination/runs/P1-B2-R1-red-02/{metadata.json,stdout.bin,stderr.bin}`. The subsequent narrow target-binding additions are in `97885b9`; all of them are covered by the clean GREEN below.
+
+At clean production SHA `d53d8579ccc96aca1296587d3503588c9107615c`, the fresh-basetemp preflight `P1-B2-R1-green-basetemp-preflight-01` exited 0 and `P1-B2-R1-green-01` ran:
+
+```text
+C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe -m pytest tests/unit/contracts/test_motion.py tests/unit/contracts/test_spatial.py --basetemp C:\Users\backo\.codex\worktrees\8dd5\CAE-harness\.local\verification\P1-B2-R1-green-01
+```
+
+The result was 56 passed, exit 0. Raw evidence is `.local/coordination/runs/P1-B2-R1-green-01/{metadata.json,stdout.bin,stderr.bin}`.
+
+### R1 contract changes
+
+- `MotionProfile` now requires `direction_evidence`, `initial_reference_point_evidence`, and `history_evidence`. Each is immutable, serialized, restored at the public payload boundary, and bound to the exact targets `motion.direction`, `motion.initial_reference_point`, and `motion.history`. Missing, swapped, or misbound evidence rejects.
+- `UnitDirection.from_dict` strictly validates the exact schema-1 field set, frame text, finite numeric components, and unit norm. It preserves already-normalized component floats without a second normalization pass, so direction payload round-trips retain canonical bytes, including subnormal-derived and PM-probe vectors.
+- `MotionProfile.from_dict` delegates direction reconstruction to `UnitDirection.from_dict`; nested payload mutations do not mutate the immutable domain value, and evidence changes affect canonical bytes.
+
+### R1 final local gates
+
+All records below ran at clean production SHA `d53d8579ccc96aca1296587d3503588c9107615c`, with dirty state empty before and after.
+
+| Record | Exact command and result | Raw evidence |
+|---|---|---|
+| `P1-B2-R1-gate-pytest-01` | `C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe -m pytest --basetemp C:\Users\backo\.codex\worktrees\8dd5\CAE-harness\.local\verification\P1-B2-R1-gate-pytest-01`; 162 passed, exit 0 | `.local/coordination/runs/P1-B2-R1-gate-pytest-01/{metadata.json,stdout.bin,stderr.bin}` |
+| `P1-B2-R1-gate-format-01` | `C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe -m ruff format --check .`; 38 files formatted, exit 0 | `.local/coordination/runs/P1-B2-R1-gate-format-01/{metadata.json,stdout.bin,stderr.bin}` |
+| `P1-B2-R1-gate-lint-01` | `C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe -m ruff check .`; all checks passed, exit 0 | `.local/coordination/runs/P1-B2-R1-gate-lint-01/{metadata.json,stdout.bin,stderr.bin}` |
+| `P1-B2-R1-gate-mypy-01` | `C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe -m mypy src tests`; no issues in 23 source files, exit 0 | `.local/coordination/runs/P1-B2-R1-gate-mypy-01/{metadata.json,stdout.bin,stderr.bin}` |
+| `P1-B2-R1-gate-scanner-01` | `C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe scripts/scan_cae_data.py --root .`; PASS with 40 filesystem files, 40 index files, and 0 issues, exit 0 | `.local/coordination/runs/P1-B2-R1-gate-scanner-01/{metadata.json,stdout.bin,stderr.bin}` |
+| `P1-B2-R1-gate-build-01` | `C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe -m build`; sdist and wheel built, exit 0 | `.local/coordination/runs/P1-B2-R1-gate-build-01/{metadata.json,stdout.bin,stderr.bin}` |
+
+### R1 installed wheel smoke
+
+```text
+Wheel: C:\Users\backo\.codex\worktrees\8dd5\CAE-harness\dist\febio_cae-0.1.0-py3-none-any.whl
+SHA-256: 50eef2b8bf6b4b3854169065c42007c9043ac5c0cc340ad6199584b1b6950567
+Size: 27280 bytes
+```
+
+The fresh installation root was `.local/verification/P1-B2-R1-installed-01`; the wheel was installed with `--no-index --disable-pip-version-check --no-cache-dir` into a new Python 3.12 virtual environment.
+
+| Record | Result | Raw evidence |
+|---|---|---|
+| `P1-B2-R1-installed-preflight-01` | fresh install root absent, exit 0 | `.local/coordination/runs/P1-B2-R1-installed-preflight-01/{metadata.json,stdout.bin,stderr.bin}` |
+| `P1-B2-R1-installed-wheel-hash-01` | SHA/size above, exit 0 | `.local/coordination/runs/P1-B2-R1-installed-wheel-hash-01/{metadata.json,stdout.bin,stderr.bin}` |
+| `P1-B2-R1-installed-venv-01` | fresh Python 3.12 venv, exit 0 | `.local/coordination/runs/P1-B2-R1-installed-venv-01/{metadata.json,stdout.bin,stderr.bin}` |
+| `P1-B2-R1-installed-pip-01` | wheel installed successfully, exit 0 | `.local/coordination/runs/P1-B2-R1-installed-pip-01/{metadata.json,stdout.bin,stderr.bin}` |
+| `P1-B2-R1-installed-cli-01` | `febio-cae 0.1.0`, exit 0 | `.local/coordination/runs/P1-B2-R1-installed-cli-01/{metadata.json,stdout.bin,stderr.bin}` |
+| `P1-B2-R1-installed-import-01` | Python 3.12.10, isolated=1, `PYTHONPATH=None`, `PYTHONHOME=None`; `febio_cae`, `domain`, `motion`, and `spatial` imported from venv site-packages; metadata/module version `0.1.0`, exit 0 | `.local/coordination/runs/P1-B2-R1-installed-import-01/{metadata.json,stdout.bin,stderr.bin}` |
+
+R1 does not change the unverified boundary: lifecycle/CAS/atomic persistence, native FEBio/FBS/Studio compatibility, registry resolution, physical applicability adequacy, real CAD/mesh inputs, authorized `02_CAE`, and BottomFrame real-model E2E remain unperformed. PM independent exact-commit review, V2 integration, and push remain outside this worker handoff.
+
 ## Report-stage postchecks
 
 The report-stage checks were captured at code HEAD `6f07c680322d252003fae8e5da2d4d39adc81d29` with only this new report staged (`A  docs/reviews/2026-09-07-p1-b2-material-motion.md`). Both records retained the expanded argv, cwd `C:\Users\backo\.codex\worktrees\8dd5\CAE-harness`, Python runner `C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe`, timestamps, staged dirty state, and raw output paths.
@@ -112,3 +195,14 @@ The report-stage checks were captured at code HEAD `6f07c680322d252003fae8e5da2d
 | `P1-B2-report-scanner-01` | `C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe scripts/scan_cae_data.py --root .`; started `2026-09-07T07:12:02.451952Z`, finished `2026-09-07T07:12:06.152658Z`, exit 0; PASS with 40 filesystem files, 40 index files, and 0 issues; HEAD before/after `6f07c680322d252003fae8e5da2d4d39adc81d29`; staged dirty state before/after `A  docs/reviews/2026-09-07-p1-b2-material-motion.md` | `.local/coordination/runs/P1-B2-report-scanner-01/{metadata.json,stdout.bin,stderr.bin}` |
 
 These are completed report-integrity records for the staged report snapshot; they do not claim a clean post-commit tree, native capability, or physical adequacy. Product RED/GREEN and code gates were not rerun for report authoring.
+
+## R1 final report-stage postchecks
+
+After the R1 addendum was complete, the final staged report snapshot was checked with only this report staged (`M  docs/reviews/2026-09-07-p1-b2-material-motion.md`). The checks retain expanded argv, cwd, Python runner, timestamps, staged dirty state, and raw output paths in their metadata records.
+
+| Record | Exact argv and captured result | Raw evidence |
+|---|---|---|
+| `P1-B2-R1-report-diff-check-final-01` | `git diff --cached --check`; exit 0; HEAD before/after `d53d8579ccc96aca1296587d3503588c9107615c` | `.local/coordination/runs/P1-B2-R1-report-diff-check-final-01/{metadata.json,stdout.bin,stderr.bin}` |
+| `P1-B2-R1-report-scanner-final-01` | `C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe scripts/scan_cae_data.py --root .`; PASS with 40 filesystem files, 40 index files, and 0 issues, exit 0; HEAD before/after `d53d8579ccc96aca1296587d3503588c9107615c` | `.local/coordination/runs/P1-B2-R1-report-scanner-final-01/{metadata.json,stdout.bin,stderr.bin}` |
+
+These final checks are report-integrity evidence only; they do not expand the synthetic/local, native, physical, lifecycle, or real-model verification boundary.
