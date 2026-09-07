@@ -12,23 +12,27 @@
 |---|---|
 | 作業ブランチ | `codex/p1-a-domain-foundation` |
 | P1-A base | `47cc20d1e05aa9bb1a3e039a39490813c98d1bb7` |
-| test-only SHA | `f48780e8d2399d23780271a184ad45bd5b39f94a` |
-| production SHA | `27fe86b9e60c37e92b1773c97735696dfa25dcfb` |
-| final code candidate SHA | `bf82ebc4a734ad179af8362fe8da4a7a560458e5` |
+| initial test-only SHA | `f48780e8d2399d23780271a184ad45bd5b39f94a` |
+| initial production SHA | `27fe86b9e60c37e92b1773c97735696dfa25dcfb` |
+| initial static-gate correction SHA | `bf82ebc4a734ad179af8362fe8da4a7a560458e5` |
+| R1 semantic test-only SHA | `85ce103fe25ef8a58a0ca01ea6f5dec6566a1e4f` |
+| R1 semantic production SHA | `ed3dab5824558e7d06a10816e605d7f5172a366b` |
+| final code candidate SHA | `ed3dab5824558e7d06a10816e605d7f5172a366b` |
+| prior report commit | `343ac887b8fb1dd1e725fbddc2a0bacf07183fc3` |
 | remote | `https://github.com/A6721jpn/cae-harness.git` |
 | remote状態 | `REMOTE_CONFIGURED` |
 | `origin/V2` observed SHA | `47cc20d1e05aa9bb1a3e039a39490813c98d1bb7` |
 | V2へのpush | 未実施 |
 
-`f48780e` は`tests/unit/contracts/{test_canonical.py,test_units.py,test_evidence.py}`だけを追加したtest-only commitで、parentは`47cc20d`である。`27fe86b` はそのテストを満たすdomain実装4ファイルだけを追加したproduction commitである。初回の静的ゲートで見つかったRuff/mypy上の不備を、`bf82ebc`でdomain 4ファイルと契約テスト2ファイルへ限定して修正した。最終candidateの作業treeはcleanである。
+`f48780e` は`tests/unit/contracts/{test_canonical.py,test_units.py,test_evidence.py}`だけを追加したtest-only commitで、parentは`47cc20d`である。`27fe86b` はそのテストを満たすdomain実装4ファイルだけを追加したproduction commitである。初回の静的ゲートで見つかったRuff/mypy上の不備を、`bf82ebc`でdomain 4ファイルと契約テスト2ファイルへ限定して修正した。その後、独立レビューのsemantic findingsに対する回帰テストを`85ce103`へ、canonical path validationとQuantity range/normalizationのproduction fixを`ed3dab5`へ分離した。最終candidateの作業treeはcleanである。
 
 ## RED / GREEN
 
 実行インタープリターは `C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe`、Python `3.12.10` である。runnerは各実行について展開済みargv、cwd、Python、HEAD、dirty state、UTC start/end、exit code、stdout/stderrの絶対パスを保存した。
 
-### test-only RED
+### 初回 API test-only RED（履歴）
 
-test-only SHA `f48780e8d2399d23780271a184ad45bd5b39f94a`で、basetempの事前作成・書込み確認を`P1-A-red-basetemp-preflight-01`（exit 0）で行った後、次を実行した。
+test-only SHA `f48780e8d2399d23780271a184ad45bd5b39f94a`で、basetempが事前に存在しないことを`P1-A-red-basetemp-preflight-01`（exit 0）で確認した後、次を実行した。
 
 ```text
 C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe -m pytest tests/unit/contracts --basetemp C:\Users\backo\.codex\worktrees\8dd5\CAE-harness\.local\verification\P1-A-red-01
@@ -36,7 +40,7 @@ C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe -m pytest test
 
 結果は `26 collected / 3 failed / 23 skipped / exit 1`。3件はcanonical、evidence、units各API availability assertionの`AssertionError`で、collection error、import setup error、`KeyError`、`AttributeError`はない。rawは `.local/coordination/runs/P1-A-red-01/{metadata.json,stdout.bin,stderr.bin}` にあり、HEADは前後ともtest-only SHA、dirtyは前後とも空である。
 
-### focused GREEN
+### 初回 focused GREEN（履歴）
 
 production SHA `27fe86b9e60c37e92b1773c97735696dfa25dcfb`で、basetemp事前確認を`P1-A-green-basetemp-preflight-01`（exit 0）で行った後、次を実行した。
 
@@ -44,20 +48,20 @@ production SHA `27fe86b9e60c37e92b1773c97735696dfa25dcfb`で、basetemp事前確
 C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe -m pytest tests/unit/contracts --basetemp C:\Users\backo\.codex\worktrees\8dd5\CAE-harness\.local\verification\P1-A-green-01
 ```
 
-結果は `26 passed / exit 0`。rawは `.local/coordination/runs/P1-A-green-01/{metadata.json,stdout.bin,stderr.bin}` にある。静的修正後にも`P1-A-fix-green-02`で `26 passed / exit 0`、format/lint/mypyを各exit 0で確認し、その結果を`bf82ebc`へcommitした。
+結果は `26 passed / exit 0`。rawは `.local/coordination/runs/P1-A-green-01/{metadata.json,stdout.bin,stderr.bin}` にある。静的修正後にも`P1-A-fix-green-02`で `26 passed / exit 0`、format/lint/mypyを各exit 0で確認し、その結果を`bf82ebc`へcommitした。このcandidateは後続の独立semantic reviewでrejectされたため、final candidateのGREENではない。
 
 初回candidateの`P1-A-lint-02`はexit 1（import/`__all__` ordering、Python 3.12 type alias）、`P1-A-fix-mypy-01`もexit 1（canonicalのtype narrowingとoptional module narrowing）だった。これらは合格証拠に数えず、rawを保持したまま修正後のfinal candidateで全ゲートを再実行した。
 
 ## 実装した契約
 
-- `src/febio_cae/domain/canonical.py` は、辞書キー順、明示されたunordered collection、明示されたunique-id collectionを単一のcanonical serializerで処理する。UTF-8、空白なし、有限数値、negative zeroの正規化、文字列キー、重複id検査を固定し、順序を持つ配列は暗黙に並べ替えない。
-- `src/febio_cae/domain/units.py` はimmutableな`Dimension`、`UnitDefinition`、`Quantity`と明示的なregistryを提供する。`m/mm`、面積・体積、`s/ms`、`N`、`Pa/MPa`、dimensionlessを登録し、SI変換、dimension mismatch、未知unit、bool・非有限値を検査する。負値は物理的に必要なsigned valueとして許容し、未指定をゼロへ変換しない。
+- `src/febio_cae/domain/canonical.py` は、辞書キー順、明示されたunordered collection、明示されたunique-id collectionを単一のcanonical serializerで処理する。UTF-8、空白なし、有限数値、negative zeroの正規化、文字列キー、重複id検査を固定し、順序を持つ配列は暗黙に並べ替えない。最終candidateでは、宣言された各collection pathが実在するlist（root・nested・list indexを含む）へ解決することを事前検証する。
+- `src/febio_cae/domain/units.py` はimmutableな`Dimension`、`UnitDefinition`、`Quantity`と明示的なregistryを提供する。`m/mm`、面積・体積、`s/ms`、`N`、`Pa/MPa`、dimensionlessを登録し、SI変換、dimension mismatch、未知unit、bool・非有限値を検査する。Quantityの変換結果は有限floatへ投影し、real zeroは`0.0`へ正規化し、非zeroのunderflowとoverflow/huge-intは`QuantityRangeError`で拒否する。負値は物理的に必要なsigned valueとして許容し、未指定をゼロへ変換しない。generic JSONのint/float distinctionは維持する。
 - `src/febio_cae/domain/evidence.py` はimmutableなschema `1` の`EvidenceRef`を提供する。source kindは`user_instruction`、`registered_document`、`registered_material`、`registered_test_condition`に限定し、非空参照、対象field形式、lowercase SHA-256 digestを検査する。LLMの確信度はsource kindに含めない。
 - `src/febio_cae/domain/__init__.py` は上記共通契約を公開する。ケース世代、質問、revision、原子的保存、競合CASは今回の範囲外であり、後続P1の単一所有者契約で実装する。
 
-## 必須ローカルゲート
+## 初回candidateの必須ローカルゲート（履歴）
 
-全gateはfinal code candidate `bf82ebc4a734ad179af8362fe8da4a7a560458e5`で実行した。pytest basetempの事前作成・書込み確認は`P1-A-gate-pytest-basetemp-preflight-03`（exit 0）である。各recordの`head_before`/`head_after`はfinal candidate、dirtyは前後とも空である。
+初回静的candidate `bf82ebc4a734ad179af8362fe8da4a7a560458e5`で実行したgateを履歴として保持する。pytest basetempが事前に存在しないことを`P1-A-gate-pytest-basetemp-preflight-03`（exit 0）で確認した。これらのgateはR1 semantic review前のcandidateに属し、final acceptance evidenceではない。各recordの`head_before`/`head_after`はこの初回candidate、dirtyは前後とも空である。
 
 | record | exact command | 結果 | raw |
 |---|---|---|---|
@@ -70,7 +74,7 @@ C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe -m pytest test
 
 scanner raw JSONは`git_tracking.available=true`、`tracked_files=26`、`index_content_checked=26`、`excluded_tracked_files=0`、`issues=[]`、`status=PASS`を記録している。除外領域は`.git`、`.local`、cache、`__pycache__`、`dist`、`febio_cae.egg-info`である。
 
-## wheel と installed smoke
+## 初回candidateのwheel と installed smoke（履歴）
 
 buildで得たwheelは次のとおりである。
 
@@ -80,7 +84,7 @@ SHA-256: 46de6ee26aa76201a9091638ea7effbf9ea80269013d7a4c45d8d1ef23fdda5c
 size: 15344 bytes
 ```
 
-新規 `.local/venvs/P1-A-installed-02` にPython 3.12のvenvを作り、repo rootではない新規cwd `.local/verification/P1-A-installed-cwd-02`から、`--no-index --no-deps --force-reinstall`でwheelをnon-editable installした。preflightは`P1-A-installed-preflight-02`（exit 0）、venv作成は`P1-A-installed-venv-02`（exit 0）である。pip/CLI/importの全metadataはHEAD前後ともfinal candidate、dirty前後とも空である。
+新規 `.local/venvs/P1-A-installed-02` にPython 3.12のvenvを作り、repo rootではない新規cwd `.local/verification/P1-A-installed-cwd-02`から、`--no-index --no-deps --force-reinstall`でwheelをnon-editable installした。preflightは`P1-A-installed-preflight-02`（exit 0）、venv作成は`P1-A-installed-venv-02`（exit 0）である。pip/CLI/importの全metadataはHEAD前後とも初回candidate、dirty前後とも空である。このsmokeはR1 semantic fix前の履歴であり、final installed evidenceではない。
 
 | record | exact command | 結果 | raw |
 |---|---|---|---|
@@ -91,12 +95,67 @@ size: 15344 bytes
 
 installed smokeはCLIの配布・import境界を確認するものであり、solver、FBS、Studio、解析入力生成、実モデル成功を意味しない。
 
+## R1 semantic remediation final candidate
+
+独立レビューは初回candidate `27fe86b`（静的修正後のworker candidateは`bf82ebc`）に対して、CODE REJECTとして次の3 semantic defectを指摘した。宣言collection pathのmissing/wrong-type silently ignored、equivalent SI quantityのint/float表現不一致、finite nonzero conversionのzero underflowである。R1では許可された`canonical.py`、`units.py`、`test_canonical.py`、`test_units.py`だけを変更した。
+
+### R1 test-first RED / GREEN
+
+test-only SHA `85ce103fe25ef8a58a0ca01ea6f5dec6566a1e4f`（parentはprior report commit `343ac887`）で、basetempが事前に存在しないことを`P1-A-r1-red-basetemp-preflight-01`（exit 0）で確認した後、次を実行した。
+
+```text
+C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe -m pytest tests/unit/contracts --basetemp C:\Users\backo\.codex\worktrees\8dd5\CAE-harness\.local\verification\P1-A-r1-red-01
+```
+
+結果は `43 collected / 13 failed / 30 passed / exit 1`。失敗は宣言path 8件、SI canonical bytes 2件、underflow 2件、huge-int range 1件で、すべてassertionまたは期待例外のbehavior failureだった。collection/setup/import failure、skip、synthetic countの置換はない。rawは`.local/coordination/runs/P1-A-r1-red-01/{metadata.json,stdout.bin,stderr.bin}`である。
+
+production SHA `ed3dab5824558e7d06a10816e605d7f5172a366b`で、basetempが事前に存在しないことを`P1-A-r1-green-basetemp-preflight-01`（exit 0）で確認した後、同じfocused commandを`P1-A-r1-green-01`で実行し、`43 passed / exit 0`となった。rawは`.local/coordination/runs/P1-A-r1-green-01/{metadata.json,stdout.bin,stderr.bin}`にある。独立レビューの`test_regressions.py`も、worker rootのsourceを対象に`P1-A-r1-independent-01`で`13 passed / exit 0`となった。preflightは全てpath absence checkであり、basetempの事前作成・書込みを主張しない。
+
+### R1 final clean-candidate gates
+
+全final gateは`ed3dab5824558e7d06a10816e605d7f5172a366b`で実行し、pytest basetempが事前に存在しないことを`P1-A-r1-gate-pytest-basetemp-preflight-01`（exit 0）で確認した。各gate metadataのHEAD前後はこのSHA、dirtyは前後とも空である。
+
+| record | exact command | 結果 | raw |
+|---|---|---|---|
+| `P1-A-r1-gate-pytest-01` | `C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe -m pytest --basetemp C:\Users\backo\.codex\worktrees\8dd5\CAE-harness\.local\verification\P1-A-r1-gate-pytest-01` | `77 passed / exit 0` | `.local/coordination/runs/P1-A-r1-gate-pytest-01/{metadata.json,stdout.bin,stderr.bin}` |
+| `P1-A-r1-format-01` | `C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe -m ruff format --check .` | `25 files already formatted / exit 0` | `.local/coordination/runs/P1-A-r1-format-01/{metadata.json,stdout.bin,stderr.bin}` |
+| `P1-A-r1-lint-01` | `C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe -m ruff check .` | `All checks passed / exit 0` | `.local/coordination/runs/P1-A-r1-lint-01/{metadata.json,stdout.bin,stderr.bin}` |
+| `P1-A-r1-mypy-01` | `C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe -m mypy src tests` | `Success, no issues, 15 source files / exit 0` | `.local/coordination/runs/P1-A-r1-mypy-01/{metadata.json,stdout.bin,stderr.bin}` |
+| `P1-A-r1-scanner-01` | `C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe scripts/scan_cae_data.py --root .` | `PASS`, 27 filesystem/index files, 0 issues / exit 0 | `.local/coordination/runs/P1-A-r1-scanner-01/{metadata.json,stdout.bin,stderr.bin}` |
+| `P1-A-r1-build-01` | `C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe -m build` | sdist and wheel built / exit 0 | `.local/coordination/runs/P1-A-r1-build-01/{metadata.json,stdout.bin,stderr.bin}` |
+
+scanner raw JSONは`git_tracking.available=true`、`tracked_files=27`、`index_content_checked=27`、`excluded_tracked_files=0`、`issues=[]`、`status=PASS`を記録している。初回candidateのgate recordsは上記の履歴として残し、R1 final candidateのcount/exitを混ぜていない。
+
+### R1 final wheel と installed smoke
+
+```text
+C:\Users\backo\.codex\worktrees\8dd5\CAE-harness\dist\febio_cae-0.1.0-py3-none-any.whl
+SHA-256: 38b1a9e01f4ac7397662f80d247fd9dfc0731cf72bcc9306c68a48547ac5eedd
+size: 15705 bytes
+```
+
+新規`.local/venvs/P1-A-r1-installed-01`へPython 3.12のvenvを作り、repo rootではない新規cwd`.local/verification/P1-A-r1-installed-cwd-01`からnon-editable installした。`P1-A-r1-installed-preflight-01`はvenv/cwdの事前不存在を確認しcwdだけを作成した（exit 0）。pip、CLI、importのmetadataはfinal candidateのHEAD前後、dirty前後を保存している。
+
+| record | exact command | 結果 | raw |
+|---|---|---|---|
+| `P1-A-r1-installed-wheel-hash-01` | wheel SHA-256/size probe | SHA/size above / exit 0 | `.local/coordination/runs/P1-A-r1-installed-wheel-hash-01/{metadata.json,stdout.bin,stderr.bin}` |
+| `P1-A-r1-installed-venv-01` | `C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe -m venv C:\Users\backo\.codex\worktrees\8dd5\CAE-harness\.local\venvs\P1-A-r1-installed-01` | fresh venv / exit 0 | `.local/coordination/runs/P1-A-r1-installed-venv-01/{metadata.json,stdout.bin,stderr.bin}` |
+| `P1-A-r1-installed-pip-01` | venv Python `-m pip install --no-index --no-deps --force-reinstall` final wheel | `Successfully installed febio-cae-0.1.0 / exit 0` | `.local/coordination/runs/P1-A-r1-installed-pip-01/{metadata.json,stdout.bin,stderr.bin}` |
+| `P1-A-r1-installed-cli-01` | venv `Scripts\febio-cae.exe --version` | `febio-cae 0.1.0 / exit 0` | `.local/coordination/runs/P1-A-r1-installed-cli-01/{metadata.json,stdout.bin,stderr.bin}` |
+| `P1-A-r1-installed-import-02` | venv Python `-I -c` import/version/origin assertions from installed cwd | Python `3.12.10`, `isolated=1`, `PYTHONPATH=None`, `PYTHONHOME=None`; package, domain, canonical, units all from venv site-packages; metadata/module `0.1.0` / exit 0 | `.local/coordination/runs/P1-A-r1-installed-import-02/{metadata.json,stdout.bin,stderr.bin}` |
+
+`P1-A-r1-installed-import-01` is retained as a failed, non-evidence helper invocation: a PowerShell quoting error produced a Python `SyntaxError` before import. It is not counted as an interrupted or successful smoke run; the corrected `import-02` record is the only accepted import evidence. Installed smoke remains limited to distribution/import boundaries and does not establish solver, FBS, Studio, or real-model success.
+
+## R1 report-stage postchecks
+
+この更新文書をstageした後、`P1-A-r1-report-diff-check-01`で`git diff --cached --check`を、`P1-A-r1-report-scanner-01`で`C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe scripts/scan_cae_data.py --root .`を実行する。両recordのmetadataはstage中のHEAD、dirty、exact argv/cwd、UTC start/end、exit、stdout/stderr絶対パスを保存する。両方ともexit 0、scannerは27 filesystem/index files、0 issuesであることを確認する。
+
 ## 未検証事項と次タスク
 
 - P1のCaseDraft、IssuedQuestion、CaseRevision、状態遷移、atomic persistence、競合/CASは未実装・未検証である。P1-Aはdomain基礎だけである。
 - 実FEBio、公式FBS、FEBio Studio、Gmsh、LLM/native/E2E、許可済み`02_CAE`、BottomFrame実モデルは未実施である。
 - 単位registryは設計仕様の初期表示・SI単位集合を対象にした合成契約であり、実STEP宣言単位やsolver profileとの実機適合性は未検証である。
 - canonical serializerは共通の正規化関数と明示的path policyを固定したが、後続の全revision/evidence manifestが同じ関数を使うことは未検証である。
-- 独立Astra Mediumレビュー、PMによるreview済みclean commit列のV2統合、V2へのpushは未実施である。
+- R1 final candidateに対する独立Astra Mediumレビューの完了、PMによるreview済みclean commit列のV2統合、V2へのpushは未実施である。初回candidateに対するCODE REJECTと、その3 semantic findingsは本書R1節へ記録した。
 
-次タスクは、PMがこのclean candidateと証拠文書を独立レビューへ渡し、レビューで受理されたcommitだけを`V2`へfast-forward統合することである。今回のlocal/synthetic evidenceを実CAE受入れへ昇格させない。
+次タスクは、PMがR1 final candidateと証拠文書を独立レビューへ渡し、レビューで受理されたcommitだけを`V2`へfast-forward統合することである。今回のlocal/synthetic evidenceを実CAE受入れへ昇格させない。
