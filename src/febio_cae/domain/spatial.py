@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from typing import cast
 
 from .canonical import canonical_bytes
 from .units import Dimension, Quantity
@@ -37,6 +38,17 @@ def _finite_float(value: object, field: str) -> float:
     if not math.isfinite(result):
         raise SpatialValidationError(f"{field} must be finite")
     return result
+
+
+def _strict_mapping(
+    value: object, expected_keys: frozenset[str], field: str
+) -> Mapping[str, object]:
+    if not isinstance(value, Mapping):
+        raise SpatialValidationError(f"{field} must be an object")
+    keys = set(value.keys())
+    if any(not isinstance(key, str) for key in keys) or keys != expected_keys:
+        raise SpatialValidationError(f"{field} has unknown or missing fields")
+    return cast(Mapping[str, object], value)
 
 
 def _quantity_dict(quantity: Quantity) -> dict[str, float | str]:
@@ -177,6 +189,34 @@ class UnitDirection:
             "y": self.y,
             "z": self.z,
         }
+
+    @classmethod
+    def from_dict(cls, value: object) -> UnitDirection:
+        payload = _strict_mapping(
+            value,
+            frozenset({"schema_version", "frame", "x", "y", "z"}),
+            "direction",
+        )
+        if payload["schema_version"] != SCHEMA_VERSION:
+            raise SpatialValidationError("unsupported direction schema version")
+        raw_frame = payload["frame"]
+        if not isinstance(raw_frame, str):
+            raise SpatialValidationError("direction.frame must be a string")
+        components = tuple(
+            _finite_float(payload[field], f"direction.{field}") for field in ("x", "y", "z")
+        )
+        norm = math.hypot(math.hypot(components[0], components[1]), components[2])
+        if not math.isfinite(norm) or norm == 0.0:
+            raise SpatialValidationError("direction must be finite and nonzero")
+        if not math.isclose(norm, 1.0, rel_tol=0.0, abs_tol=1.0e-12):
+            raise SpatialValidationError("direction components must be normalized")
+
+        restored = object.__new__(cls)
+        object.__setattr__(restored, "frame", FrameId(raw_frame))
+        object.__setattr__(restored, "x", components[0])
+        object.__setattr__(restored, "y", components[1])
+        object.__setattr__(restored, "z", components[2])
+        return restored
 
     def to_bytes(self) -> bytes:
         return canonical_bytes(self.to_dict())

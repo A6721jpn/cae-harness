@@ -2,6 +2,14 @@
 
 from .canonical import SCHEMA_VERSION, CanonicalizationError, canonical_bytes
 from .evidence import SUPPORTED_SOURCE_KINDS, EvidenceRef
+from .material import (
+    CompressibleNeoHookean,
+    IsotropicLinearElastic,
+    MaterialApplicability,
+    MaterialCandidate,
+    MaterialValidationError,
+)
+from .motion import MotionApplicability, MotionProfile, MotionSample, MotionValidationError
 from .selection import (
     CoordinatePredicate,
     CoordinatePredicateRule,
@@ -48,6 +56,7 @@ __all__ = [
     "SUPPORTED_UNITS",
     "BodyId",
     "CanonicalizationError",
+    "CompressibleNeoHookean",
     "CoordinatePredicate",
     "CoordinatePredicateRule",
     "Dimension",
@@ -61,6 +70,14 @@ __all__ = [
     "FaceSetRule",
     "FrameId",
     "GeometryId",
+    "IsotropicLinearElastic",
+    "MaterialApplicability",
+    "MaterialCandidate",
+    "MaterialValidationError",
+    "MotionApplicability",
+    "MotionProfile",
+    "MotionSample",
+    "MotionValidationError",
     "NamedAttributeRule",
     "OpaqueId",
     "Point3",
