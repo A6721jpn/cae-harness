@@ -153,6 +153,8 @@ Gmshが返した局所座標は、一次4節点の`(0,0,0),(1,0,0),(0,1,0),(0,0,
 | FEBio version probe | 1 | version 4.12.0 stdout、stderr empty | **1** |
 | native observation validation | 1 | `evidence-validation-v3.json`、失敗0 | 0 |
 
+このvalidationのprocess exit `0`は、JSONの自己申告ではなく、元のCommandExecutionのprocess結果に基づく。補足証跡は原command、cwd、開始・終了時刻、process exit `0`、空のstderr、全stdoutを保持し、stdout内のvalidation JSONの`exit: 0`と区別している。補足rawは `C:\Users\backo\.codex\worktrees\e081\CAE-harness\.local\verification\P0B-native-primitives-01\validation-runtime-capture-v1.json`、SHA-256は `123D0DAFBDDA2BC8902584082222ED640671771A5980868EAD7C39B143E12267` である。
+
 初回strict bbox probeは3件ともexit 0だが判定`bbox=false, volume=true`であり、成功件数へ数えていない。これはGmsh bbox enclosure paddingの観測を受けた許容Assumption修正の履歴である。
 
 ## 9. 権威Gateへの部分対応と未検証
