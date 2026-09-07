@@ -158,9 +158,9 @@ def test_motion_rejects_missing_zero_nonmonotonic_or_unordered_history(
     samples: list[tuple[Quantity, Quantity]],
 ) -> None:
     motion = _motion()
-    typed_samples = [_sample(motion, time, displacement) for time, displacement in samples]
 
     with pytest.raises(ValueError):
+        typed_samples = [_sample(motion, time, displacement) for time, displacement in samples]
         _profile(motion, samples=typed_samples)
 
 
