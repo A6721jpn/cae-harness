@@ -6,7 +6,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 SOURCE_ROOT = REPOSITORY_ROOT / "src"
 
@@ -20,7 +19,9 @@ def _cli_environment() -> dict[str, str]:
     return environment
 
 
-def _run_cli(*arguments: str, environment: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+def _run_cli(
+    *arguments: str, environment: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [sys.executable, "-m", "febio_cae", *arguments],
         cwd=REPOSITORY_ROOT,

@@ -6,7 +6,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 SCANNER = REPOSITORY_ROOT / "scripts" / "scan_cae_data.py"
 
