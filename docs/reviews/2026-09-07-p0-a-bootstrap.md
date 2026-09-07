@@ -110,7 +110,7 @@ C:\Users\backo\.codex\worktrees\8dd5\CAE-harness\dist\febio_cae-0.1.0-py3-none-a
 SHA-256: 9289028973a82dff1a9f600a1ed4685b0e4a503f7880460466037fe8d4c9af0b
 ```
 
-次の新規`.local/verification/P0-A-r3-installed-01/installed-env`へPython 3.12のclean venvを作り、wheelをnon-editableで`--no-index --no-deps`インストールした。pipとCLIはrepo root外の新規`installed-cwd`から実行した。全ての実行rootは `C:\Users\backo\.codex\worktrees\8dd5\CAE-harness` であり、各metadataのHEADは前後ともfinal product candidate、dirtyは前後とも空である。新規env/cwdが事前に存在しないことは`P0-A-r3-installed-preflight-01`（exit 0）、cwd作成は`P0-A-r3-installed-cwd-create-01`（exit 0）で記録した。
+次の新規`.local/verification/P0-A-r3-installed-01/installed-env`へPython 3.12のclean venvを作り、wheelをnon-editableで`--no-index --no-deps`インストールした。pipとCLIはrepo root直下の作業cwdではなく、repo内ignored verification subdirにある新規`installed-cwd`から実行した。全ての実行rootは `C:\Users\backo\.codex\worktrees\8dd5\CAE-harness` であり、各metadataのHEADは前後ともfinal product candidate、dirtyは前後とも空である。新規env/cwdが事前に存在しないことは`P0-A-r3-installed-preflight-01`（exit 0）、cwd作成は`P0-A-r3-installed-cwd-create-01`（exit 0）で記録した。
 
 ```text
 C:\Users\backo\.codex\worktrees\8dd5\CAE-harness\.local\verification\P0-A-r3-installed-01\installed-env
@@ -125,7 +125,7 @@ C:\Users\backo\.codex\worktrees\8dd5\CAE-harness\.local\verification\P0-A-r3-ins
 | `P0-A-r3-installed-pip-01` | `C:\Users\backo\.codex\worktrees\8dd5\CAE-harness\.local\verification\P0-A-r3-installed-01\installed-env\Scripts\python.exe -m pip install --no-index --no-deps --force-reinstall C:\Users\backo\.codex\worktrees\8dd5\CAE-harness\dist\febio_cae-0.1.0-py3-none-any.whl` | `Successfully installed febio-cae-0.1.0` / exit 0 | `.local/coordination/runs/P0-A-r3-installed-pip-01/{metadata.json,stdout.bin,stderr.bin}` |
 | `P0-A-r3-installed-cli-01` | `C:\Users\backo\.codex\worktrees\8dd5\CAE-harness\.local\verification\P0-A-r3-installed-01\installed-env\Scripts\febio-cae.exe --version` | `febio-cae 0.1.0` / exit 0 | `.local/coordination/runs/P0-A-r3-installed-cli-01/{metadata.json,stdout.bin,stderr.bin}` |
 
-installed importの最終確認は、repo root外の`installed-cwd`からvenv Pythonの`-I`で実行した。`-I`はisolated mode（`sys.flags.isolated=1`）を要求し、コマンド内assertはPython 3.12、venvの`site-packages`内のimport元、`__version__ == importlib.metadata.version("febio-cae")`を同時に検証する。stdoutには`PYTHONPATH=None`、`PYTHONHOME=None`も記録された。
+installed importの最終確認は、repo内ignored verification subdirの`installed-cwd`からvenv Pythonの`-I`で実行した。`-I`はisolated mode（`sys.flags.isolated=1`）を要求し、コマンド内assertはPython 3.12、venvの`site-packages`内のimport元、`__version__ == importlib.metadata.version("febio-cae")`を同時に検証する。stdoutには`PYTHONPATH=None`、`PYTHONHOME=None`も記録された。
 
 ```text
 C:\Users\backo\.codex\worktrees\8dd5\CAE-harness\.local\verification\P0-A-r3-installed-01\installed-env\Scripts\python.exe -I -c "import importlib.metadata as metadata, os, pathlib, sys, febio_cae; package_file = pathlib.Path(febio_cae.__file__).resolve(); site_packages = pathlib.Path(sys.prefix).resolve() / 'Lib' / 'site-packages'; print('python=' + sys.executable); print('version=' + sys.version); print('isolated=' + str(sys.flags.isolated)); print('PYTHONPATH=' + repr(os.environ.get('PYTHONPATH'))); print('PYTHONHOME=' + repr(os.environ.get('PYTHONHOME'))); print('package_file=' + str(package_file)); print('metadata_version=' + metadata.version('febio-cae')); print('package_version=' + febio_cae.__version__); print('sys_path=' + repr(sys.path)); assert sys.version_info[:2] == (3, 12); assert sys.flags.isolated == 1; assert package_file.is_relative_to(site_packages); assert febio_cae.__version__ == metadata.version('febio-cae')"
@@ -143,3 +143,55 @@ C:\Users\backo\.codex\worktrees\8dd5\CAE-harness\.local\verification\P0-A-r3-ins
 - wheel smokeは配布されたCLIのversion/importだけを確認し、解析経路や実モデル成功を意味しない。
 
 次タスクは独立Astra Mediumレビューの結果をPMが確認し、受理されたclean commit列だけをV2へ統合すること。P0-Bでは別の許可された範囲でFEBio、Studio、Gmshの実機probeと対応表を作成する。本書更新前の過去候補・過去wheel・過去REDは、今回のfresh candidate証拠として再利用しない。
+
+## R4 High findings remediation appendix
+
+R3 independent reviewのHigh 2（XML candidate preclassification gap、誤った7-byte XPLT fixture/signature）に対するR4の差分だけを追記する。R3の履歴と証拠は上記のまま保持し、R3の誤った11-byte XPLT fixtureを実XPLT signatureの証拠として再利用しない。
+
+### R4 commit boundary
+
+| 項目 | 値 |
+|---|---|
+| R4 base | `b7a45b69949d55cc19fc8884b704e4ee42483b1c` |
+| R4 test-only | `e7137bc356060a4b56b2e0785d2720a7ca02593c`（parent: R4 base） |
+| R4 production | `6044b97f33554c3d7545c0e1082d1117ba08dca4`（parent: test-only） |
+| test format correction | `c672bc34af121de280959ebcdc39b263ccb2b163`、`afcd6e2d98e86d0762ef1ae23576052990d0a9e4` |
+| final code candidate | `afcd6e2d98e86d0762ef1ae23576052990d0a9e4` |
+| R4 tracked code/test files | `src/febio_cae/cli/scan_cae_data.py`、`tests/unit/test_scan_cae_data.py` |
+
+Productionの変更は、既存の1 MiB bounded inspection内で先頭ASCII whitespaceを全体から除去してcandidate判定すること、DOCTYPE/CDATA先頭を安全なdecode後の`UNINSPECTABLE_CONTENT`経路へ渡すこと、XPLT magicを`BEF 00 00 00 00 01`の8-byte prefixへ修正することだけである。test-only fixtureはproduction constantを複製せず、`struct.pack("<III", 0x00464542, 0x01000000, 0)`から独立に12 bytesを生成し、length `12`とprefix hex `4245460000000001`をassertして、Git index/worktreeの両経路を検証する。
+
+### R4 TDD evidence
+
+test-only SHA `e7137bc356060a4b56b2e0785d2720a7ca02593c`で、basetemp不在を`P0-A-r4-red-basetemp-preflight-01`（exit 0）で確認後、次を実行した。
+
+```text
+C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe -m pytest tests/unit/test_scan_cae_data.py --basetemp C:\Users\backo\.codex\worktrees\8dd5\CAE-harness\.local\verification\P0-A-r4-red-01
+```
+
+結果は`29 collected / 8 failed / 21 passed / exit 1`。8件はすべてAssertionErrorで、collection/environment/setup errorはない。失敗は512/600 leading-space XMLのindex/worktree各2件、DOCTYPE-first XMLのindex/worktree各1件、独立12-byte XPLT fixtureのindex/worktree各1件であり、500-space controlは通過した。rawは`.local/coordination/runs/P0-A-r4-red-01/{metadata.json,stdout.bin,stderr.bin}`、HEAD/dirtyは前後ともtest-only SHA/cleanである。
+
+production `6044b97f33554c3d7545c0e1082d1117ba08dca4`後、test format-only corrections `c672bc34af121de280959ebcdc39b263ccb2b163`、`afcd6e2d98e86d0762ef1ae23576052990d0a9e4`を経た最終candidateで、basetemp不在を`P0-A-r4-green-basetemp-preflight-03`（exit 0）で確認し、`P0-A-r4-green-03`として同じfocused commandを実行した。結果は`29 passed / exit 0`、HEAD/dirtyは前後とも`afcd6e2d98e86d0762ef1ae23576052990d0a9e4`/cleanである。各recordのmetadataはexact argv/cwd、Python、UTC start/end、exit、前後SHA/dirty、stdout/stderr絶対パスを保存する。
+
+### R4 final candidate gates
+
+最終candidate `afcd6e2d98e86d0762ef1ae23576052990d0a9e4`で、full pytest basetemp不在を`P0-A-r4-gate-pytest-basetemp-preflight-03`（exit 0）で確認した。fresh gateは以下のとおりである。
+
+| record | exact command | 結果 | raw |
+|---|---|---|---|
+| `P0-A-r4-gate-pytest-03` | `C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe -m pytest --basetemp C:\Users\backo\.codex\worktrees\8dd5\CAE-harness\.local\verification\P0-A-r4-gate-pytest-03` | 25 passed / exit 0 | `.local/coordination/runs/P0-A-r4-gate-pytest-03/{metadata.json,stdout.bin,stderr.bin}` |
+| `P0-A-r4-gate-format-03` | `C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe -m ruff format --check .` | 15 files already formatted / exit 0 | `.local/coordination/runs/P0-A-r4-gate-format-03/{metadata.json,stdout.bin,stderr.bin}` |
+| `P0-A-r4-gate-lint-03` | `C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe -m ruff check .` | All checks passed / exit 0 | `.local/coordination/runs/P0-A-r4-gate-lint-03/{metadata.json,stdout.bin,stderr.bin}` |
+| `P0-A-r4-gate-mypy-03` | `C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe -m mypy src tests` | Success, no issues, 8 source files / exit 0 | `.local/coordination/runs/P0-A-r4-gate-mypy-03/{metadata.json,stdout.bin,stderr.bin}` |
+| `P0-A-r4-gate-scanner-03` | `C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe scripts/scan_cae_data.py --root .` | `PASS`, 17 filesystem files, 17 Git-index files, 0 issues / exit 0 | `.local/coordination/runs/P0-A-r4-gate-scanner-03/{metadata.json,stdout.bin,stderr.bin}` |
+| `P0-A-r4-gate-build-02` | `C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe -m build` | sdist and wheel built / exit 0 | `.local/coordination/runs/P0-A-r4-gate-build-02/{metadata.json,stdout.bin,stderr.bin}` |
+
+### R4 installed smoke
+
+wheelは`C:\Users\backo\.codex\worktrees\8dd5\CAE-harness\dist\febio_cae-0.1.0-py3-none-any.whl`、SHA-256は`03077f7e3c25bf42dc2b2ac8c65ab8a0fa7422cee4d1ac73d481231a0612fb45`である。新規`.local/verification/P0-A-r4-installed-02/installed-env`へnon-editable installし、pip/CLI/importはrepo内ignored verification subdirの新規`installed-cwd`から実行した。このcwdはrepo root直下ではなく、installed source packageを探索しないisolated実行境界である。
+
+`P0-A-r4-installed-preflight-02`、`P0-A-r4-installed-cwd-create-02`、`P0-A-r4-installed-venv-02`、`P0-A-r4-installed-wheel-hash-02`、`P0-A-r4-installed-pip-02`、`P0-A-r4-installed-cli-02`、`P0-A-r4-installed-import-02`はすべてexit 0である。CLI stdoutは`febio-cae 0.1.0`。importは`-I`、Python `3.12.10`、`isolated=1`、`PYTHONPATH=None`、`PYTHONHOME=None`、package fileがinstalled-envの`site-packages`内、metadata/package versionがともに`0.1.0`を記録し、assertもexit 0である。各rawは`.local/coordination/runs/<record>/{metadata.json,stdout.bin,stderr.bin}`にあり、metadataはexact argv/cwd/Python/UTC start/end/exit/前後SHA/dirty/絶対stdout/stderrを保存する。
+
+証拠文書をstageした後、`P0-A-r4-report-diff-check-02`で`git diff --cached --check`を実行しexit 0、`P0-A-r4-report-scanner-02`で`C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe scripts/scan_cae_data.py --root .`を実行しexit 0を確認した。scannerは17 filesystem files/17 Git-index files/0 issuesであり、rawは各recordの`.local/coordination/runs/<record>/{metadata.json,stdout.bin,stderr.bin}`に保存した。両metadataはstage中の`dirty_before`/`dirty_after`、final code candidate SHA、exact argv/cwd/Python、UTC start/end、exit、stdout/stderr絶対パスを保持する。
+
+R4でも実FEBio/FBS/Studio/Gmsh/LLM、native/E2E、real `02_CAE`、BottomFrame、完全XPLT reader、実モデル成功は未検証であり、synthetic/local boundary evidenceを実CAE成功として扱わない。
