@@ -51,6 +51,16 @@ def _sample(motion: ModuleType, time: Quantity, displacement: Quantity) -> Any:
     return motion.MotionSample(time=time, displacement=displacement)
 
 
+def _reference_point_with_coordinate(coordinate: str, quantity: Quantity) -> Point3:
+    values = {
+        "x": Quantity(0, "m"),
+        "y": Quantity(0, "m"),
+        "z": Quantity(0, "m"),
+    }
+    values[coordinate] = quantity
+    return Point3(FrameId("World"), values["x"], values["y"], values["z"])
+
+
 def _profile(
     motion: ModuleType,
     *,
@@ -380,6 +390,54 @@ def test_motion_profile_direction_roundtrip_preserves_canonical_bytes(
 ) -> None:
     motion = _motion()
     profile = _profile(motion, direction=UnitDirection(FrameId("World"), *vector))
+    restored = motion.MotionProfile.from_dict(profile.to_dict())
+
+    assert restored.to_bytes() == profile.to_bytes()
+
+
+@pytest.mark.parametrize("entrypoint", ["construct", "from_dict"])
+@pytest.mark.parametrize("coordinate", ["x", "y", "z"])
+@pytest.mark.parametrize(
+    ("quantity", "range_kind"),
+    [
+        (Quantity(10**400, "m"), "overflow"),
+        (Quantity(5e-324, "mm"), "underflow"),
+    ],
+    ids=["overflow", "underflow"],
+)
+def test_motion_profile_rejects_unrepresentable_initial_reference_coordinates(
+    entrypoint: str,
+    coordinate: str,
+    quantity: Quantity,
+    range_kind: str,
+) -> None:
+    motion = _motion()
+
+    with pytest.raises(ValueError, match="outside finite range|underflows"):
+        if entrypoint == "construct":
+            _profile(
+                motion,
+                reference_point=_reference_point_with_coordinate(coordinate, quantity),
+            )
+        else:
+            payload = _profile(motion).to_dict()
+            payload["initial_reference_point"][coordinate]["value"] = quantity.value
+            motion.MotionProfile.from_dict(payload)
+
+    assert range_kind in {"overflow", "underflow"}
+
+
+def test_motion_profile_accepts_signed_zero_and_representable_extreme_coordinates() -> None:
+    motion = _motion()
+    profile = _profile(
+        motion,
+        reference_point=Point3(
+            FrameId("World"),
+            Quantity(-1.0e308, "m"),
+            Quantity(0, "m"),
+            Quantity(5e-324, "m"),
+        ),
+    )
     restored = motion.MotionProfile.from_dict(profile.to_dict())
 
     assert restored.to_bytes() == profile.to_bytes()
