@@ -289,6 +289,7 @@ LLMは構造化された提案を返し、applicationがスキーマ、参照先
 | `febio-cae --version` / `doctor` | 製品版、登録したツールと対応表、実行能力の状態 |
 | `case create --case-root <path> --cad <path>` | 許可された領域へケースと形状参照を登録 |
 | `case inspect <case-id>` | ボディ・領域一覧、単位、調査図、未解決事項 |
+| `case spec <case-id> --file <json> --expected-generation <n>` | 型付き明示仕様と根拠の宣言を現行草案へCASで適用。未確定値は未解決のまま保持し、物理値を補わない |
 | `case intent <case-id> --text <text>` | 自然言語を草案へ適用し、確定値・差分・質問を返す |
 | `case answer <case-id> --question <id> --text <text>` | 現行世代の質問へ回答 |
 | `case validate <case-id>` / `case freeze <case-id>` | 検証と不変版の作成。凍結も再検証を必要とする |
@@ -298,6 +299,8 @@ LLMは構造化された提案を返し、applicationがスキーマ、参照先
 | `preview <run-id> --confirm --evidence <path>` | 読込確認の記録。内容ハッシュを再検証 |
 | `case edit <case-id> --base <revision> --text <text>` | 親版を指定した部分変更の草案 |
 | `compare <baseline-run> <candidate-run> --spec <path>` | 型付き比較条件で差分・曲線・レポートを作成 |
+
+最初の明示仕様経路は`case spec`を使い、LLM接続を必要としない。JSONは共有schemaの型・単位・根拠宣言として検証し、ケースID、現行世代、根拠の解決・鮮度、凍結と実行許可は登録済みサービスが検証する。ファイル中の`approved`や`ready`等を権限として使わず、自然言語経路にも同じ検証・凍結規則を適用する。
 
 各操作は`--json`を持ち、`schema_version, status, case_id, revision_id, run_id, diagnostics, next_actions`を返す。適用外IDはnullで表す。終了コードは0=操作成功、2=入力または比較条件不正、3=物理条件待ち、4=環境・未対応能力、5=実行失敗、6=結果完全性・必須品質不合格、7=キャンセル・中断、8=競合・古い世代とする。`status`の読取成功はrun成功を意味せず、返却JSON内の状態を解釈する。
 
