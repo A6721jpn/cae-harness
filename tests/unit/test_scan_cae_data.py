@@ -177,10 +177,7 @@ def test_boundary_scan_marks_doctype_first_febio_xml_uninspectable(
 ) -> None:
     _init_git_repo(tmp_path)
     candidate = tmp_path / "payload.txt"
-    content = (
-        b"<!DOCTYPE febio_spec>\n"
-        b'<febio_spec version="4.0"><Module type="solid"/></febio_spec>'
-    )
+    content = b'<!DOCTYPE febio_spec>\n<febio_spec version="4.0"><Module type="solid"/></febio_spec>'
     _set_index_or_worktree_payload(candidate, content, source)
 
     completed = _run_scanner(tmp_path)
