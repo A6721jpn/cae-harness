@@ -485,7 +485,7 @@ def test_check_nonzero_direction_requires_prescribed_translation(axis: str) -> N
     direction[axis] = 1.0
     result = rigid.check_translational_indentation_compatibility(
         tool,
-        _motion(direction=tuple(direction.values())),
+        _motion(direction=(direction["x"], direction["y"], direction["z"])),
     )
 
     assert result.supported is False
@@ -505,7 +505,7 @@ def test_check_zero_direction_rejects_free_translation(axis: str) -> None:
         tool = _tool(rigid, dofs=_dofs(rigid, states={"x": "free", "y": "prescribed"}))
     result = rigid.check_translational_indentation_compatibility(
         tool,
-        _motion(direction=tuple(direction.values())),
+        _motion(direction=(direction["x"], direction["y"], direction["z"])),
     )
 
     assert result.supported is False
@@ -524,7 +524,7 @@ def test_check_tiny_nonzero_direction_is_not_classified_as_zero(axis: str) -> No
     tool = _tool(rigid, dofs=_dofs(rigid, states=states))
     result = rigid.check_translational_indentation_compatibility(
         tool,
-        _motion(direction=tuple(direction.values())),
+        _motion(direction=(direction["x"], direction["y"], direction["z"])),
     )
 
     assert result.supported is False
