@@ -736,7 +736,15 @@ def test_case_spec_rejects_unrelated_or_noncommon_frame_selection_in_every_colle
             display_unit="mm",
             evidence=_evidence("outputs.requests.request_bad", "n"),
         )
-        kwargs = {"outputs": _output(requests=[request])}
+        base_output = _output()
+        kwargs = {
+            "outputs": OutputPolicy(
+                profile=base_output.profile,
+                requests=[*base_output.requests, request],
+                saved_times=base_output.saved_times,
+                evaluations=base_output.evaluations,
+            )
+        }
     else:
         output = _output()
         bad_selection = _output_selection(frame=FrameId("OtherFrame"))
