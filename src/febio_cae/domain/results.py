@@ -132,8 +132,8 @@ class NumericResultData:
         axis_values = tuple(
             _finite(item, "axis_values[]") for item in _sequence(self.axis_values, "axis_values")
         )
-        if len(axis_values) < 2:
-            raise ResultsValidationError("axis_values must contain at least two states")
+        if not axis_values:
+            raise ResultsValidationError("axis_values must contain at least one state")
         if any(current <= previous for previous, current in pairwise(axis_values)):
             raise ResultsValidationError("axis_values must be strictly increasing")
         entity_ids = tuple(
