@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from types import ModuleType
 from typing import Any
 
@@ -547,6 +547,29 @@ def test_case_spec_rejects_each_wrong_child_type_independently(field: str) -> No
         _case_value(**{field: {"forged": True}})
 
 
+@pytest.mark.parametrize(
+    "field",
+    [
+        "geometry",
+        "material",
+        "support",
+        "rigid_tool",
+        "motion",
+        "contact",
+        "mesh_policy",
+        "solver_policy",
+        "outputs",
+        "quality_policy",
+        "budget",
+    ],
+)
+def test_case_spec_omitting_required_field_uses_standard_type_error(field: str) -> None:
+    kwargs = _case_kwargs()
+    del kwargs[field]
+    with pytest.raises(TypeError, match=field):
+        _case().CaseSpec(**kwargs)
+
+
 def test_case_spec_is_frozen_and_projection_is_detached() -> None:
     case = _case_value()
     with pytest.raises(FrozenInstanceError):
@@ -557,6 +580,71 @@ def test_case_spec_is_frozen_and_projection_is_detached() -> None:
     projected["outputs"]["requests"][0]["selection"]["name"] = "mutated"  # type: ignore[index]
     assert case.geometry.body_id == PART_BODY
     assert case.to_dict()["geometry"]["body_id"] == PART_BODY.value
+
+
+def test_case_spec_preserves_nontrivial_unicode_positive() -> None:
+    case = _case_value()
+    assert case.quality_policy.criteria[0].applicability_reason == (
+        "解析条件 — convergence étape 1"
+    )
+    assert case.to_bytes() == canonical_bytes(case.to_dict())
+
+
+@pytest.mark.parametrize("field", ["material", "motion", "contact", "rigid_tool"])
+def test_case_spec_rejects_surrogate_evidence_at_parent_boundary(field: str) -> None:
+    if field == "material":
+        child = _material()
+        evidence_attr = "model_evidence"
+    elif field == "motion":
+        child = _motion()
+        evidence_attr = "history_evidence"
+    elif field == "contact":
+        child = _contact()
+        evidence_attr = "part_surface_evidence"
+    else:
+        child = _rigid_tool()
+        evidence_attr = "contact_surface_evidence"
+
+    evidence = getattr(child, evidence_attr)
+    child = replace(
+        child,
+        **{evidence_attr: replace(evidence, reference="surrogate\ud800")},
+    )
+    with pytest.raises(_case().CaseSpecValidationError, match=field):
+        _case_value(**{field: child})
+
+
+def test_case_spec_detaches_caller_owned_collections_after_composition() -> None:
+    support_values = list(_supports().supports)
+    sample_values = list(_motion().samples)
+    refinement_values = list(_mesh().local_refinements)
+    request_values = list(_output().requests)
+
+    case = _case_value(
+        support=SupportSet(support_values),
+        motion=_motion(samples=sample_values),
+        mesh_policy=_mesh(local_refinements=refinement_values),
+        outputs=_output(requests=request_values),
+    )
+    before = case.to_bytes()
+    support_content = tuple(item.support_id.value for item in case.support.supports)
+    sample_content = tuple(item.time.to_si().value for item in case.motion.samples)
+    refinement_content = tuple(item.refinement_id for item in case.mesh_policy.local_refinements)
+    request_content = tuple(item.request_id for item in case.outputs.requests)
+
+    support_values.clear()
+    sample_values.clear()
+    refinement_values.clear()
+    request_values.clear()
+
+    assert case.to_bytes() == before
+    assert tuple(item.support_id.value for item in case.support.supports) == support_content
+    assert tuple(item.time.to_si().value for item in case.motion.samples) == sample_content
+    assert (
+        tuple(item.refinement_id for item in case.mesh_policy.local_refinements)
+        == refinement_content
+    )
+    assert tuple(item.request_id for item in case.outputs.requests) == request_content
 
 
 def test_case_spec_accepts_both_material_concrete_types() -> None:
