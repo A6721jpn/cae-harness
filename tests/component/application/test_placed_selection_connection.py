@@ -17,6 +17,7 @@ from test_persistence_authority import (
 
 from febio_cae.application.service import RegisteredCaseService
 from febio_cae.domain import BodyId, GeometrySelectionRequest
+from febio_cae.storage.registry import StorageIntegrityError
 
 
 @pytest.mark.parametrize("foreign_result", [False, True])
@@ -79,6 +80,6 @@ def test_tampered_registered_source_never_reaches_placed_dependency(tmp_path: Pa
         storage.root / f"cases/{created.case_id}/sources/{created.source_asset.asset_id}.bin"
     )
     registered.write_bytes(b"changed source")
-    result = connected.validate_case(created.case_id)
-    assert result.status != "VALIDATED"
+    with pytest.raises(StorageIntegrityError, match="source bytes"):
+        connected.validate_case(created.case_id)
     assert calls == []
