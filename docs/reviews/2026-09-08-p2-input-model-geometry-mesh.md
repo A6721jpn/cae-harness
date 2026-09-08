@@ -2,7 +2,10 @@
 
 Date: 2026-09-08
 
-Status: clean report-bearing handoff pending independent whole-candidate review.
+Status: historical original handoff, subsequently rejected in independent review.
+Its M3 execution chronology is corrected below from preserved command events;
+the original commit and raw evidence remain unchanged. See the current
+[consolidated source handoff](2026-09-08-p2-c-source-handoff.md) for fresh gates.
 This slice is synthetic/local evidence only. It is not P2 closure, official FBS,
 FEBio execution, FEBio Studio evidence, real-model evidence, `02_CAE` evidence,
 or BottomFrame evidence. The worker did not integrate or push.
@@ -68,9 +71,11 @@ Gmsh module.
 
 ## Test-first evidence
 
-All commands below were run with current working directory
-`C:\Users\backo\.codex\worktrees\2ef6\CAE-harness`. Relative paths are shown
-as invoked; the captured records expand them under that same absolute cwd.
+Commands below used working directory
+`C:\Users\backo\.codex\worktrees\2ef6\CAE-harness`. Original shell events
+recorded bare `python` invocations, not independently expanded absolute child
+executables. Later installed-smoke wrapper records explicitly captured their
+absolute child argv; these two evidence formats must not be conflated.
 
 ### Availability RED chronology
 
@@ -92,40 +97,46 @@ missing `StepGeometryMeshAdapter` API; RED-01 also reached the missing
 `GmshOCCConfig` API assertion. These are genuine nonzero RED results, not
 passing evidence.
 
-The focused unit RED for the OCC target-unit ordering was then recorded at the
-test-only boundary:
+The focused unit RED for OCC target-unit ordering was recorded against the
+in-progress implementation, before that behavior was corrected:
 
 ```text
-python -m pytest tests/component/geometry/test_gmsh_units.py --basetemp C:\Users\backo\.codex\worktrees\2ef6\CAE-harness\.local\verification\P2-input-green-08-red -q
+python -m pytest tests/component/geometry/test_gmsh_units.py --basetemp .local/verification/P2-input-green-08-red -q
 ```
 
 It exited `1` because the deterministic fake requires the explicit target unit
-before import. That failure was the intended behavior-first signal. After the
-production implementation and test fixture packaging, the clean focused GREEN
-was:
+before import. That is behavior-failure evidence, not a clean-source attribution.
+The focused GREEN occurred in a format/lint/types/test shell chain before the
+production commit (preserved event ordinal 1604):
 
 ```text
-python -m pytest tests/component/geometry --basetemp C:\Users\backo\.codex\worktrees\2ef6\CAE-harness\.local\verification\P2-input-green-10 -q
+python -m pytest tests/component/geometry --basetemp .local/verification/P2-input-green-10 -q
 ```
 
-It collected and passed 18 tests, exit `0`, at clean candidate
-`1f2bc1fc52524b6363e334176ef120c6f1ac3b56`. Production implementation was
-committed separately in `c7422677497c775c43b3754d421bc72b33088e76`; the later
-`1f2bc1f` commit only packages the component fixture for the type check.
+It passed 18 tests in 0.12 s, with final shell exit `0`. It was not a run at
+clean `1f2bc1f`. Production was later committed separately in `c742267`; the
+test package initializer was subsequently added while that commit was checked
+out, then committed in `1f2bc1f` after the full test/type/format/lint runs.
 
-## Final local gates
+## Historical local gates: corrected M3 chronology
 
-These gates ran at clean final code/test candidate
-`1f2bc1fc52524b6363e334176ef120c6f1ac3b56`, before this report-only commit.
+The full test, mypy, and format/lint outputs are genuine but belong to `c742267`
+plus the uncommitted new `tests/component/geometry/__init__.py`, not clean
+`1f2bc1f`. Preserved events 1744, 1751, 1758 and 1765 precede the initializer
+commit at 1772. Scanner and build occur afterward (1781 and 1788). This is a
+chronology correction, not a reconstruction or rerun of the rejected candidate.
 
-| Exact command | Result | Exit |
-|---|---|---:|
-| `C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe -m pytest --basetemp C:\Users\backo\.codex\worktrees\2ef6\CAE-harness\.local\verification\P2-input-full-03 -q` | 1,066 passed | 0 |
-| `C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe -m ruff format --check .` | 109 files already formatted | 0 |
-| `C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe -m ruff check .` | all checks passed | 0 |
-| `C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe -m mypy src tests` | success in 77 files | 0 |
-| `C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe scripts/scan_cae_data.py --root .` | PASS; 111 tracked/checked, 0 diagnostics | 0 |
-| `C:\Users\backo\AppData\Local\Programs\Python\Python312\python.exe -m build` | sdist and wheel built | 0 |
+| Original shell command | Result | Captured exit and state |
+|---|---|---|
+| `python -m pytest --basetemp .local/verification/P2-input-full-03 -q` | 1,066 passed, 21.80 s | 0; dirty initializer at c742267 |
+| `python -m ruff format --check .; python -m ruff check .` | 109 formatted; all lint checks passed | final shell 0; individual format exit not separately captured; dirty initializer |
+| `python -m mypy src tests` | success in 77 files | 0; dirty initializer |
+| `python scripts/scan_cae_data.py --root .` | PASS; 111 checked, 0 diagnostics | 0; after 1f2bc1f |
+| `python -m build` | sdist and wheel built | 0; after 1f2bc1f |
+
+Source: PM-preserved `P2-geometry-whole-review-01/evidence-audit.json`, selected
+original command/output pairs and independent M3 finding. The new consolidated
+execution manifest hashes that preserved audit and supplies fresh clean gates.
 
 The full suite and all static gates are synthetic/local evidence. They do not
 establish a real Gmsh/FEBio/FBS/Studio execution path.
