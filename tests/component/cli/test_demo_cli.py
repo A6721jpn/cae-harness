@@ -53,3 +53,44 @@ def test_demo_cli_routes_registered_ids_and_reports_cleanup(
     else:
         assert code == 0
         assert payload["status"] == "NEEDS_PREVIEW"
+
+
+@pytest.mark.parametrize(
+    ("status", "quality", "expected"),
+    [("NEEDS_REVIEW", "FAIL", 6), ("NEEDS_PREVIEW", "PASS", 0), ("PREFLIGHT_PASSED", None, 0)],
+)
+def test_demo_completed_quality_exit_contract(
+    tmp_path: Any,
+    monkeypatch: Any,
+    capsys: Any,
+    status: str,
+    quality: str | None,
+    expected: int,
+) -> None:
+    payload = {
+        "status": status,
+        "run_status": "SUCCEEDED",
+        "quality": {"overall_status": quality},
+    }
+
+    def run(self: Any, case_id: str, revision_id: str, *, executable: str, preflight: bool) -> Any:
+        return payload
+
+    monkeypatch.setattr(RegisteredCaseService, "run_demo", run)
+    code = main(
+        [
+            "case",
+            "--state-dir",
+            str(tmp_path / "state"),
+            "run-demo",
+            "case-known",
+            "--revision-id",
+            "revision-known",
+            "--solver",
+            "solver.exe",
+            "--json",
+            *(["--preflight"] if status == "PREFLIGHT_PASSED" else []),
+        ]
+    )
+    assert json.loads(capsys.readouterr().out) == payload
+    assert code == expected
