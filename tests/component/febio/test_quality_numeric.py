@@ -258,3 +258,9 @@ def test_nonzero_required_time_cannot_underflow_to_initial_state(tmp_path: Path)
         ),
     )
     assert assess(case).overall_status is AssessmentStatus.UNVERIFIED
+
+
+def test_nearby_but_distinct_state_is_not_the_required_endpoint(tmp_path: Path) -> None:
+    case = controlled_case(tmp_path)
+    case.replace_numeric(replace(case.numeric(), axis_values=(0.0, 1.0 - 1e-13)))
+    assert assess(case).overall_status is AssessmentStatus.UNVERIFIED
