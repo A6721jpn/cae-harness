@@ -909,6 +909,33 @@ class RegisteredCaseService:
             _registered_selections(partial(revision.spec)),
         )
 
+    def _verify_execution_mesh(
+        self,
+        storage: CaseStorage,
+        registration: MeshQualityRecord,
+        revision: CaseRevision,
+        mesh: MeshArtifact,
+    ) -> None:
+        if not isinstance(registration, PlanarDemoRegistration):
+            if not mesh.quality_records or any(r.status != "PASS" for r in mesh.quality_records):
+                raise ValueError("execution requires passing mesh quality")
+            return
+        from febio_cae.domain.canonical import canonical_bytes
+        from febio_cae.domain.codec import decode_record, encode_record
+
+        def source(asset_id: str) -> bytes:
+            return storage.resolve_source(storage.source_asset(asset_id)).content
+
+        original = decode_record(source("gm03-mesh"), MeshArtifact)
+        carrier = decode_record(source("gm03-carrier"), CaseRevision)
+        expected, receipt = self._adopt_planar_mesh(registration, original, carrier, revision)
+        if (
+            encode_record(mesh) != encode_record(expected)
+            or source("adopted-mesh") != encode_record(expected)
+            or source("adoption-receipt") != canonical_bytes(receipt)
+        ):
+            raise ValueError("execution adoption differs from registered origin derivation")
+
     def _execute_ports(
         self,
         case_id: str,
@@ -937,7 +964,7 @@ class RegisteredCaseService:
             storage.evidence_snapshot(),
             storage.revision_snapshot(case_id, revision_id) as revision,
         ):
-            storage.resolve_revision_mesh_quality(revision)
+            registration = storage.resolve_revision_mesh_quality(revision)
             validated = self._validate(case_id)
             draft = validated.draft
             if (
@@ -962,6 +989,10 @@ class RegisteredCaseService:
                 storage.root / f"cases/{case_id}/runs/{owner.run_id}/attempts/{owner.attempt_id}"
             )
             mesh, bundle, inputs = build(revision, destination)
+            try:
+                self._verify_execution_mesh(storage, registration, revision, mesh)
+            except ValueError as error:
+                raise PortError(PortErrorCategory.INTEGRITY, str(error)) from error
             profile = self.compatibility.get_profile(revision.spec.solver_policy.profile.profile_id)
             if (
                 mesh.provenance.source_geometry_digest != revision.spec.geometry.geometry_digest
@@ -970,8 +1001,6 @@ class RegisteredCaseService:
                     revision.spec.geometry.body_id.value,
                     revision.spec.rigid_tool.primitive.body_id.value,
                 }
-                or not mesh.quality_records
-                or any(item.status != "PASS" for item in mesh.quality_records)
                 or bundle.thread_count > revision.spec.budget.cpu_workers
             ):
                 raise PortError(
@@ -995,6 +1024,11 @@ class RegisteredCaseService:
                     raise PortError(
                         PortErrorCategory.EXECUTION, "preparation exhausted operation budget"
                     )
+                if isinstance(registration, PlanarDemoRegistration):
+                    from febio_cae.storage.demo_budget import reserve_demo_attempt
+
+                    if not reserve_demo_attempt(storage, case_id, "febio", owner.attempt_id):
+                        raise PortError(PortErrorCategory.CONFLICT, "native start already reserved")
                 issued = runner.start(bundle, owner, revision.spec.budget)
                 storage._accept_runner_start(owner, issued)
                 while issued.state in {RunState.RUNNING, RunState.DRAINING}:
