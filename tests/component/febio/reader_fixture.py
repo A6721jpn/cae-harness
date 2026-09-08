@@ -28,6 +28,7 @@ from febio_cae.domain import (
 )
 
 from .test_compiler_native import _case
+from .fixtures import evidence
 
 
 def block(tag: int, payload: bytes) -> bytes:
@@ -194,6 +195,7 @@ def setup_reader(
         location="element",
         component_id="xx",
         display_unit="Pa",
+        evidence=evidence("outputs.requests.request_stress", "reader-stress"),
     )
     revision = replace(
         revision,

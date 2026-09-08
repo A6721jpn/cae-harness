@@ -10,6 +10,7 @@ from febio_cae.domain import NumericResultData, PortError, ReadStatus
 from febio_cae.domain.codec import decode_record, encode_record
 
 from .reader_fixture import setup_reader
+from .fixtures import make_xplt_fixture
 
 
 def test_registered_native_layout_maps_nodes_elements_and_rigid_body_then_persists(
@@ -90,6 +91,27 @@ def test_registered_unsupported_structure_never_validates(tmp_path: Path, defect
 
 def test_missing_registration_is_not_replaced_by_native_header_identity(tmp_path: Path) -> None:
     reader, attempt, bundle, _, _ = setup_reader(tmp_path, register=False)
+    # Historical candidate dialect: even embedded matching identities must not
+    # replace independent output registration. This was accepted before repair.
+    profile = replace(
+        reader.profile,
+        output_mappings=tuple(
+            replace(mapping, native_name="reaction forces")
+            if mapping.canonical_id == "contact_force"
+            else mapping
+            for mapping in reader.profile.output_mappings
+            if mapping.canonical_id != "stress"
+        ),
+    )
+    reader = type(reader)(profile=profile)
+    assert attempt.process is not None
+    (Path(attempt.process.cwd) / "output/results.xplt").write_bytes(
+        make_xplt_fixture(
+            attempt_id=attempt.attempt_id,
+            bundle_digest=bundle.bundle_digest,
+            mesh_digest=bundle.mesh_digest,
+        )
+    )
     with pytest.raises(PortError, match="registered"):
         reader.read(attempt, bundle)
 
