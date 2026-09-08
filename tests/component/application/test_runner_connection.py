@@ -106,6 +106,9 @@ def test_registered_runner_connects_issued_state_and_numeric_reader(
                 attempt.transition_to(RunState.DRAINING).transition_to(RunState.VALIDATING), ()
             )
 
+        def reconcile(self, attempt: Any, owner: Any) -> Any:
+            raise AssertionError("this issued-runner fixture has no restart path")
+
         def cancel(self, attempt: Any, owner: Any) -> Any:
             events.append("cancel")
             from febio_cae.domain import CancelResult
@@ -183,6 +186,6 @@ def test_registered_runner_connects_issued_state_and_numeric_reader(
         )
         assert events == ["start", "poll", "read"]
         assert storage.get_manifest(manifest.manifest_id) == manifest
-        assert (
-            storage.resolve(manifest.read_result.observations[0].data_ref).axis_id == "state_time"
-        )
+        reference = manifest.read_result.observations[0].data_ref
+        assert reference is not None
+        assert storage.resolve(reference).axis_id == "state_time"

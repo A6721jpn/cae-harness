@@ -33,8 +33,10 @@ from febio_cae.domain.partial_case_spec import PartialCaseSpec
 from febio_cae.domain.ports import (
     CompatibilityRegistryPort,
     GeometryPort,
+    OwnershipPort,
     PortError,
     PortErrorCategory,
+    RunnerPort,
     TrustedOwnerContext,
 )
 from febio_cae.domain.questions import IssuedQuestion
@@ -53,6 +55,7 @@ from febio_cae.storage.registry import (
 )
 from febio_cae.storage.state import ProductState
 
+from ._execution import _RunnerOwner
 from ._geometry import PlacedSelection, _PlacedGeometry
 from .specs import SourceDeclaration
 
@@ -878,6 +881,121 @@ class RegisteredCaseService:
         self, case_id: str, ref: NumericalProfileRef
     ) -> MeshQualityRegistration:
         return self._storage(case_id).resolve_mesh_quality(ref)
+
+    def _execute_ports(
+        self,
+        case_id: str,
+        revision_id: str,
+        *,
+        build: Callable[
+            [CaseRevision, Path], tuple[MeshArtifact, ExecutionBundle, Mapping[str, bytes]]
+        ],
+        runner_factory: Callable[[OwnershipPort, Path, Mapping[str, bytes]], RunnerPort],
+        read: Callable[
+            [AttemptRecord, ExecutionBundle, tuple[FileEntry, ...], CaseStorage], ResultManifest
+        ],
+    ) -> ResultManifest:
+        """Trusted adapter composition, separate from the synchronous producer seam.
+
+        The build dependency invokes the configured mesher/compiler, not a caller
+        artifact proposal. Its complete returned recipe/provenance is stored with
+        the compiled lineage. Only actual issued runner snapshots are persisted.
+        """
+        storage = self._storage(case_id)
+        with (
+            storage.evidence_snapshot(),
+            storage.revision_snapshot(case_id, revision_id) as revision,
+        ):
+            storage.resolve_revision_mesh_quality(revision)
+            validated = self._validate(case_id)
+            draft = validated.draft
+            if (
+                validated.status != "VALIDATED"
+                or draft is None
+                or storage.revision_generation(revision_id) != draft.generation
+                or draft.values.to_case_spec().to_bytes() != revision.spec.to_bytes()
+                or tuple(draft.evidence) != tuple(revision.evidence)
+            ):
+                raise PortError(
+                    PortErrorCategory.CONFLICT,
+                    "execution requires current validated frozen revision",
+                )
+            deadline = time.monotonic() + revision.spec.budget.max_elapsed.to_si().value
+            owner = TrustedOwnerContext(
+                case_id,
+                f"run-{uuid.uuid4().hex[:12]}",
+                f"attempt-{uuid.uuid4().hex[:12]}",
+                draft.generation,
+            )
+            destination = (
+                storage.root / f"cases/{case_id}/runs/{owner.run_id}/attempts/{owner.attempt_id}"
+            )
+            mesh, bundle, inputs = build(revision, destination)
+            profile = self.compatibility.get_profile(revision.spec.solver_policy.profile.profile_id)
+            if (
+                mesh.provenance.source_geometry_digest != revision.spec.geometry.geometry_digest
+                or set(mesh.provenance.source_body_ids)
+                != {
+                    revision.spec.geometry.body_id.value,
+                    revision.spec.rigid_tool.primitive.body_id.value,
+                }
+                or not mesh.quality_records
+                or any(item.status != "PASS" for item in mesh.quality_records)
+                or bundle.thread_count > revision.spec.budget.cpu_workers
+            ):
+                raise PortError(
+                    PortErrorCategory.INTEGRITY, "mesh or resource lineage differs from revision"
+                )
+            storage.claim(owner)
+            storage._register_execution(owner, bundle, mesh, profile, inputs)
+            runner_root = storage.root / "native"
+            process_root = (
+                runner_root
+                / case_id
+                / owner.run_id
+                / owner.attempt_id
+                / str(owner.owner_generation)
+            )
+            storage._prepare_runner(owner, process_root)
+            runner = runner_factory(_RunnerOwner(storage, owner), runner_root, inputs)
+            issued: AttemptRecord | None = None
+            try:
+                if time.monotonic() >= deadline:
+                    raise PortError(
+                        PortErrorCategory.EXECUTION, "preparation exhausted operation budget"
+                    )
+                issued = runner.start(bundle, owner, revision.spec.budget)
+                storage._accept_runner_start(owner, issued)
+                while issued.state in {RunState.RUNNING, RunState.DRAINING}:
+                    previous = issued
+                    observed = runner.poll(previous, owner).attempt
+                    storage._accept_runner_poll(owner, previous, observed)
+                    issued = observed
+                    if time.monotonic() > deadline:
+                        raise PortError(
+                            PortErrorCategory.EXECUTION, "owned runner exceeded operation budget"
+                        )
+                    if issued.state in {RunState.RUNNING, RunState.DRAINING}:
+                        time.sleep(0.02)
+                if issued.state is not RunState.VALIDATING:
+                    raise PortError(
+                        PortErrorCategory.EXECUTION, f"runner ended {issued.state.value}"
+                    )
+                storage._seal_native_output(owner)
+                manifest = storage.publish_manifest(owner, storage._read_candidate(owner, read))
+                storage._transition_attempt(owner, RunState.SUCCEEDED)
+                return manifest
+            except BaseException:
+                if issued is not None and issued.state in {RunState.RUNNING, RunState.DRAINING}:
+                    # Keep the issued object for cleanup; never cancel a forged poll result.
+                    cancelled = runner.cancel(issued, owner).attempt
+                    storage._accept_runner_poll(owner, issued, cancelled)
+                elif issued is not None and issued.state is RunState.VALIDATING:
+                    storage._transition_attempt(owner, RunState.FAILED)
+                elif issued is None:
+                    storage._transition_attempt(owner, RunState.PREPARING)
+                    storage._transition_attempt(owner, RunState.FAILED)
+                raise
 
     def _execute_registered(
         self,
