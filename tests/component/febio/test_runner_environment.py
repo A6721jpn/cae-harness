@@ -12,8 +12,14 @@ from febio_cae.adapters.febio.runner import RunnerAdapter
 from febio_cae.domain import PortError, PortErrorCategory, RunState
 
 from .runner_fixture import _compiled, _owner, _Ownership
-from .test_runner_authority import _finish
-from .test_runner_job import _cleanup
+from .test_runner_authority import _cleanup_process, _finish
+
+
+def cleanup(runner: RunnerAdapter) -> None:
+    for managed in list(runner._managed.values()):
+        _cleanup_process(managed.process)
+        managed.stdout.close()
+        managed.stderr.close()
 
 
 def test_issued_child_receives_worker_limits_without_mutating_parent(
@@ -49,7 +55,7 @@ def test_issued_child_receives_worker_limits_without_mutating_parent(
         assert {name: os.environ[name] for name in expected} == inherited
         assert not runner._managed
     finally:
-        _cleanup(runner, attempt)
+        cleanup(runner)
 
 
 def test_bundle_worker_count_above_budget_is_rejected_before_spawn(tmp_path: Path) -> None:
@@ -68,5 +74,4 @@ def test_bundle_worker_count_above_budget_is_rejected_before_spawn(tmp_path: Pat
         assert "worker" in str(caught.value)
         assert not marker.exists() and not runner._managed
     finally:
-        for managed in list(runner._managed.values()):
-            _cleanup(runner, managed.attempt)
+        cleanup(runner)
