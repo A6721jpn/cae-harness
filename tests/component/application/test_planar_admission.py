@@ -9,12 +9,12 @@ from typing import Any
 import pytest
 from test_persistence_authority import _created, _evidence, _populate_complete, complete_spec
 
-from febio_cae.domain import NumericalProfileRef
+from febio_cae.domain import NumericalProfileRef, Quantity
 from febio_cae.storage import mesh_quality
 
 
 def _record() -> Any:
-    cls = getattr(mesh_quality, "PlanarDemoRegistration")
+    cls = mesh_quality.PlanarDemoRegistration
     return cls(
         profile_id="planar-demo",
         source_step_digest=complete_spec().geometry.source_step_digest,
@@ -48,6 +48,17 @@ def test_planar_admission_is_registered_with_real_evidence_bytes(tmp_path: Path)
 def test_planar_admission_rejects_curved_tool_and_foreign_source() -> None:
     record = _record()
     spec = complete_spec()
+    with pytest.raises(ValueError):
+        record.check_spec(spec)
+    primitive = replace(
+        spec.rigid_tool.primitive,
+        kind="box",
+        dimensions={key: Quantity(2, "mm") for key in ("length", "width", "height")},
+        dimension_evidence={
+            key: _evidence(f"rigid_tool.{key}") for key in ("length", "width", "height")
+        },
+    )
+    spec = replace(spec, rigid_tool=replace(spec.rigid_tool, primitive=primitive))
     record.check_spec(spec)
     with pytest.raises(ValueError):
         record.check_spec(replace(spec, geometry=replace(spec.geometry, geometry_digest="f" * 64)))

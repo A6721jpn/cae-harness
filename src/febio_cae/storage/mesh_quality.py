@@ -8,6 +8,8 @@ import math
 from dataclasses import dataclass
 
 from febio_cae.domain.canonical import canonical_bytes
+from febio_cae.domain.case_spec import CaseSpec
+from febio_cae.domain.contact import AsPlaced
 from febio_cae.domain.evidence import EvidenceRef
 from febio_cae.domain.mesh_policy import NumericalProfileRef
 from febio_cae.domain.units import Dimension, Quantity
@@ -108,3 +110,92 @@ class MeshQualityRegistration:
         if result.to_bytes() != payload:
             raise ValueError("mesh quality payload is not canonical")
         return result
+
+
+@dataclass(frozen=True, slots=True)
+class PlanarDemoRegistration:
+    """Bounded execution admission, expressly not an accuracy qualification."""
+
+    profile_id: str
+    source_step_digest: str
+    geometry_digest: str
+    original_mesh_digest: str
+    original_recipe_digest: str
+    generation_profile: NumericalProfileRef
+    admission_evidence: tuple[EvidenceRef, ...]
+
+    def __post_init__(self) -> None:
+        if not self.profile_id or self.profile_id.strip() != self.profile_id:
+            raise ValueError("explicit planar admission identity required")
+        for value in (
+            self.source_step_digest,
+            self.geometry_digest,
+            self.original_mesh_digest,
+            self.original_recipe_digest,
+        ):
+            if len(value) != 64 or any(c not in "0123456789abcdef" for c in value):
+                raise ValueError("planar admission requires pinned SHA256 identities")
+        if self.generation_profile.purpose != "mesh_quality":
+            raise ValueError("original generation profile must be preserved")
+        if not self.admission_evidence or any(
+            e.target_field != "mesh.admission" for e in self.admission_evidence
+        ):
+            raise ValueError("explicit admission evidence required, not qualification evidence")
+        object.__setattr__(self, "admission_evidence", tuple(self.admission_evidence))
+
+    @property
+    def approximation_status(self) -> str:
+        return "UNVERIFIED"
+
+    def check_spec(self, spec: CaseSpec) -> None:
+        if (
+            spec.geometry.source_step_digest != self.source_step_digest
+            or spec.geometry.geometry_digest != self.geometry_digest
+            or spec.rigid_tool.primitive.kind != "box"
+            or not isinstance(spec.contact.arrangement, AsPlaced)
+        ):
+            raise ValueError("planar admission only covers the explicit source and flat box pose")
+
+    def to_bytes(self) -> bytes:
+        return canonical_bytes(
+            {
+                "format_version": 1,
+                "admission_kind": "synthetic-planar-demo",
+                "approximation_status": self.approximation_status,
+                "profile_id": self.profile_id,
+                "source_step_digest": self.source_step_digest,
+                "geometry_digest": self.geometry_digest,
+                "original_mesh_digest": self.original_mesh_digest,
+                "original_recipe_digest": self.original_recipe_digest,
+                "generation_profile": self.generation_profile.to_dict(),
+                "admission_evidence": [e.to_dict() for e in self.admission_evidence],
+            }
+        )
+
+    @property
+    def reference(self) -> NumericalProfileRef:
+        return NumericalProfileRef(
+            self.profile_id, "mesh_quality", hashlib.sha256(self.to_bytes()).hexdigest()
+        )
+
+
+MeshQualityRecord = MeshQualityRegistration | PlanarDemoRegistration
+
+
+def decode_mesh_quality(payload: bytes) -> MeshQualityRecord:
+    data = json.loads(payload)
+    if "admission_kind" not in data:
+        return MeshQualityRegistration.from_bytes(payload)
+    profile = data["generation_profile"]
+    result = PlanarDemoRegistration(
+        data["profile_id"],
+        data["source_step_digest"],
+        data["geometry_digest"],
+        data["original_mesh_digest"],
+        data["original_recipe_digest"],
+        NumericalProfileRef(profile["profile_id"], profile["purpose"], profile["record_digest"]),
+        tuple(EvidenceRef(**e) for e in data["admission_evidence"]),
+    )
+    if result.to_bytes() != payload:
+        raise ValueError("invalid or noncanonical planar admission")
+    return result

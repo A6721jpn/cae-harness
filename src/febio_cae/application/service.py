@@ -44,7 +44,7 @@ from febio_cae.domain.results import ResultManifest
 from febio_cae.domain.selection import FaceSetRule, ResolutionSnapshot, SelectionRef
 from febio_cae.domain.units import Quantity
 from febio_cae.storage.catalog import CaseCatalog, CaseCatalogError
-from febio_cae.storage.mesh_quality import MeshQualityRegistration
+from febio_cae.storage.mesh_quality import MeshQualityRecord, PlanarDemoRegistration
 from febio_cae.storage.profiles import SQLiteCompatibilityRegistry
 from febio_cae.storage.registry import (
     CaseStorage,
@@ -730,7 +730,15 @@ class RegisteredCaseService:
                 field, profile_ref = request
                 try:
                     if field == "mesh_policy.quality_profile":
-                        storage.resolve_mesh_quality(profile_ref)
+                        registered_quality = storage.resolve_mesh_quality(profile_ref)
+                        if (
+                            isinstance(registered_quality, PlanarDemoRegistration)
+                            and not draft.unresolved_fields
+                        ):
+                            try:
+                                registered_quality.check_spec(draft.values.to_case_spec())
+                            except ValueError as error:
+                                raise PortError(PortErrorCategory.INTEGRITY, str(error)) from error
                         continue
                     profile = self.compatibility.get_profile(profile_ref.profile_id)
                     if not isinstance(profile, CompatibilityProfile):
@@ -872,14 +880,10 @@ class RegisteredCaseService:
             raise ServiceConflictError("configured compatibility registry is read-only")
         return register(profile)
 
-    def register_mesh_quality(
-        self, case_id: str, record: MeshQualityRegistration
-    ) -> NumericalProfileRef:
+    def register_mesh_quality(self, case_id: str, record: MeshQualityRecord) -> NumericalProfileRef:
         return self._storage(case_id).register_mesh_quality(record)
 
-    def resolve_mesh_quality(
-        self, case_id: str, ref: NumericalProfileRef
-    ) -> MeshQualityRegistration:
+    def resolve_mesh_quality(self, case_id: str, ref: NumericalProfileRef) -> MeshQualityRecord:
         return self._storage(case_id).resolve_mesh_quality(ref)
 
     def _execute_ports(

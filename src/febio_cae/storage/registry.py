@@ -46,7 +46,12 @@ from febio_cae.domain.units import Dimension, Quantity
 from ._ownership import identity, lease, pin_directories, pinned_read
 from ._sqlite import connect as _connect
 from .catalog import validate_case_id
-from .mesh_quality import MeshQualityRegistration
+from .mesh_quality import (
+    MeshQualityRecord,
+    MeshQualityRegistration,
+    PlanarDemoRegistration,
+    decode_mesh_quality,
+)
 
 
 class StorageConflictError(RuntimeError):
@@ -1127,10 +1132,14 @@ class CaseStorage:
             media_type=str(row["media_type"]),
         )
 
-    def _mesh_quality_evidence(self, record: MeshQualityRegistration) -> bytes:
+    def _mesh_quality_evidence(self, record: MeshQualityRecord) -> bytes:
         items: list[dict[str, object]] = []
         try:
-            for evidence in record.qualification_evidence:
+            for evidence in (
+                record.admission_evidence
+                if isinstance(record, PlanarDemoRegistration)
+                else record.qualification_evidence
+            ):
                 asset = self.source_asset(evidence.reference)
                 if (
                     asset.content_digest != evidence.content_digest
@@ -1151,9 +1160,9 @@ class CaseStorage:
 
     def _verified_mesh_quality(
         self, payload: bytes, evidence_payload: bytes, ref: NumericalProfileRef
-    ) -> MeshQualityRegistration:
+    ) -> MeshQualityRecord:
         try:
-            record = MeshQualityRegistration.from_bytes(payload)
+            record = decode_mesh_quality(payload)
             if record.reference != ref:
                 raise ValueError("mesh quality identity/digest differs")
             if self._mesh_quality_evidence(record) != evidence_payload:
@@ -1162,9 +1171,9 @@ class CaseStorage:
         except (ValueError, TypeError, KeyError, StorageIntegrityError) as error:
             raise PortError(PortErrorCategory.INTEGRITY, str(error)) from error
 
-    def register_mesh_quality(self, record: MeshQualityRegistration) -> NumericalProfileRef:
+    def register_mesh_quality(self, record: MeshQualityRecord) -> NumericalProfileRef:
         """Trusted case-local registration; never exposed as a public JSON import."""
-        if not isinstance(record, MeshQualityRegistration):
+        if not isinstance(record, (MeshQualityRegistration, PlanarDemoRegistration)):
             raise PortError(
                 PortErrorCategory.INVALID_INPUT, "explicit mesh quality record required"
             )
@@ -1189,7 +1198,7 @@ class CaseStorage:
                 connection.commit()
             return ref
 
-    def resolve_mesh_quality(self, ref: NumericalProfileRef) -> MeshQualityRegistration:
+    def resolve_mesh_quality(self, ref: NumericalProfileRef) -> MeshQualityRecord:
         with self.evidence_snapshot():
             if ref.purpose != "mesh_quality":
                 raise PortError(PortErrorCategory.INTEGRITY, "wrong numerical profile purpose")
@@ -1209,7 +1218,7 @@ class CaseStorage:
 
     def _verify_mesh_quality_snapshot(
         self, connection: sqlite3.Connection, revision: CaseRevision, generation: int | None
-    ) -> MeshQualityRegistration:
+    ) -> MeshQualityRecord:
         row = connection.execute(
             "SELECT * FROM revision_mesh_quality WHERE revision_id=?", (revision.revision_id,)
         ).fetchone()
@@ -1224,7 +1233,7 @@ class CaseStorage:
             revision.spec.mesh_policy.quality_profile,
         )
 
-    def resolve_revision_mesh_quality(self, revision: CaseRevision) -> MeshQualityRegistration:
+    def resolve_revision_mesh_quality(self, revision: CaseRevision) -> MeshQualityRecord:
         with self.evidence_snapshot():
             if (
                 self.get_revision(revision.case_id, revision.revision_id).to_bytes()
