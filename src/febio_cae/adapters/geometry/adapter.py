@@ -6,9 +6,10 @@ import hashlib
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import NoReturn, cast
+from typing import TYPE_CHECKING, NoReturn, cast
 
-from febio_cae.adapters.meshing.primitives import GeneratedPrimitiveMesh, generate_primitive_mesh
+if TYPE_CHECKING:
+    from febio_cae.adapters.meshing.primitives import GeneratedPrimitiveMesh
 from febio_cae.domain import (
     AsPlaced,
     CaseRevision,
@@ -211,6 +212,7 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
     def inspect_rigid_tool(self, primitive: object, geometry_digest: str) -> BackendInspection:
         """Inspect generated rigid-tool boundary faces in the placement target frame."""
 
+        from febio_cae.adapters.meshing.primitives import generate_primitive_mesh
         from febio_cae.domain.rigid import RigidPrimitive
 
         if not isinstance(primitive, RigidPrimitive):
@@ -222,6 +224,8 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
         self, revision: CaseRevision
     ) -> InitialContactPlacement:
         """Apply only a fully explicit, unique ``SpecifiedGap`` arrangement."""
+
+        from febio_cae.adapters.meshing.primitives import generate_primitive_mesh
 
         source = self._resolve_registered_source(revision)
         spec = revision.spec
@@ -297,6 +301,8 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
         )
 
     def mesh(self, revision: CaseRevision) -> MeshArtifact:
+        from febio_cae.adapters.meshing.primitives import generate_primitive_mesh
+
         if not isinstance(revision, CaseRevision):
             self._raise(PortErrorCategory.INVALID_INPUT, "revision must be a CaseRevision")
         source = self._resolve_registered_source(revision)
@@ -832,6 +838,16 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
                     f"element {source_id} has non-positive canonical Tet10 corner volume",
                 )
             signed_volumes.append(signed_volume)
+            from .quadratic_quality import require_positive_quadratic_mapping
+
+            try:
+                require_positive_quadratic_mapping(
+                    tuple(
+                        nodes[node_id - node_start].coordinates_si for node_id in canonical_node_ids
+                    )
+                )
+            except ValueError as error:
+                self._raise(PortErrorCategory.QUALITY, f"element {source_id}: {error}")
             elements.append(
                 MeshElement(
                     element_id=element_map[source_id],

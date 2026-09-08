@@ -15,7 +15,7 @@ from febio_cae.adapters.geometry.backend import (
     BackendMeshFace,
     BackendNode,
 )
-from febio_cae.domain import RigidPrimitive
+from febio_cae.domain import PortError, PortErrorCategory, RigidPrimitive
 from febio_cae.domain.artifacts import TET10_FACE_NODE_POSITIONS
 from febio_cae.domain.canonical import canonical_bytes
 
@@ -86,13 +86,14 @@ def _box_decomposition(
         6: (half_length, half_width, half_height),
         7: (-half_length, half_width, half_height),
     }
-    # Five tetrahedra around the body diagonal 0--6 fill the rectangular box.
+    # Six tetrahedra around the body diagonal 0--6 fill the rectangular box.
     tets = [
         (0, 1, 2, 6),
         (0, 2, 3, 6),
         (0, 3, 7, 6),
         (0, 7, 4, 6),
         (0, 4, 5, 6),
+        (0, 5, 1, 6),
     ]
     return points, tets
 
@@ -160,6 +161,11 @@ def _primitive_decomposition(
     primitive: RigidPrimitive,
 ) -> tuple[dict[int, Coordinates], list[tuple[int, int, int, int]]]:
     dimensions = primitive.dimensions
+    if primitive.kind in {"sphere", "cylinder"}:
+        raise PortError(
+            PortErrorCategory.UNSUPPORTED_CAPABILITY,
+            "curved primitive surface quality is not supported; controlled approximation required",
+        )
     if primitive.kind == "sphere":
         return _sphere_decomposition(float(dimensions["radius"].to_si().value))
     if primitive.kind == "cylinder":
