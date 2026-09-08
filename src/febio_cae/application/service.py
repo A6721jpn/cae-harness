@@ -53,6 +53,7 @@ from febio_cae.storage.registry import (
 )
 from febio_cae.storage.state import ProductState
 
+from ._geometry import PlacedSelection, _PlacedGeometry
 from .specs import SourceDeclaration
 
 
@@ -184,10 +185,12 @@ class RegisteredCaseService:
         state_dir: Path | str | None = None,
         geometry: GeometryPort | None = None,
         compatibility: CompatibilityRegistryPort | None = None,
+        placed_selection: PlacedSelection | None = None,
     ) -> None:
         self.state = ProductState(state_dir)
         self.catalog = CaseCatalog(self.state.catalog_path)
         self.geometry = geometry
+        self._placed_selection = placed_selection
         self.compatibility = compatibility or SQLiteCompatibilityRegistry(
             self.state.compatibility_path
         )
@@ -615,9 +618,18 @@ class RegisteredCaseService:
                             "geometry.body_id",
                         )
                     )
+                selection_geometry: GeometryPort = self.geometry
+                if self._placed_selection is not None and draft.values.rigid_tool is not None:
+                    selection_geometry = _PlacedGeometry(
+                        self.geometry,
+                        source,
+                        geometry,
+                        draft.values.rigid_tool,
+                        self._placed_selection,
+                    )
                 for selection in _registered_selections(draft.values):
                     try:
-                        resolved = self.geometry.resolve_selection(
+                        resolved = selection_geometry.resolve_selection(
                             GeometrySelectionRequest(
                                 source_ref,
                                 selection,
