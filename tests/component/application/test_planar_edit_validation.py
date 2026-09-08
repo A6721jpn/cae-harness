@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -25,7 +26,7 @@ from febio_cae.domain.codec import encode_record
 from febio_cae.storage.profiles import SQLiteCompatibilityRegistry
 
 
-def prepared(tmp_path: Path) -> tuple[Any, ...]:
+def prepared(tmp_path: Path, configure: Callable[[Any, Any], Any] | None = None) -> tuple[Any, ...]:
     service, created, storage = _created(tmp_path)
     record, original, carrier, revision = _fixture(tmp_path)
     frame = carrier.spec.geometry.placement.source_frame
@@ -53,6 +54,8 @@ def prepared(tmp_path: Path) -> tuple[Any, ...]:
         geometry=replace(revision.spec.geometry, inspection_digest=inspected.inspection_digest),
     )
     service.register_mesh_quality(created.case_id, record)
+    if configure is not None:
+        spec = configure(service, spec)
     _populate_complete(service, created, spec)
     frozen = service.freeze_case(created.case_id)
     assert frozen.status == "FROZEN", frozen.to_dict()
