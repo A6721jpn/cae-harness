@@ -19,8 +19,10 @@ def test_meshing_first_consumer() -> None:
             sys.executable,
             "-I",
             "-c",
-            f"import sys; sys.path.insert(0, {str(source)!r}); "
-            "import febio_cae.adapters.meshing; import febio_cae.adapters.geometry",
+            (
+                f"import sys; sys.path.insert(0, {str(source)!r}); "
+                "import febio_cae.adapters.meshing; import febio_cae.adapters.geometry"
+            ),
         ],
         capture_output=True,
         text=True,
