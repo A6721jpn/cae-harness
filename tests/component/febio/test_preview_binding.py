@@ -134,6 +134,30 @@ def test_no_configured_launcher_remains_failed(tmp_path: Path) -> None:
     )
 
 
+@pytest.mark.parametrize("defect", ["not-started", "foreign-studio"])
+def test_launcher_must_return_success_for_the_exact_target(tmp_path: Path, defect: str) -> None:
+    case = PreviewCase(tmp_path)
+
+    def launch(*args: Any) -> Any:
+        result = case.launch(*args)
+        binding = result.binding
+        if defect == "foreign-studio":
+            tool = replace(case.studio, version="99")
+            binding = (
+                SimpleNamespace(**(vars(binding) | {"studio": tool}))
+                if isinstance(binding, SimpleNamespace)
+                else replace(binding, studio=tool)
+            )
+        if isinstance(result, SimpleNamespace):
+            return SimpleNamespace(binding=binding, launched=defect != "not-started")
+        return replace(result, binding=binding, launched=defect != "not-started")
+
+    assert (
+        case.adapter(launcher=launch).request(case.manifest, case.request).status
+        is PreviewStatus.FAILED
+    )
+
+
 @pytest.mark.parametrize("defect", ["manifest", "scope", "confirmed"])
 def test_caller_cannot_edit_or_self_confirm_an_issued_receipt(tmp_path: Path, defect: str) -> None:
     case = PreviewCase(tmp_path)
