@@ -106,7 +106,11 @@ def test_rotated_translated_selection_and_mesh_share_frame(connected: Any) -> No
         rule=CoordinatePredicateRule(
             spec.geometry.body_id,
             FrameId("World"),
-            (CoordinatePredicate("x", "ge", Quantity(0.9, "m")),),
+            (
+                CoordinatePredicate(
+                    UnitDirection(FrameId("World"), 1.0, 0.0, 0.0), "gte", Quantity(0.9, "m")
+                ),
+            ),
         ),
     )
     spec = replace(
@@ -126,6 +130,16 @@ def test_rotated_translated_selection_and_mesh_share_frame(connected: Any) -> No
     assert all(len(s.member_ids) == 4 for s in artifact.sets if s.body_id == "part-body")
 
 
+def _face_rule(selection: Any, face_id: str) -> FaceSetRule:
+    return FaceSetRule(
+        selection.geometry_digest,
+        selection.body_id,
+        selection.frame,
+        (FaceId(face_id),),
+        _evidence("selection.rule", "face"),
+    )
+
+
 def _gap_case(adapter: Any, revision: Any, gap: float = 0.0) -> Any:
     spec = revision.spec
     report = adapter.inspect_rigid_tool(
@@ -137,11 +151,11 @@ def _gap_case(adapter: Any, revision: Any, gap: float = 0.0) -> Any:
         if all(abs(p[2] - 0.022) < 1e-12 for p in f.boundary_points_si)
     )
     part = replace(
-        spec.contact.part_surface, rule=FaceSetRule(spec.geometry.body_id, (FaceId("bottom-face"),))
+        spec.contact.part_surface, rule=_face_rule(spec.contact.part_surface, "bottom-face")
     )
     tool = replace(
         spec.contact.tool_surface,
-        rule=FaceSetRule(spec.rigid_tool.primitive.body_id, (FaceId(upper.face_id),)),
+        rule=_face_rule(spec.contact.tool_surface, upper.face_id),
     )
     arrangement = SpecifiedGap(
         Quantity(gap, "m"),
@@ -182,7 +196,7 @@ def test_gap_rejects_unsupported_geometry(connected: Any, bad: str) -> None:
     if bad == "sloped":
         part = replace(
             spec.contact.part_surface,
-            rule=FaceSetRule(spec.geometry.body_id, (FaceId("top-face"),)),
+            rule=_face_rule(spec.contact.part_surface, "top-face"),
         )
         spec = replace(spec, contact=replace(spec.contact, part_surface=part))
     if bad == "no_footprint":
