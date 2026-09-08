@@ -111,7 +111,13 @@ def _positive_int(value: object, field: str) -> int:
 
 @dataclass(frozen=True, slots=True)
 class BackendFace:
-    """One backend-observed boundary face and its geometric measurements."""
+    """One backend-observed boundary face and its geometric measurements.
+
+    Optional reserved attribute ``planar-triangle-v1`` asserts that the three
+    boundary points describe the complete oriented affine face, not samples.
+    Directed planar placement requires this on every face of a closed body.
+    Native reports without this representation remain unsupported for that path.
+    """
 
     face_id: str
     body_id: str

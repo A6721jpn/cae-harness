@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import math
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, NoReturn, cast
 
 if TYPE_CHECKING:
@@ -237,11 +237,20 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
                 PortErrorCategory.INTEGRITY,
                 "case geometry inspection digest does not match the registered source",
             )
-        report = self.inspection_details(inspection)
+        if spec.geometry.step_unit != inspection.declared_unit:
+            self._raise(
+                PortErrorCategory.INTEGRITY, "case STEP unit conflicts with source inspection"
+            )
+        report = _placed_inspection(self.inspection_details(inspection), spec.geometry.placement)
         generated = generate_primitive_mesh(
             spec.rigid_tool.primitive,
             geometry_digest=spec.rigid_tool.contact_surface.geometry_digest,
         )
+        return self._initial_placement(spec, report, generated)
+
+    def _initial_placement(
+        self, spec: CaseSpec, report: BackendInspection, generated: GeneratedPrimitiveMesh
+    ) -> InitialContactPlacement:
         tool_report = self._tool_inspection(
             generated,
             spec.rigid_tool.primitive,
@@ -268,10 +277,19 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
         part_face = part_resolution.faces[0]
         tool_face = tool_resolution.faces[0]
         direction = arrangement.direction
-        part_point = _point_values(part_face.centroid)
-        tool_point = _point_values(tool_face.centroid)
-        current_gap = _dot(_sub(tool_point, part_point), (direction.x, direction.y, direction.z))
         requested_gap = float(arrangement.gap.to_si().value)
+        from .planar_gap import directed_planar_gap
+
+        current_gap = directed_planar_gap(
+            report,
+            tool_report,
+            spec.geometry.body_id.value,
+            spec.rigid_tool.primitive.body_id.value,
+            part_face.face_id.value,
+            tool_face.face_id.value,
+            direction,
+            requested_gap,
+        )
         delta = requested_gap - current_gap
         translation_delta = (delta * direction.x, delta * direction.y, delta * direction.z)
         old = spec.rigid_tool.primitive.placement.translation
@@ -315,7 +333,11 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
                 PortErrorCategory.INTEGRITY,
                 "case geometry inspection digest does not match the registered source",
             )
-        report = self.inspection_details(inspection)
+        if spec.geometry.step_unit != inspection.declared_unit:
+            self._raise(
+                PortErrorCategory.INTEGRITY, "case STEP unit conflicts with source inspection"
+            )
+        report = _placed_inspection(self.inspection_details(inspection), spec.geometry.placement)
         part_body_id = spec.geometry.body_id.value
         if part_body_id not in inspection.body_ids:
             self._raise(
@@ -355,6 +377,8 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
             spec.rigid_tool.primitive,
             geometry_digest=spec.rigid_tool.contact_surface.geometry_digest,
         )
+        applied = self._initial_placement(spec, report, generated)
+        placed_tool = replace(spec.rigid_tool.primitive, placement=applied.placement)
         tool_mesh = generated.mesh
         part_mapped = self._map_backend_mesh(
             part_mesh,
@@ -368,7 +392,7 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
         tool_element_start = len(part_mapped.elements) + 1
         tool_mapped = self._map_backend_mesh(
             tool_mesh,
-            transform=spec.rigid_tool.primitive.placement,
+            transform=applied.placement,
             expected_body_id=spec.rigid_tool.primitive.body_id.value,
             node_start=tool_node_start,
             element_start=tool_element_start,
@@ -381,7 +405,7 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
         all_elements = part_mapped.elements + tool_mapped.elements
         tool_report = self._tool_inspection(
             generated,
-            spec.rigid_tool.primitive,
+            placed_tool,
             spec.rigid_tool.contact_surface.geometry_digest,
         )
         selections = _spec_selections(spec)
@@ -402,7 +426,13 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
             selection_resolutions[selection_digest] = self._resolve_selection_from_report(
                 selection, selected_report
             )
-        mesh_face_ids = {face.face_id for face in all_faces}
+        coverage: dict[tuple[str, str], list[str]] = {}
+        for backend_mesh in (part_mesh, tool_mesh):
+            for face in backend_mesh.faces:
+                if len(face.adjacent_element_ids) == 1 and face.source_face_id is not None:
+                    coverage.setdefault((backend_mesh.body_id, face.source_face_id), []).append(
+                        face.face_id
+                    )
         sets: list[MeshSet] = []
         for selection in selections:
             digest = _selection_digest(selection)
@@ -411,20 +441,16 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
             resolution = selection_resolutions[digest]
             members_list: list[str] = []
             for resolved_face in resolution.faces:
-                members_list.extend(
-                    sorted(
-                        face.face_id
-                        for face in all_faces
-                        if face.face_id == resolved_face.face_id.value
-                        or face.face_id.startswith(resolved_face.face_id.value + ":facet-")
+                face_members = coverage.get(
+                    (selection.body_id.value, resolved_face.face_id.value), []
+                )
+                if not face_members:
+                    self._raise(
+                        PortErrorCategory.INTEGRITY,
+                        f"selection {selection.name!r} face {resolved_face.face_id.value!r} is not covered by the backend mesh",
                     )
-                )
+                members_list.extend(sorted(face_members))
             members = tuple(dict.fromkeys(members_list))
-            if any(member not in mesh_face_ids for member in members):
-                self._raise(
-                    PortErrorCategory.INTEGRITY,
-                    f"selection {selection.name!r} is not covered by the backend mesh",
-                )
             sets.append(
                 MeshSet(
                     set_id=f"selection:{digest[:24]}",
@@ -443,6 +469,7 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
             selection_digests=selection_digests,
             backend_id=self.backend_id,
             backend_version=self.backend_version,
+            applied=applied,
         )
         provenance = MeshProvenance(
             source_geometry_digest=spec.geometry.geometry_digest,
@@ -456,6 +483,14 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
             face_ordering_id="tet10-face-canonical-v1",
         )
         quality_records = (
+            MeshQualityRecord(
+                "initial-contact-placement",
+                math.sqrt(sum(v * v for v in applied.translation_delta_si)),
+                "m",
+                None,
+                "PASS",
+                canonical_bytes(applied.to_dict()).decode("utf-8"),
+            ),
             MeshQualityRecord(
                 "tet10-positive-corner-volume",
                 minimum_volume,
@@ -990,6 +1025,23 @@ def _transform_backend_face(face: BackendFace, transform: RigidTransform) -> Bac
     )
 
 
+def _placed_inspection(report: BackendInspection, transform: RigidTransform) -> BackendInspection:
+    if report.frame != transform.source_frame:
+        raise PortError(
+            PortErrorCategory.INTEGRITY, "inspection frame does not match placement source frame"
+        )
+    return replace(
+        report,
+        frame=transform.target_frame,
+        bodies=tuple(
+            replace(
+                body, faces=tuple(_transform_backend_face(face, transform) for face in body.faces)
+            )
+            for body in report.bodies
+        ),
+    )
+
+
 def _mesh_volume(mesh: BackendMesh) -> float:
     nodes = {node.node_id: node.coordinates_si for node in mesh.nodes}
     return sum(
@@ -1027,6 +1079,7 @@ def _mesh_recipe_digest(
     selection_digests: Sequence[str],
     backend_id: str,
     backend_version: str,
+    applied: InitialContactPlacement,
 ) -> str:
     if source_asset is None:
         raise PortError(PortErrorCategory.ENVIRONMENT, "mesh recipe requires a source identity")
@@ -1037,6 +1090,8 @@ def _mesh_recipe_digest(
         "geometry": spec.geometry.to_dict(),
         "rigid_tool": spec.rigid_tool.to_dict(),
         "mesh_policy": spec.mesh_policy.to_dict(),
+        "arrangement": spec.contact.arrangement.to_dict(),
+        "applied_placement": applied.to_dict(),
         "selection_digests": sorted(selection_digests),
         "backend": {
             "id": backend_id,

@@ -272,6 +272,7 @@ def generate_primitive_mesh(
             area_si=area,
             centroid_si=centroid,
             boundary_points_si=boundary_points,
+            source_face_id=face_id if len(neighbours) == 1 else None,
         )
         mesh_faces.append(mesh_face)
         if len(neighbours) == 1:
@@ -283,6 +284,7 @@ def generate_primitive_mesh(
                     area,
                     centroid,
                     boundary_points,
+                    attributes=("planar-triangle-v1",),
                 )
             )
 
