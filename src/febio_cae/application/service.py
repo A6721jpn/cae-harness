@@ -960,7 +960,14 @@ class RegisteredCaseService:
             if not mesh.quality_records or any(r.status != "PASS" for r in mesh.quality_records):
                 raise ValueError("execution requires passing mesh quality")
             return
-        from febio_cae.domain.canonical import canonical_bytes
+        expected = self._planar_execution_mesh(storage, registration, revision)
+        if mesh.to_bytes() != expected.to_bytes():
+            raise ValueError("execution adoption differs from registered origin derivation")
+
+    def _planar_execution_mesh(
+        self, storage: CaseStorage, registration: PlanarDemoRegistration, revision: CaseRevision
+    ) -> MeshArtifact:
+        """Rebind material-only descendants, preserving the registered root mesh/receipt."""
         from febio_cae.domain.codec import decode_record, encode_record
 
         def source(asset_id: str) -> bytes:
@@ -968,13 +975,28 @@ class RegisteredCaseService:
 
         original = decode_record(source("gm03-mesh"), MeshArtifact)
         carrier = decode_record(source("gm03-carrier"), CaseRevision)
-        expected, receipt = self._adopt_planar_mesh(registration, original, carrier, revision)
-        if (
-            encode_record(mesh) != encode_record(expected)
-            or source("adopted-mesh") != encode_record(expected)
-            or source("adoption-receipt") != canonical_bytes(receipt)
-        ):
+        root = revision
+        seen: set[str] = set()
+        while root.parent_revision_id is not None:
+            if root.revision_id in seen:
+                raise ValueError("cyclic adoption ancestry")
+            seen.add(root.revision_id)
+            parent = storage.get_revision(root.case_id, root.parent_revision_id)
+            if parent.spec_digest != root.parent_spec_digest:
+                raise ValueError("adoption parent digest is stale")
+            before, after = parent.spec.to_dict(), root.spec.to_dict()
+            before.pop("material")
+            after.pop("material")
+            if canonical_bytes(before) != canonical_bytes(after):
+                raise ValueError("execution adoption only supports material-only descendants")
+            root = parent
+        anchored, receipt = self._adopt_planar_mesh(registration, original, carrier, root)
+        if source("adopted-mesh") != encode_record(anchored) or source(
+            "adoption-receipt"
+        ) != canonical_bytes(receipt):
             raise ValueError("execution adoption differs from registered origin derivation")
+        expected, _ = self._adopt_planar_mesh(registration, original, carrier, revision)
+        return expected
 
     def _execute_ports(
         self,

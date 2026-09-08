@@ -101,7 +101,7 @@ def run_demo(
             PortErrorCategory.INVALID_INPUT, "run-demo requires registered planar admission"
         )
     original = decode_record(source("gm03-mesh"), MeshArtifact)
-    mesh = decode_record(source("adopted-mesh"), MeshArtifact)
+    mesh = service._planar_execution_mesh(storage, registration, revision)
     service._verify_execution_mesh(storage, registration, revision, mesh)
     raw = json.loads(source("gm03-backend-inspection"))
 

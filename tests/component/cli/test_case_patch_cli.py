@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -10,17 +11,21 @@ from typing import Any
 
 import pytest
 
-from tests.component.application.test_persistence_authority import _created, _populate_complete
 from febio_cae.cli.main import main
 from febio_cae.domain import EvidenceRef, PartialCaseSpec, Quantity
 from febio_cae.domain.case_patch import CasePatch, CasePatchEdit
+
+_fixtures = importlib.import_module("tests.component.application.test_persistence_authority")
+_created = _fixtures._created
+_populate_complete = _fixtures._populate_complete
 
 
 def _invoke(args: list[str]) -> int:
     try:
         return main(args)
     except SystemExit as error:
-        return int(error.code)
+        assert isinstance(error.code, int)
+        return error.code
 
 
 def _prepared(tmp_path: Path, monkeypatch: Any, capsys: Any) -> tuple[Any, ...]:
