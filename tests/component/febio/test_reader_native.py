@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from febio_cae.adapters.febio._windows_job import WindowsJobProcess
 from febio_cae.adapters.febio.compiler import LocalBundleStore
 from febio_cae.adapters.febio.runner import RunnerAdapter
 from febio_cae.adapters.febio.xplt_reader import LocalResultDataStore
@@ -209,6 +210,7 @@ def test_compiler_runner_registered_reader_codec_connection(tmp_path: Path) -> N
     try:
         attempt = _finish(runner, attempt, owner)
         assert attempt.state is RunState.VALIDATING
+        assert isinstance(managed.process, WindowsJobProcess)
         assert managed.process.closed and not runner._managed
         assert attempt.process is not None
         content = (Path(attempt.process.cwd) / "output/results.xplt").read_bytes()
