@@ -74,8 +74,11 @@ def test_tampered_registered_source_never_reaches_placed_dependency(tmp_path: Pa
         compatibility=SyntheticProfiles(),
         placed_selection=resolve,
     )
-    # Original CAD is evidence; this controlled fixture simulates external tampering.
-    (tmp_path / "source.step").write_bytes(b"changed source")
+    # Tamper the registered copy; the original CAD is deliberately not a live dependency.
+    registered = (
+        storage.root / f"cases/{created.case_id}/sources/{created.source_asset.asset_id}.bin"
+    )
+    registered.write_bytes(b"changed source")
     result = connected.validate_case(created.case_id)
     assert result.status != "VALIDATED"
     assert calls == []
