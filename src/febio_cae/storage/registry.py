@@ -41,8 +41,10 @@ from febio_cae.domain.ports import (
 )
 from febio_cae.domain.questions import IssuedQuestion
 from febio_cae.domain.results import NumericResultData, ReadStatus, ResultDataRef, ResultManifest
+from febio_cae.domain.units import Dimension, Quantity
 
 from ._ownership import identity, lease, pin_directories, pinned_read
+from ._sqlite import connect as _connect
 from .catalog import validate_case_id
 from .mesh_quality import MeshQualityRegistration
 
@@ -65,20 +67,6 @@ _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 
 def _now() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
-
-
-@contextmanager
-def _connect(path: Path) -> Iterator[sqlite3.Connection]:
-    connection = sqlite3.connect(path, timeout=30.0, isolation_level=None)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA journal_mode=WAL")
-    connection.execute("PRAGMA synchronous=FULL")
-    connection.execute("PRAGMA foreign_keys=ON")
-    connection.execute("PRAGMA busy_timeout=30000")
-    try:
-        yield connection
-    finally:
-        connection.close()
 
 
 def _serialized[**P, R](method: Callable[P, R]) -> Callable[P, R]:
@@ -474,6 +462,10 @@ class CaseStorage:
                     payload BLOB NOT NULL, evidence_payload BLOB NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS applied_patches (digest TEXT PRIMARY KEY, generation INTEGER NOT NULL);
+                CREATE TABLE IF NOT EXISTS current_frozen (
+                    case_id TEXT PRIMARY KEY, revision_id TEXT NOT NULL,
+                    generation INTEGER NOT NULL, draft_id TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS revision_contexts (
                     revision_id TEXT PRIMARY KEY, generation INTEGER, draft_id TEXT
                 );
@@ -642,6 +634,16 @@ class CaseStorage:
                             "INSERT OR IGNORE INTO revision_contexts VALUES(?,?,?)",
                             (revision.revision_id, expected_generation, row["expected_draft_id"]),
                         )
+                        if expected_generation is not None:
+                            connection.execute(
+                                "INSERT OR REPLACE INTO current_frozen VALUES(?,?,?,?)",
+                                (
+                                    revision.case_id,
+                                    revision.revision_id,
+                                    expected_generation,
+                                    row["expected_draft_id"],
+                                ),
+                            )
                     temporary = final.with_name(f".{final.name}.{row['transaction_id']}.tmp")
                     if not final.exists():
                         connection.execute(
@@ -719,6 +721,13 @@ class CaseStorage:
                 if draft.generation != expected_generation + 1:
                     raise StorageConflictError("new draft generation is not the next generation")
                 if patch_digest is not None:
+                    frozen = connection.execute(
+                        "SELECT revision_id FROM current_frozen WHERE case_id=?", (draft.case_id,)
+                    ).fetchone()
+                    if frozen is None or frozen["revision_id"] != draft.parent_revision_id:
+                        raise StorageConflictError(
+                            "patch parent is not the current frozen revision"
+                        )
                     if connection.execute(
                         "SELECT 1 FROM applied_patches WHERE digest=?", (patch_digest,)
                     ).fetchone():
@@ -878,6 +887,14 @@ class CaseStorage:
             expected_generation=expected_generation,
             mesh_quality_required=mesh_quality_required,
         )
+
+    @_serialized
+    def current_frozen_revision(self, case_id: str) -> str | None:
+        with _connect(self.registry_path) as connection:
+            row = connection.execute(
+                "SELECT revision_id FROM current_frozen WHERE case_id=?", (case_id,)
+            ).fetchone()
+        return None if row is None else str(row["revision_id"])
 
     def _publish_revision(
         self,
@@ -1068,6 +1085,16 @@ class CaseStorage:
                         expected_draft_id if expected_generation is not None else None,
                     ),
                 )
+                if expected_generation is not None:
+                    connection.execute(
+                        "INSERT OR REPLACE INTO current_frozen VALUES(?,?,?,?)",
+                        (
+                            revision.case_id,
+                            revision.revision_id,
+                            expected_generation,
+                            expected_draft_id,
+                        ),
+                    )
                 connection.commit()
             except StorageConflictError:
                 connection.rollback()
@@ -1712,6 +1739,7 @@ class CaseStorage:
                             PortErrorCategory.INTEGRITY,
                             f"manifest file bytes do not match the registered output: {entry.logical_path}",
                         )
+                self._verify_numeric_observations(connection, manifest, attempt, lineage)
                 connection.execute(
                     "INSERT INTO manifests(manifest_id,attempt_id,payload) VALUES(?,?,?)",
                     (manifest.manifest_id, manifest.attempt_id, payload),
@@ -1726,6 +1754,74 @@ class CaseStorage:
                 connection.rollback()
                 raise
         return manifest
+
+    def _verify_numeric_observations(
+        self,
+        connection: sqlite3.Connection,
+        manifest: ResultManifest,
+        attempt: AttemptRecord,
+        lineage: sqlite3.Row,
+    ) -> None:
+        """Validate the actual reader-issued rows in the publishing transaction."""
+        required = json.loads(bytes(lineage["required_outputs"]))
+        requests = {item["request_id"]: item for item in required["requests"]}
+        observations = {item.output_id: item for item in manifest.read_result.observations}
+        profile = decode_record(bytes(lineage["profile"]), CompatibilityProfile)
+        mappings = {item.canonical_id: item for item in profile.output_mappings}
+        if set(observations) != set(requests):
+            raise PortError(PortErrorCategory.INTEGRITY, "required numeric outputs differ")
+        try:
+            for output_id, request in requests.items():
+                observation = observations[output_id]
+                ref = observation.data_ref
+                if (
+                    ref is None
+                    or ref.attempt_id != attempt.attempt_id
+                    or ref.bundle_digest != attempt.bundle_digest
+                ):
+                    raise ValueError("numeric observation is outside the registered attempt/bundle")
+                row = connection.execute(
+                    "SELECT payload FROM numeric_data WHERE data_id=?", (ref.data_id,)
+                ).fetchone()
+                if row is None:
+                    raise ValueError("numeric observation was not registered by the reader")
+                data = decode_record(bytes(row["payload"]), NumericResultData)
+                data.verify_content_digest()
+                mapping = mappings.get(request["quantity_id"])
+                if data.reference != ref or data.mapping != mapping:
+                    raise ValueError("numeric payload differs from observation reference/mapping")
+                if (
+                    observation.state_count != len(data.axis_values)
+                    or data.axis_id != "time"
+                    or Quantity(1, data.axis_unit).dimension != Dimension(time=1)
+                    or (data.mapping.value_type == "scalar" and len(data.component_ids) != 1)
+                    or (
+                        observation.location,
+                        observation.value_type,
+                        observation.unit,
+                        observation.frame,
+                        observation.measure_id,
+                    )
+                    != (
+                        data.mapping.location,
+                        data.mapping.value_type,
+                        data.mapping.unit,
+                        data.mapping.frame,
+                        data.mapping.measure_id,
+                    )
+                ):
+                    raise ValueError("observation contradicts actual numeric axes/count/mapping")
+                actual = {
+                    Quantity(value, data.axis_unit).to_si().value for value in data.axis_values
+                }
+                expected = {
+                    Quantity(item["value"], item["unit"]).to_si().value
+                    for item in required["saved_times"]
+                }
+                if not expected.issubset(actual):
+                    raise ValueError("actual numeric states omit required saved times")
+        except (ValueError, TypeError, KeyError) as error:
+            raise PortError(PortErrorCategory.INTEGRITY, str(error)) from error
 
     @_serialized
     def resolve_file(
@@ -1780,6 +1876,8 @@ class CaseStorage:
             raise PortError(PortErrorCategory.INTEGRITY, "manifest output membership changed")
         for entry in manifest.files:
             self._file_content(attempt, entry)
+        with _connect(self.registry_path) as connection:
+            self._verify_numeric_observations(connection, manifest, attempt, lineage)
         return manifest
 
     @_serialized

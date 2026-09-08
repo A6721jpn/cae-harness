@@ -2,21 +2,13 @@
 
 from __future__ import annotations
 
-import sqlite3
 from pathlib import Path
 
 from febio_cae.domain.codec import decode_record, encode_record
 from febio_cae.domain.compatibility import CompatibilityProfile
 from febio_cae.domain.ports import PortError, PortErrorCategory
 
-
-def _connect(path: Path) -> sqlite3.Connection:
-    connection = sqlite3.connect(path, timeout=30.0, isolation_level=None)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA journal_mode=WAL")
-    connection.execute("PRAGMA synchronous=FULL")
-    connection.execute("PRAGMA busy_timeout=30000")
-    return connection
+from ._sqlite import connect as _connect
 
 
 class SQLiteCompatibilityRegistry:

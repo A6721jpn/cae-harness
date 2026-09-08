@@ -435,8 +435,8 @@ class RegisteredCaseService:
             expected_generation = storage.revision_generation(parent.revision_id)
         if expected_generation != current.generation:
             raise ServiceConflictError("patch requires the current explicit draft context")
-        if current.parent_revision_id not in {None, parent.revision_id}:
-            raise ServiceConflictError("patch parent differs from the current intent lineage")
+        if storage.current_frozen_revision(case_id) != parent.revision_id:
+            raise ServiceConflictError("patch parent is not the current frozen revision")
         self._resolve_declarations(storage, (), patch.evidence)
         fields = (
             "geometry",

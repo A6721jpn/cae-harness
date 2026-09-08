@@ -5,11 +5,10 @@ from __future__ import annotations
 import re
 import sqlite3
 import stat
-from collections.abc import Iterator
-from contextlib import contextmanager
 from pathlib import Path
 
 from ._ownership import identity, pin_directories
+from ._sqlite import connect as _connect
 
 
 class CaseCatalogError(RuntimeError):
@@ -25,20 +24,6 @@ def validate_case_id(value: object) -> str:
     if value in {".", ".."} or "/" in value or "\\" in value or ":" in value:
         raise CaseCatalogError("case_id must not contain path syntax")
     return value
-
-
-@contextmanager
-def _connect(path: Path) -> Iterator[sqlite3.Connection]:
-    connection = sqlite3.connect(path, timeout=30.0, isolation_level=None)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA journal_mode=WAL")
-    connection.execute("PRAGMA synchronous=FULL")
-    connection.execute("PRAGMA foreign_keys=ON")
-    connection.execute("PRAGMA busy_timeout=30000")
-    try:
-        yield connection
-    finally:
-        connection.close()
 
 
 def _is_reparse(path: Path) -> bool:
