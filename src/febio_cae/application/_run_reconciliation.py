@@ -17,7 +17,7 @@ from febio_cae.domain.lifecycle import (
 from febio_cae.domain.ports import PortError, PortErrorCategory
 from febio_cae.storage._sqlite import connect
 from febio_cae.storage.registry import CaseStorage, StorageConflictError
-from febio_cae.storage.run_reconciliation import RunSnapshot, interrupt, snapshot
+from febio_cae.storage.run_reconciliation import RunSnapshot, cancel_prelaunch, interrupt, snapshot
 
 if TYPE_CHECKING:
     from .service import RegisteredCaseService
@@ -69,12 +69,15 @@ def _completion(
 
 
 def reconcile(
-    service: RegisteredCaseService, case_id: str, run_id: str, *, resume: bool
+    service: RegisteredCaseService, case_id: str, run_id: str, *, resume: bool, cancel: bool = False
 ) -> dict[str, object]:
     storage = service._storage(case_id)
     # recovery=True rejects even a same-thread nested live operation. Null process
     # identity alone is never evidence that the cooperative operation has ended.
-    with storage.transaction(blocking=False, recovery=resume) as acquired, ExitStack() as pins:
+    with (
+        storage.transaction(blocking=False, recovery=resume or cancel) as acquired,
+        ExitStack() as pins,
+    ):
         if not acquired:
             raise StorageConflictError("run operation is still held by a live exclusive lease")
         pins.enter_context(storage.evidence_snapshot())
@@ -91,6 +94,14 @@ def reconcile(
             }
             or (attempt.state is RunState.VALIDATING and current.manifest is None)
         )
+        if cancel:
+            unsupported = current.native or attempt.state not in {
+                RunState.CREATED,
+                RunState.CANCELLED,
+            }
+            if not unsupported:
+                current = cancel_prelaunch(storage, current)
+                attempt = current.attempt
         if resume and not unsupported and attempt.state is RunState.VALIDATING:
             current = interrupt(storage, current)
             attempt = current.attempt
@@ -106,7 +117,9 @@ def reconcile(
             diagnostics.append(
                 ServiceDiagnostic(
                     ServiceErrorCategory.UNSUPPORTED_CAPABILITY,
-                    "resume supports only closed synchronous result publication; native ownership and other run boundaries are not adopted or restarted",
+                    "cancel supports only released prelaunch synchronous CREATED attempts; native and started attempts are unchanged"
+                    if cancel
+                    else "resume supports only closed synchronous result publication; native ownership and other run boundaries are not adopted or restarted",
                     "run_status",
                 )
             )
@@ -124,7 +137,9 @@ def reconcile(
             []
             if task is TaskStatus.COMPLETE
             else [
-                "inspect retained results and interruption diagnostics; no execution was restarted"
+                "retain registered inputs and cancellation diagnosis; no execution was started or restarted"
+                if attempt.state is RunState.CANCELLED
+                else "inspect retained results and interruption diagnostics; no execution was restarted"
                 if attempt.state is RunState.INTERRUPTED
                 else "use resume for supported synchronous publication reconciliation; native reconciliation is unsupported"
                 if attempt.state is not RunState.SUCCEEDED
@@ -135,7 +150,7 @@ def reconcile(
             "UNSUPPORTED_ENVIRONMENT"
             if unsupported
             else attempt.state.value
-            if resume
+            if resume or cancel
             else "STATUS",
             case_id,
             attempt.revision_id,

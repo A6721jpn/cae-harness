@@ -977,6 +977,11 @@ class RegisteredCaseService:
 
         return reconcile(self, case_id, run_id, resume=True)
 
+    def cancel_run(self, case_id: str, run_id: str) -> dict[str, object]:
+        from ._run_reconciliation import reconcile
+
+        return reconcile(self, case_id, run_id, resume=False, cancel=True)
+
     def run_demo(
         self, case_id: str, revision_id: str, *, executable: str, preflight: bool = False
     ) -> dict[str, object]:

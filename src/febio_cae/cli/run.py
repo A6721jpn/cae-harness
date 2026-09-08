@@ -14,7 +14,11 @@ from .case import _error_payload, _print
 def run_lifecycle(arguments: Namespace) -> int:
     try:
         service = RegisteredCaseService(state_dir=arguments.state_dir)
-        operation = service.run_status if arguments.command == "status" else service.resume_run
+        operation = {
+            "status": service.run_status,
+            "resume": service.resume_run,
+            "cancel": service.cancel_run,
+        }[arguments.command]
         payload = operation(arguments.case_id, arguments.run_id)
         code = (
             0

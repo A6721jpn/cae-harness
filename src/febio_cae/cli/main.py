@@ -99,11 +99,13 @@ def _build_parser() -> argparse.ArgumentParser:
     compare.add_argument("--state-dir", default=None)
     compare.add_argument("--spec", required=True, help="explicit common ComparisonSpec JSON")
     compare.add_argument("--json", action="store_true")
-    for name in ("status", "resume"):
+    for name in ("status", "resume", "cancel"):
         run = commands.add_parser(
             name,
             help="read run state"
             if name == "status"
+            else "cancel registered synchronous CREATED run before preparation"
+            if name == "cancel"
             else "diagnose interrupted synchronous publication without restarting",
         )
         run.add_argument("run_id")
@@ -123,7 +125,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return run_case(arguments)
     if arguments.command == "compare":
         return run_compare(arguments)
-    if arguments.command in {"status", "resume"}:
+    if arguments.command in {"status", "resume", "cancel"}:
         return run_lifecycle(arguments)
 
     parser.print_help()

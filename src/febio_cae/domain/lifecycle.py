@@ -74,7 +74,7 @@ class ServiceErrorCategory(str, Enum):
 
 
 _TRANSITIONS: dict[RunState, frozenset[RunState]] = {
-    RunState.CREATED: frozenset({RunState.PREPARING}),
+    RunState.CREATED: frozenset({RunState.PREPARING, RunState.CANCELLED}),
     RunState.PREPARING: frozenset({RunState.RUNNING, RunState.FAILED}),
     RunState.RUNNING: frozenset({RunState.DRAINING, RunState.INTERRUPTED}),
     RunState.DRAINING: frozenset({RunState.VALIDATING, RunState.FAILED, RunState.CANCELLED}),
