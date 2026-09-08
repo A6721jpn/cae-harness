@@ -24,10 +24,10 @@ from febio_cae.domain import (
     ResultManifest,
     RunState,
 )
-from febio_cae.domain.ports import PortError
+from febio_cae.domain.ports import PortError, PortErrorCategory
 
 
-@pytest.mark.parametrize("failure", ["none", "foreign-poll", "bad-geometry"])
+@pytest.mark.parametrize("failure", ["none", "foreign-poll", "bad-geometry", "pending-cleanup"])
 def test_registered_runner_connects_issued_state_and_numeric_reader(
     tmp_path: Path, failure: str
 ) -> None:
@@ -61,6 +61,7 @@ def test_registered_runner_connects_issued_state_and_numeric_reader(
         def __init__(self, ownership: Any, root: Path, inputs: Any) -> None:
             self.ownership = ownership
             self.root = root
+            self.cancel_calls = 0
 
         def start(self, bundle: Any, owner: Any, budget: Any) -> Any:
             self.ownership.claim(owner)
@@ -100,6 +101,8 @@ def test_registered_runner_connects_issued_state_and_numeric_reader(
         def poll(self, attempt: Any, owner: Any) -> Any:
             self.ownership.validate(owner, attempt)
             events.append("poll")
+            if failure == "pending-cleanup":
+                raise PortError(PortErrorCategory.EXECUTION, "synthetic poll I/O failure")
             if failure == "foreign-poll":
                 return PollResult(replace(attempt, revision_id="foreign"), ())
             return PollResult(
@@ -111,8 +114,21 @@ def test_registered_runner_connects_issued_state_and_numeric_reader(
 
         def cancel(self, attempt: Any, owner: Any) -> Any:
             events.append("cancel")
+            self.cancel_calls += 1
             from febio_cae.domain import CancelResult
 
+            if failure == "pending-cleanup":
+                draining = (
+                    attempt.transition_to(RunState.DRAINING)
+                    if attempt.state is RunState.RUNNING
+                    else attempt
+                )
+                return CancelResult(
+                    draining
+                    if self.cancel_calls == 1
+                    else draining.transition_to(RunState.CANCELLED),
+                    (),
+                )
             return CancelResult(
                 attempt.transition_to(RunState.DRAINING).transition_to(RunState.CANCELLED),
                 "synthetic cleanup",
@@ -180,6 +196,10 @@ def test_registered_runner_connects_issued_state_and_numeric_reader(
             assert not events
         else:
             assert "cancel" in events
+        if failure == "pending-cleanup":
+            assert events.count("cancel") == 1
+            assert service._retry_pending_cleanup() == 0
+            assert events.count("cancel") == 2
     else:
         manifest = service._execute_ports(
             created.case_id, revision.revision_id, build=build, runner_factory=Runner, read=read
