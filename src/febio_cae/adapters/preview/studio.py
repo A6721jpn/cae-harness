@@ -7,6 +7,8 @@ by themselves. Bare booleans or unbound observations cannot qualify a preview.
 from __future__ import annotations
 
 import hashlib
+import math
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -47,6 +49,28 @@ class FileSystemPreviewSource:
 
 
 @dataclass(frozen=True)
+class ExistingStudioSession:
+    """Private observed process lifetime and window identity, never a launch claim."""
+
+    studio: ToolIdentity
+    process_id: int
+    process_start_marker: str
+    window_id: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.studio, ToolIdentity):
+            raise TypeError("session studio must be a ToolIdentity")
+        if any(type(value) is not int or value <= 0 for value in (self.process_id, self.window_id)):
+            raise ValueError("session process and window identifiers must be positive integers")
+        if (
+            not isinstance(self.process_start_marker, str)
+            or not self.process_start_marker.strip()
+            or self.process_start_marker != self.process_start_marker.strip()
+        ):
+            raise ValueError("session requires an explicit process lifetime marker")
+
+
+@dataclass(frozen=True)
 class PreviewBinding:
     """One locally issued invocation; hook results must identify this target."""
 
@@ -58,6 +82,7 @@ class PreviewBinding:
     xplt_digest: str
     requested_state_ids: tuple[int, ...]
     requested_variables: tuple[str, ...]
+    existing_session: ExistingStudioSession | None = None
 
 
 @dataclass(frozen=True)
@@ -80,6 +105,7 @@ class PreviewObservation:
     variables: tuple[str, ...]
     binding: PreviewBinding | None = None
     evidence: tuple[EvidenceRef, ...] = ()
+    existing_session: ExistingStudioSession | None = None
 
 
 @dataclass(frozen=True)
@@ -87,6 +113,8 @@ class _IssuedPreview:
     receipt: PreviewReceipt
     binding: PreviewBinding
     entry: FileEntry
+    observation_only: bool = False
+    deadline: float | None = None
 
 
 class PreviewAdapter:
@@ -99,6 +127,8 @@ class PreviewAdapter:
         source: PreviewSource,
         launcher: Callable[[PreviewBinding], PreviewLaunchResult] | None = None,
         observer: Callable[[PreviewBinding], PreviewObservation] | None = None,
+        session_probe: Callable[[ExistingStudioSession], ExistingStudioSession | None]
+        | None = None,
     ) -> None:
         if not isinstance(studio, ToolIdentity):
             raise TypeError("studio must be a ToolIdentity")
@@ -106,10 +136,94 @@ class PreviewAdapter:
         self.source = source
         self.launcher = launcher
         self.observer = observer
+        self.session_probe = session_probe
         self._used_ids: set[str] = set()
         self._issued: dict[str, _IssuedPreview] = {}
 
     def request(self, manifest: ResultManifest, request: PreviewRequest) -> PreviewReceipt:
+        issued = self._prepare(manifest, request)
+        receipt, binding, entry = issued.receipt, issued.binding, issued.entry
+        if self.launcher is None:
+            return receipt
+        try:
+            result = self.launcher(binding)
+            if (
+                not isinstance(result, PreviewLaunchResult)
+                or result.launched is not True
+                or result.binding != binding
+            ):
+                return receipt
+            self._read_bound(binding.path, entry)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return receipt
+        receipt = replace(receipt, status=PreviewStatus.LAUNCHED)
+        self._issued[receipt.receipt_id] = replace(issued, receipt=receipt)
+        return receipt
+
+    def request_observation(
+        self,
+        manifest: ResultManifest,
+        request: PreviewRequest,
+        *,
+        session: ExistingStudioSession,
+        timeout_seconds: float,
+    ) -> PreviewReceipt:
+        """Issue for one live session; no launcher, persisted restore, or ledger debit.
+
+        The trusted probe must independently inspect the process/window identity.
+        Observation and confirmation must use this retained adapter instance.
+        """
+        if not isinstance(session, ExistingStudioSession) or session.studio != self.studio:
+            raise ValueError("existing session must identify this Studio tool")
+        if (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, (int, float))
+            or not math.isfinite(timeout_seconds)
+            or timeout_seconds <= 0
+        ):
+            raise ValueError("observation timeout must be finite and positive")
+        deadline = time.monotonic() + timeout_seconds
+        if not math.isfinite(deadline):
+            raise ValueError("observation deadline must be finite")
+        issued = self._prepare(manifest, request)
+        issued = replace(
+            issued,
+            binding=replace(issued.binding, existing_session=session),
+            observation_only=True,
+            deadline=deadline,
+        )
+        try:
+            self._verify_issued(issued)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return issued.receipt
+        receipt = replace(issued.receipt, status=PreviewStatus.REQUESTED)
+        self._issued[receipt.receipt_id] = replace(issued, receipt=receipt)
+        return receipt
+
+    def observation_binding(self, receipt: PreviewReceipt) -> PreviewBinding:
+        """Expose a pending local nonce for fresh capture, never restore authority."""
+        if not isinstance(receipt, PreviewReceipt):
+            raise TypeError("receipt must be a PreviewReceipt")
+        issued = self._issued.get(receipt.receipt_id)
+        if (
+            issued is None
+            or receipt != issued.receipt
+            or not issued.observation_only
+            or receipt.status is not PreviewStatus.REQUESTED
+        ):
+            raise PortError(PortErrorCategory.CONFLICT, "no matching pending observation issue")
+        try:
+            self._verify_issued(issued)
+            if self._issued.get(receipt.receipt_id) != issued:
+                raise ValueError("observation issue was invalidated during verification")
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            self._invalidate(issued)
+            raise PortError(
+                PortErrorCategory.INTEGRITY, "observation issue is no longer valid"
+            ) from error
+        return issued.binding
+
+    def _prepare(self, manifest: ResultManifest, request: PreviewRequest) -> _IssuedPreview:
         if request.manifest_id != manifest.manifest_id:
             raise PortError(
                 PortErrorCategory.CONFLICT, "preview request does not target the manifest"
@@ -129,10 +243,11 @@ class PreviewAdapter:
         # Source properties/reads are integration callbacks too. Reserve before
         # the first callback; an unsuccessful read still consumes this identity.
         self._used_ids.add(request.preview_id)
+        nonce = uuid4().hex
         path = Path(self.source.path).resolve()
         self._read_bound(path, entry)
         binding = PreviewBinding(
-            uuid4().hex,
+            nonce,
             request.preview_id,
             manifest.manifest_id,
             path,
@@ -153,22 +268,7 @@ class PreviewAdapter:
             (),
             (),
         )
-        if self.launcher is None:
-            return receipt
-        try:
-            result = self.launcher(binding)
-            if (
-                not isinstance(result, PreviewLaunchResult)
-                or result.launched is not True
-                or result.binding != binding
-            ):
-                return receipt
-            self._read_bound(path, entry)
-        except (OSError, RuntimeError, TypeError, ValueError):
-            return receipt
-        receipt = replace(receipt, status=PreviewStatus.LAUNCHED)
-        self._issued[receipt.receipt_id] = _IssuedPreview(receipt, binding, entry)
-        return receipt
+        return _IssuedPreview(receipt, binding, entry)
 
     def confirm(self, receipt: PreviewReceipt, evidence: Sequence[EvidenceRef]) -> PreviewReceipt:
         if not isinstance(receipt, PreviewReceipt):
@@ -177,10 +277,13 @@ class PreviewAdapter:
         if issued is None or receipt != issued.receipt or receipt.studio != self.studio:
             # A forged caller record does not revoke the actual locally issued record.
             return self._failed(receipt)
-        if receipt.status not in {PreviewStatus.LAUNCHED, PreviewStatus.CONFIRMED}:
+        allowed = {PreviewStatus.LAUNCHED, PreviewStatus.CONFIRMED}
+        if issued.observation_only:
+            allowed = {PreviewStatus.REQUESTED, PreviewStatus.CONFIRMED}
+        if receipt.status not in allowed:
             raise PortError(PortErrorCategory.CONFLICT, "preview cannot be confirmed in this state")
         try:
-            self._read_bound(issued.binding.path, issued.entry)
+            self._verify_issued(issued)
         except (OSError, RuntimeError, TypeError, ValueError):
             return self._invalidate(issued)
         if self._issued.get(receipt.receipt_id) != issued:
@@ -204,12 +307,16 @@ class PreviewAdapter:
             if (
                 not isinstance(observation, PreviewObservation)
                 or observation.binding != issued.binding
+                or (
+                    issued.observation_only
+                    and observation.existing_session != issued.binding.existing_session
+                )
                 or tuple(observation.evidence) != tuple(evidence)
                 or not set(receipt.requested_state_ids).issubset(observation.state_ids)
                 or not set(receipt.requested_variables).issubset(observation.variables)
             ):
                 return self._invalidate(issued)
-            self._read_bound(issued.binding.path, issued.entry)
+            self._verify_issued(issued)
             if self._issued.get(receipt.receipt_id) != issued:
                 # Observation callbacks may allow another check to invalidate
                 # the receipt. Restored bytes do not erase that observed failure.
@@ -223,6 +330,25 @@ class PreviewAdapter:
             return self._invalidate(issued)
         self._issued[receipt.receipt_id] = replace(issued, receipt=confirmed)
         return confirmed
+
+    def _verify_issued(self, issued: _IssuedPreview) -> None:
+        self._read_bound(issued.binding.path, issued.entry)
+        if not issued.observation_only:
+            return
+        session = issued.binding.existing_session
+        if (
+            session is None
+            or self.session_probe is None
+            or issued.deadline is None
+            or time.monotonic() >= issued.deadline
+        ):
+            raise ValueError("live session probe or observation time is unavailable")
+        observed = self.session_probe(session)
+        if not isinstance(observed, ExistingStudioSession) or observed != session:
+            raise ValueError("existing Studio process or window changed")
+        self._read_bound(issued.binding.path, issued.entry)
+        if time.monotonic() >= issued.deadline:
+            raise ValueError("observation deadline expired")
 
     def _read_bound(self, path: Path, entry: FileEntry) -> None:
         try:
@@ -258,6 +384,7 @@ class PreviewAdapter:
 
 
 __all__ = [
+    "ExistingStudioSession",
     "FileSystemPreviewSource",
     "PreviewAdapter",
     "PreviewBinding",
