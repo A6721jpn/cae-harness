@@ -11,6 +11,7 @@ from typing import Any
 
 import pytest
 
+from febio_cae.adapters.febio._windows_job import WindowsJobProcess
 from febio_cae.adapters.preview import studio as preview_module
 from febio_cae.domain import (
     AssessmentStatus,
@@ -217,6 +218,7 @@ def test_runner_tracks_real_owned_writer_through_uncertain_enumeration_and_natur
     started = runner.start(bundle, _owner(), revision.spec.budget)
     managed = next(iter(runner._managed.values()))
     process = managed.process
+    assert isinstance(process, WindowsJobProcess)
     try:
         _until(lambda: process.poll() == 0)
         output = managed.attempt_root / "output/owned-writer.bin"
@@ -260,6 +262,7 @@ def test_runner_cancel_drains_owned_tree_without_killing_unowned_process(tmp_pat
         long_started = long_runner.start(long_bundle, _owner(), revision.spec.budget)
         managed = next(iter(long_runner._managed.values()))
         process = managed.process
+        assert isinstance(process, WindowsJobProcess)
         child_handle = _hold_child(process, managed.attempt_root / "output/child.pid")
         assert process.active_processes() >= 2
         long_started = long_runner.poll(long_started, _owner()).attempt
