@@ -378,6 +378,11 @@ def test_rigid_generators_honor_typed_dimensions_and_pose(
         synthetic_case_revision,
         spec=replace(synthetic_case_revision.spec, rigid_tool=tool),
     )
+    if kind in {"sphere", "cylinder"}:
+        with pytest.raises(PortError, match="curved.*quality") as error:
+            mesh_port.mesh(revision)
+        _assert_port_error(error, PortErrorCategory.UNSUPPORTED_CAPABILITY)
+        return
     artifact = mesh_port.mesh(revision)
     tool_element_ids = {
         element.element_id for element in artifact.elements if element.body_id == "tool-body"
