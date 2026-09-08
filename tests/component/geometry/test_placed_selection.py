@@ -38,7 +38,7 @@ def test_resolves_explicitly_placed_part(
         ),
     )
     result = adapter.resolve_placed_selection(source_content, geometry, spec.rigid_tool, selection)
-    assert [face.value for face in result.resolved_face_ids] == ["top-face"]
+    assert [face.face_id.value for face in result.faces] == ["top-face"]
 
 
 def test_resolves_generated_tool(
@@ -49,7 +49,7 @@ def test_resolves_generated_tool(
     result = adapter.resolve_placed_selection(
         source_content, spec.geometry, spec.rigid_tool, selection
     )
-    assert result.resolved_face_ids
+    assert result.faces
     assert result.body_id == spec.rigid_tool.primitive.body_id
 
 
