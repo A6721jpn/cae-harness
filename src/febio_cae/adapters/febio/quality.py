@@ -40,14 +40,19 @@ class QualityAdapter:
         profile: CompatibilityProfile,
         data: ResultDataPort,
     ) -> QualityAssessment:
+        unavailable: str | None = None
         if manifest.read_result.status.value != "VALIDATED":
+            unavailable = f"result read status is {manifest.read_result.status.value}"
+        elif mesh.provenance.source_geometry_digest != revision.spec.geometry.geometry_digest:
+            unavailable = "mesh source geometry digest differs from the supplied revision geometry"
+        if unavailable is not None:
             criteria = tuple(
                 CriterionAssessment(
                     criterion.criterion_id,
                     "execution",
                     AssessmentStatus.UNVERIFIED,
                     (),
-                    f"result read status is {manifest.read_result.status.value}; applicability: {criterion.applicability_reason}",
+                    f"{unavailable}; applicability: {criterion.applicability_reason}",
                 )
                 for criterion in revision.spec.quality_policy.criteria
             )
