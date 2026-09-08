@@ -148,10 +148,20 @@ def test_supported_curved_mesh_has_bounded_closed_contact_boundary(
         assert all(
             set(s.member_ids) == tool_faces for s in artifact.sets if s.body_id == "tool-body"
         )
+        total_volume = 0.0
         for element in artifact.elements:
             if element.body_id != "tool-body":
                 continue
             corners = element.node_ids[:4]
+            a, b, c, d = (nodes[i] for i in corners)
+            u, v, w = (tuple(p[j] - a[j] for j in range(3)) for p in (b, c, d))
+            volume = (
+                u[0] * (v[1] * w[2] - v[2] * w[1])
+                - u[1] * (v[0] * w[2] - v[2] * w[0])
+                + u[2] * (v[0] * w[1] - v[1] * w[0])
+            ) / 6
+            assert volume > 0
+            total_volume += volume
             assert (
                 max(math.dist(nodes[a], nodes[b]) for a, b in combinations(corners, 2))
                 <= 0.005 + 1e-15
@@ -162,6 +172,16 @@ def test_supported_curved_mesh_has_bounded_closed_contact_boundary(
                 assert nodes[mid] == pytest.approx(
                     tuple((nodes[corners[a]][k] + nodes[corners[b]][k]) / 2 for k in range(3))
                 )
+        radius_lower = 0.002 - record.value
+        exact_volume = (
+            4 * math.pi * 0.002**3 / 3 if kind == "sphere" else math.pi * 0.002**2 * 0.004
+        )
+        lower_volume = (
+            4 * math.pi * radius_lower**3 / 3
+            if kind == "sphere"
+            else math.pi * radius_lower**2 * 0.004
+        )
+        assert lower_volume <= total_volume <= exact_volume
     assert len(artifacts[1].elements) > len(artifacts[0].elements)
     assert artifacts[1].provenance.mesh_recipe_digest != artifacts[0].provenance.mesh_recipe_digest
 
@@ -196,14 +216,16 @@ def test_curved_refinement_budget_exhaustion(
     assert error.value.category == PortErrorCategory.QUALITY
 
 
+@pytest.mark.parametrize("kind", ["sphere", "cylinder"])
 def test_global_size_refines_volume_not_only_surface(
     synthetic_backend: Any,
     source_content: Any,
     synthetic_case_revision: Any,
+    kind: str,
 ) -> None:
     counts = []
     for size in (0.005, 0.0015):
-        revision = _case(synthetic_case_revision, "cylinder", size=size)
+        revision = _case(synthetic_case_revision, kind, size=size)
         artifact = _adapter(synthetic_backend, source_content, revision, 0.0002).mesh(revision)
         nodes = {n.node_id: n.coordinates_si for n in artifact.nodes}
         elements = [e for e in artifact.elements if e.body_id == "tool-body"]
