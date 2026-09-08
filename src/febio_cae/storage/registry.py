@@ -11,7 +11,7 @@ import stat
 import uuid
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import ExitStack, contextmanager
-from dataclasses import fields, is_dataclass
+from dataclasses import fields, is_dataclass, replace
 from datetime import UTC, datetime
 from functools import wraps
 from pathlib import Path
@@ -30,7 +30,7 @@ from febio_cae.domain.case_revision import CaseRevision
 from febio_cae.domain.codec import decode_record, encode_record
 from febio_cae.domain.compatibility import CapabilityStatus, CompatibilityProfile
 from febio_cae.domain.evidence import EvidenceRef
-from febio_cae.domain.execution import AttemptRecord, ExecutionBundle
+from febio_cae.domain.execution import AttemptRecord, ExecutionBundle, ExecutionSetting
 from febio_cae.domain.lifecycle import RunState
 from febio_cae.domain.mesh_policy import NumericalProfileRef
 from febio_cae.domain.partial_case_spec import PartialCaseSpec
@@ -479,6 +479,10 @@ class CaseStorage:
                 CREATE TABLE IF NOT EXISTS attempt_history (
                     sequence INTEGER PRIMARY KEY AUTOINCREMENT, attempt_id TEXT NOT NULL,
                     payload BLOB NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS native_execution (
+                    attempt_id TEXT PRIMARY KEY, process_root TEXT NOT NULL UNIQUE,
+                    drained INTEGER NOT NULL DEFAULT 0
                 );
                 """
             )
@@ -1515,6 +1519,158 @@ class CaseStorage:
         return attempt
 
     @_serialized
+    def _prepare_runner(self, owner: TrustedOwnerContext, process_root: Path) -> None:
+        """Private controller preparation, before any runner launch or root creation."""
+        attempt = self._attempt(owner)
+        self.validate(owner, attempt)
+        if attempt.state is not RunState.CREATED:
+            raise PortError(PortErrorCategory.CONFLICT, "runner preparation requires CREATED")
+        try:
+            relative = process_root.absolute().relative_to(self.root).as_posix()
+            checked = _owned_path(self.root, relative)
+        except (ValueError, OSError, StorageIntegrityError) as error:
+            raise PortError(
+                PortErrorCategory.INTEGRITY, "runner root is outside storage"
+            ) from error
+        if checked.exists():
+            raise PortError(PortErrorCategory.CONFLICT, "runner root must be fresh")
+        with _connect(self.registry_path) as connection:
+            try:
+                connection.execute(
+                    "INSERT INTO native_execution(attempt_id,process_root) VALUES(?,?)",
+                    (attempt.attempt_id, str(checked)),
+                )
+            except sqlite3.IntegrityError as error:
+                raise PortError(PortErrorCategory.CONFLICT, "runner is already prepared") from error
+
+    def _native_context(self, attempt: AttemptRecord) -> sqlite3.Row:
+        with _connect(self.registry_path) as connection:
+            row = connection.execute(
+                "SELECT * FROM native_execution WHERE attempt_id=?", (attempt.attempt_id,)
+            ).fetchone()
+        if row is None:
+            raise PortError(PortErrorCategory.CONFLICT, "no prepared native execution")
+        return row
+
+    def _persist_issued(self, owner: TrustedOwnerContext, issued: AttemptRecord) -> None:
+        with _connect(self.registry_path) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "UPDATE owners SET payload=? WHERE run_id=?", (encode_record(issued), owner.run_id)
+            )
+            connection.execute(
+                "INSERT INTO attempt_history(attempt_id,payload) VALUES(?,?)",
+                (issued.attempt_id, encode_record(issued)),
+            )
+            connection.commit()
+
+    @_serialized
+    def _accept_runner_start(self, owner: TrustedOwnerContext, issued: AttemptRecord) -> None:
+        """Called only by the controller holding the actual Runner.start return value."""
+        current = self._attempt(owner)
+        self.validate(owner, current)
+        native = self._native_context(current)
+        bundle, _ = self._lineage(current)
+        revision = self.get_revision(owner.case_id, current.revision_id)
+        expected_settings = tuple(
+            sorted(
+                (
+                    *[
+                        s
+                        for s in bundle.settings
+                        if s.name not in {"attempt_root", "max_elapsed_seconds"}
+                    ],
+                    ExecutionSetting("attempt_root", native["process_root"]),
+                    ExecutionSetting(
+                        "max_elapsed_seconds", revision.spec.budget.max_elapsed.to_si().value
+                    ),
+                ),
+                key=lambda s: s.name,
+            )
+        )
+        process = issued.process
+        if (
+            current.state is not RunState.CREATED
+            or issued.state is not RunState.RUNNING
+            or replace(issued, state=current.state, process=None, settings=current.settings)
+            != current
+            or tuple(issued.settings) != expected_settings
+            or process is None
+            or process.cwd != native["process_root"]
+            or tuple(process.argv) != tuple(bundle.argv)
+            or process.executable != bundle.argv[0]
+            or process.executable_digest != bundle.tool.executable_digest
+            or process.thread_count != bundle.thread_count
+        ):
+            raise PortError(PortErrorCategory.CONFLICT, "issued runner differs from preparation")
+        self._persist_issued(owner, current.transition_to(RunState.PREPARING))
+        self._persist_issued(owner, issued)
+
+    @_serialized
+    def _accept_runner_poll(
+        self, owner: TrustedOwnerContext, previous: AttemptRecord, issued: AttemptRecord
+    ) -> None:
+        """Persist an actual issued poll, never adopt a snapshot during validate()."""
+        current = self._attempt(owner)
+        self.validate(owner, current)
+        self._native_context(current)
+        if current != previous or replace(issued, state=current.state) != current:
+            raise PortError(PortErrorCategory.CONFLICT, "issued poll snapshot is stale or foreign")
+        if current.state not in {RunState.RUNNING, RunState.DRAINING}:
+            raise PortError(PortErrorCategory.CONFLICT, "runner poll requires a live lifecycle")
+        if current.state is issued.state:
+            return
+        if current.state is RunState.RUNNING and issued.state in {
+            RunState.VALIDATING,
+            RunState.FAILED,
+            RunState.CANCELLED,
+        }:
+            current = current.transition_to(RunState.DRAINING)
+            self._persist_issued(owner, current)
+        current.transition_to(issued.state)
+        self._persist_issued(owner, issued)
+        if issued.state is RunState.VALIDATING:
+            with _connect(self.registry_path) as connection:
+                connection.execute(
+                    "UPDATE native_execution SET drained=1 WHERE attempt_id=?", (issued.attempt_id,)
+                )
+
+    @_serialized
+    def _seal_native_output(self, owner: TrustedOwnerContext) -> tuple[FileEntry, ...]:
+        """Freeze the fixed XPLT file only after controller-recorded owned drain."""
+        attempt = self._attempt(owner)
+        self.validate(owner, attempt)
+        native = self._native_context(attempt)
+        _, lineage = self._lineage(attempt)
+        if (
+            attempt.state is not RunState.VALIDATING
+            or not native["drained"]
+            or attempt.process is None
+            or lineage["sealed_files"] is not None
+        ):
+            raise PortError(
+                PortErrorCategory.CONFLICT, "native output requires unsealed owned drain"
+            )
+        relative = (
+            (Path(native["process_root"]) / "output/results.xplt").relative_to(self.root).as_posix()
+        )
+        with pinned_read(_owned_path(self.root, relative)) as stream:
+            if os.fstat(stream.fileno()).st_size > 32 * 1024 * 1024:
+                raise PortError(PortErrorCategory.INTEGRITY, "native XPLT exceeds reader limit")
+            content = stream.read()
+        entry = FileEntry(
+            "output/results.xplt", hashlib.sha256(content).hexdigest(), len(content), "result"
+        )
+        base = f"cases/{attempt.case_id}/runs/{attempt.run_id}/attempts/{attempt.attempt_id}"
+        _write_atomic(self.root, f"{base}/{entry.logical_path}", content)
+        with _connect(self.registry_path) as connection:
+            connection.execute(
+                "UPDATE execution_lineage SET sealed_files=?,writer_closed=1 WHERE attempt_id=?",
+                (canonical_bytes([entry.to_dict()]), attempt.attempt_id),
+            )
+        return (entry,)
+
+    @_serialized
     def _transition_attempt(self, owner: TrustedOwnerContext, target: RunState) -> AttemptRecord:
         attempt = self._attempt(owner)
         self.validate(owner, attempt)
@@ -1639,7 +1795,9 @@ class CaseStorage:
                 PortErrorCategory.CONFLICT, "manifest was not returned by the registered reader"
             )
         sealed = self._sealed_entries(lineage)
-        if attempt.state is not RunState.VALIDATING or attempt.process is not None:
+        if attempt.state is not RunState.VALIDATING or (
+            attempt.process is not None and not self._native_context(attempt)["drained"]
+        ):
             raise PortError(
                 PortErrorCategory.CONFLICT, "registered terminal writer state is required"
             )
