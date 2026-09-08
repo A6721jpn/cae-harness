@@ -174,3 +174,63 @@ def test_execution_admission_recomputes_from_registered_sources(tmp_path: Path, 
     else:
         with pytest.raises(ValueError, match="adoption"):
             service._verify_execution_mesh(storage, record, revision, candidate)
+
+
+def test_material_child_rebinds_mesh_without_overwriting_parent_sources(tmp_path: Path) -> None:
+    from test_persistence_authority import _created
+
+    from febio_cae.domain.canonical import canonical_bytes
+    from febio_cae.domain.codec import encode_record
+
+    service, created, storage = _created(tmp_path)
+    record, original, carrier, parent = _fixture(tmp_path)
+    parent = replace(parent, case_id=created.case_id)
+    storage.register_revision(parent)
+    adopted, receipt = service._adopt_planar_mesh(record, original, carrier, parent)
+    payloads = {
+        "gm03-mesh": encode_record(original),
+        "gm03-carrier": encode_record(carrier),
+        "adopted-mesh": encode_record(adopted),
+        "adoption-receipt": canonical_bytes(receipt),
+        "original-result": b"synthetic result placeholder; not native evidence",
+        "original-preview": b"synthetic preview placeholder; not UI evidence",
+    }
+    for name, payload in payloads.items():
+        storage.ingest_source(
+            asset_id=name,
+            source_kind="registered_document",
+            media_type="application/octet-stream",
+            content=payload,
+        )
+    child = replace(
+        parent,
+        revision_id="material-child",
+        parent_revision_id=parent.revision_id,
+        parent_spec_digest=parent.spec_digest,
+        spec=replace(
+            parent.spec, material=replace(parent.spec.material, youngs_modulus=Quantity(2e6, "Pa"))
+        ),
+    )
+    expected, _ = service._adopt_planar_mesh(record, original, carrier, child)
+    try:
+        service._verify_execution_mesh(storage, record, child, expected)
+    except ValueError as error:
+        pytest.fail(f"material-only child must rebind original mesh: {error}")
+    assert expected.nodes == adopted.nodes and expected.elements == adopted.elements
+    assert expected.artifact_digest != adopted.artifact_digest
+    assert expected.quality_records == adopted.quality_records
+    for name, payload in payloads.items():
+        assert storage.resolve_source(storage.source_asset(name)).content == payload
+    with pytest.raises(ValueError):
+        service._verify_execution_mesh(storage, record, child, adopted)
+    stale = replace(child, parent_spec_digest="0" * 64)
+    with pytest.raises(ValueError):
+        service._verify_execution_mesh(storage, record, stale, expected)
+    moved = replace(
+        child,
+        spec=replace(
+            child.spec, mesh_policy=replace(child.spec.mesh_policy, global_size=Quantity(3, "mm"))
+        ),
+    )
+    with pytest.raises(ValueError):
+        service._verify_execution_mesh(storage, record, moved, expected)
