@@ -8,6 +8,7 @@ from collections.abc import Sequence
 from febio_cae import __version__
 
 from .case import run_case
+from .compare import COMPARISON_HELP, run_compare
 from .doctor import run_doctor
 
 
@@ -85,6 +86,18 @@ def _build_parser() -> argparse.ArgumentParser:
     preview_status.add_argument("case_id")
     preview_status.add_argument("--preview-id", required=True)
     preview_status.add_argument("--json", action="store_true")
+    compare = commands.add_parser(
+        "compare",
+        help="compare registered planar material-edit force and part-displacement curves",
+        description=COMPARISON_HELP,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    compare.add_argument("baseline_run")
+    compare.add_argument("candidate_run")
+    compare.add_argument("--case-id", required=True)
+    compare.add_argument("--state-dir", default=None)
+    compare.add_argument("--spec", required=True, help="explicit common ComparisonSpec JSON")
+    compare.add_argument("--json", action="store_true")
     return parser
 
 
@@ -96,6 +109,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return run_doctor(json_output=arguments.json)
     if arguments.command == "case":
         return run_case(arguments)
+    if arguments.command == "compare":
+        return run_compare(arguments)
 
     parser.print_help()
     return 2

@@ -24,6 +24,7 @@ from febio_cae.domain.canonical import canonical_bytes
 from febio_cae.domain.case_draft import CaseDraft
 from febio_cae.domain.case_patch import CasePatch
 from febio_cae.domain.case_revision import CaseRevision
+from febio_cae.domain.comparison import ComparisonSpec
 from febio_cae.domain.compatibility import CapabilityStatus, CompatibilityProfile
 from febio_cae.domain.evidence import EvidenceRef
 from febio_cae.domain.execution import AttemptRecord, ExecutionBundle
@@ -958,6 +959,13 @@ class RegisteredCaseService:
         from ._preview import preview_summary
 
         return preview_summary(RegisteredPreviewStore(self._storage(case_id)), preview_id)
+
+    def compare_case(
+        self, case_id: str, request: ComparisonSpec, *, baseline_run_id: str, candidate_run_id: str
+    ) -> dict[str, object]:
+        from ._comparison import compare
+
+        return compare(self, case_id, request, baseline_run_id, candidate_run_id)
 
     def run_demo(
         self, case_id: str, revision_id: str, *, executable: str, preflight: bool = False
