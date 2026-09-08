@@ -274,6 +274,7 @@ def test_runner_cancel_drains_owned_tree_without_killing_unowned_process(tmp_pat
     finally:
         _cleanup(long_runner, long_started)
         if child_handle is not None:
+            assert isinstance(process, WindowsJobProcess)
             process._win.CloseHandle(child_handle)
         if unrelated.poll() is None:
             unrelated.terminate()
