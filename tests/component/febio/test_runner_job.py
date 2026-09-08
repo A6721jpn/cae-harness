@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import importlib
+import ctypes
 import os
 import subprocess
 import sys
@@ -23,7 +23,7 @@ def _job_type() -> Any:
     assert hasattr(runner_module, "WindowsJobProcess"), (
         "runner must own a pre-execution Windows Job, not rediscover descendant PIDs"
     )
-    return getattr(runner_module, "WindowsJobProcess")
+    return runner_module.WindowsJobProcess
 
 
 def _until(predicate: Any, seconds: float = 5) -> None:
@@ -56,7 +56,9 @@ def _start(tmp_path: Path, code: str, budget_seconds: float = 8) -> tuple[Any, A
     revision, _, _, bundle, _ = _compiled(tmp_path)
     runner = runner_module.RunnerAdapter(ownership=_Ownership(), root=tmp_path / "runs")
     budget = replace(revision.spec.budget, max_elapsed=Quantity(budget_seconds, "s"))
-    return runner, runner.start(replace(bundle, argv=(sys.executable, "-c", code)), _owner(), budget)
+    return runner, runner.start(
+        replace(bundle, argv=(sys.executable, "-c", code)), _owner(), budget
+    )
 
 
 def _cleanup(runner: Any, attempt: Any) -> None:
@@ -70,61 +72,103 @@ def _cleanup(runner: Any, attempt: Any) -> None:
 
 
 def test_root_exit_keeps_descendant_writer_owned_until_natural_drain(tmp_path: Path) -> None:
-    child = "from pathlib import Path; import time; p=Path('output/writer'); " + (
-        "[(p.open('ab').write(b'x'),time.sleep(.05)) for _ in range(50)]"
+    child = (
+        "from pathlib import Path; import time,os; Path('output/child.pid').write_text(str(os.getpid())); p=Path('output/writer'); "
+        + ("[(p.open('ab').write(b'x'),time.sleep(.05)) for _ in range(50)]")
     )
     code = f"import subprocess,sys; subprocess.Popen([sys.executable,'-c',{child!r}])"
     runner, attempt = _start(tmp_path, code)
     managed = runner._managed[attempt.attempt_id]
     process = managed.process
+    child_handle = None
     try:
         _until(lambda: process.poll() == 0)
         writer = managed.attempt_root / "output/writer"
         _until(writer.exists)
+        child_handle = _hold_child(process, managed.attempt_root / "output/child.pid")
         current = runner.poll(attempt, _owner()).attempt
         assert current.state is RunState.DRAINING
-        assert process.active_processes() == 1
+        assert process.active_processes() >= 1
         before = writer.stat().st_size
         _until(lambda: writer.stat().st_size > before)
         _until(lambda: process.active_processes() == 0)
+        assert process._win.WaitForSingleObject(child_handle, 0) == 0
         result = runner.reconcile(current, _owner()).attempt
         assert result.state is RunState.VALIDATING
         assert process.closed and not runner._managed
-        print("natural drain: root exit=0, job active=1 with writer growth, then active=0; handles closed")
+        print(
+            "natural drain: root exit=0, owned child HANDLE live with writer growth, then child HANDLE signaled and job active=0; handles closed"
+        )
     finally:
         _cleanup(runner, attempt)
+        if child_handle is not None:
+            process._win.CloseHandle(child_handle)
+
+
+def _hold_child(process: Any, pid_file: Path) -> int:
+    _until(lambda: pid_file.exists() and bool(pid_file.read_text()))
+    handle = int(process._win.OpenProcess(0x100000 | 0x1000, False, int(pid_file.read_text())))
+    # Bind the opened handle to the retained job before trusting it; never kill by PID.
+    api = ctypes.WinDLL("kernel32", use_last_error=True)
+    api.IsProcessInJob.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+    api.IsProcessInJob.restype = ctypes.c_int
+    member = ctypes.c_int()
+    try:
+        assert api.IsProcessInJob(handle, process._job, ctypes.byref(member)) and member.value
+        times = [ctypes.c_ulonglong() for _ in range(4)]
+        assert process._api.GetProcessTimes(handle, *(ctypes.byref(t) for t in times))
+        assert times[0].value >= process.creation_time > 0
+        assert process._win.WaitForSingleObject(handle, 0) == 258
+        print(f"held child creation FILETIME={times[0].value}; verified retained-job membership")
+        return handle
+    except BaseException:
+        process._win.CloseHandle(handle)
+        raise
 
 
 def test_cancel_owned_tree_leaves_unrelated_sentinel_alive(tmp_path: Path) -> None:
     _job_type()
     sentinel = subprocess.Popen([sys.executable, "-c", "import time;time.sleep(12)"])
-    code = "import subprocess,sys,time;subprocess.Popen([sys.executable,'-c','import time;time.sleep(8)']);time.sleep(8)"
+    child = "from pathlib import Path;import time,os;Path('output/child.pid').write_text(str(os.getpid()));time.sleep(8)"
+    code = f"import subprocess,sys,time;subprocess.Popen([sys.executable,'-c',{child!r}]);time.sleep(8)"
     runner = attempt = None
+    child_handle = None
     try:
         runner, attempt = _start(tmp_path, code)
-        process = runner._managed[attempt.attempt_id].process
-        _until(lambda: process.active_processes() == 2)
+        managed = runner._managed[attempt.attempt_id]
+        process = managed.process
+        child_handle = _hold_child(process, managed.attempt_root / "output/child.pid")
+        assert process.active_processes() >= 2
         result = runner.cancel(attempt, _owner()).attempt
         assert result.state is RunState.CANCELLED
         assert process.closed and not runner._managed
         assert sentinel.poll() is None
-        print("cancel: job active=2 -> confirmed zero/closed; unrelated held sentinel remains alive")
+        assert process._win.WaitForSingleObject(child_handle, 0) == 0
+        print(
+            "cancel: child HANDLE signaled, job confirmed zero/closed; unrelated held sentinel remains alive"
+        )
     finally:
         if runner is not None:
             _cleanup(runner, attempt)
+        if child_handle is not None:
+            process._win.CloseHandle(child_handle)
         sentinel.terminate()  # Popen retains the actual Windows process HANDLE.
         sentinel.wait(timeout=3)
 
 
-def test_accounting_failure_never_validates_then_recovers(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_accounting_failure_never_validates_then_recovers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     job_type = _job_type()
     runner, attempt = _start(tmp_path, "pass")
     process = runner._managed[attempt.attempt_id].process
     try:
         _until(lambda: process.poll() == 0)
         with monkeypatch.context() as patch:
+
             def unavailable(self: Any) -> int:
                 raise OSError("injected accounting failure")
+
             patch.setattr(job_type, "active_processes", unavailable)
             current = runner.poll(attempt, _owner()).attempt
             assert current.state is RunState.DRAINING
@@ -136,14 +180,16 @@ def test_accounting_failure_never_validates_then_recovers(tmp_path: Path, monkey
 
 
 def test_budget_applies_after_root_exit_and_uses_legal_failed_transition(tmp_path: Path) -> None:
-    code = "import subprocess,sys;subprocess.Popen([sys.executable,'-c','import time;time.sleep(8)'])"
-    runner, attempt = _start(tmp_path, code, .4)
+    code = (
+        "import subprocess,sys;subprocess.Popen([sys.executable,'-c','import time;time.sleep(8)'])"
+    )
+    runner, attempt = _start(tmp_path, code, 0.4)
     process = runner._managed[attempt.attempt_id].process
     try:
         _until(lambda: process.poll() == 0)
         current = runner.poll(attempt, _owner()).attempt
         assert current.state is RunState.DRAINING
-        time.sleep(.45)
+        time.sleep(0.45)
         result = runner.poll(current, _owner())
         assert result.attempt.state is RunState.FAILED
         assert "budget" in " ".join(result.diagnostics)
@@ -152,11 +198,11 @@ def test_budget_applies_after_root_exit_and_uses_legal_failed_transition(tmp_pat
         _cleanup(runner, attempt)
 
 
-def test_assignment_failure_never_executes_and_releases_handles(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_assignment_failure_never_executes_and_releases_handles(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     job_type = _job_type()
-    helper = importlib.import_module(job_type.__module__)
     held: list[Any] = []
-    original = job_type._assign
 
     def rejected(self: Any) -> None:
         held.append(self)
@@ -165,10 +211,12 @@ def test_assignment_failure_never_executes_and_releases_handles(tmp_path: Path, 
     monkeypatch.setattr(job_type, "_assign", rejected)
     marker = tmp_path / "must-not-execute"
     from febio_cae.domain import PortError
+
     with pytest.raises(PortError, match="assignment"):
         _start(tmp_path, f"from pathlib import Path;Path({str(marker)!r}).touch()")
     assert len(held) == 1 and held[0].closed
     assert held[0].returncode is not None
     assert not marker.exists()
-    assert helper is not None and original is not None
-    print("assignment failure: suspended root terminated by retained handle before resume; handles closed")
+    print(
+        "assignment failure: suspended root terminated by retained handle before resume; handles closed"
+    )
