@@ -28,7 +28,7 @@ test_registered_execution_publication_boundary(Path(sys.argv[1]), 'state-time')
 
 def preserved(root: Path) -> dict[str, Any]:
     with sqlite3.connect(root / "registry.sqlite3") as connection:
-        data = {
+        data: dict[str, Any] = {
             table: connection.execute(f'SELECT * FROM "{table}" ORDER BY rowid').fetchall()
             for table in ("sources", "revisions", "execution_lineage", "manifests", "numeric_data")
         }
@@ -78,6 +78,7 @@ def test_public_status_resume_reconciles_one_crash_and_preserves_outputs(tmp_pat
             env=env,
             capture_output=True,
             timeout=40,
+            check=False,
         )
         if proc.returncode == 2 and not proc.stdout:
             return proc.returncode, {"parser_error": proc.stderr.decode()}

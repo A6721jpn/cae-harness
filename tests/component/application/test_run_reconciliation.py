@@ -48,6 +48,20 @@ def test_resume_refuses_native_identity_without_adoption(tmp_path: Path) -> None
     assert storage._attempt(owner).to_bytes() == before
 
 
+def test_successful_run_without_quality_preview_is_not_a_complete_task(tmp_path: Path) -> None:
+    execute(tmp_path, "state-time")
+    service = RegisteredCaseService(state_dir=tmp_path / "state")
+    with sqlite3.connect(tmp_path / "case/registry.sqlite3") as connection:
+        case_id, run_id = connection.execute("SELECT case_id,run_id FROM owners").fetchone()
+        before = connection.execute("SELECT payload FROM owners").fetchall()
+    result = service.run_status(case_id, run_id)
+    assert result["run_status"] == "SUCCEEDED"
+    assert result["quality_status"] == "UNVERIFIED" and result["preview_status"] is None
+    assert result["task_status"] != "COMPLETE"
+    with sqlite3.connect(tmp_path / "case/registry.sqlite3") as connection:
+        assert connection.execute("SELECT payload FROM owners").fetchall() == before
+
+
 def test_resume_refuses_unclosed_registered_writer(tmp_path: Path) -> None:
     service, marker = interrupted_fixture(tmp_path)
     storage = service._storage(marker["case_id"])
