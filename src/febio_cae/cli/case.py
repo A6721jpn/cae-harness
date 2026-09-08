@@ -148,7 +148,9 @@ def run_case(arguments: Namespace) -> int:
                 preflight=arguments.preflight,
             )
             _print(payload) if arguments.json else print(payload["status"])
-            return 0 if payload["status"] in {"PREFLIGHT_PASSED", "NEEDS_PREVIEW"} else 2
+            if payload["status"] in {"PREFLIGHT_PASSED", "NEEDS_PREVIEW"}:
+                return 0
+            return 6 if payload["status"] == "NEEDS_REVIEW" else 2
         if arguments.case_action == "create":
             created = service.create_case(case_root=arguments.case_root, cad_path=arguments.cad)
             payload = _created_payload(created)
