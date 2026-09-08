@@ -21,6 +21,7 @@ from febio_cae.domain import (
     GeometryBodyFact,
     GeometryInspection,
     GeometryInspectionRequest,
+    GeometryIntent,
     GeometryPort,
     GeometrySelectionRequest,
     MeshArtifact,
@@ -36,6 +37,7 @@ from febio_cae.domain import (
     PortErrorCategory,
     Quantity,
     ResolutionSnapshot,
+    RigidToolIntent,
     RigidTransform,
     SelectionRef,
     SourceAssetContent,
@@ -225,6 +227,54 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
             raise TypeError("primitive must be a RigidPrimitive")
         generated = generate_primitive_mesh(primitive, geometry_digest=geometry_digest)
         return self._tool_inspection(generated, primitive, geometry_digest)
+
+    def resolve_placed_selection(
+        self,
+        source: SourceAssetContent,
+        geometry: GeometryIntent,
+        rigid_tool: RigidToolIntent,
+        selection: SelectionRef,
+    ) -> ResolutionSnapshot:
+        """Concrete draft-scoped bridge for explicit part and flat-tool poses.
+
+        This does not replace the source-only GeometryPort contract or apply
+        contact gap adjustments. The supplied intents must already state poses.
+        """
+        if not isinstance(geometry, GeometryIntent) or not isinstance(rigid_tool, RigidToolIntent):
+            self._raise(PortErrorCategory.INVALID_INPUT, "typed geometry and rigid tool required")
+        if not isinstance(selection, SelectionRef):
+            self._raise(PortErrorCategory.INVALID_INPUT, "selection must be a SelectionRef")
+        self._validate_source_request(self._configured_source_asset(), source)
+        if geometry.source_step_digest != source.source_asset.content_digest:
+            self._raise(PortErrorCategory.INTEGRITY, "geometry source digest is stale")
+        inspection = self.inspect(
+            GeometryInspectionRequest(self._configured_source_asset()), source
+        )
+        report = self.inspection_details(inspection)
+        if geometry.inspection_digest != inspection.inspection_digest:
+            self._raise(PortErrorCategory.INTEGRITY, "geometry inspection digest is stale")
+        if geometry.geometry_digest != report.geometry_digest:
+            self._raise(PortErrorCategory.INTEGRITY, "geometry digest is stale")
+        if geometry.step_unit != inspection.declared_unit:
+            self._raise(PortErrorCategory.INTEGRITY, "geometry STEP unit conflicts with source")
+        if geometry.body_id.value not in inspection.closed_solid_body_ids:
+            self._raise(PortErrorCategory.INVALID_INPUT, "geometry body is not a registered solid")
+        if geometry.body_id == rigid_tool.primitive.body_id:
+            self._raise(PortErrorCategory.INVALID_INPUT, "part and tool body identities overlap")
+        if selection.body_id == geometry.body_id:
+            selected_report = _placed_inspection(report, geometry.placement)
+        elif selection.body_id == rigid_tool.primitive.body_id:
+            if rigid_tool.primitive.kind != "box":
+                self._raise(
+                    PortErrorCategory.UNSUPPORTED_CAPABILITY,
+                    "placed bridge supports flat box tools only",
+                )
+            selected_report = self.inspect_rigid_tool(
+                rigid_tool.primitive, rigid_tool.contact_surface.geometry_digest
+            )
+        else:
+            self._raise(PortErrorCategory.INVALID_INPUT, "selection identifies a foreign body")
+        return self._resolve_selection_from_report(selection, selected_report)
 
     def calculate_initial_contact_placement(
         self, revision: CaseRevision
