@@ -82,6 +82,7 @@ from febio_cae.domain.results import (
 )
 from febio_cae.domain.selection import ResolutionSnapshot
 from febio_cae.domain.spatial import ProperRotation
+from febio_cae.storage.mesh_quality import MeshQualityRegistration
 from febio_cae.storage.registry import (
     CaseStorage,
     InjectedStorageFailure,
@@ -136,6 +137,18 @@ def _profile(
 
 def _profile_digest(profile_id: str) -> str:
     return hashlib.sha256(_profile(profile_id).to_bytes()).hexdigest()
+
+
+def _quality_registration() -> MeshQualityRegistration:
+    return MeshQualityRegistration(
+        "mesh",
+        Quantity(0.01, "mm"),
+        ("sphere", "cylinder"),
+        "synthetic",
+        "1",
+        "synthetic",
+        (_evidence("mesh_quality.qualification"),),
+    )
 
 
 def _identity(source: FrameId, target: FrameId) -> RigidTransform:
@@ -327,7 +340,7 @@ def complete_spec(*, solver_digest: str | None = None) -> CaseSpec:
             "tet10",
             Quantity(2, "mm"),
             [],
-            NumericalProfileRef("mesh", "mesh_quality", _profile_digest("mesh")),
+            _quality_registration().reference,
             0,
         ),
         SolverPolicy(
@@ -480,6 +493,7 @@ def _populate_complete(
     service: RegisteredCaseService, created: Any, spec: CaseSpec | None = None
 ) -> None:
     spec = complete_spec() if spec is None else spec
+    service.register_mesh_quality(created.case_id, _quality_registration())
     service.set_spec(
         created.case_id,
         values=PartialCaseSpec(
