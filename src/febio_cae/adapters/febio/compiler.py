@@ -514,8 +514,10 @@ class CompilerAdapter:
             }
             for body in (part_body, tool_body)
         }
-        for body, name in ((part_body, "part-nodes"), (tool_body, "tool-nodes")):
-            nodes = ET.SubElement(mesh_section, "Nodes", {"name": name})
+        for body in (part_body, tool_body):
+            # Names define implicit node sets; these groups need no references.
+            # Leave them unnamed so registered/generated subsets stay unambiguous.
+            nodes = ET.SubElement(mesh_section, "Nodes")
             for node in mesh.nodes:
                 if node.node_id in body_node_ids[body]:
                     ET.SubElement(nodes, "node", {"id": str(node.node_id)}).text = ",".join(
@@ -702,7 +704,10 @@ class CompilerAdapter:
             (revision.spec.contact.tool_surface, "face"),
             *((support.selection, "node") for support in revision.spec.support.supports),
             *(
-                (request.selection, "element" if request.location == "element" else "node")
+                (
+                    request.selection,
+                    {"element": "element", "rigid_body": "body"}.get(request.location, "node"),
+                )
                 for request in revision.spec.outputs.requests
             ),
         )
@@ -711,6 +716,29 @@ class CompilerAdapter:
         for selection, expected_kind in needs:
             digest = self._selection_digest(selection)
             if (digest, expected_kind) in resolved:
+                continue
+            if expected_kind == "body":
+                body = selection.body_id.value
+                projections = [
+                    item
+                    for item in mesh.sets
+                    if item.source_selection_digest == digest and item.body_id == body
+                ]
+                # A node/face projection identifies its owning rigid body, not
+                # a nodal output. Explicit body sets must identify only it.
+                if any(
+                    item.kind not in {"body", "node", "face"}
+                    or (item.kind == "body" and tuple(item.member_ids) != (body,))
+                    for item in projections
+                ):
+                    self._unsupported(
+                        "rigid output requires a single-body set or node/face projection"
+                    )
+                if not projections:
+                    raise PortError(
+                        PortErrorCategory.INTEGRITY, "rigid output body binding missing"
+                    )
+                resolved[(digest, "body")] = body
                 continue
             matching = [
                 item
