@@ -264,3 +264,24 @@ def test_nearby_but_distinct_state_is_not_the_required_endpoint(tmp_path: Path) 
     case = controlled_case(tmp_path)
     case.replace_numeric(replace(case.numeric(), axis_values=(0.0, 1.0 - 1e-13)))
     assert assess(case).overall_status is AssessmentStatus.UNVERIFIED
+
+
+def test_mesh_geometry_provenance_must_match_the_supplied_revision(tmp_path: Path) -> None:
+    case = quality_case(tmp_path)
+    assert (
+        case.mesh.provenance.source_geometry_digest == case.revision.spec.geometry.geometry_digest
+    )
+    assert assess(case).overall_status is AssessmentStatus.PASS
+    foreign_digest = "f" * 64
+    assert foreign_digest != case.revision.spec.geometry.geometry_digest
+    case.mesh = replace(
+        case.mesh,
+        provenance=replace(
+            case.mesh.provenance,
+            source_geometry_digest=foreign_digest,
+        ),
+    )
+    result = assess(case)
+    assert result.overall_status is AssessmentStatus.UNVERIFIED
+    assert not result.criteria[0].measured
+    assert "geometry" in result.criteria[0].reason
