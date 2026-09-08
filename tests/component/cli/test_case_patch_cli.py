@@ -119,7 +119,7 @@ def test_cli_material_patch_validate_freeze_preserves_parent(
     assert child.parent_revision_id == parent.revision_id
     assert child.parent_spec_digest == parent.spec_digest
     assert child.spec.material.youngs_modulus == Quantity(2e6, "Pa")
-    assert replace(child.spec, material=parent.spec.material) == parent.spec
+    assert replace(child.spec, material=parent.spec.material).to_bytes() == parent.spec.to_bytes()
     assert child.spec_digest != parent.spec_digest
     assert service.get_revision(created.case_id, parent.revision_id).to_bytes() == original
     assert storage.resolve_source(created.source_asset).content == source
@@ -179,4 +179,4 @@ def test_cli_patch_rejects_stale_context_and_blocks_incomplete_material(
         assert main(["case", "freeze", created.case_id, "--json"]) == 3
     else:
         assert service.current_draft(created.case_id) == before
-    assert service.get_revision(created.case_id, parent.revision_id) == parent
+    assert service.get_revision(created.case_id, parent.revision_id).to_bytes() == parent.to_bytes()
