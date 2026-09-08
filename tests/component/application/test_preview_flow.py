@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -10,18 +10,11 @@ from typing import Any
 import pytest
 from test_preview_storage import _store
 
+from febio_cae.adapters.preview.studio import ExistingStudioSession as Session
 from febio_cae.domain import PreviewReceipt, PreviewStatus, ToolIdentity
 
 
-@dataclass(frozen=True)
-class Session:
-    studio: ToolIdentity
-    process_id: int
-    process_start_marker: str
-    window_id: int
-
-
-@pytest.mark.parametrize("defect", ["none", "old-capture", "foreign-nonce"])
+@pytest.mark.parametrize("defect", ["none", "real-adapter", "old-capture", "foreign-nonce"])
 def test_preview_issues_before_capture_and_rejects_unbound_evidence(
     tmp_path: Path, defect: str
 ) -> None:
@@ -107,7 +100,7 @@ def test_preview_issues_before_capture_and_rejects_unbound_evidence(
             "observer": "synthetic trusted operator",
         }
 
-    if defect == "none":
+    if defect in {"none", "real-adapter"}:
         result = observe_preview(
             store,
             "native-shaped-manifest",
@@ -115,8 +108,8 @@ def test_preview_issues_before_capture_and_rejects_unbound_evidence(
             session_probe=lambda expected: replace(expected),
             capture=capture,
             timeout_seconds=30,
-            adapter_factory=Adapter,
-            observation_factory=SimpleNamespace,
+            adapter_factory=None if defect == "real-adapter" else Adapter,
+            observation_factory=None if defect == "real-adapter" else SimpleNamespace,
         )
         assert result["preview_status"] == "CONFIRMED"
         assert result["task_status"] != "COMPLETE"  # synthetic fixture quality is UNVERIFIED

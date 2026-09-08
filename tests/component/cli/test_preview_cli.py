@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
 import time
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -118,3 +121,64 @@ def test_cli_reads_preview_status_without_a_new_observation(
         == 0
     )
     assert json.loads(capsys.readouterr().out)["task_status"] == "COMPLETE"
+
+
+def test_actual_child_stdin_protocol_accepts_unicode_record() -> None:
+    environment = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[3] / "src")}
+    command = "import json,sys; from febio_cae.cli.preview import read_observation; print(json.dumps(read_observation(sys.stdin.fileno(),2)))"
+    result = subprocess.run(
+        [sys.executable, "-c", command],
+        input=b'{"observer":"\\u65b0\\u898f"}\n',
+        capture_output=True,
+        env=environment,
+        timeout=5,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr.decode()
+    assert json.loads(result.stdout) == {"observer": "新規"}
+
+
+def test_actual_child_stdin_timeout_exits_while_parent_pipe_stays_open() -> None:
+    environment = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[3] / "src")}
+    command = "import sys\nfrom febio_cae.cli.preview import read_observation\ntry:\n read_observation(sys.stdin.fileno(),.05)\nexcept TimeoutError:\n print('finite-timeout');sys.exit(7)"
+    with subprocess.Popen(
+        [sys.executable, "-c", command],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=environment,
+    ) as child:
+        assert child.wait(timeout=5) == 7
+        output, error = child.communicate(timeout=1)
+        assert output.strip() == b"finite-timeout" and not error
+
+
+def test_preview_timeout_is_interrupted_not_unsupported_environment(
+    tmp_path: Any, monkeypatch: Any, capsys: Any
+) -> None:
+    def observe(self: Any, *args: Any, **kwargs: Any) -> Any:
+        raise TimeoutError("finite preview observation expired")
+
+    monkeypatch.setattr(RegisteredCaseService, "observe_preview", observe)
+    result = main(
+        [
+            "case",
+            "--state-dir",
+            str(tmp_path / "state"),
+            "preview",
+            "case-synthetic",
+            "--manifest-id",
+            "manifest",
+            "--window-id",
+            "321",
+            "--studio",
+            "FEBioStudio.exe",
+            "--timeout",
+            "30",
+            "--json",
+        ]
+    )
+    assert result == 7
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "NEEDS_PREVIEW"
+    assert payload["preview_status"] == "FAILED"
