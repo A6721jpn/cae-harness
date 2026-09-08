@@ -710,7 +710,9 @@ def test_owner_scope_and_manifest_files_are_registered_before_publication(
     )
     with pytest.raises(PortError):
         storage.validate(owner, wrong_attempt)
-    storage.validate(owner, attempt)
+    # A claimed owner cannot promote an invented revision/bundle to authority.
+    with pytest.raises(PortError):
+        storage.validate(owner, attempt)
     manifest = ResultManifest(
         "manifest-1",
         attempt.attempt_id,
