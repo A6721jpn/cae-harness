@@ -75,6 +75,10 @@ class RunnerAdapter:
             raise PortError(PortErrorCategory.CONFLICT, "owner case does not match bundle")
         if not isinstance(budget, Budget):
             raise PortError(PortErrorCategory.INVALID_INPUT, "budget must be a Budget")
+        if bundle.thread_count > budget.cpu_workers:
+            raise PortError(
+                PortErrorCategory.INVALID_INPUT, "solver worker count exceeds the CPU budget"
+            )
         self._validate_owner_components(owner)
         key = self._scope(owner)
         if key in self._managed:
@@ -297,6 +301,15 @@ class RunnerAdapter:
     def _spawn(
         bundle: ExecutionBundle, attempt_root: Path
     ) -> tuple[subprocess.Popen[bytes] | WindowsJobProcess, BinaryIO, BinaryIO]:
+        environment = os.environ.copy()
+        for name in (
+            "OMP_NUM_THREADS",
+            "OMP_THREAD_LIMIT",
+            "MKL_NUM_THREADS",
+            "OPENBLAS_NUM_THREADS",
+        ):
+            environment[name] = str(bundle.thread_count)
+        environment.update(OMP_DYNAMIC="FALSE", MKL_DYNAMIC="FALSE")
         stdout = (attempt_root / "logs" / "solver.stdout.log").open("wb")
         try:
             stderr = (attempt_root / "logs" / "solver.stderr.log").open("wb")
@@ -306,7 +319,9 @@ class RunnerAdapter:
         if os.name == "nt":
             try:
                 return (
-                    WindowsJobProcess(tuple(bundle.argv), attempt_root, stdout, stderr),
+                    WindowsJobProcess(
+                        tuple(bundle.argv), attempt_root, stdout, stderr, environment=environment
+                    ),
                     stdout,
                     stderr,
                 )
@@ -321,6 +336,7 @@ class RunnerAdapter:
             "stdout": stdout,
             "stderr": stderr,
             "shell": False,
+            "env": environment,
         }
         kwargs["start_new_session"] = True
         try:

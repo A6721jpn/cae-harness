@@ -90,7 +90,13 @@ class WindowsJobProcess:
     """Retain actual kernel handles until root exit AND job accounting is zero."""
 
     def __init__(
-        self, argv: tuple[str, ...], cwd: Path, stdout: BinaryIO, stderr: BinaryIO
+        self,
+        argv: tuple[str, ...],
+        cwd: Path,
+        stdout: BinaryIO,
+        stderr: BinaryIO,
+        *,
+        environment: dict[str, str] | None = None,
     ) -> None:
         self._api = _kernel()
         self._win = importlib.import_module("_winapi")
@@ -140,7 +146,7 @@ class WindowsJobProcess:
                     None,
                     True,
                     0x4 | 0x08000000,  # CREATE_SUSPENDED | CREATE_NO_WINDOW
-                    None,
+                    environment,
                     str(cwd),
                     info,
                 )
