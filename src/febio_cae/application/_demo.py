@@ -81,28 +81,15 @@ class _RecordedInspection:
         raise PortError(PortErrorCategory.CONFLICT, "Gmsh demo budget is exhausted")
 
 
-def run_demo(
-    service: RegisteredCaseService,
-    case_id: str,
-    revision_id: str,
-    *,
-    executable: str,
-    preflight: bool,
-) -> dict[str, object]:
-    storage = service._storage(case_id)
+def recorded_geometry(
+    storage: CaseStorage, registration: PlanarDemoRegistration
+) -> StepGeometryMeshAdapter:
+    """Replay pinned inspection bytes; never import or invoke a native backend."""
 
     def source(asset_id: str) -> bytes:
         return storage.resolve_source(storage.source_asset(asset_id)).content
 
-    revision = storage.get_revision(case_id, revision_id)
-    registration = storage.resolve_revision_mesh_quality(revision)
-    if not isinstance(registration, PlanarDemoRegistration):
-        raise PortError(
-            PortErrorCategory.INVALID_INPUT, "run-demo requires registered planar admission"
-        )
     original = decode_record(source("gm03-mesh"), MeshArtifact)
-    mesh = service._planar_execution_mesh(storage, registration, revision)
-    service._verify_execution_mesh(storage, registration, revision, mesh)
     raw = json.loads(source("gm03-backend-inspection"))
 
     def frame(value: Any) -> FrameId:
@@ -122,9 +109,33 @@ def run_demo(
     report = BackendInspection(**{**raw, "frame": frame(raw["frame"]), "bodies": bodies})
     if report.geometry_digest != registration.geometry_digest:
         raise ValueError("native inspection geometry differs from admission")
-    geometry = StepGeometryMeshAdapter(
+    return StepGeometryMeshAdapter(
         _RecordedInspection(report, original), source_asset=storage.source_asset("cad")
     )
+
+
+def run_demo(
+    service: RegisteredCaseService,
+    case_id: str,
+    revision_id: str,
+    *,
+    executable: str,
+    preflight: bool,
+) -> dict[str, object]:
+    storage = service._storage(case_id)
+
+    def source(asset_id: str) -> bytes:
+        return storage.resolve_source(storage.source_asset(asset_id)).content
+
+    revision = storage.get_revision(case_id, revision_id)
+    registration = storage.resolve_revision_mesh_quality(revision)
+    if not isinstance(registration, PlanarDemoRegistration):
+        raise PortError(
+            PortErrorCategory.INVALID_INPUT, "run-demo requires registered planar admission"
+        )
+    mesh = service._planar_execution_mesh(storage, registration, revision)
+    service._verify_execution_mesh(storage, registration, revision, mesh)
+    geometry = recorded_geometry(storage, registration)
     service.geometry = geometry
     service._placed_selection = geometry.resolve_placed_selection
     profile = service.compatibility.get_profile(revision.spec.solver_policy.profile.profile_id)

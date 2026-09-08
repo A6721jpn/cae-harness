@@ -554,6 +554,23 @@ class RegisteredCaseService:
                     _diagnostic(ServiceErrorCategory.CONFLICT, str(error), "parent_revision_id")
                 )
 
+        geometry_port = self.geometry
+        placed_selection = self._placed_selection
+        if geometry_port is None and draft.parent_revision_id is not None:
+            try:
+                parent = storage.get_revision(case_id, draft.parent_revision_id)
+                registration = storage.resolve_revision_mesh_quality(parent)
+                if isinstance(registration, PlanarDemoRegistration):
+                    from ._demo import recorded_geometry
+
+                    self._planar_execution_mesh(storage, registration, parent)
+                    replay = recorded_geometry(storage, registration)
+                    geometry_port = replay
+                    placed_selection = replay.resolve_placed_selection
+            except (PortError, StorageConflictError, ValueError, OSError) as error:
+                diagnostics.append(
+                    _diagnostic(ServiceErrorCategory.INTEGRITY, str(error), "geometry")
+                )
         geometry = draft.values.geometry
         if geometry is None:
             diagnostics.append(
@@ -563,7 +580,7 @@ class RegisteredCaseService:
                     "geometry",
                 )
             )
-            if self.geometry is None:
+            if geometry_port is None:
                 diagnostics.append(
                     _diagnostic(
                         ServiceErrorCategory.UNSUPPORTED_CAPABILITY,
@@ -571,7 +588,7 @@ class RegisteredCaseService:
                         "geometry",
                     )
                 )
-        elif self.geometry is None:
+        elif geometry_port is None:
             diagnostics.append(
                 _diagnostic(
                     ServiceErrorCategory.UNSUPPORTED_CAPABILITY,
@@ -591,7 +608,7 @@ class RegisteredCaseService:
                         )
                     )
                 source = storage.resolve_source(source_ref)
-                inspection = self.geometry.inspect(
+                inspection = geometry_port.inspect(
                     GeometryInspectionRequest(source_ref, (geometry.body_id.value,)), source
                 )
                 if (
@@ -621,14 +638,14 @@ class RegisteredCaseService:
                             "geometry.body_id",
                         )
                     )
-                selection_geometry: GeometryPort = self.geometry
-                if self._placed_selection is not None and draft.values.rigid_tool is not None:
+                selection_geometry: GeometryPort = geometry_port
+                if placed_selection is not None and draft.values.rigid_tool is not None:
                     selection_geometry = _PlacedGeometry(
-                        self.geometry,
+                        geometry_port,
                         source,
                         geometry,
                         draft.values.rigid_tool,
-                        self._placed_selection,
+                        placed_selection,
                     )
                 for selection in _registered_selections(draft.values):
                     try:
