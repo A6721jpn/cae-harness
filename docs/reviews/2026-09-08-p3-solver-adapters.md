@@ -1,111 +1,128 @@
-# P3 solver, result, quality, and preview adapter candidate
+# P3 solver adapters: corrected evidence and mixed-test migration
 
-Date: 2026-09-08 (Asia/Tokyo)  
-Branch: `codex/p3-solver-adapters`  
-Remote state: `REMOTE_CONFIGURED` (`https://github.com/A6721jpn/cae-harness.git`, integration branch `V2`)  
-Base: `c23dc59d4dae4810acd51fe2156b7d190d645acb`  
-Production candidate before this report: `96b8891959c2db35ac9e20265d0f024e347b4375`
+Date: 2026-09-08. Branch: `codex/p3-solver-adapters`.
+REMOTE_CONFIGURED: `https://github.com/A6721jpn/cae-harness`
+(the authorized repository; configured URL omits the optional .git suffix).
+Integration branch: `V2`.
 
-This candidate consumes the frozen common ports and stays inside the assigned adapter and
-component-test ownership. It does not modify common domain records, application/storage/CLI
-code, packaging metadata, real `02_CAE` data, or native solver/viewer state.
+## Summary and decision
 
-## Implemented boundary
+The mixed component tests now consume the registered native-layout synthetic
+reader, canonical numeric codec, issued preview binding, and current compiler
+and runner contracts. This is a test/report migration, not a new production
+implementation or native qualification. Whole-candidate independent review
+and acceptance remain pending; this report does not authorize integration.
 
-- `CompilerAdapter` validates the registered profile, revision/mesh identity, canonical Tet10
-  ordering, separate part/tool ownership, every declared selection-to-mesh mapping, output
-  mapping, and required supported capabilities. It emits deterministic self-contained FEBio
-  XML with materials, mesh, supports, rigid six-DOF intent, motion controller, contact
-  orientation/numerics, and XPLT output requests. `LocalBundleStore` verifies staged bytes;
-  it is a synthetic adapter-local store, not publication authority.
-- `RunnerAdapter` consumes trusted owner context, makes one unique attempt root, launches the
-  exact argv with `shell=False` and a new process group, records executable/cwd/argv/thread
-  provenance, writes solver stdout/stderr logs, supports poll/cancel/reconcile, and reports
-  root exit separately from descendant drain before `VALIDATING`.
-- `XpltReaderAdapter` reads binary XPLT bytes, not JSON. The bounded supported subset is the
-  observed bare FEBio magic, length-delimited blocks, version `0x35`, no compression, header,
-  dictionary, node mesh, state times, and `VEC3F` fields. It binds output to the exact
-  attempt and bundle, verifies file stability/digest/size, requires mapped variables and
-  finite values, and applies the profile's explicit reaction sign mapping. Decoded values are
-  kept in `LocalResultDataStore` as common `NumericResultData`; storage/publication remains
-  outside this adapter.
-- `QualityAdapter` retrieves actual numeric values through `ResultDataPort`, evaluates the
-  declared `peak_abs_value`/`max_value` criterion, and returns separate `PASS`, `FAIL`,
-  `UNVERIFIED`, or `NOT_APPLICABLE` statuses with measured values and applicability reasons.
-  Missing output/state/data never becomes an implicit pass.
-- `PreviewAdapter` checks the current registered XPLT digest before launch, uses the configured
-  exact Studio `ToolIdentity`, requires an injected independent observation for confirmation,
-  and returns a failed receipt when the file mutates after launch or confirmation.
+Migration base: `3014b0da79f1c6f3486f688af2adfaeffc003c5b`.
+The exact clean migration candidate and its fresh complete gate results are
+recorded separately after commit in the ignored local verification manifest.
+No pre-commit run below is described as a clean committed-source gate.
 
-## Changed files
+## Context, scope, and method
 
-Test commits:
+The decision is whether a coherent P3 candidate can enter whole-applicability
+review. Product authorities remain the V2 design and greenfield plan.
+Verification uses repository-local synthetic fixtures and bounded Python
+processes. Synthetic reader/preview results are not native FEBio, official FBS,
+Studio, Computer Use, or real-model evidence.
 
-- `9ed8a255b8749d05bb854c40dc834a5c66f87a2` — `tests/component/febio/__init__.py`,
-  `fixtures.py`, `test_adapters.py`.
-- `f35910f1e52c8f6cacb2ba03287edd7dcf311668` — expanded cross-record, lifecycle, and
-  nonfinite-value component coverage.
+Only these tracked files change in this migration:
 
-Production commit:
+- `tests/component/febio/test_adapters.py`
+- `tests/component/febio/test_r1_remediation.py`
+- `tests/component/febio/mixed_fixture.py`
+- this report
 
-- `96b8891959c2db35ac9e20265d0f024e347b4375` —
-  `src/febio_cae/adapters/febio/{__init__,compiler,quality,runner,xplt_reader}.py` and
-  `src/febio_cae/adapters/preview/{__init__,studio}.py`.
+Existing standalone compiler, reader, runner, quality, and preview fixtures and
+regressions are reused. No production, common-record, dependency, storage,
+application, CLI, or real `02_CAE` changes belong to this migration.
 
-No other tracked files were changed by the candidate before this report.
+## Historical evidence correction
 
-## Test-first and gate evidence
+The initial P3 report overstated the original RED and verification chronology.
+The preserved independent audit records collection/import errors in both
+original RED attempts; the second had ten ModuleNotFoundErrors. Those attempts
+reused the RED basetemp and are **not genuine behavioral RED evidence**.
 
-All commands were run from `C:\Users\backo\.codex\worktrees\e081\CAE-harness` with the
-Python 3.12 interpreter selected by the workspace. Each `--basetemp` directory was fresh.
+The original full GREEN returned 1,060 passed before the production commit:
+20:51:41 UTC start, 20:52:06 result, 20:53:37 production commit output.
+It was a dirty/pre-production-commit run, not a clean post-commit gate.
+Missing historical metadata is not reconstructed. The original wheel/sdist
+hashes do not establish identity with this later migration candidate.
 
-| Gate | Exact command | Result | Exit |
-|---|---|---:|---:|
-| genuine RED | `python -m pytest tests\component\febio --basetemp .local\verification\P3-solver-red-01` | collected 10, failed 10 | 1 |
-| component GREEN | `python -m pytest tests\component\febio --basetemp .local\verification\P3-debug-11 -q` | 12 passed | 0 |
-| full tests | `python -m pytest --basetemp .local\verification\P3-full-01` | 1,060 passed in 23.65s | 0 |
-| format | `python -m ruff format --check .` | 109 files already formatted | 0 |
-| lint | `python -m ruff check .` | all checks passed | 0 |
-| types | `python -m mypy src tests` | 77 source files, no issues | 0 |
-| CAE boundary | `python scripts/scan_cae_data.py --root .` | 111 tracked files; 0 diagnostics/issues; status PASS | 0 |
-| build | `python -m build` | wheel and sdist built | 0 |
-| installed import | `python.exe -I -c "import febio_cae, febio_cae.adapters.febio.xplt_reader; ..."` from outside checkout | installed site-packages import, `installed-import-ok` | 0 |
-| installed CLI | isolated venv `febio-cae.exe --version` | `febio-cae 0.1.0` | 0 |
+The independent review's own exact-candidate 1,060-pass run was separate
+evidence and did not retroactively repair TDD history. Its original candidate
+was rejected for product findings. Later finite-slice RED/GREEN manifests
+remain the relevant remediation evidence, with their inherited-dirty and
+committed-source boundaries intact.
 
-The initial RED was a behavioral collection run, not a collection/setup error. The component
-tests were then committed separately before the production commit. The final component suite
-exercises compiler output and identity, unsupported capability, selection mapping loss,
-truncation/mutation/wrong attempt/nonfinite XPLT, pre-drain reader rejection, owned process
-poll/cancel/wrong-owner behavior, data-driven quality, and preview mutation invalidation.
+## Migration results and coverage
 
-## Artifacts and hashes
+Before edits, the two inherited mixed files had SHA-256:
 
-Built artifacts from the final production candidate:
+- `test_adapters.py`: `A6897CB5C1B289B5BEBAFE8626A7F8353CCCA4AD10DE6017D1F0B8B8952CB05F`
+- `test_r1_remediation.py`: `9161F97C2992B17F2522277E082660D6A39B6E02F2D8C2DBB09E20E9F3C7FF5B`
 
-- `dist/febio_cae-0.1.0-py3-none-any.whl` — SHA-256
-  `7d5b43827e8190753740cd397ab44ca89512824b1cb033c289ee56cda4f17cd9`
-- `dist/febio_cae-0.1.0.tar.gz` — SHA-256
-  `52140b25b789be2c137dac1d8164689a899860c5f6a76d85d8c2d38fef09015a`
+Their inherited diff is preserved locally. All 25 collected mixed cases remain;
+no valid test is skipped or removed. Old private XPLT identity tampering becomes
+a foreign-attempt registered-source probe. Truncation and tool mismatch use
+correctly hashed registered bytes to reach the intended parser boundary.
+The quality negative uses correctly rehashed public-codec data with a foreign
+execution binding. Preview negatives first establish an issued launch and
+return a structured bound observation, including mutation during observation.
 
-The final report-file hash is recorded in the PM handoff after the report commit so the report
-content and hash remain consistent.
+Compiler assertions check unnamed, disjoint node groups, native plot variables,
+signed motion, numeric friction, and resolved set references. Negative-zero
+checking matches complete zero tokens instead of rejecting legitimate -0.01
+coordinates. Runner coverage retains wrong-owner, path escape, executable
+registration, descendant writer growth during unavailable job accounting,
+natural drain, cancellation, and an unrelated live sentinel. Cleanup uses
+retained process/job handles.
 
-## Unverified and intentionally pending
+Commands below ran at the migration base with the stated test-file edits:
 
-- No real FEBio executable was launched. The compiler and XPLT bytes are synthetic component
-  evidence only; they do not establish official FEBio input compatibility or solver success.
-- No FEBio Studio process was launched. Preview confirmation uses an injected synthetic observer;
-  it is not VW-01 evidence and does not establish an official Studio read confirmation.
-- The XPLT implementation is deliberately bounded to the observed `0x35`/uncompressed/VEC3F
-  subset. Compression, other versions, unsupported tags/storage, integration-point fields,
-  and broader native layouts remain explicitly unsupported rather than inferred.
-- The adapter-local bundle/result stores are not A's registered resolver, immutable publication,
-  lifecycle CAS, ownership registry, or recovery service. Connected integration with A's P1
-  service remains unverified.
-- Geometry/meshing service integration, R1 readiness, CLI wiring, native profile registration,
-  the new finite native synthetic specification/budget/output root, real E2E, VW-01, QA-01,
-  and the final BottomFrame real-model E2E remain open. No native launch or `02_CAE` mutation
-  was attempted under this work order.
+| Stage | Exact command | Result | Exit |
+| --- | --- | --- | --- |
+| Baseline | `python -m pytest tests/component/febio/test_adapters.py tests/component/febio/test_r1_remediation.py --basetemp .local/verification/P3-mixed-baseline -q` | 12 failed, 13 passed | 1 |
+| Migration 01 | same selection, `--basetemp .local/verification/P3-mixed-migration-01 -q` | 1 failed, 24 passed; test XML selector included non-var metadata | 1 |
+| Migration 02 | same selection, `--basetemp .local/verification/P3-mixed-migration-02 -q` | 1 failed, 24 passed; old negative-zero substring assertion | 1 |
+| Migration GREEN | `python -m pytest tests/component/febio/test_adapters.py tests/component/febio/test_r1_remediation.py --basetemp .local/verification/P3-mixed-migration-green -q` | 25 passed, zero skipped | 0 |
 
-This is a clean reviewed candidate for independent review and PM integration; it is not a
-project-complete or native-qualified release.
+A diagnostic mypy invocation selecting only the three changed test files
+could not resolve the src-layout package (27 import errors). It is not passing
+type evidence; the required candidate gate is `python -m mypy src tests`.
+No new product behavior is claimed from this test-only migration.
+No physical calculation or material assumption is introduced.
+
+## Verification plan and limitations
+
+After the test/report commit, run one fresh complete required gate set:
+`python -m pytest` with fresh basetemp, `python -m ruff format --check .`,
+`python -m ruff check .`, `python -m mypy src tests`,
+`python scripts/scan_cae_data.py --root .`, `python -m build` with a fresh
+output directory, and a clean wheel installation with installed CLI version
+and isolated synthetic numeric consumer. Record exact SHA, commands, counts,
+exit codes, artifact hashes, source/installed identity, and clean status.
+
+The next decision is exact whole-candidate review, including pending finite
+preview and geometry-binding review outcomes. Local passing gates do not
+establish publication authority, connected application/storage integration,
+native solver/viewer qualification, or final BottomFrame E2E. Real E2E and
+native evidence remain unverified; project completion is not claimed.
+
+## References and evidence ledger
+
+Published local evidence (not external physical data):
+
+- `docs/specs/2026-08-27-febio-llm-cae-harness-design-v2.md` and
+  `docs/plans/2026-08-27-febio-cae-harness-greenfield-plan.md`: product authority.
+- Independent P3 product review M1: original collection errors and dirty GREEN
+  chronology; its preserved audit is the source of the correction above.
+- Finite compiler, runner issued-authority, reader, compiler-reference,
+  quality, preview, and geometry-binding manifests: scoped remediation
+  chronology. Their local paths and hashes are indexed by the migration
+  manifest rather than copied into Git with development coordination state.
+- Migration command records: direct local observations for the table above.
+
+Inference: preserving coverage on the accepted contracts makes the candidate
+coherent enough to request review; it does not itself establish acceptance.

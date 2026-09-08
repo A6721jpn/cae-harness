@@ -1,88 +1,36 @@
 from __future__ import annotations
 
-import hashlib
-import struct
+import re
+import subprocess
 import sys
 import time
+import xml.etree.ElementTree as ET
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from febio_cae.adapters.preview import studio as preview_module
 from febio_cae.domain import (
     AssessmentStatus,
     CoulombFriction,
-    EvidenceRef,
     NumericResultData,
     PortError,
     PreviewStatus,
-    ResultDataRef,
+    Quantity,
     RunState,
     ToolIdentity,
-    TrustedOwnerContext,
 )
 from febio_cae.domain.codec import decode_record, encode_record
 
-from .fixtures import evidence, make_mesh, make_profile, make_revision, make_xplt_fixture
-
-
-def _compiled(tmp_path: Path) -> tuple[Any, Any, Any, Any, Any]:
-    from febio_cae.adapters.febio.compiler import CompilerAdapter, LocalBundleStore
-
-    revision = make_revision()
-    mesh = make_mesh(revision.spec)
-    profile = make_profile(sys.executable)
-    store = LocalBundleStore(tmp_path / "bundles")
-    bundle = CompilerAdapter(store=store, executable=sys.executable).compile(
-        revision, mesh, profile
-    )
-    return revision, mesh, profile, bundle, store
-
-
-def _attempt(bundle: Any, revision: Any, root: Path, *, state: RunState) -> Any:
-    from febio_cae.domain import AttemptRecord, ExecutionSetting, ProcessIdentity
-
-    digest = hashlib.sha256(Path(bundle.argv[0]).read_bytes()).hexdigest()
-    return AttemptRecord(
-        attempt_id="attempt-p3",
-        run_id="run-p3",
-        case_id=revision.case_id,
-        revision_id=revision.revision_id,
-        owner_generation=1,
-        bundle_digest=bundle.bundle_digest,
-        state=state,
-        process=ProcessIdentity(
-            executable=str(Path(bundle.argv[0])),
-            executable_digest=digest,
-            argv=bundle.argv,
-            cwd=str(root),
-            thread_count=1,
-            start_marker="r1-process",
-        ),
-        settings=tuple(bundle.settings) + (ExecutionSetting("attempt_root", str(root)),),
-    )
-
-
-class _Ownership:
-    def claim(self, owner: TrustedOwnerContext) -> TrustedOwnerContext:
-        return owner
-
-    def validate(self, owner: TrustedOwnerContext, attempt: Any) -> TrustedOwnerContext:
-        if (owner.run_id, owner.attempt_id, owner.owner_generation) != (
-            attempt.run_id,
-            attempt.attempt_id,
-            attempt.owner_generation,
-        ):
-            raise RuntimeError("owner mismatch")
-        return owner
-
-    def publish_manifest(self, owner: TrustedOwnerContext, manifest: Any) -> Any:
-        return manifest
-
-
-def _owner(run_id: str = "run-p3") -> TrustedOwnerContext:
-    return TrustedOwnerContext("case-p3", run_id, "attempt-p3", 1)
+from .fixtures import evidence
+from .mixed_fixture import MixedPreviewCase
+from .reader_fixture import setup_reader
+from .runner_fixture import _compiled, _owner, _Ownership
+from .test_compiler_native import _required
+from .test_quality_numeric import assess, controlled_case
+from .test_runner_job import _cleanup, _hold_child, _until
 
 
 def test_compiler_uses_native_febio_structure_and_semantics(tmp_path: Path) -> None:
@@ -91,14 +39,29 @@ def test_compiler_uses_native_febio_structure_and_semantics(tmp_path: Path) -> N
 
     assert b'<febio_spec version="4.0">' in content
     assert b"<MeshDomains>" in content
-    assert b"<Domain" in content
-    assert b'<Nodes name="part-nodes">' in content
-    assert b'<Nodes name="tool-nodes">' in content
-    assert b'<Elements type="tet10" name="part-elements">' in content
-    assert b'<Elements type="tet10" name="tool-elements">' in content
-    assert b'<plotfile type="xplt"' in content
-    assert b"<var type=\"node\">displacement</var>" in content
-    assert b"-0.0" not in content
+    assert b"<SolidDomain" in content
+    root = ET.fromstring(content)
+    groups = root.findall("Mesh/Nodes")
+    assert len(groups) == 2
+    assert all("name" not in group.attrib for group in groups)
+    assert [{int(n.attrib["id"]) for n in group} for group in groups] == [
+        set(range(1, 11)),
+        set(range(11, 21)),
+    ]
+    elements = root.findall("Mesh/Elements")
+    assert {g.attrib["name"] for g in elements} == {
+        "compiled-part-elements",
+        "compiled-tool-elements",
+    }
+    assert all(g.attrib["type"] == "tet10" for g in elements)
+    assert {int(e.attrib["id"]) for g in elements for e in g} == {1, 2}
+    plot = _required(root, "Output/plotfile")
+    assert plot.attrib["type"] == "febio"
+    assert {v.attrib["type"] for v in plot.findall("var")} == {"displacement", "rigid force"}
+    assert all(not (v.text or "").strip() for v in plot.findall("var"))
+    # Nondegenerate fixture coordinates include -0.01: reject negative zero
+    # tokens, not legitimate negative coordinates sharing that byte prefix.
+    assert re.search(rb"(?<![\d.])-0(?:\.0+)?(?:[eE][+-]?\d+)?(?=[,<\s])", content) is None
     assert revision.spec.motion.direction.z == 1.0
     assert mesh.artifact_digest == bundle.mesh_digest
 
@@ -106,13 +69,11 @@ def test_compiler_uses_native_febio_structure_and_semantics(tmp_path: Path) -> N
 def test_compiler_preserves_signed_motion_contact_numbers_and_resolved_set_ids(
     tmp_path: Path,
 ) -> None:
-    revision, mesh, _profile, _bundle, _store = _compiled(tmp_path)
+    revision, mesh, profile, _bundle, _store = _compiled(tmp_path)
     from febio_cae.adapters.febio.compiler import CompilerAdapter, LocalBundleStore
 
     friction = CoulombFriction(
-        coefficient=revision.spec.contact.friction.coefficient
-        if isinstance(revision.spec.contact.friction, CoulombFriction)
-        else __import__("febio_cae.domain", fromlist=["Quantity"]).Quantity(0.37, "1"),
+        coefficient=Quantity(0.37, "1"),
         model_evidence=evidence("contact.friction_model", "r1-friction-model"),
         coefficient_evidence=evidence("contact.friction_coefficient", "r1-friction-coefficient"),
     )
@@ -125,19 +86,28 @@ def test_compiler_preserves_signed_motion_contact_numbers_and_resolved_set_ids(
         revision,
         spec=replace(revision.spec, contact=changed_contact, motion=changed_motion),
     )
-    resolved_sets = tuple(
-        replace(item, set_id=f"resolved-{item.set_id}") for item in mesh.sets
-    )
+    resolved_sets = tuple(replace(item, set_id=f"resolved-{item.set_id}") for item in mesh.sets)
     resolved_mesh = replace(mesh, sets=resolved_sets)
-    profile = make_profile(sys.executable)
     store = LocalBundleStore(tmp_path / "bundles-r1")
     bundle = CompilerAdapter(store=store, executable=sys.executable).compile(
         changed_revision, resolved_mesh, profile
     )
     content = store.resolve(bundle, "input/case.feb")
 
-    assert b"-1" in content
-    assert b">0.37<" in content
+    root = ET.fromstring(content)
+    prescribed = _required(root, "Rigid/rigid_bc[@type='rigid_displacement']")
+    assert prescribed.findtext("dof") == "z"
+    value = _required(prescribed, "value")
+    curve = _required(root, f"LoadData/load_controller[@id='{value.attrib['lc']}']")
+    points = [
+        tuple(float(x) for x in (p.text or "").split(",")) for p in curve.findall("points/point")
+    ]
+    assert points == [(0.0, 0.0), (1.0, 0.0001)]
+    assert float(value.text or "nan") * points[-1][1] == pytest.approx(-0.0001)
+    assert float(root.findtext("Contact/contact/fric_coeff", "nan")) == pytest.approx(0.37)
+    pair = _required(root, "Mesh/SurfacePair")
+    assert pair.findtext("primary") == "resolved-tool-contact"
+    assert pair.findtext("secondary") == "resolved-part-contact"
     assert b"resolved-tool-contact" in content
     assert b"resolved-part-contact" in content
     assert b">explicit-profile<" not in content
@@ -146,113 +116,54 @@ def test_compiler_preserves_signed_motion_contact_numbers_and_resolved_set_ids(
 def test_reader_accepts_observed_header_without_private_identity_and_codec_round_trips(
     tmp_path: Path,
 ) -> None:
-    revision, mesh, profile, bundle, _store = _compiled(tmp_path)
-    output_root = tmp_path / "attempt-p3"
-    output_path = output_root / "output" / "results.xplt"
-    output_path.parent.mkdir(parents=True)
-    payload = make_xplt_fixture(
-        attempt_id="attempt-p3",
-        bundle_digest=bundle.bundle_digest,
-        mesh_digest=mesh.artifact_digest,
-        include_identity=False,
-    )
-    # Ownership is supplied by the attempt/bundle, as in the observed native
-    # header, rather than by private adapter-authored identity fields.
-    output_path.write_bytes(payload)
-    reader = __import__(
-        "febio_cae.adapters.febio.xplt_reader", fromlist=["XpltReaderAdapter"]
-    ).XpltReaderAdapter(profile=profile)
-
-    manifest = reader.read(
-        _attempt(bundle, revision, output_root, state=RunState.VALIDATING), bundle
-    )
+    reader, attempt, bundle, mesh, payload = setup_reader(tmp_path)
+    assert attempt.attempt_id.encode() not in payload
+    assert bundle.bundle_digest.encode() not in payload
+    assert mesh.artifact_digest.encode() not in payload
+    manifest = reader.read(attempt, bundle)
     numeric = reader.data_store.resolve_manifest_output(manifest.manifest_id, "displacement")
     assert numeric.reference.codec_id == "numeric-result-v1"
     assert decode_record(encode_record(numeric), NumericResultData) == numeric
 
 
 def test_reader_rejects_unknown_state_block_and_allows_one_state(tmp_path: Path) -> None:
-    revision, mesh, profile, bundle, _store = _compiled(tmp_path)
-    output_root = tmp_path / "attempt-p3"
-    output_path = output_root / "output" / "results.xplt"
-    output_path.parent.mkdir(parents=True)
-    payload = make_xplt_fixture(
-        attempt_id="attempt-p3", bundle_digest=bundle.bundle_digest, mesh_digest=mesh.artifact_digest
-    )
-    offset = 4
-    for _ in range(2):
-        _identifier, size = struct.unpack_from("<II", payload, offset)
-        offset += 8 + size
-    broken = payload[:offset] + struct.pack("<I", 0xDEADBEEF) + payload[offset + 4 :]
-    output_path.write_bytes(broken)
-    reader = __import__(
-        "febio_cae.adapters.febio.xplt_reader", fromlist=["XpltReaderAdapter"]
-    ).XpltReaderAdapter(profile=profile)
+    reader, attempt, bundle, _, _ = setup_reader(tmp_path, defect="unknown-state")
     with pytest.raises(PortError, match="state"):
-        reader.read(_attempt(bundle, revision, output_root, state=RunState.VALIDATING), bundle)
+        reader.read(attempt, bundle)
 
-    output_path.write_bytes(
-        make_xplt_fixture(
-            attempt_id="attempt-p3",
-            bundle_digest=bundle.bundle_digest,
-            mesh_digest=mesh.artifact_digest,
-            state_count=1,
-        )
-    )
-    one_state = reader.read(
-        _attempt(bundle, revision, output_root, state=RunState.VALIDATING), bundle
-    )
-    assert one_state.read_result.observations[0].state_count == 1
+
+def test_reader_accepts_a_single_observed_state(tmp_path: Path) -> None:
+    reader, attempt, bundle, _, _ = setup_reader(tmp_path, times=(0.0,))
+    manifest = reader.read(attempt, bundle)
+    assert all(item.state_count == 1 for item in manifest.read_result.observations)
+    assert reader.data_store.resolve_manifest_output(
+        manifest.manifest_id, "displacement"
+    ).axis_values == (0.0,)
 
 
 def test_quality_selects_requested_component_and_rejects_wrong_binding(tmp_path: Path) -> None:
-    revision, mesh, profile, bundle, _store = _compiled(tmp_path)
-    output_root = tmp_path / "attempt-p3"
-    output_path = output_root / "output" / "results.xplt"
-    output_path.parent.mkdir(parents=True)
-    output_path.write_bytes(
-        make_xplt_fixture(
-            attempt_id="attempt-p3",
-            bundle_digest=bundle.bundle_digest,
-            mesh_digest=mesh.artifact_digest,
-            values={
-                "displacement": (
-                    ((3.0, 0.0, 0.0), (3.0, 0.0, 0.0)),
-                    ((3.0, 0.0, 0.2), (3.0, 0.0, 0.2)),
-                ),
-                "reaction forces": (
-                    ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0)),
-                    ((0.0, 0.0, 1.0), (0.0, 0.0, 2.0)),
-                ),
-            },
+    case = controlled_case(tmp_path)
+    assessment = assess(case)
+    assert assessment.overall_status is AssessmentStatus.PASS
+    assert assessment.criteria[0].measured[0].value == pytest.approx(0.2)
+    numeric = case.numeric()
+    assert numeric.values[0][0] == 3.0
+    case.replace_numeric(
+        replace(
+            numeric,
+            reference=replace(
+                numeric.reference, bundle_digest="9" * 64, attempt_id="other-attempt"
+            ),
         )
     )
-    attempt = _attempt(bundle, revision, output_root, state=RunState.VALIDATING)
-    reader = __import__(
-        "febio_cae.adapters.febio.xplt_reader", fromlist=["XpltReaderAdapter"]
-    ).XpltReaderAdapter(profile=profile)
-    manifest = reader.read(attempt, bundle)
-    quality = __import__("febio_cae.adapters.febio.quality", fromlist=["QualityAdapter"]).QualityAdapter()
-    assessment = quality.assess(manifest, revision, mesh, profile, reader.data_store)
-    assert assessment.overall_status is AssessmentStatus.PASS
-    numeric = reader.data_store.resolve_manifest_output(manifest.manifest_id, "displacement")
-    wrong_ref = replace(
-        numeric.reference,
-        content_digest=numeric.reference.content_digest,
-        bundle_digest="9" * 64,
-        attempt_id="other-attempt",
-    )
-    wrong_numeric = replace(numeric, reference=wrong_ref)
-
-    class WrongData:
-        def resolve_manifest_output(self, _manifest_id: str, _output_id: str) -> NumericResultData:
-            return wrong_numeric
-
-    rejected = quality.assess(manifest, revision, mesh, profile, WrongData())
+    # A correctly rehashed public codec record still fails its execution binding.
+    assert case.numeric().reference.content_digest == case.numeric().expected_content_digest
+    rejected = assess(case)
     assert rejected.overall_status is AssessmentStatus.UNVERIFIED
+    assert not rejected.criteria[0].measured
 
 
-def test_runner_rejects_path_escape_and_unregistered_executable(tmp_path: Path) -> None:
+def test_runner_rejects_path_escape(tmp_path: Path) -> None:
     revision, _mesh, _profile, bundle, _store = _compiled(tmp_path)
     from febio_cae.adapters.febio.runner import RunnerAdapter
 
@@ -260,11 +171,21 @@ def test_runner_rejects_path_escape_and_unregistered_executable(tmp_path: Path) 
     with pytest.raises(PortError, match="run_id"):
         runner.start(bundle, _owner("../escaped"), revision.spec.budget)
 
+
+def test_runner_rejects_unregistered_executable_before_spawn(tmp_path: Path) -> None:
+    revision, _mesh, _profile, bundle, _store = _compiled(tmp_path)
+    from febio_cae.adapters.febio.runner import RunnerAdapter
+
+    runner = RunnerAdapter(ownership=_Ownership(), root=tmp_path / "runs")
     marker = tmp_path / "ran.txt"
     unregistered = replace(
         bundle,
         tool=replace(bundle.tool, executable_digest="0" * 64),
-        argv=(sys.executable, "-c", f"from pathlib import Path; Path({str(marker)!r}).write_text('ran')"),
+        argv=(
+            sys.executable,
+            "-c",
+            f"from pathlib import Path; Path({str(marker)!r}).write_text('ran')",
+        ),
     )
     with pytest.raises(PortError, match="executable"):
         runner.start(unregistered, _owner(), revision.spec.budget)
@@ -272,76 +193,117 @@ def test_runner_rejects_path_escape_and_unregistered_executable(tmp_path: Path) 
     assert not marker.exists()
 
 
-def test_runner_drain_reconciles_and_cancel_does_not_publish_before_drain(
+def test_runner_tracks_real_owned_writer_through_uncertain_enumeration_and_natural_drain(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     revision, _mesh, _profile, bundle, _store = _compiled(tmp_path)
     from febio_cae.adapters.febio.runner import RunnerAdapter
 
     runner = RunnerAdapter(ownership=_Ownership(), root=tmp_path / "runs")
-    bundle = replace(bundle, argv=(sys.executable, "-c", "pass"))
+    child_code = (
+        "from pathlib import Path\n"
+        "import time\n"
+        "path = Path('output/owned-writer.bin')\n"
+        "for _ in range(20):\n"
+        "    with path.open('ab') as stream: stream.write(b'x' * 256); stream.flush()\n"
+        "    time.sleep(0.05)\n"
+    ).strip()
+    root_code = (
+        "import subprocess,sys,time; "
+        f"subprocess.Popen([sys.executable, '-c', {child_code!r}]); "
+        "time.sleep(0.35)"
+    ).strip()
+    bundle = replace(bundle, argv=(sys.executable, "-c", root_code))
     started = runner.start(bundle, _owner(), revision.spec.budget)
-    descendant_live = True
-    monkeypatch.setattr(
-        RunnerAdapter,
-        "_descendant_pids",
-        staticmethod(lambda _pid: (999,) if descendant_live else ()),
-    )
-    time.sleep(0.05)
-    draining = runner.poll(started, _owner()).attempt
-    assert draining.state is RunState.DRAINING
-    descendant_live = False
-    reconciled = runner.poll(draining, _owner()).attempt
-    assert reconciled.state is RunState.VALIDATING
+    managed = next(iter(runner._managed.values()))
+    process = managed.process
+    try:
+        _until(lambda: process.poll() == 0)
+        output = managed.attempt_root / "output/owned-writer.bin"
+        _until(output.exists)
+        assert process.active_processes() >= 1
 
+        def unavailable(self: Any) -> int:
+            raise OSError("injected job accounting unavailable")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(type(process), "active_processes", unavailable)
+            draining = runner.poll(started, _owner()).attempt
+            assert draining.state is RunState.DRAINING
+            before = output.stat().st_size
+            _until(lambda: output.stat().st_size > before)
+            assert runner.reconcile(draining, _owner()).attempt.state is RunState.DRAINING
+        _until(lambda: process.active_processes() == 0)
+        reconciled = runner.reconcile(draining, _owner()).attempt
+        assert reconciled.state is RunState.VALIDATING
+        assert process.closed and not runner._managed
+    finally:
+        _cleanup(runner, started)
+
+
+def test_runner_cancel_drains_owned_tree_without_killing_unowned_process(tmp_path: Path) -> None:
+    revision, _mesh, _profile, bundle, _store = _compiled(tmp_path)
+    from febio_cae.adapters.febio.runner import RunnerAdapter
+
+    unrelated = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(5)"])
     long_runner = RunnerAdapter(ownership=_Ownership(), root=tmp_path / "runs-long")
-    long_bundle = replace(bundle, argv=(sys.executable, "-c", "import time; time.sleep(30)"))
-    long_started = long_runner.start(long_bundle, _owner(), revision.spec.budget)
-    monkeypatch.setattr(long_runner, "_wait_for_drain", lambda _managed, force: False)
-    cancelled = long_runner.cancel(long_started, _owner()).attempt
-    assert cancelled.state is RunState.DRAINING
-    # The test owns the process; clean it up after the nonterminal assertion.
-    monkeypatch.undo()
-    long_runner.cancel(long_started, _owner())
+    child_code = "from pathlib import Path;import os,time;Path('output/child.pid').write_text(str(os.getpid()));time.sleep(10)"
+    root_code = (
+        "import subprocess,sys,time; "
+        f"subprocess.Popen([sys.executable, '-c', {child_code!r}]); "
+        "time.sleep(10)"
+    ).strip()
+    long_bundle = replace(bundle, argv=(sys.executable, "-c", root_code))
+    child_handle = None
+    long_started = None
+    try:
+        long_started = long_runner.start(long_bundle, _owner(), revision.spec.budget)
+        managed = next(iter(long_runner._managed.values()))
+        process = managed.process
+        child_handle = _hold_child(process, managed.attempt_root / "output/child.pid")
+        assert process.active_processes() >= 2
+        long_started = long_runner.poll(long_started, _owner()).attempt
+        cancelled = long_runner.cancel(long_started, _owner()).attempt
+        assert cancelled.state is RunState.CANCELLED
+        assert unrelated.poll() is None
+        assert process.closed and not long_runner._managed
+        assert process._win.WaitForSingleObject(child_handle, 0) == 0
+    finally:
+        _cleanup(long_runner, long_started)
+        if child_handle is not None:
+            process._win.CloseHandle(child_handle)
+        if unrelated.poll() is None:
+            unrelated.terminate()
+            unrelated.wait(timeout=3)
 
 
-def test_preview_requires_real_launch_bound_studio_and_final_digest(tmp_path: Path) -> None:
-    revision, mesh, profile, bundle, _store = _compiled(tmp_path)
-    output_root = tmp_path / "attempt-p3"
-    output_path = output_root / "output" / "results.xplt"
-    output_path.parent.mkdir(parents=True)
-    output_path.write_bytes(
-        make_xplt_fixture(
-            attempt_id="attempt-p3", bundle_digest=bundle.bundle_digest, mesh_digest=mesh.artifact_digest
-        )
-    )
-    reader = __import__(
-        "febio_cae.adapters.febio.xplt_reader", fromlist=["XpltReaderAdapter"]
-    ).XpltReaderAdapter(profile=profile)
-    manifest = reader.read(
-        _attempt(bundle, revision, output_root, state=RunState.VALIDATING), bundle
-    )
-    preview_module = __import__("febio_cae.adapters.preview.studio", fromlist=["PreviewAdapter"])
-    studio = ToolIdentity("febio-studio", "2.8.0", "f" * 64)
-    request = preview_module.PreviewRequest("preview-r1", manifest.manifest_id, (0,), ("displacement",))
-    preview = preview_module.PreviewAdapter(
-        studio=studio,
-        source=preview_module.FileSystemPreviewSource(output_path),
-        observer=lambda _path, _identity: preview_module.PreviewObservation((0,), ("displacement",)),
-    )
-    receipt = preview.request(manifest, request)
-    assert receipt.status is PreviewStatus.FAILED
+def test_preview_requires_configured_launcher(tmp_path: Path) -> None:
+    case = MixedPreviewCase(tmp_path)
+    adapter = case.adapter(launcher=None)
+    assert adapter.request(case.manifest, case.request).status is PreviewStatus.FAILED
+    assert not case.launched and case.observed == 0
 
-    launched = preview_module.PreviewAdapter(
-        studio=studio,
-        source=preview_module.FileSystemPreviewSource(output_path),
-        launcher=lambda _path, _identity: True,
-        observer=lambda path, _identity: (
-            path.write_bytes(path.read_bytes() + b"mutation")
-            or preview_module.PreviewObservation((0,), ("displacement",))
-        ),
-    )
-    receipt = launched.request(manifest, request)
+
+def test_preview_rejects_foreign_studio_receipt(tmp_path: Path) -> None:
+    case = MixedPreviewCase(tmp_path)
+    adapter = case.adapter()
+    receipt = adapter.request(case.manifest, case.request)
+    assert receipt.status is PreviewStatus.LAUNCHED
     wrong_studio = replace(receipt, studio=ToolIdentity("febio-studio", "99.0.0", "0" * 64))
-    confirmed = launched.confirm(wrong_studio, (EvidenceRef("1", "registered_document", "r1", "preview", "1" * 64),))
+    assert adapter.confirm(wrong_studio, case.evidence).status is PreviewStatus.FAILED
+    assert case.observed == 0
+
+
+def test_preview_rejects_mutation_during_confirmation(tmp_path: Path) -> None:
+    case = MixedPreviewCase(tmp_path)
+
+    def mutate(binding: preview_module.PreviewBinding) -> preview_module.PreviewObservation:
+        case.path.write_bytes(case.path.read_bytes() + b"mutation")
+        return case.observe(binding)
+
+    adapter = case.adapter(observer=mutate)
+    receipt = adapter.request(case.manifest, case.request)
+    assert receipt.status is PreviewStatus.LAUNCHED
+    confirmed = adapter.confirm(receipt, case.evidence)
     assert confirmed.status is PreviewStatus.FAILED
+    assert case.observed == 1
