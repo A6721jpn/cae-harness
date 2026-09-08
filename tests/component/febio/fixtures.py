@@ -234,13 +234,26 @@ def make_case_spec() -> CaseSpec:
     )
     solver_policy = SolverPolicy(
         profile=NumericalProfileRef("solver-profile", "solver", "d" * 64),
-        controls=(SolverControl("alpha", 1),),
+        # Explicit synthetic numerical profile; no inferred contact defaults.
+        controls=(
+            SolverControl("max_refs", 30),
+            SolverControl("dtol", Quantity(0.002, "1")),
+            SolverControl("penalty", Quantity(7.5, "1")),
+            SolverControl("auto_penalty", True),
+            SolverControl("update_penalty", False),
+            SolverControl("laugon", 1),
+            SolverControl("tolerance", Quantity(0.15, "1")),
+            SolverControl("gaptol", Quantity(0.02, "mm")),
+            SolverControl("search_tol", Quantity(0.03, "1")),
+            SolverControl("search_radius", Quantity(2, "mm")),
+            SolverControl("two_pass", False),
+        ),
         increments=TimeIncrementPolicy(
             initial_step=Quantity(0.1, "s"),
             minimum_step=Quantity(0.01, "s"),
             maximum_step=Quantity(1.0, "s"),
             adaptive=True,
-            max_steps=10,
+            max_steps=100,
             max_step_retries=1,
             must_points=(),
         ),
@@ -425,7 +438,7 @@ def make_profile(executable: str | Path | None = None) -> CompatibilityProfile:
     mappings = (
         OutputMapping("displacement", "displacement", "node", "VEC3F", "m", WORLD, 1, 1, "value"),
         OutputMapping(
-            "contact_force", "reaction forces", "rigid_body", "VEC3F", "N", WORLD, -1, 1, "value"
+            "contact_force", "rigid force", "rigid_body", "VEC3F", "N", WORLD, -1, 1, "value"
         ),
     )
     return CompatibilityProfile(

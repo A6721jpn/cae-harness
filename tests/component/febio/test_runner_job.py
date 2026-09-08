@@ -16,7 +16,7 @@ import pytest
 from febio_cae.adapters.febio import runner as runner_module
 from febio_cae.domain import Quantity, RunState
 
-from .test_r1_remediation import _compiled, _owner, _Ownership
+from .runner_fixture import _compiled, _owner, _Ownership
 
 
 def _job_type() -> Any:
@@ -63,7 +63,7 @@ def _start(tmp_path: Path, code: str, budget_seconds: float = 8) -> tuple[Any, A
 
 def _cleanup(runner: Any, attempt: Any) -> None:
     if runner._managed:
-        managed = runner._managed[attempt.attempt_id]
+        managed = next(iter(runner._managed.values()))
         managed.process.terminate_tree()
         _until(lambda: managed.process.active_processes() == 0)
         managed.process.close()
@@ -78,7 +78,7 @@ def test_root_exit_keeps_descendant_writer_owned_until_natural_drain(tmp_path: P
     )
     code = f"import subprocess,sys; subprocess.Popen([sys.executable,'-c',{child!r}])"
     runner, attempt = _start(tmp_path, code)
-    managed = runner._managed[attempt.attempt_id]
+    managed = next(iter(runner._managed.values()))
     process = managed.process
     child_handle = None
     try:
@@ -135,7 +135,7 @@ def test_cancel_owned_tree_leaves_unrelated_sentinel_alive(tmp_path: Path) -> No
     child_handle = None
     try:
         runner, attempt = _start(tmp_path, code)
-        managed = runner._managed[attempt.attempt_id]
+        managed = next(iter(runner._managed.values()))
         process = managed.process
         child_handle = _hold_child(process, managed.attempt_root / "output/child.pid")
         assert process.active_processes() >= 2
@@ -161,7 +161,7 @@ def test_accounting_failure_never_validates_then_recovers(
 ) -> None:
     job_type = _job_type()
     runner, attempt = _start(tmp_path, "pass")
-    process = runner._managed[attempt.attempt_id].process
+    process = next(iter(runner._managed.values())).process
     try:
         _until(lambda: process.poll() == 0)
         with monkeypatch.context() as patch:
@@ -184,7 +184,7 @@ def test_budget_applies_after_root_exit_and_uses_legal_failed_transition(tmp_pat
         "import subprocess,sys;subprocess.Popen([sys.executable,'-c','import time;time.sleep(8)'])"
     )
     runner, attempt = _start(tmp_path, code, 0.4)
-    process = runner._managed[attempt.attempt_id].process
+    process = next(iter(runner._managed.values())).process
     try:
         _until(lambda: process.poll() == 0)
         current = runner.poll(attempt, _owner()).attempt

@@ -181,3 +181,62 @@ def test_assignment_and_termination_failure_retains_recoverable_suspended_root(
                 original_terminate(handle, 1)
             assert _winapi.WaitForSingleObject(handle, 3000) == 0
             _winapi.CloseHandle(handle)
+
+
+@pytest.mark.parametrize("invalid", ["path", "executable"])
+def test_inherited_prelaunch_rejections_never_execute(tmp_path: Path, invalid: str) -> None:
+    runner, _, bundle, budget = _fixture(tmp_path)
+    marker = tmp_path / "must-not-run"
+    bundle = replace(
+        bundle,
+        argv=(sys.executable, "-c", f"from pathlib import Path;Path({str(marker)!r}).touch()"),
+    )
+    owner = _owner()
+    if invalid == "path":
+        owner = _owner("../escaped")
+    else:
+        bundle = replace(bundle, tool=replace(bundle.tool, executable_digest="0" * 64))
+    with pytest.raises(PortError):
+        runner.start(bundle, owner, budget)
+    assert not runner._managed and not marker.exists()
+
+
+def test_cancel_with_uncertain_drain_retains_job_and_intent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner, _, bundle, budget = _fixture(tmp_path)
+    attempt = runner.start(bundle, _owner(), budget)
+    managed = next(iter(runner._managed.values()))
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(runner, "_wait_for_drain", lambda *args, **kwargs: False)
+            current = runner.cancel(attempt, _owner()).attempt
+            assert current.state is RunState.DRAINING
+            assert not managed.process.closed and runner._managed
+        assert _finish(runner, current, _owner()).state is RunState.CANCELLED
+        assert managed.process.closed
+    finally:
+        _cleanup_process(managed.process)
+        managed.stdout.close()
+        managed.stderr.close()
+
+
+def test_compiled_input_is_staged_and_success_requires_observed_exit(tmp_path: Path) -> None:
+    runner, _, bundle, budget = _fixture(tmp_path)
+    bundle = replace(
+        bundle,
+        argv=(
+            sys.executable,
+            "-c",
+            "from pathlib import Path;assert b'febio_spec' in Path('input/case.feb').read_bytes()",
+        ),
+    )
+    attempt = runner.start(bundle, _owner(), budget)
+    managed = next(iter(runner._managed.values()))
+    try:
+        assert _finish(runner, attempt, _owner()).state is RunState.VALIDATING
+        assert managed.process.returncode == 0 and managed.process.closed
+    finally:
+        _cleanup_process(managed.process)
+        managed.stdout.close()
+        managed.stderr.close()
