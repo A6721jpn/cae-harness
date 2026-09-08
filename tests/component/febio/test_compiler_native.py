@@ -25,6 +25,7 @@ from febio_cae.domain import (
     MeshArtifact,
     MeshNode,
     PortError,
+    PortErrorCategory,
     Quantity,
     RigidTransform,
     SolverControl,
@@ -445,3 +446,27 @@ def test_rigid_output_resolves_declared_body_instead_of_requiring_nodes(
     assert _required(root, "Output/plotfile/var[@type='rigid force']") is not None
     material = _required(root, "Material/material[@type='rigid body']").attrib["name"]
     assert _required(root, "Rigid/rigid_bc[@type='rigid_fixed']").findtext("rb") == material
+
+
+def test_rigid_multibody_set_is_truthfully_unsupported_before_staging(tmp_path: Path) -> None:
+    revision, mesh, profile = _case()
+    mesh = replace(
+        mesh,
+        sets=tuple(
+            replace(
+                item,
+                kind="body",
+                member_ids=(
+                    revision.spec.rigid_tool.primitive.body_id.value,
+                    revision.spec.geometry.body_id.value,
+                ),
+            )
+            if item.set_id == "tool-output"
+            else item
+            for item in mesh.sets
+        ),
+    )
+    with pytest.raises(PortError) as caught:
+        _compile(tmp_path, revision, mesh, profile)
+    assert caught.value.category is PortErrorCategory.UNSUPPORTED_CAPABILITY
+    assert not list((tmp_path / "bundles").rglob("*.feb"))
