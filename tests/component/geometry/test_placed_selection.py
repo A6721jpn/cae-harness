@@ -70,7 +70,8 @@ def test_rejects_stale_or_foreign_identity(
             "inspection": "inspection_digest",
             "geometry": "geometry_digest",
         }[corruption]
-        geometry = replace(geometry, **{field: "9" * 64})
+        changes: dict[str, Any] = {field: "9" * 64}
+        geometry = replace(geometry, **changes)
     elif corruption == "unit":
         geometry = replace(geometry, step_unit="m")
     elif corruption == "foreign":
