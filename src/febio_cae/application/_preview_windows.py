@@ -5,6 +5,7 @@ from __future__ import annotations
 import ctypes
 import hashlib
 import os
+import re
 from ctypes import wintypes
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,7 +21,7 @@ class ProcessSnapshot:
     process_id: int
     start_marker: str
     executable: Path
-    version: str
+    version: str | None
     executable_digest: str
 
 
@@ -67,7 +68,7 @@ def _kernel() -> Any:
     return kernel
 
 
-def _file_version(path: Path) -> str:
+def _file_version(path: Path) -> str | None:
     library = ctypes.WinDLL("version", use_last_error=True)
     library.GetFileVersionInfoSizeW.argtypes = (wintypes.LPCWSTR, ctypes.POINTER(wintypes.DWORD))
     library.GetFileVersionInfoSizeW.restype = wintypes.DWORD
@@ -86,9 +87,15 @@ def _file_version(path: Path) -> str:
     )
     library.VerQueryValueW.restype = wintypes.BOOL
     unused = wintypes.DWORD()
+    ctypes.set_last_error(0)
     size = library.GetFileVersionInfoSizeW(str(path), ctypes.byref(unused))
-    if not size or size > 4 * 1024 * 1024:
-        raise OSError("executable file-version resource is unavailable")
+    if not size:
+        error = ctypes.get_last_error()
+        if error in {0, 1812, 1813, 1814, 1815}:
+            return None
+        raise ctypes.WinError(error)
+    if size > 4 * 1024 * 1024:
+        raise OSError("executable file-version resource is oversized")
     content = ctypes.create_string_buffer(size)
     if not library.GetFileVersionInfoW(str(path), 0, size, content):
         raise ctypes.WinError(ctypes.get_last_error())
@@ -163,21 +170,65 @@ def _window_pid(window_id: int) -> int:
     return int(process.value)
 
 
+def _window_title(window_id: int) -> str:
+    user = ctypes.WinDLL("user32", use_last_error=True)
+    user.GetWindowTextLengthW.argtypes = (wintypes.HWND,)
+    user.GetWindowTextLengthW.restype = ctypes.c_int
+    user.GetWindowTextW.argtypes = (wintypes.HWND, wintypes.LPWSTR, ctypes.c_int)
+    user.GetWindowTextW.restype = ctypes.c_int
+    length = user.GetWindowTextLengthW(window_id)
+    if length <= 0 or length > 256:
+        raise ValueError("Studio runtime title is unavailable or unrecognized")
+    buffer = ctypes.create_unicode_buffer(length + 1)
+    if user.GetWindowTextW(window_id, buffer, len(buffer)) != length:
+        raise OSError("Studio runtime title changed during its read")
+    return buffer.value
+
+
+def _runtime_version(title: str) -> str:
+    part = r"(?:0|[1-9][0-9]{0,4})"
+    match = re.fullmatch(rf"FEBio Studio ({part}\.{part}\.{part}(?:\.{part})?)", title)
+    if match is None or any(int(value) > 65535 for value in match[1].split(".")):
+        raise ValueError("Studio runtime title does not report a recognized numeric version")
+    return match[1]
+
+
 class WindowsStudioProbe:
     def __init__(self, executable: Path | str) -> None:
         self.executable = Path(executable).absolute()
+        self.version_evidence: dict[str, object] | None = None
         if self.executable.name.casefold() != "febiostudio.exe":
             raise ValueError("the existing-window probe requires the FEBioStudio executable")
 
     def identify(self, window_id: int) -> ExistingStudioSession:
+        self.version_evidence = None
         process_id = _window_pid(window_id)
         measured = process_snapshot(process_id)
         if measured.executable != self.executable:
             raise ValueError("window process image is not the specified Studio executable")
+        version = measured.version
+        title = None
+        if version is None:
+            title = _window_title(window_id)
+            version = _runtime_version(title)
+            # A title is only attributable to this exact process lifetime and
+            # image. Re-query both instead of substituting a default version.
+            if process_snapshot(process_id) != measured or _window_title(window_id) != title:
+                raise OSError("Studio process or runtime title changed during version observation")
         if _window_pid(window_id) != measured.process_id:
             raise OSError("window process identity changed during observation")
+        self.version_evidence = {
+            "source": "runtime-window-title" if title is not None else "pe-file-version",
+            "reported_version": version,
+            "window_title": title,
+            "window_id": window_id,
+            "process_id": measured.process_id,
+            "process_start_marker": measured.start_marker,
+            "executable_path": str(measured.executable),
+            "executable_digest": measured.executable_digest,
+        }
         return ExistingStudioSession(
-            ToolIdentity("FEBio Studio", measured.version, measured.executable_digest),
+            ToolIdentity("FEBio Studio", version, measured.executable_digest),
             measured.process_id,
             measured.start_marker,
             window_id,

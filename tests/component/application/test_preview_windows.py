@@ -106,6 +106,7 @@ def test_missing_pe_version_uses_verified_runtime_window_title(
     probe = module.WindowsStudioProbe(executable)
     session = probe.identify(321)
     assert session.studio.version == "3.1.0"
+    assert probe.version_evidence is not None
     assert probe.version_evidence["source"] == "runtime-window-title"
     assert probe.version_evidence["window_title"] == "FEBio Studio 3.1.0"
     assert probe.version_evidence["process_start_marker"] == session.process_start_marker
