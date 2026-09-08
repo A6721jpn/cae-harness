@@ -1950,7 +1950,7 @@ class CaseStorage:
                     raise ValueError("numeric payload differs from observation reference/mapping")
                 if (
                     observation.state_count != len(data.axis_values)
-                    or data.axis_id != "time"
+                    or data.axis_id not in {"time", "state_time"}
                     or Quantity(1, data.axis_unit).dimension != Dimension(time=1)
                     or (data.mapping.value_type == "scalar" and len(data.component_ids) != 1)
                     or (
