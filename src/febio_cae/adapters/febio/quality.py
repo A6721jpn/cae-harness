@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import math
 import struct
 from dataclasses import replace
 
@@ -281,9 +280,6 @@ class QualityAdapter:
             or Quantity(0, numeric.axis_unit).dimension != Quantity(0, "s").dimension
         ):
             raise ValueError("numeric axis must represent state time")
-        axes = tuple(
-            float(Quantity(value, numeric.axis_unit).to_si().value) for value in numeric.axis_values
-        )
         indices: list[int] = []
         for target in requested_times:
             # Supported FEBio XPLT saves float32 time. Accept that exact
@@ -291,14 +287,13 @@ class QualityAdapter:
             native_target = struct.unpack("<f", struct.pack("<f", target))[0]
             if target != 0 and native_target == 0:
                 raise ValueError("requested time underflows the supported native representation")
-            matches = [
-                index
-                for index, axis in enumerate(axes)
-                if any(
-                    math.isclose(axis, value, rel_tol=1e-12, abs_tol=0.0)
-                    for value in (target, native_target)
-                )
-            ]
+            # Compare in the stored axis unit to avoid an extra conversion's
+            # roundoff. No proximity tolerance may turn an earlier state into an endpoint.
+            targets = {
+                float(Quantity(value, "s").convert_to(numeric.axis_unit).value)
+                for value in (target, native_target)
+            }
+            matches = [index for index, axis in enumerate(numeric.axis_values) if axis in targets]
             if len(matches) != 1:
                 raise PortError(PortErrorCategory.QUALITY, "requested result state is absent")
             indices.append(matches[0])
