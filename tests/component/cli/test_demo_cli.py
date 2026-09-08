@@ -16,7 +16,7 @@ from febio_cae.domain.ports import PortError, PortErrorCategory
 def test_demo_cli_routes_registered_ids_and_reports_cleanup(
     tmp_path: Any, monkeypatch: Any, capsys: Any, fail: bool
 ) -> None:
-    calls = []
+    calls: list[Any] = []
 
     def run(self: Any, case_id: str, revision_id: str, *, executable: str, preflight: bool) -> Any:
         calls.append((case_id, revision_id, executable, preflight))

@@ -17,7 +17,7 @@ from febio_cae.application.service import (
 from febio_cae.application.specs import SpecInputError, parse_spec_request
 from febio_cae.domain.lifecycle import ServiceErrorCategory
 from febio_cae.domain.ports import PortError
-from febio_cae.storage.registry import StorageIntegrityError
+from febio_cae.storage.registry import StorageConflictError, StorageIntegrityError
 
 
 def _reject_duplicate_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -137,8 +137,18 @@ def _error_payload(error: Exception) -> tuple[dict[str, object], int]:
 
 
 def run_case(arguments: Namespace) -> int:
+    service = None
     try:
         service = RegisteredCaseService(state_dir=arguments.state_dir)
+        if arguments.case_action == "run-demo":
+            payload = service.run_demo(
+                arguments.case_id,
+                arguments.revision_id,
+                executable=arguments.solver,
+                preflight=arguments.preflight,
+            )
+            _print(payload) if arguments.json else print(payload["status"])
+            return 0 if payload["status"] in {"PREFLIGHT_PASSED", "NEEDS_PREVIEW"} else 2
         if arguments.case_action == "create":
             created = service.create_case(case_root=arguments.case_root, cad_path=arguments.cad)
             payload = _created_payload(created)
@@ -177,9 +187,28 @@ def run_case(arguments: Namespace) -> int:
         ServiceConflictError,
         SpecInputError,
         StorageIntegrityError,
+        StorageConflictError,
         ValueError,
     ) as error:
         payload, code = _error_payload(error)
+        if arguments.case_action == "run-demo" and service is not None:
+            pending = 1
+            for _ in range(3):
+                try:
+                    pending = service._retry_pending_cleanup()
+                except (
+                    OSError,
+                    PortError,
+                    StorageIntegrityError,
+                    StorageConflictError,
+                ) as cleanup_error:
+                    payload["cleanup_error"] = str(cleanup_error)
+                    continue
+                if pending == 0:
+                    break
+            payload["pending_cleanup"] = pending
+            if pending:
+                payload["status"] = "CLEANUP_PENDING"
         _print(payload) if getattr(arguments, "json", False) else print(str(error))
         return code
 

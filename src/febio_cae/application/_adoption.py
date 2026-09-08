@@ -135,9 +135,7 @@ def adopt(
                     kind, members = "body", (body,)
                 else:
                     raise ValueError("unsupported whole-body output projection")
-                mapped.append(
-                    MeshSet(f"adopt:{digest[:24]}:{kind}", kind, body, members, digest)
-                )
+                mapped.append(MeshSet(f"adopt:{digest[:24]}:{kind}", kind, body, members, digest))
         sets.extend(mapped)
         aliases.append(
             {

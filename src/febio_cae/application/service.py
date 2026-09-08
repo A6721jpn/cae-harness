@@ -909,6 +909,13 @@ class RegisteredCaseService:
             _registered_selections(partial(revision.spec)),
         )
 
+    def run_demo(
+        self, case_id: str, revision_id: str, *, executable: str, preflight: bool = False
+    ) -> dict[str, object]:
+        from ._demo import run_demo
+
+        return run_demo(self, case_id, revision_id, executable=executable, preflight=preflight)
+
     def _verify_execution_mesh(
         self,
         storage: CaseStorage,
