@@ -14,10 +14,12 @@ from test_planar_edit_validation import prepared
 
 from febio_cae.adapters.febio import QualityAdapter
 from febio_cae.domain import (
+    AttemptRecord,
     ComparisonAxis,
     ComparisonInterval,
     ComparisonSpec,
     ExecutionBundle,
+    ExecutionSetting,
     FileEntry,
     FrameId,
     MotionSample,
@@ -25,6 +27,7 @@ from febio_cae.domain import (
     NumericResultData,
     OutputMapping,
     OutputObservation,
+    ProcessIdentity,
     QualityThreshold,
     Quantity,
     ReadResult,
@@ -137,7 +140,7 @@ def _configure(service: Any, spec: Any) -> Any:
 def _result(
     service: Any, storage: Any, revision: Any, label: str, times: tuple[float, ...], factor: float
 ) -> Any:
-    """Exercise registered publication with an explicitly synthetic synchronous reader."""
+    """Synthetic issued-runner snapshots and reader; no native process is started."""
     record = storage.resolve_revision_mesh_quality(revision)
     mesh = service._planar_execution_mesh(storage, record, revision)
     profile = service.compatibility.get_profile(revision.spec.solver_policy.profile.profile_id)
@@ -168,12 +171,45 @@ def _result(
     )
     storage.claim(owner)
     storage._register_execution(owner, bundle, mesh, profile, {entry.logical_path: payload})
-    for state in (RunState.PREPARING, RunState.RUNNING, RunState.DRAINING):
-        storage._transition_attempt(owner, state)
-    storage._seal_outputs(
-        owner, {request.request_id: label.encode() for request in revision.spec.outputs.requests}
+    process_root = (
+        storage.root
+        / "native"
+        / owner.case_id
+        / owner.run_id
+        / owner.attempt_id
+        / str(owner.owner_generation)
     )
-    storage._transition_attempt(owner, RunState.VALIDATING)
+    storage._prepare_runner(owner, process_root)
+    (process_root / "output").mkdir(parents=True)
+    (process_root / "output/results.xplt").write_bytes(
+        b"synthetic result bytes; no native execution"
+    )
+    issued = AttemptRecord(
+        owner.attempt_id,
+        owner.run_id,
+        owner.case_id,
+        revision.revision_id,
+        owner.owner_generation,
+        bundle.bundle_digest,
+        RunState.RUNNING,
+        ProcessIdentity(
+            bundle.argv[0],
+            profile.solver.executable_digest,
+            bundle.argv,
+            str(process_root),
+            1,
+            "synthetic-only",
+        ),
+        (
+            ExecutionSetting("attempt_root", str(process_root)),
+            ExecutionSetting("max_elapsed_seconds", revision.spec.budget.max_elapsed.to_si().value),
+        ),
+    )
+    storage._accept_runner_start(owner, issued)
+    storage._accept_runner_poll(
+        owner, issued, issued.transition_to(RunState.DRAINING).transition_to(RunState.VALIDATING)
+    )
+    storage._seal_native_output(owner)
 
     def read(attempt: Any, bundle: Any, files: Any, registered: Any) -> Any:
         observations = []
@@ -184,7 +220,7 @@ def _result(
                 if is_force
                 else tuple(str(n.node_id) for n in mesh.nodes)
             )
-            rows = []
+            rows: list[tuple[float, ...]] = []
             for t in times:
                 if is_force:
                     rows.append((0.0, 0.0, -2.0 * t * factor))
@@ -210,7 +246,7 @@ def _result(
                     label + "-" + mapping.canonical_id,
                     "0" * 64,
                     "numeric-result-v1",
-                    "numeric/" + mapping.canonical_id + ".json",
+                    files[0].logical_path,
                     bundle.bundle_digest,
                     attempt.attempt_id,
                 ),
@@ -249,6 +285,7 @@ def _result(
     manifest = storage.publish_manifest(owner, storage._read_candidate(owner, read))
     storage._transition_attempt(owner, RunState.SUCCEEDED)
     quality = QualityAdapter().assess(manifest, revision, mesh, profile, storage)
+    assert quality.overall_status.value == ("FAIL" if factor == 100 else "PASS"), quality.to_dict()
     storage.ingest_source(
         asset_id="quality-" + quality.assessment_id[:24],
         source_kind="registered_document",
@@ -332,7 +369,8 @@ def test_registered_comparison_interpolates_signed_curve_and_part_roi(tmp_path: 
     assert force["baseline"] == pytest.approx([0, -0.5, -1, -1.5, -2])
     assert force["candidate"] == pytest.approx([0, -0.75, -1.5, -2.25, -3])
     assert force["difference"] == pytest.approx([0, -0.25, -0.5, -0.75, -1])
-    assert force["relative_difference"] == [None, 0.5, 0.5, 0.5, 0.5]
+    assert force["relative_difference"][0] is None
+    assert force["relative_difference"][1:] == pytest.approx([0.5, 0.5, 0.5, 0.5])
     assert force["relative_status"][0] == "undefined_zero_baseline"
     assert series["displacement.world_z"]["candidate"][-1] == pytest.approx(1.5e-5)
     assert comparison["surface_approximation"] == "UNVERIFIED"
@@ -367,7 +405,15 @@ def test_comparison_refuses_incompatible_or_ineligible_results(tmp_path: Path, d
             )
     operation = getattr(service, "compare_case", None)
     assert callable(operation), "normal registered comparison consumer is missing"
-    with pytest.raises((ValueError, PortError)):
+    reason = {
+        "fixed-declaration": "fixed condition",
+        "nonmaterial-change": "fixed-condition",
+        "extrapolation": "extrapolation",
+        "roi": "ROI",
+        "quality": "quality",
+        "numeric": "numeric",
+    }[defect]
+    with pytest.raises((ValueError, PortError), match=reason):
         operation(
             created.case_id, spec, baseline_run_id="run-baseline", candidate_run_id="run-candidate"
         )

@@ -12,6 +12,7 @@ def test_normal_comparison_cli_uses_registered_results(
     tmp_path: Path, monkeypatch: Any, capsys: Any
 ) -> None:
     # Dynamic import avoids giving the shared test module two mypy module names.
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1] / "application"))
     fixture = importlib.import_module("test_comparison").comparison_fixture
     _, created, _, spec = fixture(tmp_path)
     monkeypatch.setenv("FEBIO_CAE_STATE_DIR", str(tmp_path / "state"))
@@ -31,6 +32,7 @@ def test_normal_comparison_cli_uses_registered_results(
             ]
         )
     except SystemExit as error:
+        assert isinstance(error.code, int)
         code = error.code
     assert code == 0
     result = json.loads(capsys.readouterr().out)
