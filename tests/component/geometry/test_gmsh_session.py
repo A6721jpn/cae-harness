@@ -86,7 +86,7 @@ def test_two_sessions_cannot_both_pass_uninitialized_query() -> None:
         try:
             with _GmshSession(fake, "OpenCASCADE"):
                 first_outcomes.append("entered")
-        except BaseException as error:
+        except (BackendError, AssertionError, RuntimeError) as error:
             first_outcomes.append(error)
 
     thread = Thread(target=first, daemon=True)
@@ -143,4 +143,23 @@ def test_failed_lifetime_releases_admission(stage: str, monkeypatch: Any) -> Non
     assert not fake.initialized
     assert fake.events.count("finalize") == 1
     with _GmshSession(SessionDouble(False), "OpenCASCADE"):
+        pass
+
+
+def test_admission_remains_owned_during_cleanup(monkeypatch: Any) -> None:
+    fake = SessionDouble(False)
+    original = fake.clear
+
+    def checked_clear() -> None:
+        with (
+            pytest.raises(BackendError, match="busy"),
+            _GmshSession(SessionDouble(False), "OpenCASCADE"),
+        ):
+            pass
+        original()
+
+    monkeypatch.setattr(fake, "clear", checked_clear)
+    with _GmshSession(fake, "OpenCASCADE"):
+        pass
+    with _GmshSession(fake, "OpenCASCADE"):
         pass
