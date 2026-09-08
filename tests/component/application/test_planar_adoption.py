@@ -144,3 +144,33 @@ def test_adoption_rejects_unapproved_changes(tmp_path: Path, bad: str) -> None:
         )
     with pytest.raises(ValueError):
         RegisteredCaseService._adopt_planar_mesh(record, mesh, carrier, revision)
+
+
+@pytest.mark.parametrize("bad", ["none", "candidate", "receipt", "registered-mesh"])
+def test_execution_admission_recomputes_from_registered_sources(tmp_path: Path, bad: str) -> None:
+    from test_persistence_authority import _created
+
+    from febio_cae.domain.canonical import canonical_bytes
+    from febio_cae.domain.codec import encode_record
+
+    service, _, storage = _created(tmp_path)
+    record, original, carrier, revision = _fixture(tmp_path)
+    adopted, receipt = service._adopt_planar_mesh(record, original, carrier, revision)
+    for name, payload in (
+        ("gm03-mesh", encode_record(original)),
+        ("gm03-carrier", encode_record(carrier)),
+        ("adopted-mesh", encode_record(original if bad == "registered-mesh" else adopted)),
+        ("adoption-receipt", canonical_bytes({} if bad == "receipt" else receipt)),
+    ):
+        storage.ingest_source(
+            asset_id=name,
+            source_kind="registered_document",
+            media_type="application/json",
+            content=payload,
+        )
+    candidate = original if bad == "candidate" else adopted
+    if bad == "none":
+        service._verify_execution_mesh(storage, record, revision, candidate)
+    else:
+        with pytest.raises(ValueError, match="adoption"):
+            service._verify_execution_mesh(storage, record, revision, candidate)
