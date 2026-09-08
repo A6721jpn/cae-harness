@@ -200,6 +200,29 @@ class PreviewAdapter:
         self._issued[receipt.receipt_id] = replace(issued, receipt=receipt)
         return receipt
 
+    def observation_binding(self, receipt: PreviewReceipt) -> PreviewBinding:
+        """Expose a pending local nonce for fresh capture, never restore authority."""
+        if not isinstance(receipt, PreviewReceipt):
+            raise TypeError("receipt must be a PreviewReceipt")
+        issued = self._issued.get(receipt.receipt_id)
+        if (
+            issued is None
+            or receipt != issued.receipt
+            or not issued.observation_only
+            or receipt.status is not PreviewStatus.REQUESTED
+        ):
+            raise PortError(PortErrorCategory.CONFLICT, "no matching pending observation issue")
+        try:
+            self._verify_issued(issued)
+            if self._issued.get(receipt.receipt_id) != issued:
+                raise ValueError("observation issue was invalidated during verification")
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            self._invalidate(issued)
+            raise PortError(
+                PortErrorCategory.INTEGRITY, "observation issue is no longer valid"
+            ) from error
+        return issued.binding
+
     def _prepare(self, manifest: ResultManifest, request: PreviewRequest) -> _IssuedPreview:
         if request.manifest_id != manifest.manifest_id:
             raise PortError(
