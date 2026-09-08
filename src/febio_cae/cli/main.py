@@ -10,6 +10,7 @@ from febio_cae import __version__
 from .case import run_case
 from .compare import COMPARISON_HELP, run_compare
 from .doctor import run_doctor
+from .run import run_lifecycle
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -98,6 +99,17 @@ def _build_parser() -> argparse.ArgumentParser:
     compare.add_argument("--state-dir", default=None)
     compare.add_argument("--spec", required=True, help="explicit common ComparisonSpec JSON")
     compare.add_argument("--json", action="store_true")
+    for name in ("status", "resume"):
+        run = commands.add_parser(
+            name,
+            help="read run state"
+            if name == "status"
+            else "diagnose interrupted synchronous publication without restarting",
+        )
+        run.add_argument("run_id")
+        run.add_argument("--case-id", required=True)
+        run.add_argument("--state-dir", default=None)
+        run.add_argument("--json", action="store_true")
     return parser
 
 
@@ -111,6 +123,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return run_case(arguments)
     if arguments.command == "compare":
         return run_compare(arguments)
+    if arguments.command in {"status", "resume"}:
+        return run_lifecycle(arguments)
 
     parser.print_help()
     return 2

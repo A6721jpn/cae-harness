@@ -967,6 +967,16 @@ class RegisteredCaseService:
 
         return compare(self, case_id, request, baseline_run_id, candidate_run_id)
 
+    def run_status(self, case_id: str, run_id: str) -> dict[str, object]:
+        from ._run_reconciliation import reconcile
+
+        return reconcile(self, case_id, run_id, resume=False)
+
+    def resume_run(self, case_id: str, run_id: str) -> dict[str, object]:
+        from ._run_reconciliation import reconcile
+
+        return reconcile(self, case_id, run_id, resume=True)
+
     def run_demo(
         self, case_id: str, revision_id: str, *, executable: str, preflight: bool = False
     ) -> dict[str, object]:

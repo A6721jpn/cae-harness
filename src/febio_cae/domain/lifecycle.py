@@ -78,7 +78,7 @@ _TRANSITIONS: dict[RunState, frozenset[RunState]] = {
     RunState.PREPARING: frozenset({RunState.RUNNING, RunState.FAILED}),
     RunState.RUNNING: frozenset({RunState.DRAINING, RunState.INTERRUPTED}),
     RunState.DRAINING: frozenset({RunState.VALIDATING, RunState.FAILED, RunState.CANCELLED}),
-    RunState.VALIDATING: frozenset({RunState.SUCCEEDED, RunState.FAILED}),
+    RunState.VALIDATING: frozenset({RunState.SUCCEEDED, RunState.FAILED, RunState.INTERRUPTED}),
     RunState.SUCCEEDED: frozenset(),
     RunState.FAILED: frozenset(),
     RunState.CANCELLED: frozenset(),
