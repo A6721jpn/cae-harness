@@ -3,9 +3,9 @@
 The product deliberately does not depend on Gmsh at import time.  A caller
 provides an explicit configuration and the backend imports the configured
 Python module only when an operation is requested.  Every native call is made
-inside a short-lived Gmsh session and every coordinate/measure is converted
-from the single declared STEP length unit to SI before it crosses the backend
-boundary.
+inside an exclusively owned, short-lived Gmsh session. An already initialized
+session is refused without modifying caller state. OCC import explicitly uses
+metres; the declared STEP unit is retained as source provenance.
 
 This adapter reports Gmsh observations; it does not infer physical meaning
 from face orientation, names, or the order in which CAD entities happen to be
@@ -552,18 +552,24 @@ class _GmshSession:
                 f"unsupported geometry kernel: {self.kernel!r}",
             )
         try:
-            initialized = (
-                bool(self.gmsh.isInitialized()) if hasattr(self.gmsh, "isInitialized") else False
-            )
-            if not initialized:
-                self.gmsh.initialize()
-                self._started = True
+            if not callable(getattr(self.gmsh, "isInitialized", None)):
+                raise BackendError(
+                    BackendErrorCategory.ENVIRONMENT, "Gmsh session ownership query unavailable"
+                )
+            if self.gmsh.isInitialized():
+                raise BackendError(
+                    BackendErrorCategory.ENVIRONMENT,
+                    "Gmsh initialized session is unowned; refusing mutation",
+                )
+            self.gmsh.initialize()
+            self._started = True
             if hasattr(self.gmsh, "option") and hasattr(self.gmsh.option, "setNumber"):
                 self.gmsh.option.setNumber("General.Terminal", 0)
             self._temporary_directory = tempfile.TemporaryDirectory(prefix="febio-cae-gmsh-")
             self.path = Path(self._temporary_directory.name) / "input.step"
             return self
         except BackendError:
+            self._close()
             raise
         except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as error:
             self._close()
@@ -584,7 +590,7 @@ class _GmshSession:
 
     def _close(self) -> None:
         try:
-            if hasattr(self.gmsh, "clear"):
+            if self._started and hasattr(self.gmsh, "clear"):
                 self.gmsh.clear()
         except (AttributeError, RuntimeError, TypeError, ValueError):
             pass
@@ -592,6 +598,7 @@ class _GmshSession:
             if self._started and hasattr(self.gmsh, "finalize"):
                 self.gmsh.finalize()
         finally:
+            self._started = False
             if self._temporary_directory is not None:
                 self._temporary_directory.cleanup()
                 self._temporary_directory = None

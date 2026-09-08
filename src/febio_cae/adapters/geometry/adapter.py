@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import math
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, NoReturn, cast
 
 if TYPE_CHECKING:
+    from febio_cae.adapters.meshing.approximation import CriteriaProvider
     from febio_cae.adapters.meshing.primitives import GeneratedPrimitiveMesh
 from febio_cae.domain import (
     AsPlaced,
@@ -149,6 +151,7 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
         *,
         source_resolver: SourceAssetResolverPort | None = None,
         source_asset: SourceAssetRef | None = None,
+        resolve_mesh_quality: CriteriaProvider | None = None,
     ) -> None:
         if not isinstance(backend, GeometryMeshBackend):
             raise TypeError("backend must implement GeometryMeshBackend")
@@ -166,6 +169,9 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
         self._backend = backend
         self._source_resolver = source_resolver
         self._source_asset = source_asset
+        if resolve_mesh_quality is not None and not callable(resolve_mesh_quality):
+            raise TypeError("resolve_mesh_quality must be a trusted callable or None")
+        self._resolve_mesh_quality = resolve_mesh_quality
         self._inspection_details: dict[str, BackendInspection] = {}
 
     @property
@@ -225,8 +231,7 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
     ) -> InitialContactPlacement:
         """Apply only a fully explicit, unique ``SpecifiedGap`` arrangement."""
 
-        from febio_cae.adapters.meshing.primitives import generate_primitive_mesh
-
+        deadline = time.monotonic() + float(revision.spec.budget.max_elapsed.to_si().value)
         source = self._resolve_registered_source(revision)
         spec = revision.spec
         inspection = self.inspect(
@@ -242,11 +247,32 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
                 PortErrorCategory.INTEGRITY, "case STEP unit conflicts with source inspection"
             )
         report = _placed_inspection(self.inspection_details(inspection), spec.geometry.placement)
-        generated = generate_primitive_mesh(
-            spec.rigid_tool.primitive,
-            geometry_digest=spec.rigid_tool.contact_surface.geometry_digest,
-        )
+        generated = self._generate_tool(spec, deadline)
         return self._initial_placement(spec, report, generated)
+
+    def _generate_tool(self, spec: CaseSpec, deadline: float) -> GeneratedPrimitiveMesh:
+        from febio_cae.adapters.meshing.approximation import check_deadline, resolve_criteria
+        from febio_cae.adapters.meshing.primitives import generate_primitive_mesh
+
+        check_deadline(deadline)
+        primitive = spec.rigid_tool.primitive
+        criteria = (
+            resolve_criteria(self._resolve_mesh_quality, spec.mesh_policy, primitive.kind)
+            if primitive.kind in {"sphere", "cylinder"}
+            else None
+        )
+        try:
+            return generate_primitive_mesh(
+                primitive,
+                geometry_digest=spec.rigid_tool.contact_surface.geometry_digest,
+                policy=spec.mesh_policy,
+                criteria=criteria,
+                deadline=deadline,
+            )
+        except (ArithmeticError, ValueError) as error:
+            raise PortError(
+                PortErrorCategory.QUALITY, f"primitive numerical quality failure: {error}"
+            ) from error
 
     def _initial_placement(
         self, spec: CaseSpec, report: BackendInspection, generated: GeneratedPrimitiveMesh
@@ -319,10 +345,11 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
         )
 
     def mesh(self, revision: CaseRevision) -> MeshArtifact:
-        from febio_cae.adapters.meshing.primitives import generate_primitive_mesh
+        from febio_cae.adapters.meshing.approximation import check_deadline
 
         if not isinstance(revision, CaseRevision):
             self._raise(PortErrorCategory.INVALID_INPUT, "revision must be a CaseRevision")
+        deadline = time.monotonic() + float(revision.spec.budget.max_elapsed.to_si().value)
         source = self._resolve_registered_source(revision)
         spec = revision.spec
         inspection = self.inspect(
@@ -373,10 +400,7 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
             )
         if part_mesh.geometry_digest != spec.geometry.geometry_digest:
             self._raise(PortErrorCategory.INTEGRITY, "backend mesh geometry digest is stale")
-        generated = generate_primitive_mesh(
-            spec.rigid_tool.primitive,
-            geometry_digest=spec.rigid_tool.contact_surface.geometry_digest,
-        )
+        generated = self._generate_tool(spec, deadline)
         applied = self._initial_placement(spec, report, generated)
         placed_tool = replace(spec.rigid_tool.primitive, placement=applied.placement)
         tool_mesh = generated.mesh
@@ -387,6 +411,7 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
             node_start=1,
             element_start=1,
             expected_geometry_digest=spec.geometry.geometry_digest,
+            deadline=deadline,
         )
         tool_node_start = len(part_mapped.nodes) + 1
         tool_element_start = len(part_mapped.elements) + 1
@@ -397,6 +422,7 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
             node_start=tool_node_start,
             element_start=tool_element_start,
             expected_geometry_digest=spec.rigid_tool.contact_surface.geometry_digest,
+            deadline=deadline,
         )
         all_faces = part_mapped.faces + tool_mapped.faces
         if len({face.face_id for face in all_faces}) != len(all_faces):
@@ -470,6 +496,7 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
             backend_id=self.backend_id,
             backend_version=self.backend_version,
             applied=applied,
+            tool_recipe_digest=tool_mesh.source_digest,
         )
         provenance = MeshProvenance(
             source_geometry_digest=spec.geometry.geometry_digest,
@@ -482,7 +509,7 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
             node_ordering_id="tet10-canonical-v1",
             face_ordering_id="tet10-face-canonical-v1",
         )
-        quality_records = (
+        quality_records: tuple[MeshQualityRecord, ...] = (
             MeshQualityRecord(
                 "initial-contact-placement",
                 math.sqrt(sum(v * v for v in applied.translation_delta_si)),
@@ -524,7 +551,21 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
                 "bidirectional CAD-to-mesh approximation evidence is backend-dependent",
             ),
         )
-        return MeshArtifact(
+        if generated.approximation is not None:
+            quality_records += (
+                MeshQualityRecord(
+                    "tool-boundary-deviation-upper-bound",
+                    cast(float, generated.approximation["deviation_upper_bound_si"]),
+                    "m",
+                    cast(dict[str, float], generated.approximation["criteria"])[
+                        "max_boundary_deviation_si"
+                    ],
+                    "PASS",
+                    canonical_bytes(generated.approximation).decode("utf-8"),
+                ),
+            )
+        check_deadline(deadline)
+        artifact = MeshArtifact(
             artifact_id=f"mesh:{recipe_digest[:24]}",
             frame=spec.geometry.placement.target_frame,
             provenance=provenance,
@@ -534,6 +575,8 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
             sets=tuple(sets),
             quality_records=quality_records,
         )
+        check_deadline(deadline)
+        return artifact
 
     def _resolve_registered_source(self, revision: CaseRevision) -> SourceAssetContent:
         if not isinstance(revision, CaseRevision):
@@ -808,6 +851,7 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
         node_start: int,
         element_start: int,
         expected_geometry_digest: str,
+        deadline: float | None = None,
     ) -> _MappedMesh:
         if mesh.ordering_id != BACKEND_TET10_ORDER_ID:
             self._raise(
@@ -848,6 +892,10 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
         elements: list[MeshElement] = []
         signed_volumes: list[float] = []
         for source_id in ordered_source_elements:
+            if deadline is not None:
+                from febio_cae.adapters.meshing.approximation import check_deadline
+
+                check_deadline(deadline)
             source_element = source_elements[source_id]
             if source_element.ordering_id != BACKEND_TET10_ORDER_ID:
                 self._raise(
@@ -892,12 +940,13 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
                 )
             )
         faces: list[MeshFace] = []
+        mapped_elements = {element.element_id: element for element in elements}
         for source_face in mesh.faces:
+            if deadline is not None:
+                check_deadline(deadline)
             adjacency = tuple(element_map[item] for item in source_face.adjacent_element_ids)
             local_face_ids = tuple(source_face.local_face_ids)
-            first_element = next(
-                element for element in elements if element.element_id == adjacency[0]
-            )
+            first_element = mapped_elements[adjacency[0]]
             first_local_face = local_face_ids[0]
             face_node_ids = tuple(
                 first_element.node_ids[position]
@@ -1080,6 +1129,7 @@ def _mesh_recipe_digest(
     backend_id: str,
     backend_version: str,
     applied: InitialContactPlacement,
+    tool_recipe_digest: str,
 ) -> str:
     if source_asset is None:
         raise PortError(PortErrorCategory.ENVIRONMENT, "mesh recipe requires a source identity")
@@ -1092,6 +1142,7 @@ def _mesh_recipe_digest(
         "mesh_policy": spec.mesh_policy.to_dict(),
         "arrangement": spec.contact.arrangement.to_dict(),
         "applied_placement": applied.to_dict(),
+        "tool_recipe_digest": tool_recipe_digest,
         "selection_digests": sorted(selection_digests),
         "backend": {
             "id": backend_id,

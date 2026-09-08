@@ -15,9 +15,11 @@ from febio_cae.adapters.geometry.backend import (
     BackendMeshFace,
     BackendNode,
 )
-from febio_cae.domain import PortError, PortErrorCategory, RigidPrimitive
+from febio_cae.domain import MeshPolicy, PortError, PortErrorCategory, RigidPrimitive
 from febio_cae.domain.artifacts import TET10_FACE_NODE_POSITIONS
 from febio_cae.domain.canonical import canonical_bytes
+
+from .approximation import ApproximationCriteria, check_deadline, controlled_decomposition
 
 type Coordinates = tuple[float, float, float]
 
@@ -28,6 +30,7 @@ class GeneratedPrimitiveMesh:
 
     mesh: BackendMesh
     boundary_faces: tuple[BackendFace, ...]
+    approximation: dict[str, object] | None = None
 
 
 def _add(left: Coordinates, right: Coordinates) -> Coordinates:
@@ -99,13 +102,15 @@ def _box_decomposition(
 
 
 def _cylinder_decomposition(
-    radius: float, height: float, segments: int = 8
+    radius: float, height: float, segments: int = 8, deadline: float | None = None
 ) -> tuple[dict[int, Coordinates], list[tuple[int, int, int, int]]]:
     points: dict[int, Coordinates] = {
         0: (0.0, 0.0, -height / 2.0),
         1: (0.0, 0.0, height / 2.0),
     }
     for index in range(segments):
+        if deadline is not None:
+            check_deadline(deadline)
         angle = 2.0 * math.pi * index / segments
         points[2 + index] = (radius * math.cos(angle), radius * math.sin(angle), -height / 2.0)
         points[2 + segments + index] = (
@@ -116,6 +121,8 @@ def _cylinder_decomposition(
 
     tets: list[tuple[int, int, int, int]] = []
     for index in range(segments):
+        if deadline is not None:
+            check_deadline(deadline)
         next_index = (index + 1) % segments
         bottom = 2 + index
         bottom_next = 2 + next_index
@@ -195,10 +202,24 @@ def generate_primitive_mesh(
     primitive: RigidPrimitive,
     *,
     geometry_digest: str,
+    policy: MeshPolicy | None = None,
+    criteria: ApproximationCriteria | None = None,
+    deadline: float | None = None,
 ) -> GeneratedPrimitiveMesh:
     """Generate a deterministic, independent local Tet10 mesh for one primitive."""
 
-    points, raw_tets = _primitive_decomposition(primitive)
+    approximation = None
+    if (
+        primitive.kind in {"sphere", "cylinder"}
+        and policy is not None
+        and criteria is not None
+        and deadline is not None
+    ):
+        points, raw_tets, approximation = controlled_decomposition(
+            primitive, policy, criteria, deadline
+        )
+    else:
+        points, raw_tets = _primitive_decomposition(primitive)
     tets: list[tuple[int, int, int, int]] = [
         _orient_tetrahedron(points, (tet[0], tet[1], tet[2], tet[3])) for tet in raw_tets
     ]
@@ -212,6 +233,8 @@ def generate_primitive_mesh(
     next_node_id = len(coordinates) + 1
     element_node_ids: dict[int, tuple[int, ...]] = {}
     for element_id, tetrahedron in enumerate(tets, start=1):
+        if deadline is not None:
+            check_deadline(deadline)
         corners: tuple[int, int, int, int] = (
             point_id_to_node_id[tetrahedron[0]],
             point_id_to_node_id[tetrahedron[1]],
@@ -235,6 +258,8 @@ def generate_primitive_mesh(
         tuple[int, int, int], tuple[float, Coordinates, tuple[Coordinates, ...]]
     ] = {}
     for element_id, node_ids in element_node_ids.items():
+        if deadline is not None:
+            check_deadline(deadline)
         for local_face_id, positions in enumerate(TET10_FACE_NODE_POSITIONS):
             corner_node_ids = (
                 node_ids[positions[0]],
@@ -294,6 +319,7 @@ def generate_primitive_mesh(
                 "primitive": primitive.to_dict(),
                 "geometry_digest": geometry_digest,
                 "ordering_id": BACKEND_TET10_ORDER_ID,
+                "approximation": approximation,
             }
         )
     ).hexdigest()
@@ -316,7 +342,9 @@ def generate_primitive_mesh(
         faces=tuple(mesh_faces),
         ordering_id=BACKEND_TET10_ORDER_ID,
     )
-    return GeneratedPrimitiveMesh(mesh=mesh, boundary_faces=tuple(boundary_faces))
+    return GeneratedPrimitiveMesh(
+        mesh=mesh, boundary_faces=tuple(boundary_faces), approximation=approximation
+    )
 
 
 def _backend_node_order(node_ids: tuple[int, ...]) -> tuple[int, ...]:
