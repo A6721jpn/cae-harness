@@ -82,7 +82,6 @@ _REQUIRED_CAPABILITIES: Final[frozenset[str]] = frozenset(
         "febio.material.isotropic_linear_elastic",
         "febio.mesh.tet10",
         "febio.contact.sliding_elastic",
-        "febio.contact.primary_tool_secondary_part",
         "febio.rigid_body",
         "febio.support",
         "febio.motion",
@@ -311,10 +310,11 @@ class CompilerAdapter:
                     f"mesh selection mapping is missing or crosses body ownership: {selection.name}",
                 )
         capabilities = {item.capability_id: item for item in profile.capabilities}
-        missing = sorted(_REQUIRED_CAPABILITIES - capabilities.keys())
+        required = _REQUIRED_CAPABILITIES | {self._contact_direction(profile)}
+        missing = sorted(required - capabilities.keys())
         unavailable = sorted(
             capability_id
-            for capability_id in _REQUIRED_CAPABILITIES
+            for capability_id in required
             if capability_id in capabilities
             and capabilities[capability_id].status is not CapabilityStatus.SUPPORTED
         )
@@ -324,7 +324,7 @@ class CompilerAdapter:
                 PortErrorCategory.UNSUPPORTED_CAPABILITY,
                 f"required capabilities unavailable: {detail}",
             )
-        for capability_id in _REQUIRED_CAPABILITIES:
+        for capability_id in required:
             capability = capabilities[capability_id]
             if (
                 capability.version != _CAPABILITY_VERSION
@@ -359,6 +359,20 @@ class CompilerAdapter:
                 self._unsupported(f"output frame or measure mismatch: {request.request_id}")
             if mapping.location == "rigid_body" and request.selection.body_id.value != tool_body:
                 self._unsupported("rigid output must identify the rigid-tool body")
+
+    def _contact_direction(self, profile: CompatibilityProfile) -> str:
+        directions = [
+            item.capability_id
+            for item in profile.capabilities
+            if item.capability_id
+            in {
+                "febio.contact.primary_tool_secondary_part",
+                "febio.contact.primary_part_secondary_tool",
+            }
+        ]
+        if len(directions) != 1:
+            self._unsupported("exactly one explicit contact direction is required")
+        return directions[0]
 
     @staticmethod
     def _unsupported(reason: str) -> NoReturn:
@@ -576,11 +590,12 @@ class CompilerAdapter:
 
         pair_name = self._allocate_name("compiled-contact-pair", allocated)
         pair = ET.SubElement(mesh_section, "SurfacePair", {"name": pair_name})
-        ET.SubElement(pair, "primary").text = resolved[
-            (self._selection_digest(spec.contact.tool_surface), "face")
-        ]
+        primary, secondary = spec.contact.tool_surface, spec.contact.part_surface
+        if self._contact_direction(profile) == "febio.contact.primary_part_secondary_tool":
+            primary, secondary = secondary, primary
+        ET.SubElement(pair, "primary").text = resolved[(self._selection_digest(primary), "face")]
         ET.SubElement(pair, "secondary").text = resolved[
-            (self._selection_digest(spec.contact.part_surface), "face")
+            (self._selection_digest(secondary), "face")
         ]
 
         domains = ET.SubElement(root, "MeshDomains")
