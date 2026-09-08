@@ -17,6 +17,8 @@ import pytest
 
 from febio_cae.adapters.febio.compiler import CompilerAdapter, LocalBundleStore
 from febio_cae.domain import (
+    CapabilityRef,
+    CapabilityStatus,
     CaseRevision,
     CompatibilityProfile,
     CompilerPort,
@@ -197,6 +199,53 @@ def test_complete_two_body_compiler_port_emits_native_entities_and_references(
         tuple(float(x) for x in (point.text or "").split(","))
         for point in max_curve.findall("points/point")
     ] == [(0.0, 1.0), (1.0, 1.0)]
+
+
+def test_explicit_part_primary_contact_direction(tmp_path: Path) -> None:
+    revision, mesh, profile = _case()
+    profile = replace(
+        profile,
+        capabilities=tuple(
+            replace(item, capability_id="febio.contact.primary_part_secondary_tool")
+            if item.capability_id == "febio.contact.primary_tool_secondary_part"
+            else item
+            for item in profile.capabilities
+        ),
+    )
+    mesh = replace(
+        mesh, sets=tuple(replace(item, set_id="renamed-" + item.set_id) for item in mesh.sets)
+    )
+    _, root, _ = _compile(tmp_path, revision, mesh, profile)
+    assert root.findtext("Mesh/SurfacePair/primary") == "renamed-part-contact"
+    assert root.findtext("Mesh/SurfacePair/secondary") == "renamed-tool-contact"
+
+
+@pytest.mark.parametrize("invalid", ["absent", "ambiguous", "unsupported", "version", "evidence"])
+def test_contact_direction_fails_closed_before_staging(tmp_path: Path, invalid: str) -> None:
+    revision, mesh, profile = _case()
+    old = next(
+        item
+        for item in profile.capabilities
+        if item.capability_id == "febio.contact.primary_tool_secondary_part"
+    )
+    others = tuple(item for item in profile.capabilities if item != old)
+    new = replace(old, capability_id="febio.contact.primary_part_secondary_tool")
+    directions: tuple[CapabilityRef, ...] = (new,)
+    if invalid == "absent":
+        directions = ()
+    elif invalid == "ambiguous":
+        directions = (old, new)
+    elif invalid == "unsupported":
+        directions = (replace(new, status=CapabilityStatus.UNSUPPORTED),)
+    elif invalid == "version":
+        directions = (replace(new, version="unknown"),)
+    else:
+        directions = (replace(new, evidence=()),)
+    profile = replace(profile, capabilities=(*others, *directions))
+    with pytest.raises(PortError) as caught:
+        _compile(tmp_path, revision, mesh, profile)
+    assert caught.value.category is PortErrorCategory.UNSUPPORTED_CAPABILITY
+    assert not list((tmp_path / "bundles").rglob("*.feb"))
 
 
 def test_signed_rigid_motion_is_evaluated_in_the_declared_direction(tmp_path: Path) -> None:
