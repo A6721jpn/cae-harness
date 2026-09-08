@@ -197,12 +197,21 @@ def test_registered_execution_publication_boundary(tmp_path: Path, failure: str)
                 storage.publish_manifest(owner, manifest)
         return manifest
 
-    if failure in {"missing-output", "tampered", "partial-manifest", "foreign-numeric", "undercovered-numeric", "wrong-axis", "missing-numeric"}:
+    if failure in {
+        "missing-output",
+        "tampered",
+        "partial-manifest",
+        "foreign-numeric",
+        "undercovered-numeric",
+        "wrong-axis",
+        "missing-numeric",
+    }:
         with pytest.raises((PortError, ValueError)):
             service._execute_registered(
                 created.case_id, frozen.revision_id, build=_build, produce=produce, read=read
             )
         import sqlite3
+
         with sqlite3.connect(created.case_root / "registry.sqlite3") as connection:
             assert connection.execute("SELECT COUNT(*) FROM manifests").fetchone()[0] == 0
     else:
