@@ -32,6 +32,7 @@ from febio_cae.domain.compatibility import CapabilityStatus, CompatibilityProfil
 from febio_cae.domain.evidence import EvidenceRef
 from febio_cae.domain.execution import AttemptRecord, ExecutionBundle
 from febio_cae.domain.lifecycle import RunState
+from febio_cae.domain.mesh_policy import NumericalProfileRef
 from febio_cae.domain.partial_case_spec import PartialCaseSpec
 from febio_cae.domain.ports import (
     PortError,
@@ -43,6 +44,7 @@ from febio_cae.domain.results import NumericResultData, ReadStatus, ResultDataRe
 
 from ._ownership import identity, lease, pin_directories, pinned_read
 from .catalog import validate_case_id
+from .mesh_quality import MeshQualityRegistration
 
 
 class StorageConflictError(RuntimeError):
@@ -463,6 +465,14 @@ class CaseStorage:
                     payload BLOB NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS root_identity (singleton INTEGER PRIMARY KEY, identity TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS mesh_quality (
+                    profile_id TEXT NOT NULL, digest TEXT NOT NULL, payload BLOB NOT NULL,
+                    evidence_payload BLOB NOT NULL, PRIMARY KEY(profile_id,digest)
+                );
+                CREATE TABLE IF NOT EXISTS revision_mesh_quality (
+                    revision_id TEXT PRIMARY KEY, generation INTEGER NOT NULL,
+                    payload BLOB NOT NULL, evidence_payload BLOB NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS applied_patches (digest TEXT PRIMARY KEY, generation INTEGER NOT NULL);
                 CREATE TABLE IF NOT EXISTS revision_contexts (
                     revision_id TEXT PRIMARY KEY, generation INTEGER, draft_id TEXT
@@ -491,6 +501,7 @@ class CaseStorage:
             for column, definition in (
                 ("expected_generation", "INTEGER"),
                 ("expected_draft_id", "TEXT"),
+                ("mesh_quality_required", "INTEGER NOT NULL DEFAULT 0"),
             ):
                 try:
                     connection.execute(f"ALTER TABLE publications ADD COLUMN {column} {definition}")
@@ -518,6 +529,10 @@ class CaseStorage:
         with _connect(self.registry_path) as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
+                connection.execute(
+                    "DELETE FROM revision_mesh_quality WHERE revision_id IN (SELECT record_id FROM publications WHERE transaction_id=?) AND revision_id NOT IN (SELECT revision_id FROM revisions)",
+                    (transaction_id,),
+                )
                 connection.execute(
                     "DELETE FROM publications WHERE transaction_id=?", (transaction_id,)
                 )
@@ -556,6 +571,10 @@ class CaseStorage:
                     revision = decode_record(payload, CaseRevision)
                     self._verify_revision_sources(revision)
                     expected_generation = row["expected_generation"]
+                    if row["mesh_quality_required"]:
+                        self._verify_mesh_quality_snapshot(
+                            connection, revision, expected_generation
+                        )
                     if expected_generation is not None:
                         current = self._case_row(connection, revision.case_id)
                         if current["current_generation"] != expected_generation or (
@@ -573,6 +592,10 @@ class CaseStorage:
                             )
                             if temporary.exists():
                                 temporary.unlink()
+                            connection.execute(
+                                "DELETE FROM revision_mesh_quality WHERE revision_id=? AND revision_id NOT IN (SELECT revision_id FROM revisions)",
+                                (revision.revision_id,),
+                            )
                             connection.execute(
                                 "DELETE FROM publications WHERE transaction_id=?",
                                 (row["transaction_id"],),
@@ -620,6 +643,11 @@ class CaseStorage:
                             (revision.revision_id, expected_generation, row["expected_draft_id"]),
                         )
                     temporary = final.with_name(f".{final.name}.{row['transaction_id']}.tmp")
+                    if not final.exists():
+                        connection.execute(
+                            "DELETE FROM revision_mesh_quality WHERE revision_id=? AND revision_id NOT IN (SELECT revision_id FROM revisions)",
+                            (revision.revision_id,),
+                        )
                     if temporary.exists():
                         temporary.unlink()
                     connection.execute(
@@ -839,12 +867,24 @@ class CaseStorage:
         return None if row is None else row["generation"]
 
     def register_revision_if_current(
-        self, revision: CaseRevision, *, expected_generation: int
+        self,
+        revision: CaseRevision,
+        *,
+        expected_generation: int,
+        mesh_quality_required: bool = False,
     ) -> CaseRevision:
-        return self._publish_revision(revision, expected_generation=expected_generation)
+        return self._publish_revision(
+            revision,
+            expected_generation=expected_generation,
+            mesh_quality_required=mesh_quality_required,
+        )
 
     def _publish_revision(
-        self, revision: CaseRevision, *, expected_generation: int | None
+        self,
+        revision: CaseRevision,
+        *,
+        expected_generation: int | None,
+        mesh_quality_required: bool = False,
     ) -> CaseRevision:
         with self.evidence_snapshot():
             self._verify_revision_sources(revision)
@@ -854,7 +894,9 @@ class CaseStorage:
             ).parent
             with pin_directories(parent, create=True):
                 return self._publish_revision_pinned(
-                    revision, expected_generation=expected_generation
+                    revision,
+                    expected_generation=expected_generation,
+                    mesh_quality_required=mesh_quality_required,
                 )
 
     def _verify_revision_sources(self, revision: CaseRevision) -> None:
@@ -870,13 +912,22 @@ class CaseStorage:
             raise StorageIntegrityError("revision CAD identity differs from registration")
 
     def _publish_revision_pinned(
-        self, revision: CaseRevision, *, expected_generation: int | None
+        self,
+        revision: CaseRevision,
+        *,
+        expected_generation: int | None,
+        mesh_quality_required: bool = False,
     ) -> CaseRevision:
         self._recover_publications()
         payload = encode_record(revision)
         relative = f"cases/{revision.case_id}/revisions/{revision.revision_id}/revision.json"
         transaction_id = uuid.uuid4().hex[:12]
         duplicate = False
+        quality = (
+            self.resolve_mesh_quality(revision.spec.mesh_policy.quality_profile)
+            if mesh_quality_required
+            else None
+        )
         with _connect(self.registry_path) as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
@@ -905,6 +956,10 @@ class CaseStorage:
                             "revision identity is already registered with different bytes"
                         )
                     duplicate = True
+                    if mesh_quality_required:
+                        self._verify_mesh_quality_snapshot(
+                            connection, revision, expected_generation
+                        )
                 else:
                     target = _owned_path(self.root, relative)
                     if target.exists():
@@ -916,6 +971,16 @@ class CaseStorage:
                         if expected_generation is not None
                         else None
                     )
+                    if quality is not None:
+                        connection.execute(
+                            "INSERT INTO revision_mesh_quality VALUES(?,?,?,?)",
+                            (
+                                revision.revision_id,
+                                expected_generation,
+                                quality.to_bytes(),
+                                self._mesh_quality_evidence(quality),
+                            ),
+                        )
                     connection.execute(
                         """
                         INSERT INTO publications(
@@ -935,6 +1000,11 @@ class CaseStorage:
                             _now(),
                         ),
                     )
+                    if mesh_quality_required:
+                        connection.execute(
+                            "UPDATE publications SET mesh_quality_required=1 WHERE transaction_id=?",
+                            (transaction_id,),
+                        )
                 connection.commit()
             except Exception:
                 connection.rollback()
@@ -966,6 +1036,8 @@ class CaseStorage:
                         or current["current_draft_id"] != expected_draft_id
                     ):
                         raise StorageConflictError("draft changed before revision finalization")
+                if mesh_quality_required:
+                    self._verify_mesh_quality_snapshot(connection, revision, expected_generation)
                 connection.execute(
                     """
                     INSERT INTO revisions(
@@ -1023,6 +1095,117 @@ class CaseStorage:
             content_digest=str(row["content_digest"]),
             media_type=str(row["media_type"]),
         )
+
+    def _mesh_quality_evidence(self, record: MeshQualityRegistration) -> bytes:
+        items: list[dict[str, object]] = []
+        try:
+            for evidence in record.qualification_evidence:
+                asset = self.source_asset(evidence.reference)
+                if (
+                    asset.content_digest != evidence.content_digest
+                    or self.source_kind(evidence.reference) != evidence.source_kind
+                ):
+                    raise StorageIntegrityError("qualification evidence identity differs")
+                content = self.resolve_source(asset).content
+                items.append(
+                    {
+                        "evidence": evidence.to_dict(),
+                        "source": asset.to_dict(),
+                        "content_hex": content.hex(),
+                    }
+                )
+        except (StorageConflictError, StorageIntegrityError) as error:
+            raise PortError(PortErrorCategory.INTEGRITY, str(error)) from error
+        return canonical_bytes(items)
+
+    def _verified_mesh_quality(
+        self, payload: bytes, evidence_payload: bytes, ref: NumericalProfileRef
+    ) -> MeshQualityRegistration:
+        try:
+            record = MeshQualityRegistration.from_bytes(payload)
+            if record.reference != ref:
+                raise ValueError("mesh quality identity/digest differs")
+            if self._mesh_quality_evidence(record) != evidence_payload:
+                raise ValueError("mesh quality qualification snapshot differs")
+            return record
+        except (ValueError, TypeError, KeyError, StorageIntegrityError) as error:
+            raise PortError(PortErrorCategory.INTEGRITY, str(error)) from error
+
+    def register_mesh_quality(self, record: MeshQualityRegistration) -> NumericalProfileRef:
+        """Trusted case-local registration; never exposed as a public JSON import."""
+        if not isinstance(record, MeshQualityRegistration):
+            raise PortError(
+                PortErrorCategory.INVALID_INPUT, "explicit mesh quality record required"
+            )
+        with self.evidence_snapshot():
+            evidence = self._mesh_quality_evidence(record)
+            ref = record.reference
+            with _connect(self.registry_path) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    "SELECT * FROM mesh_quality WHERE profile_id=? AND digest=?",
+                    (ref.profile_id, ref.record_digest),
+                ).fetchone()
+                if row is not None:
+                    self._verified_mesh_quality(
+                        bytes(row["payload"]), bytes(row["evidence_payload"]), ref
+                    )
+                else:
+                    connection.execute(
+                        "INSERT INTO mesh_quality VALUES(?,?,?,?)",
+                        (ref.profile_id, ref.record_digest, record.to_bytes(), evidence),
+                    )
+                connection.commit()
+            return ref
+
+    def resolve_mesh_quality(self, ref: NumericalProfileRef) -> MeshQualityRegistration:
+        with self.evidence_snapshot():
+            if ref.purpose != "mesh_quality":
+                raise PortError(PortErrorCategory.INTEGRITY, "wrong numerical profile purpose")
+            with _connect(self.registry_path) as connection:
+                row = connection.execute(
+                    "SELECT * FROM mesh_quality WHERE profile_id=? AND digest=?",
+                    (ref.profile_id, ref.record_digest),
+                ).fetchone()
+            if row is None:
+                raise PortError(
+                    PortErrorCategory.UNSUPPORTED_CAPABILITY,
+                    "explicit mesh quality criteria are not registered",
+                )
+            return self._verified_mesh_quality(
+                bytes(row["payload"]), bytes(row["evidence_payload"]), ref
+            )
+
+    def _verify_mesh_quality_snapshot(
+        self, connection: sqlite3.Connection, revision: CaseRevision, generation: int | None
+    ) -> MeshQualityRegistration:
+        row = connection.execute(
+            "SELECT * FROM revision_mesh_quality WHERE revision_id=?", (revision.revision_id,)
+        ).fetchone()
+        if row is None or generation is None or row["generation"] != generation:
+            raise PortError(
+                PortErrorCategory.INTEGRITY,
+                "registered revision criteria context is missing or stale",
+            )
+        return self._verified_mesh_quality(
+            bytes(row["payload"]),
+            bytes(row["evidence_payload"]),
+            revision.spec.mesh_policy.quality_profile,
+        )
+
+    def resolve_revision_mesh_quality(self, revision: CaseRevision) -> MeshQualityRegistration:
+        with self.evidence_snapshot():
+            if (
+                self.get_revision(revision.case_id, revision.revision_id).to_bytes()
+                != revision.to_bytes()
+            ):
+                raise PortError(
+                    PortErrorCategory.INTEGRITY, "mesh quality revision is not registered"
+                )
+            with _connect(self.registry_path) as connection:
+                return self._verify_mesh_quality_snapshot(
+                    connection, revision, self.revision_generation(revision.revision_id)
+                )
 
     @_serialized
     def source_kind(self, asset_id: str) -> str:

@@ -2231,11 +2231,17 @@ def _inspection_request(value: object, field: str) -> GeometryInspectionRequest:
 
 
 def _selection_request(value: object, field: str) -> GeometrySelectionRequest:
-    payload = _mapping(value, {"schema_version", "source_asset", "selection"}, field)
+    keys = {"schema_version", "source_asset", "selection"}
+    if isinstance(value, Mapping) and "geometry_intent" in value:
+        keys.add("geometry_intent")
+    payload = _mapping(value, keys, field)
     _schema(payload, field)
     return GeometrySelectionRequest(
         _source_asset(payload["source_asset"], f"{field}.source_asset"),
         _selection(payload["selection"], f"{field}.selection"),
+        None
+        if payload.get("geometry_intent") is None
+        else _geometry(payload["geometry_intent"], f"{field}.geometry_intent"),
     )
 
 

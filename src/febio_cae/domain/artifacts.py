@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from typing import Final, NoReturn
 
 from .canonical import canonical_bytes
+from .geometry import GeometryIntent
 from .selection import SelectionRef
 from .spatial import FrameId
 
@@ -215,19 +216,34 @@ class GeometrySelectionRequest:
 
     source_asset: SourceAssetRef
     selection: SelectionRef
+    geometry_intent: GeometryIntent | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.source_asset, SourceAssetRef):
             raise ArtifactValidationError("source_asset must be a SourceAssetRef")
         if not isinstance(self.selection, SelectionRef):
             raise ArtifactValidationError("selection must be a SelectionRef")
+        if self.geometry_intent is not None:
+            intent = self.geometry_intent
+            if not isinstance(intent, GeometryIntent):
+                raise ArtifactValidationError("geometry_intent must be a GeometryIntent")
+            if (
+                intent.source_step_digest != self.source_asset.content_digest
+                or intent.geometry_digest != self.selection.geometry_digest
+                or intent.body_id != self.selection.body_id
+                or intent.placement.target_frame != self.selection.frame
+            ):
+                raise ArtifactValidationError("selection differs from explicit geometry context")
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "schema_version": SCHEMA_VERSION,
             "source_asset": self.source_asset.to_dict(),
             "selection": self.selection.to_dict(),
         }
+        if self.geometry_intent is not None:
+            payload["geometry_intent"] = self.geometry_intent.to_dict()
+        return payload
 
     def to_bytes(self) -> bytes:
         return canonical_bytes(self.to_dict())

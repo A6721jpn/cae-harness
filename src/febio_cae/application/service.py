@@ -28,6 +28,7 @@ from febio_cae.domain.compatibility import CapabilityStatus, CompatibilityProfil
 from febio_cae.domain.evidence import EvidenceRef
 from febio_cae.domain.execution import AttemptRecord, ExecutionBundle
 from febio_cae.domain.lifecycle import RunState, ServiceDiagnostic, ServiceErrorCategory
+from febio_cae.domain.mesh_policy import NumericalProfileRef
 from febio_cae.domain.partial_case_spec import PartialCaseSpec
 from febio_cae.domain.ports import (
     CompatibilityRegistryPort,
@@ -41,6 +42,7 @@ from febio_cae.domain.results import ResultManifest
 from febio_cae.domain.selection import FaceSetRule, ResolutionSnapshot, SelectionRef
 from febio_cae.domain.units import Quantity
 from febio_cae.storage.catalog import CaseCatalog, CaseCatalogError
+from febio_cae.storage.mesh_quality import MeshQualityRegistration
 from febio_cae.storage.profiles import SQLiteCompatibilityRegistry
 from febio_cae.storage.registry import (
     CaseStorage,
@@ -492,6 +494,10 @@ class RegisteredCaseService:
             )
 
     def _validate(self, case_id: str) -> ServiceResult:
+        with self._storage(case_id).evidence_snapshot():
+            return self._validate_pinned(case_id)
+
+    def _validate_pinned(self, case_id: str) -> ServiceResult:
         storage = self._storage(case_id)
         draft = storage.current_draft(case_id)
         diagnostics: list[ServiceDiagnostic] = []
@@ -612,7 +618,18 @@ class RegisteredCaseService:
                 for selection in _registered_selections(draft.values):
                     try:
                         resolved = self.geometry.resolve_selection(
-                            GeometrySelectionRequest(source_ref, selection), source
+                            GeometrySelectionRequest(
+                                source_ref,
+                                selection,
+                                geometry
+                                if (
+                                    geometry.source_step_digest == source_ref.content_digest
+                                    and geometry.body_id == selection.body_id
+                                    and geometry.geometry_digest == selection.geometry_digest
+                                )
+                                else None,
+                            ),
+                            source,
                         )
                         resolutions[selection.to_bytes()] = resolved
                         if not isinstance(resolved, ResolutionSnapshot) or (
@@ -648,6 +665,10 @@ class RegisteredCaseService:
                                 f"registered geometry selection resolution is unavailable: {error}",
                                 "selection",
                             )
+                        )
+                    except ValueError as error:
+                        diagnostics.append(
+                            _diagnostic(ServiceErrorCategory.INTEGRITY, str(error), "selection")
                         )
                     except PortError as error:
                         diagnostics.append(
@@ -693,6 +714,9 @@ class RegisteredCaseService:
                     continue
                 field, profile_ref = request
                 try:
+                    if field == "mesh_policy.quality_profile":
+                        storage.resolve_mesh_quality(profile_ref)
+                        continue
                     profile = self.compatibility.get_profile(profile_ref.profile_id)
                     if not isinstance(profile, CompatibilityProfile):
                         diagnostics.append(
@@ -815,7 +839,7 @@ class RegisteredCaseService:
         )
         try:
             stored = self._storage(case_id).register_revision_if_current(
-                revision, expected_generation=draft.generation
+                revision, expected_generation=draft.generation, mesh_quality_required=True
             )
         except StorageConflictError as error:
             raise ConcurrentUpdateError(str(error)) from error
@@ -832,6 +856,16 @@ class RegisteredCaseService:
         if not callable(register):
             raise ServiceConflictError("configured compatibility registry is read-only")
         return register(profile)
+
+    def register_mesh_quality(
+        self, case_id: str, record: MeshQualityRegistration
+    ) -> NumericalProfileRef:
+        return self._storage(case_id).register_mesh_quality(record)
+
+    def resolve_mesh_quality(
+        self, case_id: str, ref: NumericalProfileRef
+    ) -> MeshQualityRegistration:
+        return self._storage(case_id).resolve_mesh_quality(ref)
 
     def _execute_registered(
         self,
@@ -856,6 +890,7 @@ class RegisteredCaseService:
             storage.evidence_snapshot(),
             storage.revision_snapshot(case_id, revision_id) as revision,
         ):
+            storage.resolve_revision_mesh_quality(revision)
             validated = self._validate(case_id)
             draft = validated.draft
             if (
