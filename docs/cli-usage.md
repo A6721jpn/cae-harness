@@ -55,7 +55,11 @@ febio-cae case --state-dir '<STATE_DIR>' run-demo '<CASE_ID>' --revision-id '<RE
 
 ## 既存Studioセッションのプレビュー観測
 
-公開`preview`はStudioを起動せず、指定された既存セッションを観測する。登録された出力manifest、実際のウィンドウID、Studio実行ファイル、タイムアウトを明示する。単に画面が開いているだけではプレビュー証跡の成立を意味しない。
+公開`preview`はStudioを起動せず、指定された既存セッションに対する外部の独立した操作者・観測側の証跡を受け付ける。登録された出力manifest、実際のウィンドウID、Studio実行ファイルに加え、Windowsのリダイレクトされた標準入力PIPEで観測応答を返す仕組みが必要となる。端末またはファイルを標準入力にした実行は拒否される。タイムアウトは有限の正数で120秒以下に指定する。
+
+観測側は標準出力の`PREVIEW_REQUESTED`を受け取り、その都度発行されたnonce、セッション、ソースファイル・digest、要求された表示状態・時刻・変数・成分・座標系・単位に結び付く新鮮な観測結果を、改行終端のUTF-8 JSON 1件として標準入力PIPEへ返す必要がある。独立した観測者の帰属情報と、要求発行後に新規取得したPNGキャプチャも必要で、有限の期限内に検証される。静的な確認JSONや過去のキャプチャの再利用では成立しない。正確な通信仕様は[CLI観測プロトコル](../src/febio_cae/cli/preview.py)、応答の照合・キャプチャ要件は[観測検証処理](../src/febio_cae/application/_preview.py)を参照する。
+
+この外部観測を行う公開のエンドユーザー向けヘルパーは現行CLIにはない。下の`preview`行は引数の構文だけを示し、通常の端末から単独で実行してもStudio確認は完了できない。CLI自体が独立した観測やPNG取得を代行するわけではなく、画面が開いているだけでもプレビュー証跡は成立しない。
 
 ```powershell
 febio-cae case --state-dir '<STATE_DIR>' preview '<CASE_ID>' --manifest-id '<MANIFEST_ID>' --window-id '<WINDOW_ID>' --studio '<STUDIO_EXE>' --timeout '<TIMEOUT_SECONDS>' --json
