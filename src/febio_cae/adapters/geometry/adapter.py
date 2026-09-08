@@ -911,26 +911,17 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
                 self._raise(
                     PortErrorCategory.INTEGRITY, "backend element references an unknown node"
                 )
-            corner_points = tuple(
-                nodes[node_id - node_start].coordinates_si for node_id in canonical_node_ids[:4]
-            )
-            signed_volume = _signed_volume_points(corner_points)
-            if signed_volume <= 0.0:
-                self._raise(
-                    PortErrorCategory.QUALITY,
-                    f"element {source_id} has non-positive canonical Tet10 corner volume",
-                )
-            signed_volumes.append(signed_volume)
             from .quadratic_quality import require_positive_quadratic_mapping
 
             try:
-                require_positive_quadratic_mapping(
+                signed_volume = require_positive_quadratic_mapping(
                     tuple(
                         nodes[node_id - node_start].coordinates_si for node_id in canonical_node_ids
                     )
                 )
             except ValueError as error:
                 self._raise(PortErrorCategory.QUALITY, f"element {source_id}: {error}")
+            signed_volumes.append(signed_volume)
             elements.append(
                 MeshElement(
                     element_id=element_map[source_id],

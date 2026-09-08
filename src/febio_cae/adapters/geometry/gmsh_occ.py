@@ -460,15 +460,6 @@ class GmshOCCBackend:
                 canonical_nodes = tuple(
                     backend_nodes[position] for position in BACKEND_TET10_TO_CANONICAL_POSITIONS
                 )
-                volume = _signed_volume(
-                    tuple(node_coordinates[node_id] for node_id in canonical_nodes[:4])
-                )
-                if volume <= 0.0:
-                    raise BackendError(
-                        BackendErrorCategory.QUALITY,
-                        f"Gmsh Tet10 element {element_id} has non-positive corner volume",
-                    )
-                contexts.append(_ElementContext(element_id, backend_nodes, canonical_nodes))
                 from .quadratic_quality import require_positive_quadratic_mapping
 
                 try:
@@ -477,6 +468,7 @@ class GmshOCCBackend:
                     )
                 except ValueError as error:
                     raise BackendError(BackendErrorCategory.QUALITY, str(error)) from error
+                contexts.append(_ElementContext(element_id, backend_nodes, canonical_nodes))
         if not contexts:
             raise BackendError(
                 BackendErrorCategory.UNSUPPORTED_CAPABILITY,
