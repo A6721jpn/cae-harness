@@ -15,6 +15,8 @@ from febio_cae.application.service import (
     ServiceResult,
 )
 from febio_cae.application.specs import SpecInputError, parse_spec_request
+from febio_cae.domain.case_patch import CasePatch
+from febio_cae.domain.codec import decode_record
 from febio_cae.domain.lifecycle import ServiceErrorCategory
 from febio_cae.domain.ports import PortError
 from febio_cae.storage.registry import StorageConflictError, StorageIntegrityError
@@ -187,6 +189,16 @@ def run_case(arguments: Namespace) -> int:
                 evidence=request.evidence,
                 source_declarations=request.source_declarations,
                 input_intent=request.input_intent,
+            )
+            result = ServiceResult("UPDATED", arguments.case_id, draft=draft)
+            _print(result.to_dict()) if arguments.json else print(draft.generation)
+            return 0
+        if arguments.case_action == "patch":
+            patch = decode_record(
+                json.dumps(_read_json(Path(arguments.file)), ensure_ascii=False), CasePatch
+            )
+            draft = service.apply_patch(
+                arguments.case_id, patch, expected_generation=arguments.expected_generation
             )
             result = ServiceResult("UPDATED", arguments.case_id, draft=draft)
             _print(result.to_dict()) if arguments.json else print(draft.generation)
