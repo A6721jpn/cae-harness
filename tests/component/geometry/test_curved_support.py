@@ -43,9 +43,10 @@ def _case(revision: Any, kind: str, *, size: float = 0.005, refinements: int = 5
 
 
 def _adapter(backend: Any, source: Any, revision: Any, error: float, bad: str = "") -> Any:
-    kwargs: dict[str, Any] = dict(
-        source_resolver=SyntheticSourceResolver(source), source_asset=source.source_asset
-    )
+    kwargs: dict[str, Any] = {
+        "source_resolver": SyntheticSourceResolver(source),
+        "source_asset": source.source_asset,
+    }
     # Keep pre-implementation RED behavioral: exercise the existing curved refusal,
     # not a missing import or an unknown constructor keyword.
     if "resolve_mesh_quality" in inspect.signature(StepGeometryMeshAdapter).parameters:
@@ -113,6 +114,24 @@ def test_supported_curved_mesh_has_bounded_closed_contact_boundary(
                         distance = min(abs(math.hypot(x, y) - 0.002), abs(abs(z) - 0.002))
                     sampled_error = max(sampled_error, distance)
         assert sampled_error <= record.value + 1e-15
+        triangles = [
+            tuple(
+                tuple(nodes[i][j] - (0.02 if j == 2 else 0) for j in range(3))
+                for i in f.node_ids[:3]
+            )
+            for f in faces
+        ]
+        # Independently intersect rays from the center toward exact analytic
+        # surface points, checking the reverse direction on side AND end caps.
+        for index in range(24):
+            angle = 2 * math.pi * (index + 0.37) / 24
+            for axial in (-1.0, -0.7, 0.0, 0.4, 1.0):
+                r = 0.002 * (math.sqrt(1 - axial * axial) if kind == "sphere" else 1)
+                target = (r * math.cos(angle), r * math.sin(angle), 0.002 * axial)
+                hits = [_ray_fraction(target, triangle) for triangle in triangles]
+                hit = next((t for t in hits if t is not None), None)
+                assert hit is not None, "closed radial boundary has a hole"
+                assert abs(1 - hit) * math.sqrt(sum(x * x for x in target)) <= record.value + 1e-14
         assert edges and all(count == 1 and edges[v, u] == 1 for (u, v), count in edges.items())
         tool_faces = {f.face_id for f in faces}
         assert all(
@@ -184,3 +203,48 @@ def test_global_size_refines_volume_not_only_surface(
             for a, b in combinations(e.node_ids[:4], 2)
         )
     assert counts[1] > counts[0]
+
+
+def _ray_fraction(target: Any, triangle: Any) -> float | None:
+    a, b, c = triangle
+
+    def sub(u: Any, v: Any) -> tuple[float, ...]:
+        return tuple(u[j] - v[j] for j in range(3))
+
+    def cross(u: Any, v: Any) -> tuple[float, ...]:
+        return (u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0])
+
+    def dot(u: Any, v: Any) -> float:
+        return sum(u[j] * v[j] for j in range(3))
+
+    e, f = sub(b, a), sub(c, a)
+    p = cross(target, f)
+    det = dot(e, p)
+    if abs(det) < 1e-25:
+        return None
+    s = tuple(-x for x in a)
+    u = dot(s, p) / det
+    q = cross(s, e)
+    v = dot(target, q) / det
+    t = dot(f, q) / det
+    return t if u >= -1e-10 and v >= -1e-10 and u + v <= 1 + 1e-10 and t > 0 else None
+
+
+def test_elapsed_budget_not_reset_after_provider(
+    synthetic_backend: Any,
+    source_content: Any,
+    synthetic_case_revision: Any,
+    monkeypatch: Any,
+) -> None:
+    revision = _case(synthetic_case_revision, "sphere")
+    adapter = _adapter(synthetic_backend, source_content, revision, 0.0002)
+    provider = adapter._resolve_mesh_quality
+
+    def delayed(ref: Any) -> Any:
+        criteria = provider(ref)
+        monkeypatch.setattr("time.monotonic", lambda: 1e20)
+        return criteria
+
+    adapter._resolve_mesh_quality = delayed
+    with pytest.raises(PortError, match="elapsed budget"):
+        adapter.mesh(revision)

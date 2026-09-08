@@ -34,17 +34,33 @@ class SessionDouble:
 
 def test_existing_session_is_refused_without_any_mutation() -> None:
     fake = SessionDouble(True)
-    with pytest.raises(BackendError, match="initialized.*unowned"):
-        with _GmshSession(fake, "OpenCASCADE"):
-            pass
+    with (
+        pytest.raises(BackendError, match="initialized.*unowned"),
+        _GmshSession(fake, "OpenCASCADE"),
+    ):
+        pass
     assert fake.models == ["caller-model"]
     assert fake.initialized and fake.events == []
 
 
 def test_owned_session_finalized_on_failure() -> None:
     fake = SessionDouble(False)
-    with pytest.raises(RuntimeError, match="operation failed"):
-        with _GmshSession(fake, "OpenCASCADE"):
-            raise RuntimeError("operation failed")
+    with pytest.raises(RuntimeError, match="operation failed"), _GmshSession(fake, "OpenCASCADE"):
+        raise RuntimeError("operation failed")
+    assert fake.events.count("finalize") == 1
+    assert not fake.initialized
+
+
+def test_initialization_failure_preserves_owned_cleanup(monkeypatch: Any) -> None:
+    from febio_cae.adapters.geometry.backend import BackendErrorCategory
+
+    fake = SessionDouble(False)
+
+    def fail(*args: Any) -> None:
+        raise BackendError(BackendErrorCategory.ENVIRONMENT, "option failed")
+
+    monkeypatch.setattr(fake, "setNumber", fail)
+    with pytest.raises(BackendError, match="option failed"), _GmshSession(fake, "OpenCASCADE"):
+        pass
     assert fake.events.count("finalize") == 1
     assert not fake.initialized
