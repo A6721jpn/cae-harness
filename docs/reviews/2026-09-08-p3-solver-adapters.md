@@ -13,6 +13,16 @@ and runner contracts. This is a test/report migration, not a new production
 implementation or native qualification. Whole-candidate independent review
 and acceptance remain pending; this report does not authorize integration.
 
+Current disposition: Q-H1 was independently ACCEPTED at `3014b0d`.
+Preview `6ccb9ad` was independently REJECTED for PV-H1 (High) and PV-M1
+(Medium). Migration `59e62f7` has no production delta and is not evidence of
+their repair. The subsequent source-callback correction reserves the preview
+ID before source access and rechecks retained issuance after the initial
+confirmation read. Its two primary behavioral RED cases failed before the
+production edit; all 37 focused preview cases then passed. Exact corrected
+candidate gates and independent acceptance are recorded separately; the old
+migration gates are historical migration evidence only.
+
 Migration base: `3014b0da79f1c6f3486f688af2adfaeffc003c5b`.
 The exact clean migration candidate and its fresh complete gate results are
 recorded separately after commit in the ignored local verification manifest.
@@ -104,8 +114,9 @@ output directory, and a clean wheel installation with installed CLI version
 and isolated synthetic numeric consumer. Record exact SHA, commands, counts,
 exit codes, artifact hashes, source/installed identity, and clean status.
 
-The next decision is exact whole-candidate review, including pending finite
-preview and geometry-binding review outcomes. Local passing gates do not
+The next decision is exact review of the corrected preview source followed by
+whole-candidate review. Q-H1 is accepted; preview acceptance remains pending
+after the rejected `6ccb9ad` candidate. Local passing gates do not
 establish publication authority, connected application/storage integration,
 native solver/viewer qualification, or final BottomFrame E2E. Real E2E and
 native evidence remain unverified; project completion is not claimed.

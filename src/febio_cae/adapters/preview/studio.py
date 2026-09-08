@@ -126,6 +126,9 @@ class PreviewAdapter:
                 PortErrorCategory.INTEGRITY, "manifest must contain exactly one result XPLT"
             )
         entry = entries[0]
+        # Source properties/reads are integration callbacks too. Reserve before
+        # the first callback; an unsuccessful read still consumes this identity.
+        self._used_ids.add(request.preview_id)
         path = Path(self.source.path).resolve()
         self._read_bound(path, entry)
         binding = PreviewBinding(
@@ -150,9 +153,6 @@ class PreviewAdapter:
             (),
             (),
         )
-        # Reserve before calling an integration: reentrant/repeated requests
-        # cannot create a second invocation under the same public receipt ID.
-        self._used_ids.add(request.preview_id)
         if self.launcher is None:
             return receipt
         try:
@@ -183,6 +183,11 @@ class PreviewAdapter:
             self._read_bound(issued.binding.path, issued.entry)
         except (OSError, RuntimeError, TypeError, ValueError):
             return self._invalidate(issued)
+        if self._issued.get(receipt.receipt_id) != issued:
+            # A nested source callback may have retained an invalidation even
+            # though the outer read sees restored bytes. Do not return stale
+            # confirmation or invoke an observer against that superseded issue.
+            return self._failed(receipt)
         if receipt.status is PreviewStatus.CONFIRMED:
             return receipt
         if not evidence:
