@@ -94,6 +94,7 @@ def _build(
     "failure",
     [
         "none",
+        "state-time",
         "missing-output",
         "running",
         "retarget",
@@ -160,7 +161,11 @@ def test_registered_execution_publication_boundary(tmp_path: Path, failure: str)
                     attempt.attempt_id,
                 ),
                 _profile(bundle.profile_id).output_mappings[0],
-                "load" if failure == "wrong-axis" else "time",
+                "load"
+                if failure == "wrong-axis"
+                else "state_time"
+                if failure == "state-time"
+                else "time",
                 "s",
                 (0.0,) if failure == "undercovered-numeric" else (0.0, 1.0),
                 ("node-1",),
