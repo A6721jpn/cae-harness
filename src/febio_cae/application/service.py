@@ -886,6 +886,29 @@ class RegisteredCaseService:
     def resolve_mesh_quality(self, case_id: str, ref: NumericalProfileRef) -> MeshQualityRecord:
         return self._storage(case_id).resolve_mesh_quality(ref)
 
+    @staticmethod
+    def _adopt_planar_mesh(
+        registration: PlanarDemoRegistration,
+        original: MeshArtifact,
+        carrier: CaseRevision,
+        revision: CaseRevision,
+    ) -> tuple[MeshArtifact, dict[str, object]]:
+        from ._adoption import adopt
+
+        def partial(spec: Any) -> PartialCaseSpec:
+            return PartialCaseSpec(
+                **{f.name: getattr(spec, f.name) for f in fields(PartialCaseSpec) if f.init}
+            )
+
+        return adopt(
+            registration,
+            original,
+            carrier,
+            revision,
+            _registered_selections(partial(carrier.spec)),
+            _registered_selections(partial(revision.spec)),
+        )
+
     def _execute_ports(
         self,
         case_id: str,
