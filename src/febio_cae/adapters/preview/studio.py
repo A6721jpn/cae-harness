@@ -1,15 +1,21 @@
-"""Hash-bound FEBio Studio launch and independent read confirmation."""
+"""Locally issued, artifact-bound Studio launch and independent confirmation.
+
+Launcher/observer hooks are trusted platform integrations, not native evidence
+by themselves. Bare booleans or unbound observations cannot qualify a preview.
+"""
 
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Protocol
+from uuid import uuid4
 
 from febio_cae.domain import (
     EvidenceRef,
+    FileEntry,
     PortError,
     PortErrorCategory,
     PreviewReceipt,
@@ -41,71 +47,144 @@ class FileSystemPreviewSource:
 
 
 @dataclass(frozen=True)
+class PreviewBinding:
+    """One locally issued invocation; hook results must identify this target."""
+
+    launch_id: str
+    receipt_id: str
+    manifest_id: str
+    path: Path
+    studio: ToolIdentity
+    xplt_digest: str
+    requested_state_ids: tuple[int, ...]
+    requested_variables: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class PreviewLaunchResult:
+    """Trusted launcher attests actual launch success for the exact binding."""
+
+    binding: PreviewBinding
+    launched: bool
+
+
+@dataclass(frozen=True)
 class PreviewObservation:
+    """Trusted observer attests the tool/artifact actually loaded and evidence.
+
+    An integration must derive the returned identity from its observation, not
+    merely echo the requested target. Native integration qualification is separate.
+    """
+
     state_ids: tuple[int, ...]
     variables: tuple[str, ...]
+    binding: PreviewBinding | None = None
+    evidence: tuple[EvidenceRef, ...] = ()
+
+
+@dataclass(frozen=True)
+class _IssuedPreview:
+    receipt: PreviewReceipt
+    binding: PreviewBinding
+    entry: FileEntry
 
 
 class PreviewAdapter:
-    """The request hash and independent observation are separate evidence steps."""
+    """Launch is not confirmation; only an exact locally issued receipt may advance."""
 
     def __init__(
         self,
         *,
         studio: ToolIdentity,
         source: PreviewSource,
-        launcher: Callable[[Path, ToolIdentity], bool] | None = None,
-        observer: Callable[[Path, ToolIdentity], PreviewObservation] | None = None,
+        launcher: Callable[[PreviewBinding], PreviewLaunchResult] | None = None,
+        observer: Callable[[PreviewBinding], PreviewObservation] | None = None,
     ) -> None:
         if not isinstance(studio, ToolIdentity):
             raise TypeError("studio must be a ToolIdentity")
         self.studio = studio
         self.source = source
-        self.launcher = launcher or (lambda _path, _studio: True)
+        self.launcher = launcher
         self.observer = observer
+        self._used_ids: set[str] = set()
+        self._issued: dict[str, _IssuedPreview] = {}
 
     def request(self, manifest: ResultManifest, request: PreviewRequest) -> PreviewReceipt:
         if request.manifest_id != manifest.manifest_id:
             raise PortError(
                 PortErrorCategory.CONFLICT, "preview request does not target the manifest"
             )
-        digest = self._current_digest(manifest)
-        launched = bool(self.launcher(self.source.path, self.studio))
-        status = PreviewStatus.LAUNCHED if launched else PreviewStatus.FAILED
-        return PreviewReceipt(
-            receipt_id=request.preview_id,
-            manifest_id=manifest.manifest_id,
-            xplt_digest=digest,
-            studio=self.studio,
-            status=status,
-            requested_state_ids=request.state_ids,
-            requested_variables=request.variables,
-            observed_state_ids=(),
-            observed_variables=(),
-            confirmation_evidence=(),
+        if request.preview_id in self._used_ids:
+            raise PortError(PortErrorCategory.CONFLICT, "preview identity was already used")
+        entries = [
+            entry
+            for entry in manifest.files
+            if entry.role == "result" and entry.logical_path.endswith(".xplt")
+        ]
+        if len(entries) != 1:
+            raise PortError(
+                PortErrorCategory.INTEGRITY, "manifest must contain exactly one result XPLT"
+            )
+        entry = entries[0]
+        path = Path(self.source.path).resolve()
+        self._read_bound(path, entry)
+        binding = PreviewBinding(
+            uuid4().hex,
+            request.preview_id,
+            manifest.manifest_id,
+            path,
+            self.studio,
+            entry.digest,
+            tuple(request.state_ids),
+            tuple(request.variables),
         )
+        receipt = PreviewReceipt(
+            request.preview_id,
+            manifest.manifest_id,
+            entry.digest,
+            self.studio,
+            PreviewStatus.FAILED,
+            request.state_ids,
+            request.variables,
+            (),
+            (),
+            (),
+        )
+        # Reserve before calling an integration: reentrant/repeated requests
+        # cannot create a second invocation under the same public receipt ID.
+        self._used_ids.add(request.preview_id)
+        if self.launcher is None:
+            return receipt
+        try:
+            result = self.launcher(binding)
+            if (
+                not isinstance(result, PreviewLaunchResult)
+                or result.launched is not True
+                or result.binding != binding
+            ):
+                return receipt
+            self._read_bound(path, entry)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return receipt
+        receipt = replace(receipt, status=PreviewStatus.LAUNCHED)
+        self._issued[receipt.receipt_id] = _IssuedPreview(receipt, binding, entry)
+        return receipt
 
-    def confirm(
-        self, receipt: PreviewReceipt, evidence: tuple[EvidenceRef, ...] | list[EvidenceRef]
-    ) -> PreviewReceipt:
+    def confirm(self, receipt: PreviewReceipt, evidence: Sequence[EvidenceRef]) -> PreviewReceipt:
         if not isinstance(receipt, PreviewReceipt):
             raise TypeError("receipt must be a PreviewReceipt")
-        if receipt.status is PreviewStatus.CONFIRMED:
-            try:
-                current_digest = hashlib.sha256(self.source.read()).hexdigest()
-            except OSError:
-                return self._failed(receipt, "preview file is unavailable after confirmation")
-            if current_digest != receipt.xplt_digest:
-                return self._failed(receipt, "preview XPLT changed after confirmation")
-            return receipt
-        if receipt.status is not PreviewStatus.LAUNCHED:
-            raise PortError(PortErrorCategory.CONFLICT, "only a launched preview can be confirmed")
+        issued = self._issued.get(receipt.receipt_id)
+        if issued is None or receipt != issued.receipt or receipt.studio != self.studio:
+            # A forged caller record does not revoke the actual locally issued record.
+            return self._failed(receipt)
+        if receipt.status not in {PreviewStatus.LAUNCHED, PreviewStatus.CONFIRMED}:
+            raise PortError(PortErrorCategory.CONFLICT, "preview cannot be confirmed in this state")
         try:
-            current_digest = hashlib.sha256(self.source.read()).hexdigest()
-        except OSError as error:
-            return self._failed(receipt, f"preview file is unavailable: {error}")
-        if current_digest != receipt.xplt_digest:
-            return self._failed(receipt, "preview XPLT changed after launch")
+            self._read_bound(issued.binding.path, issued.entry)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return self._invalidate(issued)
+        if receipt.status is PreviewStatus.CONFIRMED:
+            return receipt
         if not evidence:
             raise PortError(
                 PortErrorCategory.INTEGRITY, "confirmation requires independent evidence"
@@ -116,62 +195,68 @@ class PreviewAdapter:
                 "independent Studio observation is unavailable",
             )
         try:
-            observation = self.observer(self.source.path, self.studio)
-        except (OSError, RuntimeError, TypeError, ValueError) as error:
-            return self._failed(receipt, f"Studio observation failed: {error}")
-        if not isinstance(observation, PreviewObservation):
-            return self._failed(receipt, "Studio observation has an invalid shape")
-        observed_states = tuple(observation.state_ids)
-        observed_variables = tuple(observation.variables)
-        if not set(receipt.requested_state_ids).issubset(observed_states):
-            return self._failed(receipt, "Studio observation did not include all requested states")
-        if not set(receipt.requested_variables).issubset(observed_variables):
-            return self._failed(
-                receipt, "Studio observation did not include all requested variables"
+            observation = self.observer(issued.binding)
+            if (
+                not isinstance(observation, PreviewObservation)
+                or observation.binding != issued.binding
+                or tuple(observation.evidence) != tuple(evidence)
+                or not set(receipt.requested_state_ids).issubset(observation.state_ids)
+                or not set(receipt.requested_variables).issubset(observation.variables)
+            ):
+                return self._invalidate(issued)
+            self._read_bound(issued.binding.path, issued.entry)
+            if self._issued.get(receipt.receipt_id) != issued:
+                # Observation callbacks may allow another check to invalidate
+                # the receipt. Restored bytes do not erase that observed failure.
+                return self._failed(receipt)
+            confirmed = receipt.confirmed(
+                evidence=observation.evidence,
+                observed_state_ids=observation.state_ids,
+                observed_variables=observation.variables,
             )
-        return receipt.confirmed(
-            evidence=evidence,
-            observed_state_ids=observed_states,
-            observed_variables=observed_variables,
-        )
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return self._invalidate(issued)
+        self._issued[receipt.receipt_id] = replace(issued, receipt=confirmed)
+        return confirmed
 
-    def _current_digest(self, manifest: ResultManifest) -> str:
-        entries = [
-            entry
-            for entry in manifest.files
-            if entry.role == "result" and entry.logical_path.endswith(".xplt")
-        ]
-        if len(entries) != 1:
-            raise PortError(
-                PortErrorCategory.INTEGRITY, "manifest must contain exactly one result XPLT"
-            )
+    def _read_bound(self, path: Path, entry: FileEntry) -> None:
         try:
+            if Path(self.source.path).resolve() != path:
+                raise ValueError("preview source path changed")
             content = self.source.read()
-        except OSError as error:
+            if (
+                not isinstance(content, bytes)
+                or Path(self.source.path).resolve() != path
+                or len(content) != entry.size_bytes
+                or hashlib.sha256(content).hexdigest() != entry.digest
+            ):
+                raise ValueError("preview XPLT differs from its registered artifact")
+        except (OSError, ValueError, TypeError) as error:
             raise PortError(
-                PortErrorCategory.INTEGRITY, f"preview XPLT is unavailable: {error}"
+                PortErrorCategory.INTEGRITY, f"preview source is unavailable or changed: {error}"
             ) from error
-        digest = hashlib.sha256(content).hexdigest()
-        if digest != entries[0].digest or len(content) != entries[0].size_bytes:
-            raise PortError(
-                PortErrorCategory.INTEGRITY, "preview XPLT does not match the registered manifest"
-            )
-        return digest
+
+    def _invalidate(self, issued: _IssuedPreview) -> PreviewReceipt:
+        failed = self._failed(issued.receipt)
+        self._issued[failed.receipt_id] = replace(issued, receipt=failed)
+        return failed
 
     @staticmethod
-    def _failed(receipt: PreviewReceipt, _reason: str) -> PreviewReceipt:
-        return PreviewReceipt(
-            receipt_id=receipt.receipt_id,
-            manifest_id=receipt.manifest_id,
-            xplt_digest=receipt.xplt_digest,
-            studio=receipt.studio,
+    def _failed(receipt: PreviewReceipt) -> PreviewReceipt:
+        return replace(
+            receipt,
             status=PreviewStatus.FAILED,
-            requested_state_ids=receipt.requested_state_ids,
-            requested_variables=receipt.requested_variables,
             observed_state_ids=(),
             observed_variables=(),
             confirmation_evidence=(),
         )
 
 
-__all__ = ["FileSystemPreviewSource", "PreviewAdapter", "PreviewObservation", "PreviewRequest"]
+__all__ = [
+    "FileSystemPreviewSource",
+    "PreviewAdapter",
+    "PreviewBinding",
+    "PreviewLaunchResult",
+    "PreviewObservation",
+    "PreviewRequest",
+]
