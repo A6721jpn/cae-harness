@@ -17,6 +17,7 @@ import pytest
 
 from febio_cae.adapters.febio.compiler import CompilerAdapter, LocalBundleStore
 from febio_cae.domain import (
+    CapabilityRef,
     CapabilityStatus,
     CaseRevision,
     CompatibilityProfile,
@@ -229,7 +230,7 @@ def test_contact_direction_fails_closed_before_staging(tmp_path: Path, invalid: 
     )
     others = tuple(item for item in profile.capabilities if item != old)
     new = replace(old, capability_id="febio.contact.primary_part_secondary_tool")
-    directions = (new,)
+    directions: tuple[CapabilityRef, ...] = (new,)
     if invalid == "absent":
         directions = ()
     elif invalid == "ambiguous":

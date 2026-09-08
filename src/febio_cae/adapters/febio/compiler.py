@@ -371,7 +371,7 @@ class CompilerAdapter:
             }
         ]
         if len(directions) != 1:
-            self._unsupported("exactly one explicit contact direction is required")
+            self._unsupported("exactly one explicit contact direction capability is required")
         return directions[0]
 
     @staticmethod
