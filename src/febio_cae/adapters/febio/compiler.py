@@ -3,24 +3,79 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 import tempfile
 import xml.etree.ElementTree as ET
+from itertools import pairwise
 from pathlib import Path
-from typing import Any, Final, Protocol
+from typing import Final, NoReturn, Protocol
 
 from febio_cae.domain import (
+    AsPlaced,
     CapabilityStatus,
     CaseRevision,
     CompatibilityProfile,
+    CoulombFriction,
     ExecutionBundle,
     ExecutionSetting,
     FileEntry,
+    Frictionless,
+    IsotropicLinearElastic,
     MeshArtifact,
     PortError,
     PortErrorCategory,
+    Quantity,
+    SelectionRef,
 )
 from febio_cae.domain.artifacts import TET10_NODE_ORDER_ID, validate_logical_path
+from febio_cae.domain.rigid_kinematics import check_translational_indentation_compatibility
+
+# This adapter dialect is deliberately separate from the solver's version.
+_FEB_SCHEMA = "4.0"
+_SOLVER_VERSION = "4.12.0"
+_CAPABILITY_VERSION = "4.12.0/0x35"
+_CONTACT_CONTROLS: Final[frozenset[str]] = frozenset(
+    {
+        "penalty",
+        "auto_penalty",
+        "update_penalty",
+        "laugon",
+        "tolerance",
+        "gaptol",
+        "search_tol",
+        "search_radius",
+        "two_pass",
+    }
+)
+_SOLVER_CONTROLS: Final[frozenset[str]] = frozenset(
+    {
+        "alpha",
+        "dtol",
+        "etol",
+        "rtol",
+        "max_refs",
+        "diverge_reform",
+        "reform_each_time_step",
+        "min_residual",
+    }
+)
+_BOOLEAN_CONTROLS: Final[frozenset[str]] = frozenset(
+    {
+        "auto_penalty",
+        "update_penalty",
+        "two_pass",
+        "diverge_reform",
+        "reform_each_time_step",
+    }
+)
+_PLOT_VARIABLES: Final[dict[str, tuple[str, str, str]]] = {
+    "displacement": ("node", "VEC3F", "m"),
+    "reaction forces": ("node", "VEC3F", "N"),
+    "rigid force": ("rigid_body", "VEC3F", "N"),
+    "rigid position": ("rigid_body", "VEC3F", "m"),
+    "stress": ("element", "MAT3FS", "Pa"),
+}
 
 _REQUIRED_CAPABILITIES: Final[frozenset[str]] = frozenset(
     {
@@ -114,7 +169,9 @@ class CompilerAdapter:
                 (
                     revision.spec_digest.encode(),
                     mesh.artifact_digest.encode(),
-                    profile.profile_id.encode(),
+                    profile.to_bytes(),
+                    content,
+                    self.executable.encode(),
                 )
             )
         ).hexdigest()
@@ -131,12 +188,29 @@ class CompilerAdapter:
             profile_id=profile.profile_id,
             tool=profile.solver,
             files=(file_entry,),
-            argv=(self.executable, "-i", "input/case.feb", "-o", "output/results.xplt"),
+            argv=(
+                self.executable,
+                "-i",
+                "input/case.feb",
+                "-o",
+                "output/solver.log",
+                "-p",
+                "output/results.xplt",
+                "-noappend",
+                "-noconfig",
+            ),
             cwd=str(getattr(self.store, "root", Path.cwd())),
             thread_count=1,
             settings=(
                 ExecutionSetting("solver_threads", 1),
                 ExecutionSetting("xplt_version", "0x35"),
+                ExecutionSetting("feb_schema_version", _FEB_SCHEMA),
+                ExecutionSetting(
+                    "compatibility_profile_digest", hashlib.sha256(profile.to_bytes()).hexdigest()
+                ),
+                ExecutionSetting("compiler_dialect", "feb4-static-tet10-v1"),
+                ExecutionSetting("output_plot_path", "output/results.xplt"),
+                ExecutionSetting("output_log_path", "output/solver.log"),
             ),
         )
         self.store.stage(bundle.bundle_id, file_entry.logical_path, content)
@@ -153,6 +227,25 @@ class CompilerAdapter:
             raise PortError(
                 PortErrorCategory.INVALID_INPUT, "profile must be a CompatibilityProfile"
             )
+        if profile.solver.version != _SOLVER_VERSION:
+            self._unsupported("solver version is not supported by the FEB 4.0 dialect")
+        if not profile.evidence:
+            self._unsupported("compatibility profile has no registration evidence")
+        if not isinstance(revision.spec.material, IsotropicLinearElastic):
+            self._unsupported("material model is not enabled by this compiler")
+        if not isinstance(revision.spec.contact.arrangement, AsPlaced):
+            self._unsupported(
+                "specified-gap arrangement requires verified placement provenance not available to this compiler"
+            )
+        if mesh.frame != revision.spec.geometry.placement.target_frame:
+            self._unsupported("mesh and physical conditions must use the same frame")
+        compatibility = check_translational_indentation_compatibility(
+            revision.spec.rigid_tool, revision.spec.motion
+        )
+        if not compatibility.supported:
+            self._unsupported(compatibility.reason or "unsupported rigid motion")
+        self._validate_controls(revision)
+        self._timeline(revision)
         if mesh.provenance.source_geometry_digest != revision.spec.geometry.geometry_digest:
             raise PortError(
                 PortErrorCategory.INTEGRITY, "mesh geometry identity does not match revision"
@@ -172,17 +265,34 @@ class CompilerAdapter:
                 PortErrorCategory.INTEGRITY, "part and rigid-tool bodies must be distinct"
             )
         source_bodies = set(mesh.provenance.source_body_ids)
-        if not {part_body, tool_body}.issubset(source_bodies):
+        if source_bodies != {part_body, tool_body}:
             raise PortError(
                 PortErrorCategory.INTEGRITY,
                 "mesh provenance does not contain both declared part and tool bodies",
             )
         mesh_bodies = {element.body_id for element in mesh.elements}
-        if not {part_body, tool_body}.issubset(mesh_bodies):
+        if mesh_bodies != {part_body, tool_body}:
             raise PortError(
                 PortErrorCategory.INTEGRITY,
                 "mesh does not contain separate part and rigid-tool element ownership",
             )
+        part_nodes = {
+            node
+            for element in mesh.elements
+            if element.body_id == part_body
+            for node in element.node_ids
+        }
+        tool_nodes = {
+            node
+            for element in mesh.elements
+            if element.body_id == tool_body
+            for node in element.node_ids
+        }
+        if part_nodes & tool_nodes:
+            raise PortError(PortErrorCategory.INTEGRITY, "part and rigid tool must not share nodes")
+        for support in revision.spec.support.supports:
+            if support.frame != mesh.frame or support.transform is not None:
+                self._unsupported("transformed support conditions are not enabled by this dialect")
         selections = (
             revision.spec.contact.part_surface,
             revision.spec.contact.tool_surface,
@@ -214,6 +324,15 @@ class CompilerAdapter:
                 PortErrorCategory.UNSUPPORTED_CAPABILITY,
                 f"required capabilities unavailable: {detail}",
             )
+        for capability_id in _REQUIRED_CAPABILITIES:
+            capability = capabilities[capability_id]
+            if (
+                capability.version != _CAPABILITY_VERSION
+                or capability.compression != "none"
+                or capability.ordering_id != TET10_NODE_ORDER_ID
+                or not capability.evidence
+            ):
+                self._unsupported(f"unsupported capability profile declaration: {capability_id}")
         for request in revision.spec.outputs.requests:
             try:
                 mapping = profile.mapping_for(request.quantity_id)
@@ -227,26 +346,138 @@ class CompilerAdapter:
                     PortErrorCategory.UNSUPPORTED_CAPABILITY,
                     f"output location mismatch for {request.request_id}: {mapping.location} != {request.location}",
                 )
+            native = _PLOT_VARIABLES.get(mapping.native_name)
+            if native != (mapping.location, mapping.value_type, mapping.unit):
+                self._unsupported(
+                    f"unsupported native output mapping: {mapping.native_name}/{mapping.location}"
+                )
+            if (
+                mapping.frame != mesh.frame
+                or request.frame != mesh.frame
+                or mapping.measure_id != request.measure_id
+            ):
+                self._unsupported(f"output frame or measure mismatch: {request.request_id}")
+            if mapping.location == "rigid_body" and request.selection.body_id.value != tool_body:
+                self._unsupported("rigid output must identify the rigid-tool body")
+
+    @staticmethod
+    def _unsupported(reason: str) -> NoReturn:
+        raise PortError(PortErrorCategory.UNSUPPORTED_CAPABILITY, reason)
+
+    def _validate_controls(self, revision: CaseRevision) -> None:
+        controls = {item.name: item.value for item in revision.spec.solver_policy.controls}
+        missing = _CONTACT_CONTROLS - controls.keys()
+        unknown = controls.keys() - (_CONTACT_CONTROLS | _SOLVER_CONTROLS)
+        if missing or unknown:
+            self._unsupported(
+                f"explicit supported contact/solver controls required; missing={sorted(missing)}, unknown={sorted(unknown)}"
+            )
+        for name, value in controls.items():
+            if name in _BOOLEAN_CONTROLS:
+                if not isinstance(value, bool):
+                    self._unsupported(f"{name} requires an explicit boolean")
+            elif name in {"laugon", "max_refs"}:
+                if (
+                    type(value) is not int
+                    or value < 0
+                    or (name == "laugon" and value not in {0, 1})
+                ):
+                    self._unsupported(f"{name} requires a supported integer")
+            else:
+                expected_unit = "m" if name in {"gaptol", "search_radius"} else "1"
+                if isinstance(value, bool) or not isinstance(value, (Quantity, int)):
+                    self._unsupported(f"{name} requires numeric data")
+                if isinstance(value, Quantity):
+                    if value.dimension != Quantity(1, expected_unit).dimension:
+                        self._unsupported(f"{name} requires units compatible with {expected_unit}")
+                    number = value.to_si().value
+                else:
+                    if expected_unit != "1":
+                        self._unsupported(f"{name} requires a length Quantity")
+                    number = value
+                if number < 0 or (name in {"penalty", "search_radius"} and number == 0):
+                    self._unsupported(
+                        f"{name} must be nonnegative (penalty/radius strictly positive)"
+                    )
+        if controls["auto_penalty"] is not True:
+            self._unsupported(
+                "this dialect requires explicit auto_penalty=true and a dimensionless penalty factor"
+            )
+
+    def _timeline(self, revision: CaseRevision) -> tuple[int, tuple[float, ...]]:
+        spec = revision.spec
+        increments = spec.solver_policy.increments
+        start = spec.motion.samples[0].time.to_si().value
+        end = spec.motion.samples[-1].time.to_si().value
+        if start != 0:
+            self._unsupported(
+                "this single-step dialect requires the motion timeline to start at zero"
+            )
+        initial = increments.initial_step.to_si().value
+        steps = round(end / initial)
+        if steps < 1 or not math.isclose(steps * initial, end, rel_tol=1e-12, abs_tol=0):
+            self._unsupported("motion duration must be an integer multiple of initial_step")
+        points = tuple(
+            sorted(
+                {
+                    *(sample.time.to_si().value for sample in spec.motion.samples),
+                    *(point.to_si().value for point in increments.must_points),
+                    *(point.to_si().value for point in spec.outputs.saved_times),
+                }
+            )
+        )
+        if any(point < 0 or point > end for point in points):
+            self._unsupported("required state or must-point is outside the motion timeline")
+        if increments.adaptive:
+            minimum = increments.minimum_step.to_si().value
+            # A final fragment at each must-point may be smaller than dtmin.
+            bound = sum(math.ceil((b - a) / minimum - 1e-12) for a, b in pairwise(points))
+            if bound > increments.max_steps:
+                self._unsupported("adaptive dtmin/must-points cannot honor the max_steps bound")
+        else:
+            if steps > increments.max_steps or any(
+                not math.isclose(
+                    round(point / initial) * initial, point, rel_tol=1e-12, abs_tol=1e-15
+                )
+                for point in points
+            ):
+                self._unsupported("fixed time grid cannot honor required state times or max_steps")
+        return steps, points
 
     def _render(
         self, revision: CaseRevision, mesh: MeshArtifact, profile: CompatibilityProfile
     ) -> bytes:
         spec = revision.spec
-        root = ET.Element("febio_spec", {"version": self._febio_version(profile.solver.version)})
-        ET.SubElement(root, "Module", {"type": "solid"})
+        root = ET.Element("febio_spec", {"version": _FEB_SCHEMA})
+        module = ET.SubElement(root, "Module", {"type": "solid"})
+        ET.SubElement(module, "units").text = "SI"
         control = ET.SubElement(root, "Control")
-        ET.SubElement(control, "analysis").text = "static"
-        ET.SubElement(control, "time_steps").text = str(spec.solver_policy.increments.max_steps)
+        steps, must_points = self._timeline(revision)
+        ET.SubElement(control, "analysis", {"type": "static"})
+        ET.SubElement(control, "time_steps").text = str(steps)
         ET.SubElement(control, "step_size").text = self._quantity(
             spec.solver_policy.increments.initial_step
         )
-        ET.SubElement(control, "max_refs").text = str(
-            spec.solver_policy.increments.max_step_retries
-        )
-        ET.SubElement(control, "max_ups").text = "0"
+        ET.SubElement(control, "plot_level").text = "PLOT_MAJOR_ITRS"
+        ET.SubElement(control, "plot_zero_state").text = "1"
+        if spec.solver_policy.increments.adaptive:
+            stepper = ET.SubElement(control, "time_stepper", {"type": "default"})
+            ET.SubElement(stepper, "max_retries").text = str(
+                spec.solver_policy.increments.max_step_retries
+            )
+            ET.SubElement(stepper, "dtmin").text = self._quantity(
+                spec.solver_policy.increments.minimum_step
+            )
+            ET.SubElement(stepper, "dtmax", {"lc": "2"}).text = self._quantity(
+                spec.solver_policy.increments.maximum_step
+            )
+        solver = ET.SubElement(control, "solver", {"type": "solid"})
+        for setting in spec.solver_policy.controls:
+            if setting.name in _SOLVER_CONTROLS:
+                ET.SubElement(solver, setting.name).text = self._control_value(setting.value)
 
         materials = ET.SubElement(root, "Material")
-        if hasattr(spec.material, "youngs_modulus"):
+        if isinstance(spec.material, IsotropicLinearElastic):
             material = ET.SubElement(
                 materials,
                 "material",
@@ -259,110 +490,272 @@ class CompilerAdapter:
                 PortErrorCategory.UNSUPPORTED_CAPABILITY,
                 "material model is not enabled by this compiler",
             )
+        ET.SubElement(
+            materials,
+            "material",
+            {"id": "2", "name": "tool-rigid", "type": "rigid body"},
+        )
 
         mesh_section = ET.SubElement(root, "Mesh")
-        nodes = ET.SubElement(mesh_section, "Nodes", {"name": "part-and-tool"})
-        for node in mesh.nodes:
-            ET.SubElement(nodes, "node", {"id": str(node.node_id)}).text = " ".join(
-                self._float(value) for value in node.coordinates_si
-            )
-        elements = ET.SubElement(
-            mesh_section, "Elements", {"type": "tet10", "name": "part-and-tool"}
-        )
-        for element in mesh.elements:
-            ET.SubElement(
-                elements,
-                "elem",
-                {"id": str(element.element_id), "type": "tet10", "body": element.body_id},
-            ).text = " ".join(str(value) for value in element.node_ids)
-        surfaces = ET.SubElement(mesh_section, "SurfacePair", {"name": "contact-main"})
-        ET.SubElement(surfaces, "primary").text = spec.rigid_tool.contact_surface.name
-        ET.SubElement(surfaces, "secondary").text = spec.contact.part_surface.name
+        part_body = spec.geometry.body_id.value
+        tool_body = spec.rigid_tool.primitive.body_id.value
+        # Elements define implicit element sets; never collide with registered sets.
+        allocated = {item.set_id for item in mesh.sets}
+        group_names = {
+            part_body: self._allocate_name("compiled-part-elements", allocated),
+            tool_body: self._allocate_name("compiled-tool-elements", allocated),
+        }
+        body_node_ids = {
+            body: {
+                node_id
+                for element in mesh.elements
+                if element.body_id == body
+                for node_id in element.node_ids
+            }
+            for body in (part_body, tool_body)
+        }
+        for body, name in ((part_body, "part-nodes"), (tool_body, "tool-nodes")):
+            nodes = ET.SubElement(mesh_section, "Nodes", {"name": name})
+            for node in mesh.nodes:
+                if node.node_id in body_node_ids[body]:
+                    ET.SubElement(nodes, "node", {"id": str(node.node_id)}).text = ",".join(
+                        self._float(value) for value in node.coordinates_si
+                    )
+        for body, name in group_names.items():
+            elements = ET.SubElement(mesh_section, "Elements", {"type": "tet10", "name": name})
+            for element in mesh.elements:
+                if element.body_id == body:
+                    ET.SubElement(
+                        elements, "elem", {"id": str(element.element_id)}
+                    ).text = ",".join(str(value) for value in element.node_ids)
+
+        resolved = self._resolved_set_ids(revision, mesh)
         for item in mesh.sets:
-            set_element = ET.SubElement(
-                mesh_section, "Set", {"name": item.set_id, "type": item.kind, "body": item.body_id}
+            if item.kind == "face":
+                surface = ET.SubElement(mesh_section, "Surface", {"name": item.set_id})
+                for facet_index, face_id in enumerate(item.member_ids, 1):
+                    face = next(
+                        (candidate for candidate in mesh.faces if candidate.face_id == face_id),
+                        None,
+                    )
+                    if face is None:
+                        raise PortError(
+                            PortErrorCategory.INTEGRITY,
+                            f"mesh face set member is missing: {face_id}",
+                        )
+                    ET.SubElement(surface, "tri6", {"id": str(facet_index)}).text = ",".join(
+                        str(value) for value in face.node_ids
+                    )
+            elif item.kind in {"node", "element"}:
+                set_tag = "NodeSet" if item.kind == "node" else "ElementSet"
+                set_element = ET.SubElement(mesh_section, set_tag, {"name": item.set_id})
+                set_element.text = ",".join(str(member) for member in item.member_ids)
+        registered_node_sets = {item.set_id for item in mesh.sets if item.kind == "node"}
+        for (digest, kind), set_id in resolved.items():
+            if kind != "node" or set_id in registered_node_sets:
+                continue
+            item = next(
+                item
+                for item in mesh.sets
+                if item.kind == "face" and item.source_selection_digest == digest
             )
-            set_element.text = " ".join(str(value) for value in item.member_ids)
+            node_members = sorted(
+                {
+                    node_id
+                    for face_id in item.member_ids
+                    for face in mesh.faces
+                    if face.face_id == face_id
+                    for node_id in face.node_ids
+                }
+            )
+            node_set = ET.SubElement(mesh_section, "NodeSet", {"name": set_id})
+            node_set.text = ",".join(str(node) for node in node_members)
+            registered_node_sets.add(set_id)
+
+        pair_name = self._allocate_name("compiled-contact-pair", allocated)
+        pair = ET.SubElement(mesh_section, "SurfacePair", {"name": pair_name})
+        ET.SubElement(pair, "primary").text = resolved[
+            (self._selection_digest(spec.contact.tool_surface), "face")
+        ]
+        ET.SubElement(pair, "secondary").text = resolved[
+            (self._selection_digest(spec.contact.part_surface), "face")
+        ]
+
+        domains = ET.SubElement(root, "MeshDomains")
+        ET.SubElement(
+            domains,
+            "SolidDomain",
+            {"name": group_names[part_body], "mat": "part-material"},
+        )
+        ET.SubElement(
+            domains,
+            "SolidDomain",
+            {"name": group_names[tool_body], "mat": "tool-rigid"},
+        )
 
         boundary = ET.SubElement(root, "Boundary")
         for support in spec.support.supports:
-            fixed = ",".join(
-                axis for axis in ("x", "y", "z") if getattr(support, axis).state == "fixed"
-            )
-            ET.SubElement(
+            fixed = ET.SubElement(
                 boundary,
-                "fix",
-                {"bc": fixed, "set": support.selection.name, "frame": support.frame.value},
-            )
-        rigid = ET.SubElement(
-            root,
-            "Rigid",
-            {
-                "body": spec.rigid_tool.primitive.body_id.value,
-                "kind": spec.rigid_tool.primitive.kind,
-            },
-        )
-        for axis in ("x", "y", "z", "rx", "ry", "rz"):
-            ET.SubElement(
-                rigid, "dof", {"axis": axis, "state": getattr(spec.rigid_tool.dofs, axis).state}
-            )
-        motion = ET.SubElement(root, "LoadData")
-        load = ET.SubElement(
-            motion,
-            "load_controller",
-            {"id": "motion-main", "type": "loadcurve", "interpolate": "linear"},
-        )
-        for sample in spec.motion.samples:
-            ET.SubElement(
-                load, "point"
-            ).text = f"{sample.time.to_si().value:.17g},{sample.displacement.to_si().value:.17g}"
-        loads = ET.SubElement(root, "Loads")
-        ET.SubElement(
-            loads,
-            "prescribed",
-            {"bc": "z", "set": spec.rigid_tool.contact_surface.name, "lc": "motion-main"},
-        )
-        contacts = ET.SubElement(root, "Contact")
-        contact = ET.SubElement(
-            contacts, "contact", {"type": "sliding-elastic", "id": spec.contact.contact_id.value}
-        )
-        ET.SubElement(contact, "primary").text = spec.rigid_tool.contact_surface.name
-        ET.SubElement(contact, "secondary").text = spec.contact.part_surface.name
-        ET.SubElement(contact, "friction").text = (
-            "0" if spec.contact.friction.__class__.__name__ == "Frictionless" else "explicit"
-        )
-        ET.SubElement(contact, "penalty").text = "explicit-profile"
-        output = ET.SubElement(root, "Output")
-        ET.SubElement(output, "plotfile", {"type": "plot", "file": "output/results.xplt"})
-        for request in spec.outputs.requests:
-            mapping = profile.mapping_for(request.quantity_id)
-            ET.SubElement(
-                output,
-                "plotvar",
+                "bc",
                 {
-                    "name": mapping.native_name,
-                    "canonical": mapping.canonical_id,
-                    "location": request.location,
-                    "set": request.selection.name,
-                    "unit": mapping.unit,
+                    "type": "zero displacement",
+                    "name": support.support_id.value,
+                    "node_set": resolved[(self._selection_digest(support.selection), "node")],
                 },
             )
+            for axis in ("x", "y", "z"):
+                ET.SubElement(fixed, f"{axis}_dof").text = (
+                    "1" if getattr(support, axis).state == "fixed" else "0"
+                )
+        rigid = ET.SubElement(root, "Rigid")
+        fixed_rigid = ET.SubElement(rigid, "rigid_bc", {"type": "rigid_fixed"})
+        ET.SubElement(fixed_rigid, "rb").text = "tool-rigid"
+        for axis, native_dof in zip(
+            ("x", "y", "z", "rx", "ry", "rz"),
+            ("Rx_dof", "Ry_dof", "Rz_dof", "Ru_dof", "Rv_dof", "Rw_dof"),
+            strict=True,
+        ):
+            ET.SubElement(fixed_rigid, native_dof).text = (
+                "1" if getattr(spec.rigid_tool.dofs, axis).state == "fixed" else "0"
+            )
+        for axis in ("x", "y", "z"):
+            if getattr(spec.rigid_tool.dofs, axis).state == "prescribed":
+                prescribed = ET.SubElement(rigid, "rigid_bc", {"type": "rigid_displacement"})
+                ET.SubElement(prescribed, "rb").text = "tool-rigid"
+                ET.SubElement(prescribed, "dof").text = axis
+                ET.SubElement(prescribed, "value", {"lc": "1"}).text = self._float(
+                    getattr(spec.motion.direction, axis)
+                )
+                ET.SubElement(prescribed, "relative").text = "0"
+        contacts = ET.SubElement(root, "Contact")
+        contact = ET.SubElement(
+            contacts,
+            "contact",
+            {
+                "type": "sliding-elastic",
+                "name": spec.contact.contact_id.value,
+                "surface_pair": pair_name,
+            },
+        )
+        if isinstance(spec.contact.friction, Frictionless):
+            friction_value = "0"
+        elif isinstance(spec.contact.friction, CoulombFriction):
+            friction_value = self._quantity(spec.contact.friction.coefficient)
+        else:
+            raise PortError(PortErrorCategory.UNSUPPORTED_CAPABILITY, "unsupported friction intent")
+        ET.SubElement(contact, "fric_coeff").text = friction_value
+        for setting in spec.solver_policy.controls:
+            if setting.name in _CONTACT_CONTROLS:
+                ET.SubElement(contact, setting.name).text = self._control_value(setting.value)
+        motion = ET.SubElement(root, "LoadData")
+        load = ET.SubElement(motion, "load_controller", {"id": "1", "type": "loadcurve"})
+        ET.SubElement(load, "interpolate").text = "LINEAR"
+        ET.SubElement(load, "extend").text = "CONSTANT"
+        points = ET.SubElement(load, "points")
+        for sample in spec.motion.samples:
+            ET.SubElement(
+                points, "point"
+            ).text = f"{self._quantity(sample.time)},{self._quantity(sample.displacement)}"
+        if spec.solver_policy.increments.adaptive:
+            must_curve = ET.SubElement(motion, "load_controller", {"id": "2", "type": "loadcurve"})
+            ET.SubElement(must_curve, "interpolate").text = "STEP"
+            ET.SubElement(must_curve, "extend").text = "CONSTANT"
+            points = ET.SubElement(must_curve, "points")
+            for value in must_points:
+                ET.SubElement(
+                    points, "point"
+                ).text = f"{self._float(value)},{self._quantity(spec.solver_policy.increments.maximum_step)}"
+        output = ET.SubElement(root, "Output")
+        # CLI -p owns the path; do not introduce a second potentially relative path.
+        plotfile = ET.SubElement(output, "plotfile", {"type": "febio"})
+        ET.SubElement(plotfile, "compression").text = "0"
+        variables: set[str] = set()
+        for request in spec.outputs.requests:
+            mapping = profile.mapping_for(request.quantity_id)
+            if mapping.native_name not in variables:
+                ET.SubElement(plotfile, "var", {"type": mapping.native_name})
+                variables.add(mapping.native_name)
 
         ET.indent(root, space="  ")
         return b'<?xml version="1.0" encoding="UTF-8"?>\n' + ET.tostring(root, encoding="utf-8")
 
     @staticmethod
-    def _quantity(value: Any) -> str:
+    def _selection_digest(selection: SelectionRef) -> str:
+        return hashlib.sha256(selection.to_bytes()).hexdigest()
+
+    @staticmethod
+    def _allocate_name(base: str, allocated: set[str]) -> str:
+        name = base
+        suffix = 1
+        while name in allocated:
+            suffix += 1
+            name = f"{base}-{suffix}"
+        allocated.add(name)
+        return name
+
+    def _resolved_set_ids(
+        self, revision: CaseRevision, mesh: MeshArtifact
+    ) -> dict[tuple[str, str], str]:
+        needs = (
+            (revision.spec.contact.part_surface, "face"),
+            (revision.spec.contact.tool_surface, "face"),
+            *((support.selection, "node") for support in revision.spec.support.supports),
+            *(
+                (request.selection, "element" if request.location == "element" else "node")
+                for request in revision.spec.outputs.requests
+            ),
+        )
+        resolved: dict[tuple[str, str], str] = {}
+        allocated = {item.set_id for item in mesh.sets}
+        for selection, expected_kind in needs:
+            digest = self._selection_digest(selection)
+            if (digest, expected_kind) in resolved:
+                continue
+            matching = [
+                item
+                for item in mesh.sets
+                if item.source_selection_digest == digest
+                and item.body_id == selection.body_id.value
+                and item.kind == expected_kind
+            ]
+            if not matching and expected_kind == "node":
+                faces = [
+                    item
+                    for item in mesh.sets
+                    if item.source_selection_digest == digest
+                    and item.body_id == selection.body_id.value
+                    and item.kind == "face"
+                ]
+                if len(faces) == 1:
+                    resolved[(digest, "face")] = faces[0].set_id
+                    resolved[(digest, "node")] = self._allocate_name(
+                        f"{faces[0].set_id}-nodes", allocated
+                    )
+                    continue
+            if len(matching) != 1:
+                raise PortError(
+                    PortErrorCategory.INTEGRITY,
+                    f"selection does not resolve to one {expected_kind} mesh set: {selection.name}",
+                )
+            resolved[(digest, expected_kind)] = matching[0].set_id
+        return resolved
+
+    @staticmethod
+    def _control_value(value: Quantity | int | bool) -> str:
+        if isinstance(value, Quantity):
+            return f"{value.to_si().value:.17g}"
+        if isinstance(value, bool):
+            return "1" if value else "0"
+        return str(value)
+
+    @staticmethod
+    def _quantity(value: Quantity) -> str:
         return f"{value.to_si().value:.17g}"
 
     @staticmethod
     def _float(value: float) -> str:
-        return f"{value:.17g}"
-
-    @staticmethod
-    def _febio_version(version: str) -> str:
-        parts = version.split(".")
-        return ".".join(parts[:2]) if len(parts) >= 2 else version
+        return "0" if value == 0 else f"{value:.17g}"
 
 
 __all__ = ["BundleStore", "CompilerAdapter", "LocalBundleStore"]
