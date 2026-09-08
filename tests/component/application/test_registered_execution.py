@@ -100,6 +100,10 @@ def _build(
         "tampered",
         "partial-manifest",
         "unissued-reader",
+        "foreign-numeric",
+        "undercovered-numeric",
+        "wrong-axis",
+        "missing-numeric",
     ],
 )
 def test_registered_execution_publication_boundary(tmp_path: Path, failure: str) -> None:
@@ -145,7 +149,7 @@ def test_registered_execution_publication_boundary(tmp_path: Path, failure: str)
             )
             for request in frozen.spec.outputs.requests
         )
-        if failure == "none":
+        if failure != "missing-numeric":
             candidate = NumericResultData(
                 ResultDataRef(
                     "numeric",
@@ -156,12 +160,12 @@ def test_registered_execution_publication_boundary(tmp_path: Path, failure: str)
                     attempt.attempt_id,
                 ),
                 _profile(bundle.profile_id).output_mappings[0],
-                "time",
+                "load" if failure == "wrong-axis" else "time",
                 "s",
-                (0.0, 1.0),
+                (0.0,) if failure == "undercovered-numeric" else (0.0, 1.0),
                 ("node-1",),
                 ("z",),
-                ((0.0,), (2.0,)),
+                ((0.0,),) if failure == "undercovered-numeric" else ((0.0,), (2.0,)),
             )
             candidate = replace(
                 candidate,
@@ -171,7 +175,10 @@ def test_registered_execution_publication_boundary(tmp_path: Path, failure: str)
             )
             storage.register_numeric_data(candidate)
             numeric.append(candidate)
-            observations = (replace(observations[0], data_ref=candidate.reference),)
+            reference = candidate.reference
+            if failure == "foreign-numeric":
+                reference = replace(reference, bundle_digest="f" * 64, attempt_id="foreign")
+            observations = (replace(observations[0], data_ref=reference),)
         manifest = ResultManifest(
             "manifest",
             attempt.attempt_id,
@@ -190,11 +197,14 @@ def test_registered_execution_publication_boundary(tmp_path: Path, failure: str)
                 storage.publish_manifest(owner, manifest)
         return manifest
 
-    if failure in {"missing-output", "tampered", "partial-manifest"}:
+    if failure in {"missing-output", "tampered", "partial-manifest", "foreign-numeric", "undercovered-numeric", "wrong-axis", "missing-numeric"}:
         with pytest.raises((PortError, ValueError)):
             service._execute_registered(
                 created.case_id, frozen.revision_id, build=_build, produce=produce, read=read
             )
+        import sqlite3
+        with sqlite3.connect(created.case_root / "registry.sqlite3") as connection:
+            assert connection.execute("SELECT COUNT(*) FROM manifests").fetchone()[0] == 0
     else:
         manifest = service._execute_registered(
             created.case_id, frozen.revision_id, build=_build, produce=produce, read=read
