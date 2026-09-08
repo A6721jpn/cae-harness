@@ -374,6 +374,7 @@ def test_bundle_attempt_manifest_chain_binds_exact_ids(synthetic_case_spec: Any)
 def test_attempt_transitions_are_guarded_and_retry_is_a_new_record() -> None:
     _require_api()
     assert transition_allowed(RunState.CREATED, RunState.PREPARING)
+    assert transition_allowed(RunState.CREATED, RunState.CANCELLED)
     assert transition_allowed(RunState.VALIDATING, RunState.INTERRUPTED)
     assert not transition_allowed(RunState.SUCCEEDED, RunState.RUNNING)
     assert CasePreparationState.READY.value == "READY"
