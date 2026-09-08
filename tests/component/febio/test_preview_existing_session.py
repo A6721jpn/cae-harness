@@ -95,6 +95,34 @@ def test_existing_session_requires_probe_and_consumes_failed_identity(tmp_path: 
     assert case.launches == case.observations == 0
 
 
+def test_observation_binding_exposes_only_a_current_local_issue(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    case = PreviewCase(tmp_path)
+    current = session(case)
+    now = [1.0]
+    monkeypatch.setattr(module.time, "monotonic", lambda: now[0])
+    adapter = case.adapter(session_probe=lambda expected: current)
+    receipt = adapter.request_observation(
+        case.manifest, case.request, session=current, timeout_seconds=60
+    )
+    binding = adapter.observation_binding(receipt)
+    assert binding.existing_session == current and binding.receipt_id == receipt.receipt_id
+    assert binding.launch_id and binding.xplt_digest == case.digest
+    assert binding.requested_variables == ("displacement",)
+    with pytest.raises(PortError):
+        case.adapter().observation_binding(receipt)
+    with pytest.raises(PortError):
+        adapter.observation_binding(replace(receipt, requested_state_ids=(0,)))
+    assert adapter.observation_binding(receipt) == binding
+    now[0] = 62.0
+    with pytest.raises(PortError):
+        adapter.observation_binding(receipt)
+    now[0] = 2.0
+    with pytest.raises(PortError):
+        adapter.observation_binding(receipt)
+
+
 def test_existing_session_deadline_rechecked_after_observation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
