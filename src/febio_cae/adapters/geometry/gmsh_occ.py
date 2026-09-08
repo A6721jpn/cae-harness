@@ -19,6 +19,7 @@ import importlib
 import math
 import re
 import tempfile
+import threading
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -52,6 +53,10 @@ _CONVERSION_LENGTH_RE = re.compile(
 )
 _BODY_ID_RE = re.compile(r"^body-(?P<tag>[1-9][0-9]*)$")
 _TET10_TYPE = 11
+# Native Gmsh state is process-global even across different backend/module
+# wrappers. Non-reentrant admission avoids both query/initialize races and
+# waiting indefinitely on nested calls. External callers must still coordinate.
+_GMSH_ADMISSION = threading.Lock()
 # OCC otherwise defaults to millimetres (and that default has changed across
 # historical Gmsh releases). Keep the source STEP unit as provenance, but
 # make the native coordinate unit deterministic before importing the shape.
@@ -534,6 +539,7 @@ class _GmshSession:
         self.gmsh = gmsh
         self.kernel = kernel
         self._started = False
+        self._admitted = False
         self._temporary_directory: tempfile.TemporaryDirectory[str] | None = None
         self.path: Path = Path()
 
@@ -543,6 +549,11 @@ class _GmshSession:
                 BackendErrorCategory.UNSUPPORTED_CAPABILITY,
                 f"unsupported geometry kernel: {self.kernel!r}",
             )
+        if not _GMSH_ADMISSION.acquire(blocking=False):
+            raise BackendError(
+                BackendErrorCategory.ENVIRONMENT, "Gmsh session busy; admission refused"
+            )
+        self._admitted = True
         try:
             if not callable(getattr(self.gmsh, "isInitialized", None)):
                 raise BackendError(
@@ -553,8 +564,8 @@ class _GmshSession:
                     BackendErrorCategory.ENVIRONMENT,
                     "Gmsh initialized session is unowned; refusing mutation",
                 )
-            self.gmsh.initialize()
             self._started = True
+            self.gmsh.initialize()
             if hasattr(self.gmsh, "option") and hasattr(self.gmsh.option, "setNumber"):
                 self.gmsh.option.setNumber("General.Terminal", 0)
             self._temporary_directory = tempfile.TemporaryDirectory(prefix="febio-cae-gmsh-")
@@ -568,6 +579,9 @@ class _GmshSession:
             raise BackendError(
                 BackendErrorCategory.ENVIRONMENT, f"Gmsh session initialization failed: {error}"
             ) from error
+        except BaseException:
+            self._close()
+            raise
 
     def write(self, content: bytes) -> None:
         try:
@@ -582,18 +596,22 @@ class _GmshSession:
 
     def _close(self) -> None:
         try:
-            if self._started and hasattr(self.gmsh, "clear"):
-                self.gmsh.clear()
-        except (AttributeError, RuntimeError, TypeError, ValueError):
-            pass
-        try:
-            if self._started and hasattr(self.gmsh, "finalize"):
-                self.gmsh.finalize()
+            try:
+                if self._started and hasattr(self.gmsh, "clear"):
+                    self.gmsh.clear()
+            finally:
+                if self._started and hasattr(self.gmsh, "finalize"):
+                    self.gmsh.finalize()
         finally:
             self._started = False
-            if self._temporary_directory is not None:
-                self._temporary_directory.cleanup()
+            try:
+                if self._temporary_directory is not None:
+                    self._temporary_directory.cleanup()
+            finally:
                 self._temporary_directory = None
+                if self._admitted:
+                    self._admitted = False
+                    _GMSH_ADMISSION.release()
 
 
 def _source_digest(content: bytes) -> str:
