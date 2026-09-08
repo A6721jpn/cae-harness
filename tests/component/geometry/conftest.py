@@ -221,7 +221,7 @@ class SyntheticBackend:
             BackendNode(index + 1, coordinates)
             for index, coordinates in enumerate(node_coordinates)
         )
-        element_node_ids = tuple(range(1, 11))
+        element_node_ids = (1, 2, 3, 4, 5, 6, 7, 8, 10, 9)
         if self.reverse_orientation:
             element_node_ids = (2, 1, *element_node_ids[2:])
         element = BackendElement(
@@ -368,12 +368,15 @@ def make_case_spec(inspection_digest: str, *, primitive: RigidPrimitive | None =
         frame_evidence=_evidence("support.frame", "support-frame"),
     )
     primitive = primitive or RigidPrimitive(
-        kind="sphere",
+        kind="box",
         body_id=TOOL_BODY,
         local_frame=TOOL_LOCAL,
         placement=_identity_transform(TOOL_LOCAL, WORLD, z_mm=20.0),
-        dimensions={"radius": Quantity(2, "mm")},
-        dimension_evidence={"radius": _evidence("rigid_tool.radius", "tool-radius")},
+        dimensions={name: Quantity(4, "mm") for name in ("length", "width", "height")},
+        dimension_evidence={
+            name: _evidence(f"rigid_tool.{name}", f"tool-{name}")
+            for name in ("length", "width", "height")
+        },
         model_evidence=_evidence("rigid_tool.model", "tool-model"),
         placement_evidence=_evidence("rigid_tool.placement", "tool-placement"),
     )
