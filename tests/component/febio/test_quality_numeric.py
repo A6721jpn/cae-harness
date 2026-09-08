@@ -103,19 +103,23 @@ def test_different_hashed_data_with_same_bundle_attempt_cannot_replace_observati
     assert assess(case).overall_status is AssessmentStatus.UNVERIFIED
 
 
-@pytest.mark.parametrize(
-    "field,value", [("unit", "N"), ("value_type", "FLOAT"), ("state_count", 99)]
-)
-def test_observation_metadata_must_match_numeric_record(
-    tmp_path: Path, field: str, value: object
-) -> None:
+@pytest.mark.parametrize("field", ["unit", "value_type", "state_count"])
+def test_observation_metadata_must_match_numeric_record(tmp_path: Path, field: str) -> None:
     case = controlled_case(tmp_path)
     case.manifest = replace(
         case.manifest,
         read_result=replace(
             case.manifest.read_result,
             observations=tuple(
-                replace(item, **{field: value}) if item.output_id == "displacement" else item
+                (
+                    replace(item, unit="N")
+                    if field == "unit"
+                    else replace(item, value_type="FLOAT")
+                    if field == "value_type"
+                    else replace(item, state_count=99)
+                )
+                if item.output_id == "displacement"
+                else item
                 for item in case.manifest.read_result.observations
             ),
         ),
@@ -203,33 +207,7 @@ def test_reader_element_and_rigid_body_outputs_use_matching_roi_location(
     unit: str,
     expected: float,
 ) -> None:
-    case = quality_case(tmp_path)
-    request = next(
-        item for item in case.revision.spec.outputs.requests if item.request_id == request_id
-    )
-    evaluation = case.revision.spec.outputs.evaluations[0]
-    criterion = case.revision.spec.quality_policy.criteria[0]
-    case.revision = replace(
-        case.revision,
-        spec=replace(
-            case.revision.spec,
-            outputs=replace(
-                case.revision.spec.outputs,
-                evaluations=(
-                    replace(evaluation, output_request_id=request_id, selection=request.selection),
-                ),
-            ),
-            quality_policy=replace(
-                case.revision.spec.quality_policy,
-                criteria=(
-                    replace(
-                        criterion,
-                        thresholds=(QualityThreshold("max_value", Quantity(expected + 1, unit)),),
-                    ),
-                ),
-            ),
-        ),
-    )
+    case = quality_case(tmp_path, output_request_id=request_id, limit=Quantity(expected + 1, unit))
     result = assess(case)
     assert result.overall_status is AssessmentStatus.PASS
     assert result.criteria[0].measured[0].value == pytest.approx(expected)
@@ -258,6 +236,24 @@ def test_empty_numeric_obligation_is_unverified_not_an_exception(tmp_path: Path)
             quality_policy=replace(
                 case.revision.spec.quality_policy,
                 criteria=(replace(criterion, evaluation_ids=()),),
+            ),
+        ),
+    )
+    assert assess(case).overall_status is AssessmentStatus.UNVERIFIED
+
+
+def test_nonzero_required_time_cannot_underflow_to_initial_state(tmp_path: Path) -> None:
+    case = controlled_case(tmp_path)
+    evaluation = case.revision.spec.outputs.evaluations[0]
+    times = (Quantity(1e-50, "s"),)
+    case.revision = replace(
+        case.revision,
+        spec=replace(
+            case.revision.spec,
+            outputs=replace(
+                case.revision.spec.outputs,
+                saved_times=times,
+                evaluations=(replace(evaluation, state_times=times),),
             ),
         ),
     )

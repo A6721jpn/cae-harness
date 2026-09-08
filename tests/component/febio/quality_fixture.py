@@ -19,6 +19,7 @@ from febio_cae.domain import (
     NumericResultData,
     OutputMapping,
     ProcessIdentity,
+    QualityThreshold,
     Quantity,
     ResolvedFileContent,
     ResultManifest,
@@ -81,7 +82,13 @@ class QualityCase:
             )
 
 
-def quality_case(tmp_path: Path, times: tuple[float, ...] = (0.0, 1.0)) -> QualityCase:
+def quality_case(
+    tmp_path: Path,
+    times: tuple[float, ...] = (0.0, 1.0),
+    *,
+    output_request_id: str = "request_part",
+    limit: Quantity | None = None,
+) -> QualityCase:
     revision, mesh, profile = _case()
     # Element identity must not accidentally equal a node ID in the ROI.
     mesh = replace(
@@ -119,16 +126,37 @@ def quality_case(tmp_path: Path, times: tuple[float, ...] = (0.0, 1.0)) -> Quali
         evidence=evidence("outputs.requests.request_stress", "quality-stress"),
     )
     evaluation = revision.spec.outputs.evaluations[0]
+    requests = (*revision.spec.outputs.requests, stress)
+    selected = next(item for item in requests if item.request_id == output_request_id)
+    if output_request_id != "request_part":
+        assert limit is not None, "non-default output requires its explicit test threshold"
+    policy = revision.spec.quality_policy
+    if limit is not None:
+        policy = replace(
+            policy,
+            criteria=(
+                replace(
+                    policy.criteria[0],
+                    thresholds=(QualityThreshold("max_value", limit),),
+                ),
+            ),
+        )
     revision = replace(
         revision,
         spec=replace(
             revision.spec,
+            quality_policy=policy,
             outputs=replace(
                 revision.spec.outputs,
-                requests=(*revision.spec.outputs.requests, stress),
+                requests=requests,
                 saved_times=tuple(Quantity(t, "s") for t in times),
                 evaluations=(
-                    replace(evaluation, state_times=tuple(Quantity(t, "s") for t in times)),
+                    replace(
+                        evaluation,
+                        output_request_id=output_request_id,
+                        selection=selected.selection,
+                        state_times=tuple(Quantity(t, "s") for t in times),
+                    ),
                 ),
             ),
         ),
