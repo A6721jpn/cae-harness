@@ -1,3 +1,4 @@
+from threading import Event, Thread
 from typing import Any
 
 import pytest
@@ -64,3 +65,82 @@ def test_initialization_failure_preserves_owned_cleanup(monkeypatch: Any) -> Non
         pass
     assert fake.events.count("finalize") == 1
     assert not fake.initialized
+
+
+def test_two_sessions_cannot_both_pass_uninitialized_query() -> None:
+    fake = SessionDouble(False)
+    entered_query, release_query = Event(), Event()
+    first_outcomes: list[object] = []
+    original = fake.isInitialized
+
+    def held_query() -> bool:
+        observed = original()
+        if not entered_query.is_set():
+            entered_query.set()
+            assert release_query.wait(3), "bounded query release expired"
+        return observed
+
+    fake.isInitialized = held_query  # type: ignore[method-assign]
+
+    def first() -> None:
+        try:
+            with _GmshSession(fake, "OpenCASCADE"):
+                first_outcomes.append("entered")
+        except BaseException as error:
+            first_outcomes.append(error)
+
+    thread = Thread(target=first, daemon=True)
+    thread.start()
+    try:
+        assert entered_query.wait(3)
+        # First caller owns admission but is paused before initialization. The
+        # second observes False without a process-wide guard and enters unsafely.
+        with pytest.raises(BackendError, match="busy"), _GmshSession(fake, "OpenCASCADE"):
+            pass
+        assert fake.events == []
+    finally:
+        release_query.set()
+        thread.join(3)
+    assert not thread.is_alive()
+    assert first_outcomes == ["entered"]
+    assert fake.events.count("initialize") == 1
+    with _GmshSession(fake, "OpenCASCADE"):
+        pass
+    assert fake.events.count("initialize") == 2
+
+
+def test_reentry_and_different_wrapper_are_busy_without_mutation() -> None:
+    fake = SessionDouble(False)
+    session = _GmshSession(fake, "OpenCASCADE")
+    with session:
+        before = list(fake.events)
+        with pytest.raises(BackendError, match="busy"), session:
+            pass
+        with (
+            pytest.raises(BackendError, match="busy"),
+            _GmshSession(SessionDouble(False), "OpenCASCADE"),
+        ):
+            pass
+        assert fake.events == before
+        assert fake.initialized
+
+
+@pytest.mark.parametrize("stage", ["initialize", "clear", "finalize"])
+def test_failed_lifetime_releases_admission(stage: str, monkeypatch: Any) -> None:
+    fake = SessionDouble(False)
+    original = getattr(fake, stage)
+
+    def fail() -> None:
+        original()
+        raise RuntimeError("injected lifetime failure")
+
+    monkeypatch.setattr(fake, stage, fail)
+    with (
+        pytest.raises(RuntimeError, match="injected lifetime failure"),
+        _GmshSession(fake, "OpenCASCADE"),
+    ):
+        pass
+    assert not fake.initialized
+    assert fake.events.count("finalize") == 1
+    with _GmshSession(SessionDouble(False), "OpenCASCADE"):
+        pass
