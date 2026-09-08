@@ -116,6 +116,8 @@ def lease(root: Path, *, blocking: bool = True, recovery: bool = False) -> Itera
         with pin_directories(root):
             descriptor = _open(root / ".publication.lock", writable=True)
             try:
+                if os.fstat(descriptor).st_nlink != 1:
+                    raise OSError("publication lock has multiple hard links")
                 if os.fstat(descriptor).st_size == 0:
                     os.write(descriptor, b"\0")
                 deadline = time.monotonic() + 30

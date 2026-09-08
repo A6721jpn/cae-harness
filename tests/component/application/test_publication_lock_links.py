@@ -19,9 +19,8 @@ def test_linked_lock_is_not_initialized_or_appended(tmp_path: Path, initial: byt
     sibling = tmp_path / "outside.bin"
     sibling.write_bytes(initial)
     os.link(sibling, root / ".publication.lock")
-    with pytest.raises(OSError, match="hard link"):
-        with lease(root):
-            pytest.fail("linked publication lock was acquired")
+    with pytest.raises(OSError, match="hard link"), lease(root):
+        pytest.fail("linked publication lock was acquired")
     assert sibling.read_bytes() == initial
 
 
