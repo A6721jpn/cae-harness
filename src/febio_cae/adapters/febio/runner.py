@@ -8,7 +8,7 @@ import signal
 import subprocess
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, BinaryIO
 
@@ -28,15 +28,21 @@ from febio_cae.domain import (
     TrustedOwnerContext,
 )
 
+from ._windows_job import WindowsJobProcess
+
 
 @dataclass
 class _Managed:
-    process: subprocess.Popen[bytes]
+    process: subprocess.Popen[bytes] | WindowsJobProcess
     attempt_root: Path
     started_at: float
     stdout: BinaryIO
     stderr: BinaryIO
     timed_out: bool = False
+    cancel_requested: bool = False
+    descendants: set[int] = field(default_factory=set)
+    enumeration_unknown: bool = False
+    returncode: int | None = None
 
 
 class RunnerAdapter:
@@ -62,8 +68,27 @@ class RunnerAdapter:
             raise PortError(PortErrorCategory.CONFLICT, "owner case does not match bundle")
         if not isinstance(budget, Budget):
             raise PortError(PortErrorCategory.INVALID_INPUT, "budget must be a Budget")
+        self._validate_owner_components(owner)
+        executable = Path(bundle.argv[0]).resolve()
+        try:
+            executable_digest = hashlib.sha256(executable.read_bytes()).hexdigest()
+        except (OSError, ValueError) as error:
+            raise PortError(
+                PortErrorCategory.ENVIRONMENT, "registered solver executable is unavailable"
+            ) from error
+        if executable_digest != bundle.tool.executable_digest:
+            raise PortError(
+                PortErrorCategory.INTEGRITY,
+                "solver executable digest does not match the registered profile",
+            )
         self.ownership.claim(owner)
-        attempt_root = self.root / owner.run_id / owner.attempt_id
+        attempt_root = (self.root / owner.run_id / owner.attempt_id).resolve()
+        try:
+            attempt_root.relative_to(self.root)
+        except ValueError as error:
+            raise PortError(
+                PortErrorCategory.INTEGRITY, "attempt path escapes runner root"
+            ) from error
         try:
             attempt_root.mkdir(parents=True, exist_ok=False)
         except FileExistsError as error:
@@ -91,18 +116,17 @@ class RunnerAdapter:
             raise PortError(
                 PortErrorCategory.ENVIRONMENT, f"solver process could not start: {error}"
             ) from error
-        executable = Path(bundle.argv[0])
-        try:
-            digest = hashlib.sha256(executable.read_bytes()).hexdigest()
-        except (OSError, ValueError):
-            digest = bundle.tool.executable_digest
         identity = ProcessIdentity(
             executable=str(executable),
-            executable_digest=digest,
+            executable_digest=executable_digest,
             argv=bundle.argv,
             cwd=str(attempt_root),
             thread_count=bundle.thread_count,
-            start_marker=f"{process.pid}:{uuid.uuid4().hex}",
+            start_marker=(
+                f"{process.pid}:{process.creation_time}:{uuid.uuid4().hex}"
+                if isinstance(process, WindowsJobProcess)
+                else f"{process.pid}:{uuid.uuid4().hex}"
+            ),
         )
         attempt = AttemptRecord(
             attempt_id=preparing.attempt_id,
@@ -131,8 +155,9 @@ class RunnerAdapter:
                     ("owned process is not recoverable",),
                 )
             return PollResult(attempt, ())
-        if attempt.state is not RunState.RUNNING:
+        if attempt.state not in {RunState.RUNNING, RunState.DRAINING}:
             return PollResult(attempt, ())
+        self._refresh_descendants(managed)
         budget_seconds = self._budget_seconds(attempt)
         if budget_seconds is not None and time.monotonic() - managed.started_at > budget_seconds:
             managed.timed_out = True
@@ -149,12 +174,17 @@ class RunnerAdapter:
                     ("owned process is not recoverable",),
                 )
             return CancelResult(attempt, ())
+        if attempt.state not in {RunState.RUNNING, RunState.DRAINING}:
+            return CancelResult(attempt, ())
+        managed.cancel_requested = True
+        self._terminate(managed.process)
         if attempt.state is RunState.RUNNING:
-            self._terminate(managed.process)
             current = attempt.transition_to(RunState.DRAINING)
         else:
             current = attempt
-        self._wait_for_drain(managed, force=True)
+        drained = self._wait_for_drain(managed, force=True)
+        if not drained:
+            return CancelResult(current, ("owned descendants are not yet drained",))
         if current.state is RunState.DRAINING:
             current = current.transition_to(RunState.CANCELLED)
         self._close_streams(managed)
@@ -171,10 +201,9 @@ class RunnerAdapter:
                     ("process identity cannot be reattached",),
                 )
             return ReconcileResult(attempt, ())
-        if attempt.state is RunState.RUNNING:
-            return ReconcileResult(
-                self._observe_exit(attempt, managed).attempt, ("reconciled owned process",)
-            )
+        if attempt.state in {RunState.RUNNING, RunState.DRAINING}:
+            result = self.poll(attempt, owner)
+            return ReconcileResult(result.attempt, result.diagnostics)
         return ReconcileResult(attempt, ())
 
     def _validate(self, attempt: AttemptRecord, owner: TrustedOwnerContext) -> None:
@@ -190,11 +219,35 @@ class RunnerAdapter:
             ) from error
 
     @staticmethod
+    def _validate_owner_components(owner: TrustedOwnerContext) -> None:
+        for field_name in ("run_id", "attempt_id"):
+            value = getattr(owner, field_name)
+            if value in {".", ".."} or any(separator in value for separator in ("/", "\\", ":")):
+                raise PortError(
+                    PortErrorCategory.INVALID_INPUT, f"{field_name} must be one path component"
+                )
+
+    @staticmethod
     def _spawn(
         bundle: ExecutionBundle, attempt_root: Path
-    ) -> tuple[subprocess.Popen[bytes], BinaryIO, BinaryIO]:
+    ) -> tuple[subprocess.Popen[bytes] | WindowsJobProcess, BinaryIO, BinaryIO]:
         stdout = (attempt_root / "logs" / "solver.stdout.log").open("wb")
-        stderr = (attempt_root / "logs" / "solver.stderr.log").open("wb")
+        try:
+            stderr = (attempt_root / "logs" / "solver.stderr.log").open("wb")
+        except OSError:
+            stdout.close()
+            raise
+        if os.name == "nt":
+            try:
+                return (
+                    WindowsJobProcess(tuple(bundle.argv), attempt_root, stdout, stderr),
+                    stdout,
+                    stderr,
+                )
+            except BaseException:
+                stdout.close()
+                stderr.close()
+                raise
         kwargs: dict[str, Any] = {
             "args": list(bundle.argv),
             "cwd": str(attempt_root),
@@ -203,10 +256,7 @@ class RunnerAdapter:
             "stderr": stderr,
             "shell": False,
         }
-        if os.name == "nt":
-            kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-        else:
-            kwargs["start_new_session"] = True
+        kwargs["start_new_session"] = True
         try:
             return subprocess.Popen(**kwargs), stdout, stderr
         except (OSError, TypeError, ValueError):
@@ -233,19 +283,33 @@ class RunnerAdapter:
             target.write_bytes(content)
 
     def _observe_exit(self, attempt: AttemptRecord, managed: _Managed) -> PollResult:
-        returncode = managed.process.poll()
-        if returncode is None:
+        if attempt.state is RunState.RUNNING:
+            returncode = managed.process.poll()
+            if returncode is None:
+                return PollResult(attempt, ())
+            managed.returncode = returncode
+            draining = attempt.transition_to(RunState.DRAINING)
+        elif attempt.state is RunState.DRAINING:
+            returncode = managed.returncode
+            if returncode is None:
+                returncode = managed.process.poll()
+                if returncode is None:
+                    return PollResult(attempt, ())
+                managed.returncode = returncode
+            draining = attempt
+        else:
             return PollResult(attempt, ())
-        draining = attempt.transition_to(RunState.DRAINING)
         if not self._wait_for_drain(managed, force=False):
             return PollResult(draining, ("root exited; owned descendants are still draining",))
         self._managed.pop(attempt.attempt_id, None)
         self._close_streams(managed)
         if managed.timed_out:
             return PollResult(
-                draining.transition_to(RunState.INTERRUPTED),
+                draining.transition_to(RunState.FAILED),
                 ("attempt exceeded its elapsed budget",),
             )
+        if managed.cancel_requested:
+            return PollResult(draining.transition_to(RunState.CANCELLED), ("owned tree cancelled",))
         if returncode == 0:
             return PollResult(
                 draining.transition_to(RunState.VALIDATING),
@@ -257,36 +321,66 @@ class RunnerAdapter:
 
     @staticmethod
     def _close_streams(managed: _Managed) -> None:
+        if isinstance(managed.process, WindowsJobProcess):
+            managed.process.close()
         managed.stdout.close()
         managed.stderr.close()
 
     def _wait_for_drain(self, managed: _Managed, *, force: bool) -> bool:
+        if isinstance(managed.process, WindowsJobProcess):
+            if force:
+                managed.process.terminate_tree()
+            deadline = time.monotonic() + (2.0 if force or managed.timed_out else 0.15)
+            while True:
+                try:
+                    if (
+                        managed.process.active_processes() == 0
+                        and managed.process.poll() is not None
+                    ):
+                        return True
+                except OSError:
+                    return False
+                if time.monotonic() >= deadline:
+                    return False
+                time.sleep(0.02)
         deadline = time.monotonic() + (0.15 if not force else 2.0)
         while time.monotonic() < deadline:
-            if self._descendant_pids(managed.process.pid):
+            self._refresh_descendants(managed)
+            if managed.enumeration_unknown:
                 if force:
-                    self._terminate_descendants(managed.process.pid)
+                    self._terminate_descendant_pids(managed.descendants)
                 time.sleep(0.02)
                 continue
-            return True
-        if force:
-            self._terminate_descendants(managed.process.pid)
-            return not self._descendant_pids(managed.process.pid)
-        return not self._descendant_pids(managed.process.pid)
+            live = {pid for pid in managed.descendants if self._pid_alive(pid)}
+            managed.descendants = live
+            if not live:
+                return True
+            if force:
+                self._terminate_descendant_pids(live)
+            time.sleep(0.02)
+        self._refresh_descendants(managed)
+        if managed.enumeration_unknown:
+            return False
+        live = {pid for pid in managed.descendants if self._pid_alive(pid)}
+        managed.descendants = live
+        if force and live:
+            self._terminate_descendant_pids(live)
+            deadline = time.monotonic() + 0.25
+            while live and time.monotonic() < deadline:
+                time.sleep(0.02)
+                live = {pid for pid in live if self._pid_alive(pid)}
+            managed.descendants = live
+        return not live
 
     @staticmethod
-    def _terminate(process: subprocess.Popen[bytes]) -> None:
+    def _terminate(process: subprocess.Popen[bytes] | WindowsJobProcess) -> None:
+        if isinstance(process, WindowsJobProcess):
+            process.terminate_tree()
+            return
         if process.poll() is not None:
             return
         if os.name == "nt":
-            subprocess.run(
-                ["taskkill.exe", "/PID", str(process.pid), "/T", "/F"],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                shell=False,
-                check=False,
-            )
+            raise OSError("Windows termination requires retained Job ownership")
         else:
             killpg = getattr(os, "killpg", None)
             if callable(killpg):
@@ -300,43 +394,48 @@ class RunnerAdapter:
             process.kill()
 
     @staticmethod
-    def _terminate_descendants(pid: int) -> None:
+    def _terminate_descendant_pids(pids: set[int] | tuple[int, ...]) -> None:
         if os.name == "nt":
-            subprocess.run(
-                ["taskkill.exe", "/PID", str(pid), "/T", "/F"],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                shell=False,
-                check=False,
-            )
+            raise OSError("PID-only Windows termination is forbidden")
+        else:
+            for pid in pids:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
 
     @staticmethod
-    def _descendant_pids(pid: int) -> tuple[int, ...]:
+    def _pid_alive(pid: int) -> bool:
         if os.name == "nt":
-            command = (
-                "$root=" + str(pid) + "; $all=Get-CimInstance Win32_Process; $seen=@($root); "
-                "$changed=$true; while($changed){$changed=$false; foreach($p in $all){"
-                "if($seen -contains [int]$p.ParentProcessId -and -not($seen -contains [int]$p.ProcessId)){"
-                "$seen += [int]$p.ProcessId; $changed=$true}}}; $seen | Select-Object -Skip 1"
-            )
-            try:
-                completed = subprocess.run(
-                    ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command],
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.DEVNULL,
-                    shell=False,
-                    check=False,
-                    text=True,
-                    timeout=1.0,
-                )
-                return tuple(int(line) for line in completed.stdout.split() if line.isdigit())
-            except (OSError, subprocess.SubprocessError, ValueError):
-                return ()
+            raise OSError("PID-only Windows observation is forbidden")
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return False
+        return True
+
+    def _refresh_descendants(self, managed: _Managed) -> None:
+        if isinstance(managed.process, WindowsJobProcess):
+            return  # Retained Job membership, not a process enumeration, is authority.
+        observed = self._descendant_pids(managed.process.pid)
+        if observed is None:
+            managed.enumeration_unknown = True
+            return
+        managed.enumeration_unknown = False
+        managed.descendants.update(observed)
+        managed.descendants = {pid for pid in managed.descendants if self._pid_alive(pid)}
+
+    @staticmethod
+    def _descendant_pids(pid: int) -> tuple[int, ...] | None:
+        if os.name == "nt":
+            raise OSError("Windows descendants require retained Job ownership")
         proc = Path("/proc")
         if not proc.is_dir():
-            return ()
+            return None
         parents: dict[int, list[int]] = {}
         for entry in proc.iterdir():
             if not entry.name.isdigit():
