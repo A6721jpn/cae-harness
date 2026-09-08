@@ -361,3 +361,87 @@ def test_unrepresented_physical_conditions_are_not_silently_ignored(
         spec = replace(spec, support=replace(spec.support, supports=(support,)))
     with pytest.raises(PortError):
         _compile(tmp_path, replace(revision, spec=spec), mesh, profile)
+
+
+@pytest.mark.parametrize("name", ["part-nodes", "tool-nodes"])
+@pytest.mark.parametrize("kind", ["node", "face"])
+def test_support_reference_has_one_native_definition(tmp_path: Path, name: str, kind: str) -> None:
+    revision, mesh, profile = _case()
+    mesh = replace(
+        mesh,
+        sets=tuple(
+            replace(
+                item,
+                set_id=name if kind == "node" else name.removesuffix("-nodes"),
+                kind=kind,
+                member_ids=mesh.faces[0].node_ids if kind == "node" else item.member_ids,
+            )
+            if item.set_id == "support-region"
+            else item
+            for item in mesh.sets
+        ),
+    )
+    _, root, _ = _compile(tmp_path, revision, mesh, profile)
+    reference = _required(root, "Boundary/bc").attrib["node_set"]
+    assert reference == name
+    definitions = [
+        item
+        for tag in ("Nodes", "NodeSet")
+        for item in root.findall(f"Mesh/{tag}")
+        if item.get("name") == reference
+    ]
+    assert len(definitions) == 1, "implicit Nodes and explicit NodeSet share a namespace"
+    assert set(_integers(definitions[0].text)) == set(mesh.faces[0].node_ids)
+
+
+def test_generated_support_name_preserves_existing_registered_membership(tmp_path: Path) -> None:
+    revision, mesh, profile = _case()
+    mesh = replace(
+        mesh,
+        sets=tuple(
+            replace(item, set_id="support-region-nodes") if item.set_id == "part-output" else item
+            for item in mesh.sets
+        ),
+    )
+    _, root, _ = _compile(tmp_path, revision, mesh, profile)
+    reference = _required(root, "Boundary/bc").attrib["node_set"]
+    assert reference != "support-region-nodes"
+    assert set(_integers(_required(root, f"Mesh/NodeSet[@name='{reference}']").text)) == set(
+        mesh.faces[0].node_ids
+    )
+    original = next(item for item in mesh.sets if item.set_id == "support-region-nodes")
+    assert _integers(_required(root, "Mesh/NodeSet[@name='support-region-nodes']").text) == (
+        original.member_ids
+    )
+
+
+@pytest.mark.parametrize("kind", ["body", "node", "face"])
+def test_rigid_output_resolves_declared_body_instead_of_requiring_nodes(
+    tmp_path: Path, kind: str
+) -> None:
+    revision, mesh, profile = _case()
+    tool_body = revision.spec.rigid_tool.primitive.body_id.value
+    mesh = replace(
+        mesh,
+        sets=tuple(
+            replace(
+                item,
+                kind=kind,
+                member_ids=(
+                    (tool_body,)
+                    if kind == "body"
+                    else (mesh.faces[1].face_id,)
+                    if kind == "face"
+                    else item.member_ids
+                ),
+            )
+            if item.set_id == "tool-output"
+            else item
+            for item in mesh.sets
+        ),
+    )
+    bundle, root, _ = _compile(tmp_path, revision, mesh, profile)
+    assert bundle.mesh_digest == mesh.artifact_digest
+    assert _required(root, "Output/plotfile/var[@type='rigid force']") is not None
+    material = _required(root, "Material/material[@type='rigid body']").attrib["name"]
+    assert _required(root, "Rigid/rigid_bc[@type='rigid_fixed']").findtext("rb") == material
