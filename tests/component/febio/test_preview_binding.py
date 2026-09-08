@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -288,3 +289,146 @@ def test_observer_cannot_overwrite_a_concurrent_artifact_invalidation(tmp_path: 
     adapter = case.adapter(observer=observe)
     receipt = adapter.request(case.manifest, case.request)
     assert adapter.confirm(receipt, case.evidence).status is PreviewStatus.FAILED
+
+
+class ReentrantSource:
+    """One-shot synchronous callbacks around truthful disposable-file reads."""
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self.callback: Callable[[], None] | None = None
+        self.phase = "read"
+        self.path_calls = 0
+
+    def _call(self) -> None:
+        callback, self.callback = self.callback, None
+        if callback is not None:
+            callback()
+
+    @property
+    def path(self) -> Path:
+        self.path_calls += 1
+        if self.phase == "path" or (self.phase == "post-path" and self.path_calls == 2):
+            self._call()
+        return self._path
+
+    def read(self) -> bytes:
+        if self.phase == "read":
+            self._call()
+        return self._path.read_bytes()
+
+
+def test_confirmed_source_read_retains_nested_invalidation(tmp_path: Path) -> None:
+    case = PreviewCase(tmp_path)
+    source = ReentrantSource(case.path)
+    adapter = case.adapter(source=source)
+    receipt = adapter.request(case.manifest, case.request)
+    confirmed = adapter.confirm(receipt, case.evidence)
+    assert confirmed.status is PreviewStatus.CONFIRMED
+    nested: list[PreviewReceipt] = []
+
+    def invalidate() -> None:
+        case.path.write_bytes(b"changed during confirmed source read")
+        nested.append(adapter.confirm(confirmed, case.evidence))
+        case.path.write_bytes(case.content)
+
+    source.callback = invalidate
+    outer = adapter.confirm(confirmed, case.evidence)
+    assert len(nested) == 1 and nested[0].status is PreviewStatus.FAILED
+    assert adapter.confirm(confirmed, case.evidence).status is PreviewStatus.FAILED
+    assert outer.status is PreviewStatus.FAILED
+    assert not outer.confirmation_evidence
+    assert case.observations == 1
+
+
+def test_initial_source_read_reserves_identity_before_nested_request(tmp_path: Path) -> None:
+    case = PreviewCase(tmp_path)
+    source = ReentrantSource(case.path)
+    adapter = case.adapter(source=source)
+    conflicts: list[PortError] = []
+
+    def request_again() -> None:
+        try:
+            adapter.request(case.manifest, case.request)
+        except PortError as error:
+            conflicts.append(error)
+
+    source.callback = request_again
+    receipt = adapter.request(case.manifest, case.request)
+    assert case.launches == 1
+    assert len(conflicts) == 1 and conflicts[0].category is PortErrorCategory.CONFLICT
+    assert receipt.status is PreviewStatus.LAUNCHED
+    confirmed = adapter.confirm(
+        decode_record(encode_record(receipt), PreviewReceipt), case.evidence
+    )
+    assert confirmed.status is PreviewStatus.CONFIRMED
+    assert adapter.confirm(confirmed, case.evidence) == confirmed
+    assert case.observations == 1
+
+
+@pytest.mark.parametrize("phase", ["path", "post-path"])
+def test_source_path_callbacks_cannot_launch_same_identity_twice(
+    tmp_path: Path, phase: str
+) -> None:
+    case = PreviewCase(tmp_path)
+    source = ReentrantSource(case.path)
+    source.phase = phase
+    adapter = case.adapter(source=source)
+
+    def request_again() -> None:
+        with pytest.raises(PortError) as caught:
+            adapter.request(case.manifest, case.request)
+        assert caught.value.category is PortErrorCategory.CONFLICT
+
+    source.callback = request_again
+    assert adapter.request(case.manifest, case.request).status is PreviewStatus.LAUNCHED
+    assert case.launches == 1
+
+
+@pytest.mark.parametrize("phase", ["path", "read", "post-path"])
+@pytest.mark.parametrize("already_confirmed", [False, True])
+def test_source_callback_invalidation_prevents_any_confirmation_success(
+    tmp_path: Path, phase: str, already_confirmed: bool
+) -> None:
+    case = PreviewCase(tmp_path)
+    source = ReentrantSource(case.path)
+    adapter = case.adapter(source=source)
+    receipt = adapter.request(case.manifest, case.request)
+    if already_confirmed:
+        receipt = adapter.confirm(receipt, case.evidence)
+    observations = case.observations
+
+    def invalidate() -> None:
+        case.path.write_bytes(b"changed during source callback")
+        assert adapter.confirm(receipt, case.evidence).status is PreviewStatus.FAILED
+        case.path.write_bytes(case.content)
+
+    source.phase, source.path_calls, source.callback = phase, 0, invalidate
+    failed = adapter.confirm(receipt, case.evidence)
+    assert failed.status is PreviewStatus.FAILED
+    assert not failed.confirmation_evidence
+    assert case.observations == observations
+
+
+def test_launcher_reentrancy_and_failed_initial_read_keep_identity_reserved(tmp_path: Path) -> None:
+    case = PreviewCase(tmp_path)
+
+    def launch(binding: module.PreviewBinding) -> module.PreviewLaunchResult:
+        with pytest.raises(PortError) as caught:
+            adapter.request(case.manifest, case.request)
+        assert caught.value.category is PortErrorCategory.CONFLICT
+        return case.launch(binding)
+
+    adapter = case.adapter(launcher=launch)
+    assert adapter.request(case.manifest, case.request).status is PreviewStatus.LAUNCHED
+    assert case.launches == 1
+    failed_request = replace(case.request, preview_id="initial-read-failure")
+    case.path.write_bytes(b"not registered")
+    with pytest.raises(PortError) as caught:
+        adapter.request(case.manifest, failed_request)
+    assert caught.value.category is PortErrorCategory.INTEGRITY
+    case.path.write_bytes(case.content)
+    with pytest.raises(PortError) as caught:
+        adapter.request(case.manifest, failed_request)
+    assert caught.value.category is PortErrorCategory.CONFLICT
+    assert case.launches == 1
