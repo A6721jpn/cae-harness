@@ -214,8 +214,14 @@ def test_gap_rejects_unsupported_geometry(connected: Any, bad: str) -> None:
             spec,
             rigid_tool=replace(spec.rigid_tool, primitive=replace(primitive, placement=placement)),
         )
-    with pytest.raises(PortError):
+    diagnostic = {
+        "sloped": "planes must face each other",
+        "overlap": "negative overlap",
+        "no_footprint": "projected overlap",
+    }[bad]
+    with pytest.raises(PortError, match=diagnostic) as error:
         adapter.mesh(replace(revision, spec=spec))
+    assert error.value.category == PortErrorCategory.UNSUPPORTED_CAPABILITY
 
 
 def test_unit_conflict_stops_before_backend_meshing(connected: Any) -> None:
