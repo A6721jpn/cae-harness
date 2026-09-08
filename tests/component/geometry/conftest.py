@@ -232,7 +232,7 @@ class SyntheticBackend:
             ordering_id=self.mesh_ordering_id,
         )
         faces = tuple(
-            BackendMeshFace(face_id, (1,), (local_face_id,))
+            BackendMeshFace(face_id, (1,), (local_face_id,), source_face_id=face_id)
             for face_id, local_face_id in (
                 ("bottom-face", 0),
                 ("side-face", 1),
@@ -243,7 +243,7 @@ class SyntheticBackend:
         return BackendMesh(
             source_digest=hashlib.sha256(content).hexdigest(),
             geometry_digest=self.geometry_digest,
-            frame=PART_LOCAL,
+            frame=WORLD,
             body_id=body_id,
             nodes=node_ids,
             elements=(element,),
@@ -333,7 +333,7 @@ def make_case_spec(inspection_digest: str, *, primitive: RigidPrimitive | None =
         inspection_digest=inspection_digest,
         body_id=PART_BODY,
         step_unit="mm",
-        placement=_identity_transform(PART_LOCAL, WORLD),
+        placement=_identity_transform(WORLD, WORLD),
         body_evidence=_evidence("geometry.body_id", "geometry-body"),
         unit_evidence=_evidence("geometry.step_unit", "geometry-unit"),
         placement_evidence=_evidence("geometry.placement", "geometry-placement"),
