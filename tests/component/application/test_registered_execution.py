@@ -84,7 +84,7 @@ def _build(
 
 
 @pytest.mark.parametrize(
-    "failure", ["none", "missing-output", "running", "retarget", "tampered", "partial-manifest"]
+    "failure", ["none", "missing-output", "running", "retarget", "tampered", "partial-manifest", "unissued-reader"]
 )
 def test_registered_execution_publication_boundary(tmp_path: Path, failure: str) -> None:
     service, created, _ = _created(tmp_path)
@@ -128,7 +128,7 @@ def test_registered_execution_publication_boundary(tmp_path: Path, failure: str)
             )
             for request in frozen.spec.outputs.requests
         )
-        return ResultManifest(
+        manifest = ResultManifest(
             "manifest",
             attempt.attempt_id,
             bundle.bundle_digest,
@@ -140,6 +140,11 @@ def test_registered_execution_publication_boundary(tmp_path: Path, failure: str)
                 (),
             ),
         )
+
+        if failure == "unissued-reader":
+            with pytest.raises(PortError):
+                storage.publish_manifest(owner, manifest)
+        return manifest
 
     if failure in {"missing-output", "tampered", "partial-manifest"}:
         with pytest.raises((PortError, ValueError)):

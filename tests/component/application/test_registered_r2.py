@@ -143,6 +143,7 @@ def test_h6_freeze_holds_evidence_until_publication(tmp_path: Path, monkeypatch:
     result = service.freeze_case(created.case_id)
     assert result.status == "FROZEN"
     assert source.read_bytes() == CAD_BYTES
+    assert result.revision_id is not None
     assert service.get_revision(created.case_id, result.revision_id).spec_digest
 
 
