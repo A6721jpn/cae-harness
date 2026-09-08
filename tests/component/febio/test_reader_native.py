@@ -1,16 +1,31 @@
 """Actual-layout synthetic reader behavior through the frozen public codec."""
 
+import hashlib
+import sys
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
+from febio_cae.adapters.febio.compiler import LocalBundleStore
+from febio_cae.adapters.febio.runner import RunnerAdapter
 from febio_cae.adapters.febio.xplt_reader import LocalResultDataStore
-from febio_cae.domain import NumericResultData, PortError, ReadStatus
+from febio_cae.domain import (
+    FileEntry,
+    NumericResultData,
+    PortError,
+    ReadStatus,
+    ResolvedFileContent,
+    RunState,
+    TrustedOwnerContext,
+)
 from febio_cae.domain.codec import decode_record, encode_record
 
-from .reader_fixture import setup_reader
 from .fixtures import make_xplt_fixture
+from .reader_fixture import setup_reader
+from .runner_fixture import _Ownership
+from .test_compiler_native import _case
+from .test_runner_authority import _cleanup_process, _finish
 
 
 def test_registered_native_layout_maps_nodes_elements_and_rigid_body_then_persists(
@@ -120,3 +135,97 @@ def test_registered_source_cannot_be_replayed_in_another_run(tmp_path: Path) -> 
     reader, attempt, bundle, _, _ = setup_reader(tmp_path)
     with pytest.raises(PortError, match="registered"):
         reader.read(replace(attempt, run_id="other-run"), bundle)
+
+
+def test_resolver_cannot_substitute_a_different_verified_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reader, attempt, bundle, _, _ = setup_reader(tmp_path)
+    content = b"different registered-looking file"
+    foreign = ResolvedFileContent(
+        FileEntry(
+            "output/results.xplt", hashlib.sha256(content).hexdigest(), len(content), "result"
+        ),
+        content,
+    )
+    monkeypatch.setattr(reader.data_store, "resolve_file", lambda *args: foreign)
+    with pytest.raises(PortError, match="registered"):
+        reader.read(attempt, bundle)
+    assert not reader.data_store._data
+
+
+def test_native_indices_do_not_replace_noncontiguous_entity_ids(tmp_path: Path) -> None:
+    reader, attempt, bundle, mesh, _ = setup_reader(tmp_path, renumber=True)
+    manifest = reader.read(attempt, bundle)
+    nodes = reader.data_store.resolve_manifest_output(manifest.manifest_id, "displacement")
+    stress = reader.data_store.resolve_manifest_output(manifest.manifest_id, "stress")
+    force = reader.data_store.resolve_manifest_output(manifest.manifest_id, "contact_force")
+    assert nodes.entity_ids == tuple(str(node.node_id) for node in mesh.nodes)
+    assert nodes.values[-1][-1] == pytest.approx(mesh.nodes[-1].node_id / 100.0)
+    assert stress.entity_ids == ("71",)
+    assert force.entity_ids == (mesh.elements[1].body_id,)
+
+
+def test_registered_snapshot_survives_filesystem_alias_change(tmp_path: Path) -> None:
+    reader, attempt, bundle, _, _ = setup_reader(tmp_path)
+    assert attempt.process is not None
+    (Path(attempt.process.cwd) / "output/results.xplt").write_bytes(b"replacement")
+    assert reader.read(attempt, bundle).read_result.status is ReadStatus.VALIDATED
+
+
+def test_registered_snapshot_cannot_be_overwritten(tmp_path: Path) -> None:
+    reader, attempt, bundle, mesh, _ = setup_reader(tmp_path)
+    source = reader.data_store.source_for(attempt, bundle)
+    with pytest.raises(PortError, match="immutable"):
+        reader.data_store.register_source(
+            attempt,
+            bundle,
+            source.raw,
+            mesh=mesh,
+            state_times=(0.0,),
+            part_bodies=dict(source.part_bodies),
+            entity_ids=dict(source.entity_ids),
+        )
+
+
+def test_compiler_runner_registered_reader_codec_connection(tmp_path: Path) -> None:
+    # Real bounded Python process writes synthetic bytes; this is not FEBio E2E.
+    reader, original, compiled, mesh, payload = setup_reader(tmp_path)
+    source = reader.data_store.source_for(original, compiled)
+    script = (
+        "from pathlib import Path;"
+        "Path('output').mkdir(exist_ok=True);"
+        f"Path('output/results.xplt').write_bytes(bytes.fromhex('{payload.hex()}'))"
+    )
+    bundle = replace(compiled, argv=(sys.executable, "-c", script))
+    runner = RunnerAdapter(
+        ownership=_Ownership(),
+        root=tmp_path / "runs",
+        bundle_store=LocalBundleStore(tmp_path / "bundles"),
+    )
+    owner = TrustedOwnerContext(bundle.case_id, "connected-run", "connected-attempt", 1)
+    attempt = runner.start(bundle, owner, _case()[0].spec.budget)
+    managed = next(iter(runner._managed.values()))
+    try:
+        attempt = _finish(runner, attempt, owner)
+        assert attempt.state is RunState.VALIDATING
+        assert managed.process.closed and not runner._managed
+        assert attempt.process is not None
+        content = (Path(attempt.process.cwd) / "output/results.xplt").read_bytes()
+        assert content == payload
+        reader.data_store.register_source(
+            attempt,
+            bundle,
+            ResolvedFileContent(source.raw.entry, content),
+            mesh=mesh,
+            state_times=source.state_times,
+            part_bodies=dict(source.part_bodies),
+            entity_ids=dict(source.entity_ids),
+        )
+        manifest = reader.read(attempt, bundle)
+        data = reader.data_store.resolve_manifest_output(manifest.manifest_id, "stress")
+        assert decode_record(encode_record(data), NumericResultData) == data
+    finally:
+        _cleanup_process(managed.process)
+        managed.stdout.close()
+        managed.stderr.close()

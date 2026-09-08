@@ -27,8 +27,8 @@ from febio_cae.domain import (
     RunState,
 )
 
-from .test_compiler_native import _case
 from .fixtures import evidence
+from .test_compiler_native import _case
 
 
 def block(tag: int, payload: bytes) -> bytes:
@@ -185,8 +185,44 @@ def setup_reader(
     required_times: tuple[float, ...] | None = None,
     defect: str = "",
     register: bool = True,
+    renumber: bool = False,
 ) -> tuple[Any, Any, Any, Any, Any]:
     revision, mesh, profile = _case()
+    if renumber:
+        node_ids = {node.node_id: 100 + node.node_id * 3 for node in mesh.nodes}
+        element_ids = {1: 71, 2: 19}
+        mesh = replace(
+            mesh,
+            nodes=tuple(replace(node, node_id=node_ids[node.node_id]) for node in mesh.nodes),
+            elements=tuple(
+                replace(
+                    element,
+                    element_id=element_ids[element.element_id],
+                    node_ids=tuple(node_ids[n] for n in element.node_ids),
+                )
+                for element in mesh.elements
+            ),
+            faces=tuple(
+                replace(
+                    face,
+                    node_ids=tuple(node_ids[n] for n in face.node_ids),
+                    adjacent_element_ids=tuple(element_ids[e] for e in face.adjacent_element_ids),
+                )
+                for face in mesh.faces
+            ),
+            sets=tuple(
+                replace(
+                    item,
+                    member_ids=tuple(
+                        (node_ids if item.kind == "node" else element_ids)[int(n)]
+                        for n in item.member_ids
+                    ),
+                )
+                if item.kind in {"node", "element"}
+                else item
+                for item in mesh.sets
+            ),
+        )
     output = revision.spec.outputs.requests[0]
     stress_request = replace(
         output,
@@ -215,7 +251,7 @@ def setup_reader(
                 "stress-elements",
                 "element",
                 node_set.body_id,
-                (1,),
+                (mesh.elements[0].element_id,),
                 node_set.source_selection_digest,
             ),
         ),
@@ -255,11 +291,8 @@ def setup_reader(
         bundle.settings,
     )
     data_store = LocalResultDataStore()
-    # Transitional RED fixture: old reader ignores external registration and
-    # reaches the actual native-layout file. Removed once registration exists.
-    register_source = getattr(data_store, "register_source", None)
-    if register and callable(register_source):
-        register_source(
+    if register:
+        data_store.register_source(
             attempt,
             bundle,
             ResolvedFileContent(
@@ -276,7 +309,7 @@ def setup_reader(
             part_bodies={1: mesh.elements[0].body_id, 2: mesh.elements[1].body_id},
             entity_ids={
                 "displacement": tuple(str(node.node_id) for node in mesh.nodes),
-                "stress": ("1",),
+                "stress": (str(mesh.elements[0].element_id),),
                 "contact_force": (mesh.elements[1].body_id,),
             },
         )
