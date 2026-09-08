@@ -128,10 +128,21 @@ def test_supported_curved_mesh_has_bounded_closed_contact_boundary(
             for axial in (-1.0, -0.7, 0.0, 0.4, 1.0):
                 r = 0.002 * (math.sqrt(1 - axial * axial) if kind == "sphere" else 1)
                 target = (r * math.cos(angle), r * math.sin(angle), 0.002 * axial)
-                hits = [_ray_fraction(target, triangle) for triangle in triangles]
+                # Cylinder correspondence holds z fixed; a ray from the 3-D
+                # center adds an unnecessary axial displacement at cap rims.
+                ray = target if kind == "sphere" else (target[0], target[1], 0.0)
+                shifted = (
+                    triangles
+                    if kind == "sphere"
+                    else [
+                        tuple((p[0], p[1], p[2] - target[2]) for p in triangle)
+                        for triangle in triangles
+                    ]
+                )
+                hits = [_ray_fraction(ray, triangle) for triangle in shifted]
                 hit = next((t for t in hits if t is not None), None)
                 assert hit is not None, "closed radial boundary has a hole"
-                assert abs(1 - hit) * math.sqrt(sum(x * x for x in target)) <= record.value + 1e-14
+                assert abs(1 - hit) * math.sqrt(sum(x * x for x in ray)) <= record.value + 1e-14
         assert edges and all(count == 1 and edges[v, u] == 1 for (u, v), count in edges.items())
         tool_faces = {f.face_id for f in faces}
         assert all(
