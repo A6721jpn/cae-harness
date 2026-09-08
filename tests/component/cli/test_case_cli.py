@@ -7,6 +7,15 @@ from typing import Any
 from febio_cae.cli.main import main
 
 
+def test_state_initialization_error_is_structured(tmp_path: Path, capsys: Any) -> None:
+    state = tmp_path / "state-file"
+    state.write_bytes(b"not a directory")
+    assert main(["case", "--state-dir", str(state), "inspect", "unknown", "--json"]) == 4
+    result = json.loads(capsys.readouterr().out)
+    assert result["status"] == "UNSUPPORTED_ENVIRONMENT"
+    assert result["diagnostics"][0]["code"] == "environment"
+
+
 def test_case_cli_create_inspect_and_spec_use_registered_state(
     tmp_path: Path, monkeypatch: Any, capsys: Any
 ) -> None:
