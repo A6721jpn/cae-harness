@@ -8,7 +8,7 @@ import signal
 import subprocess
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, BinaryIO
 
@@ -28,7 +28,9 @@ from febio_cae.domain import (
     TrustedOwnerContext,
 )
 
-from ._windows_job import WindowsJobProcess
+from ._windows_job import LaunchCleanupPending, WindowsJobProcess
+
+_Scope = tuple[str, str, str, int]
 
 
 @dataclass
@@ -38,6 +40,10 @@ class _Managed:
     started_at: float
     stdout: BinaryIO
     stderr: BinaryIO
+    owner: TrustedOwnerContext
+    attempt: AttemptRecord
+    deadline: float
+    revoked: bool = False
     timed_out: bool = False
     cancel_requested: bool = False
     descendants: set[int] = field(default_factory=set)
@@ -55,7 +61,8 @@ class RunnerAdapter:
         self.root = Path(root).resolve()
         self.bundle_store = bundle_store
         self.root.mkdir(parents=True, exist_ok=True)
-        self._managed: dict[str, _Managed] = {}
+        self._managed: dict[_Scope, _Managed] = {}
+        self._failed_launches: list[WindowsJobProcess] = []
 
     def start(
         self, bundle: ExecutionBundle, owner: TrustedOwnerContext, budget: Budget
@@ -69,6 +76,11 @@ class RunnerAdapter:
         if not isinstance(budget, Budget):
             raise PortError(PortErrorCategory.INVALID_INPUT, "budget must be a Budget")
         self._validate_owner_components(owner)
+        key = self._scope(owner)
+        if key in self._managed:
+            raise PortError(PortErrorCategory.CONFLICT, "execution scope is already live")
+        self.retry_failed_launch_cleanup()
+        deadline = time.monotonic() + budget.max_elapsed.to_si().value
         executable = Path(bundle.argv[0]).resolve()
         try:
             executable_digest = hashlib.sha256(executable.read_bytes()).hexdigest()
@@ -82,7 +94,13 @@ class RunnerAdapter:
                 "solver executable digest does not match the registered profile",
             )
         self.ownership.claim(owner)
-        attempt_root = (self.root / owner.run_id / owner.attempt_id).resolve()
+        attempt_root = (
+            self.root
+            / owner.case_id
+            / owner.run_id
+            / owner.attempt_id
+            / str(owner.owner_generation)
+        ).resolve()
         try:
             attempt_root.relative_to(self.root)
         except ValueError as error:
@@ -107,11 +125,19 @@ class RunnerAdapter:
             bundle_digest=bundle.bundle_digest,
             state=RunState.CREATED,
             process=None,
-            settings=tuple(bundle.settings)
+            settings=tuple(
+                s for s in bundle.settings if s.name not in {"attempt_root", "max_elapsed_seconds"}
+            )
             + (ExecutionSetting("attempt_root", str(attempt_root)),),
         ).transition_to(RunState.PREPARING)
         try:
             process, stdout, stderr = self._spawn(bundle, attempt_root)
+        except LaunchCleanupPending as error:
+            self._failed_launches.append(error.process)
+            raise PortError(
+                PortErrorCategory.ENVIRONMENT,
+                "launch failed; retained suspended-root cleanup remains pending",
+            ) from error
         except OSError as error:
             raise PortError(
                 PortErrorCategory.ENVIRONMENT, f"solver process could not start: {error}"
@@ -140,14 +166,13 @@ class RunnerAdapter:
             settings=tuple(preparing.settings)
             + (ExecutionSetting("max_elapsed_seconds", budget.max_elapsed.to_si().value),),
         )
-        self._managed[attempt.attempt_id] = _Managed(
-            process, attempt_root, time.monotonic(), stdout, stderr
+        self._managed[key] = _Managed(
+            process, attempt_root, time.monotonic(), stdout, stderr, owner, attempt, deadline
         )
         return attempt
 
     def poll(self, attempt: AttemptRecord, owner: TrustedOwnerContext) -> PollResult:
-        self._validate(attempt, owner)
-        managed = self._managed.get(attempt.attempt_id)
+        managed = self._lookup(attempt, owner)
         if managed is None:
             if attempt.state is RunState.RUNNING:
                 return PollResult(
@@ -155,18 +180,20 @@ class RunnerAdapter:
                     ("owned process is not recoverable",),
                 )
             return PollResult(attempt, ())
+        attempt = managed.attempt
         if attempt.state not in {RunState.RUNNING, RunState.DRAINING}:
             return PollResult(attempt, ())
         self._refresh_descendants(managed)
-        budget_seconds = self._budget_seconds(attempt)
-        if budget_seconds is not None and time.monotonic() - managed.started_at > budget_seconds:
+        if time.monotonic() > managed.deadline:
             managed.timed_out = True
+        if managed.timed_out or managed.revoked:
             self._terminate(managed.process)
-        return self._observe_exit(attempt, managed)
+        result = self._observe_exit(attempt, managed)
+        managed.attempt = result.attempt
+        return result
 
     def cancel(self, attempt: AttemptRecord, owner: TrustedOwnerContext) -> CancelResult:
-        self._validate(attempt, owner)
-        managed = self._managed.get(attempt.attempt_id)
+        managed = self._lookup(attempt, owner)
         if managed is None:
             if attempt.state is RunState.RUNNING:
                 return CancelResult(
@@ -174,6 +201,10 @@ class RunnerAdapter:
                     ("owned process is not recoverable",),
                 )
             return CancelResult(attempt, ())
+        attempt = managed.attempt
+        if managed.revoked:
+            result = self.poll(attempt, owner)
+            return CancelResult(result.attempt, result.diagnostics)
         if attempt.state not in {RunState.RUNNING, RunState.DRAINING}:
             return CancelResult(attempt, ())
         managed.cancel_requested = True
@@ -182,18 +213,18 @@ class RunnerAdapter:
             current = attempt.transition_to(RunState.DRAINING)
         else:
             current = attempt
+        managed.attempt = current
         drained = self._wait_for_drain(managed, force=True)
         if not drained:
             return CancelResult(current, ("owned descendants are not yet drained",))
         if current.state is RunState.DRAINING:
             current = current.transition_to(RunState.CANCELLED)
         self._close_streams(managed)
-        self._managed.pop(attempt.attempt_id, None)
+        self._managed.pop(self._scope(owner), None)
         return CancelResult(current, ("owned process group terminated",))
 
     def reconcile(self, attempt: AttemptRecord, owner: TrustedOwnerContext) -> ReconcileResult:
-        self._validate(attempt, owner)
-        managed = self._managed.get(attempt.attempt_id)
+        managed = self._lookup(attempt, owner)
         if managed is None:
             if attempt.state is RunState.RUNNING:
                 return ReconcileResult(
@@ -201,10 +232,45 @@ class RunnerAdapter:
                     ("process identity cannot be reattached",),
                 )
             return ReconcileResult(attempt, ())
-        if attempt.state in {RunState.RUNNING, RunState.DRAINING}:
-            result = self.poll(attempt, owner)
+        if managed.attempt.state in {RunState.RUNNING, RunState.DRAINING}:
+            result = self.poll(managed.attempt, owner)
             return ReconcileResult(result.attempt, result.diagnostics)
         return ReconcileResult(attempt, ())
+
+    @staticmethod
+    def _scope(owner: TrustedOwnerContext | AttemptRecord) -> _Scope:
+        return owner.case_id, owner.run_id, owner.attempt_id, owner.owner_generation
+
+    def _lookup(self, attempt: AttemptRecord, owner: TrustedOwnerContext) -> _Managed | None:
+        if not isinstance(attempt, AttemptRecord) or not isinstance(owner, TrustedOwnerContext):
+            raise PortError(PortErrorCategory.INVALID_INPUT, "attempt and owner records required")
+        if self._scope(attempt) != self._scope(owner):
+            raise PortError(PortErrorCategory.CONFLICT, "caller scope does not match attempt")
+        managed = self._managed.get(self._scope(owner))
+        if managed is None:
+            self._validate(attempt, owner)
+            return None
+        # Lifecycle comes from the local issued object, never a caller's snapshot.
+        if (
+            owner != managed.owner
+            or replace(attempt, state=managed.attempt.state) != managed.attempt
+        ):
+            raise PortError(
+                PortErrorCategory.CONFLICT, "caller does not match locally issued execution"
+            )
+        try:
+            self.ownership.validate(managed.owner, managed.attempt)
+        except Exception:  # noqa: BLE001 - any authority-provider failure revokes continuation.
+            # Revocation stops publication/continuation, not retained cleanup authority.
+            managed.revoked = True
+        return managed
+
+    def retry_failed_launch_cleanup(self) -> int:
+        """Retry retained failed launches; return outstanding cleanup obligations."""
+        self._failed_launches[:] = [
+            process for process in self._failed_launches if not process.retry_launch_cleanup()
+        ]
+        return len(self._failed_launches)
 
     def _validate(self, attempt: AttemptRecord, owner: TrustedOwnerContext) -> None:
         if not isinstance(attempt, AttemptRecord) or not isinstance(owner, TrustedOwnerContext):
@@ -220,7 +286,7 @@ class RunnerAdapter:
 
     @staticmethod
     def _validate_owner_components(owner: TrustedOwnerContext) -> None:
-        for field_name in ("run_id", "attempt_id"):
+        for field_name in ("case_id", "run_id", "attempt_id"):
             value = getattr(owner, field_name)
             if value in {".", ".."} or any(separator in value for separator in ("/", "\\", ":")):
                 raise PortError(
@@ -301,8 +367,13 @@ class RunnerAdapter:
             return PollResult(attempt, ())
         if not self._wait_for_drain(managed, force=False):
             return PollResult(draining, ("root exited; owned descendants are still draining",))
-        self._managed.pop(attempt.attempt_id, None)
         self._close_streams(managed)
+        self._managed.pop(self._scope(attempt), None)
+        if managed.revoked:
+            return PollResult(
+                draining.transition_to(RunState.FAILED),
+                ("owner authority revoked; retained job drained",),
+            )
         if managed.timed_out:
             return PollResult(
                 draining.transition_to(RunState.FAILED),
@@ -454,13 +525,6 @@ class RunnerAdapter:
                     found.append(child)
                     queue.append(child)
         return tuple(found)
-
-    @staticmethod
-    def _budget_seconds(attempt: AttemptRecord) -> float | None:
-        for setting in attempt.settings:
-            if setting.name == "max_elapsed_seconds":
-                return float(setting.value)
-        return None
 
 
 __all__ = ["RunnerAdapter"]

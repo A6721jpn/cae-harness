@@ -78,6 +78,14 @@ def _kernel() -> Any:
     return api
 
 
+class LaunchCleanupPending(OSError):
+    """Failed launch with an outstanding, retained-handle cleanup obligation."""
+
+    def __init__(self, process: WindowsJobProcess) -> None:
+        super().__init__("failed launch cleanup did not confirm exit")
+        self.process = process
+
+
 class WindowsJobProcess:
     """Retain actual kernel handles until root exit AND job accounting is zero."""
 
@@ -92,6 +100,7 @@ class WindowsJobProcess:
         self.creation_time = 0
         self.returncode: int | None = None
         self.closed = False
+        self._assigned = False
         thread: int | None = None
         inherited: list[int] = []
         try:
@@ -136,6 +145,7 @@ class WindowsJobProcess:
                     info,
                 )
             self._assign()
+            self._assigned = True
             times = [ctypes.c_ulonglong() for _ in range(4)]
             self._check(
                 self._api.GetProcessTimes(self._process, *(ctypes.byref(item) for item in times))
@@ -143,17 +153,11 @@ class WindowsJobProcess:
             self.creation_time = times[0].value
             if self._api.ResumeThread(thread) != 1:
                 raise OSError("root thread could not resume from its initial suspension")
-        except BaseException:
+        except BaseException as error:
             # Even failed assignment leaves a suspended process that we created.
             # It is addressed only by its retained handle, never its numeric PID.
-            try:
-                if self._process is not None:
-                    self._win.TerminateProcess(self._process, 1)
-                    if self._win.WaitForSingleObject(self._process, 3000) != 0:
-                        raise OSError("suspended launch failure cleanup did not confirm exit")
-                    self.returncode = self._win.GetExitCodeProcess(self._process)
-            finally:
-                self.close()
+            if not self.retry_launch_cleanup():
+                raise LaunchCleanupPending(self) from error
             raise
         finally:
             if thread is not None:
@@ -197,8 +201,35 @@ class WindowsJobProcess:
             raise OSError("job handle is unavailable")
         self._check(self._api.TerminateJobObject(self._job, 1))
 
+    def retry_launch_cleanup(self) -> bool:
+        """Never lose the last handle if termination or exit observation fails."""
+        if self.closed:
+            return True
+        if self._process is not None:
+            try:
+                if self._assigned:
+                    self.terminate_tree()
+                else:
+                    self._win.TerminateProcess(self._process, 1)
+            except OSError:
+                pass  # Termination can fail after exit; observe the retained handle.
+            try:
+                if self._win.WaitForSingleObject(self._process, 100) != 0:
+                    return False
+                self.returncode = int(self._win.GetExitCodeProcess(self._process))
+                if self._assigned and self.active_processes() != 0:
+                    return False
+            except OSError:
+                return False
+        self.close()
+        return True
+
     def close(self) -> None:
-        """Close retained handles; kill-on-close also covers exceptional teardown."""
+        """Release only after observed exit, retaining uncertain cleanup capability."""
+        if self._process is not None and (
+            self.poll() is None or (self._assigned and self.active_processes() != 0)
+        ):
+            raise OSError("cannot discard live or uncertain owned process handles")
         if self._job is not None:
             self._win.CloseHandle(self._job)
             self._job = None
