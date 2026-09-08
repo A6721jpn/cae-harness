@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -16,6 +15,8 @@ from febio_cae.domain import (
     FileEntry,
     OutputObservation,
     PortError,
+    PortErrorCategory,
+    PreviewReceipt,
     PreviewRequest,
     PreviewStatus,
     ReadResult,
@@ -23,13 +24,9 @@ from febio_cae.domain import (
     ResultManifest,
     ToolIdentity,
 )
+from febio_cae.domain.codec import decode_record, encode_record
 
 from .fixtures import WORLD
-
-
-@dataclass(frozen=True)
-class _TaggedObservation(module.PreviewObservation):
-    binding: Any = None
 
 
 class PreviewCase:
@@ -65,43 +62,24 @@ class PreviewCase:
         )
         self.launches = 0
         self.observations = 0
-        self.binding: Any = None
+        self.binding: module.PreviewBinding | None = None
 
-    def target(self, args: tuple[Any, ...]) -> Any:
-        if len(args) == 1:
-            return args[0]
-        # RED-only bridge: the old callback accepted path/tool without a binding.
-        return SimpleNamespace(
-            launch_id="synthetic-launch",
-            receipt_id=self.request.preview_id,
-            manifest_id=self.manifest.manifest_id,
-            path=args[0],
-            studio=args[1],
-            xplt_digest=self.digest,
-        )
-
-    def launch(self, *args: Any) -> Any:
+    def launch(self, binding: module.PreviewBinding) -> module.PreviewLaunchResult:
         self.launches += 1
-        self.binding = self.target(args)
-        result_type = getattr(module, "PreviewLaunchResult", None)
-        if result_type is None:
-            return SimpleNamespace(binding=self.binding, launched=True)
-        return result_type(self.binding, True)
+        self.binding = binding
+        return module.PreviewLaunchResult(binding, True)
 
-    def observe(self, *args: Any) -> Any:
+    def observe(self, binding: module.PreviewBinding) -> module.PreviewObservation:
         self.observations += 1
-        binding = self.target(args)
-        if hasattr(module, "PreviewBinding"):
-            return module.PreviewObservation((0, 1), ("displacement",), binding)
-        return _TaggedObservation((0, 1), ("displacement",), binding)
+        return module.PreviewObservation((0, 1), ("displacement",), binding, self.evidence)
 
     def adapter(self, **overrides: Any) -> module.PreviewAdapter:
-        options = dict(
-            studio=self.studio,
-            source=module.FileSystemPreviewSource(self.path),
-            launcher=self.launch,
-            observer=self.observe,
-        )
+        options: dict[str, Any] = {
+            "studio": self.studio,
+            "source": module.FileSystemPreviewSource(self.path),
+            "launcher": self.launch,
+            "observer": self.observe,
+        }
         options.update(overrides)
         return module.PreviewAdapter(**options)
 
@@ -117,6 +95,8 @@ def test_configured_bound_launch_then_independent_confirmation(tmp_path: Path) -
     assert case.launches == case.observations == 1
     assert adapter.confirm(confirmed, case.evidence) == confirmed
     assert case.observations == 1
+    restored = decode_record(encode_record(confirmed), PreviewReceipt)
+    assert adapter.confirm(restored, case.evidence) == confirmed
 
 
 @pytest.mark.parametrize("value", [True, "failed", 1])
@@ -138,18 +118,12 @@ def test_no_configured_launcher_remains_failed(tmp_path: Path) -> None:
 def test_launcher_must_return_success_for_the_exact_target(tmp_path: Path, defect: str) -> None:
     case = PreviewCase(tmp_path)
 
-    def launch(*args: Any) -> Any:
-        result = case.launch(*args)
+    def launch(target: module.PreviewBinding) -> module.PreviewLaunchResult:
+        result = case.launch(target)
         binding = result.binding
         if defect == "foreign-studio":
             tool = replace(case.studio, version="99")
-            binding = (
-                SimpleNamespace(**(vars(binding) | {"studio": tool}))
-                if isinstance(binding, SimpleNamespace)
-                else replace(binding, studio=tool)
-            )
-        if isinstance(result, SimpleNamespace):
-            return SimpleNamespace(binding=binding, launched=defect != "not-started")
+            binding = replace(binding, studio=tool)
         return replace(result, binding=binding, launched=defect != "not-started")
 
     assert (
@@ -158,7 +132,7 @@ def test_launcher_must_return_success_for_the_exact_target(tmp_path: Path, defec
     )
 
 
-@pytest.mark.parametrize("defect", ["manifest", "scope", "confirmed"])
+@pytest.mark.parametrize("defect", ["manifest", "scope", "confirmed", "studio"])
 def test_caller_cannot_edit_or_self_confirm_an_issued_receipt(tmp_path: Path, defect: str) -> None:
     case = PreviewCase(tmp_path)
     adapter = case.adapter()
@@ -167,6 +141,8 @@ def test_caller_cannot_edit_or_self_confirm_an_issued_receipt(tmp_path: Path, de
         forged = replace(receipt, manifest_id="foreign-manifest")
     elif defect == "scope":
         forged = replace(receipt, requested_state_ids=(0,))
+    elif defect == "studio":
+        forged = replace(receipt, studio=replace(case.studio, version="99"))
     else:
         forged = receipt.confirmed(
             evidence=case.evidence, observed_state_ids=(0, 1), observed_variables=("displacement",)
@@ -199,18 +175,17 @@ def test_observation_must_identify_the_launched_tool_artifact_and_invocation(
 ) -> None:
     case = PreviewCase(tmp_path)
 
-    def observe(*args: Any) -> Any:
-        observation = case.observe(*args)
+    def observe(target: module.PreviewBinding) -> module.PreviewObservation:
+        observation = case.observe(target)
         binding = observation.binding
-        field, value = {
-            "studio": ("studio", replace(case.studio, version="99")),
-            "artifact": ("xplt_digest", "9" * 64),
-            "launch": ("launch_id", "foreign-launch"),
-        }[defect]
-        if isinstance(binding, SimpleNamespace):
-            binding = SimpleNamespace(**(vars(binding) | {field: value}))
-        else:
-            binding = replace(binding, **{field: value})
+        assert binding is not None
+        binding = (
+            replace(binding, studio=replace(case.studio, version="99"))
+            if defect == "studio"
+            else replace(binding, xplt_digest="9" * 64)
+            if defect == "artifact"
+            else replace(binding, launch_id="foreign-launch")
+        )
         return replace(observation, binding=binding)
 
     adapter = case.adapter(observer=observe)
@@ -222,14 +197,14 @@ def test_observation_must_identify_the_launched_tool_artifact_and_invocation(
 def test_artifact_mutation_is_not_confirmed(tmp_path: Path, phase: str) -> None:
     case = PreviewCase(tmp_path)
 
-    def launch(*args: Any) -> Any:
-        result = case.launch(*args)
+    def launch(target: module.PreviewBinding) -> module.PreviewLaunchResult:
+        result = case.launch(target)
         if phase == "launch":
             case.path.write_bytes(b"mutated during launch")
         return result
 
-    def observe(*args: Any) -> Any:
-        result = case.observe(*args)
+    def observe(target: module.PreviewBinding) -> module.PreviewObservation:
+        result = case.observe(target)
         if phase == "observation":
             case.path.write_bytes(b"mutated during observation")
         return result
@@ -245,3 +220,71 @@ def test_artifact_mutation_is_not_confirmed(tmp_path: Path, phase: str) -> None:
         case.path.write_bytes(b"mutated after confirmation")
         confirmed = adapter.confirm(confirmed, case.evidence)
     assert confirmed.status is PreviewStatus.FAILED
+
+
+@pytest.mark.parametrize("missing", ["observer", "evidence"])
+def test_missing_confirmation_authority_is_not_confirmed(tmp_path: Path, missing: str) -> None:
+    case = PreviewCase(tmp_path)
+    adapter = case.adapter(observer=None) if missing == "observer" else case.adapter()
+    receipt = adapter.request(case.manifest, case.request)
+    with pytest.raises(PortError) as caught:
+        adapter.confirm(receipt, () if missing == "evidence" else case.evidence)
+    assert caught.value.category is (
+        PortErrorCategory.UNSUPPORTED_CAPABILITY
+        if missing == "observer"
+        else PortErrorCategory.INTEGRITY
+    )
+    assert case.observations == 0
+
+
+def test_caller_evidence_must_be_the_observers_bound_evidence(tmp_path: Path) -> None:
+    case = PreviewCase(tmp_path)
+    adapter = case.adapter()
+    receipt = adapter.request(case.manifest, case.request)
+    stale = (replace(case.evidence[0], reference="foreign-observation", content_digest="9" * 64),)
+    assert adapter.confirm(receipt, stale).status is PreviewStatus.FAILED
+
+
+def test_observed_failure_cannot_be_erased_by_restoring_bytes(tmp_path: Path) -> None:
+    case = PreviewCase(tmp_path)
+    adapter = case.adapter()
+    receipt = adapter.request(case.manifest, case.request)
+    confirmed = adapter.confirm(receipt, case.evidence)
+    case.path.write_bytes(b"changed")
+    assert adapter.confirm(confirmed, case.evidence).status is PreviewStatus.FAILED
+    case.path.write_bytes(case.content)
+    assert adapter.confirm(confirmed, case.evidence).status is PreviewStatus.FAILED
+
+
+def test_same_bytes_at_another_path_are_not_the_launched_target(tmp_path: Path) -> None:
+    case = PreviewCase(tmp_path)
+    adapter = case.adapter()
+    receipt = adapter.request(case.manifest, case.request)
+    other = tmp_path / "other.xplt"
+    other.write_bytes(case.content)
+    adapter.source = module.FileSystemPreviewSource(other)
+    assert adapter.confirm(receipt, case.evidence).status is PreviewStatus.FAILED
+    assert case.observations == 0
+
+
+def test_initial_artifact_mismatch_never_calls_launcher(tmp_path: Path) -> None:
+    case = PreviewCase(tmp_path)
+    case.path.write_bytes(b"not registered")
+    with pytest.raises(PortError) as caught:
+        case.adapter().request(case.manifest, case.request)
+    assert caught.value.category is PortErrorCategory.INTEGRITY
+    assert case.launches == 0
+
+
+def test_observer_cannot_overwrite_a_concurrent_artifact_invalidation(tmp_path: Path) -> None:
+    case = PreviewCase(tmp_path)
+
+    def observe(binding: module.PreviewBinding) -> module.PreviewObservation:
+        case.path.write_bytes(b"changed while observation is pending")
+        assert adapter.confirm(receipt, case.evidence).status is PreviewStatus.FAILED
+        case.path.write_bytes(case.content)
+        return case.observe(binding)
+
+    adapter = case.adapter(observer=observe)
+    receipt = adapter.request(case.manifest, case.request)
+    assert adapter.confirm(receipt, case.evidence).status is PreviewStatus.FAILED
