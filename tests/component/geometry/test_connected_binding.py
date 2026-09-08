@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import replace
 from typing import Any
@@ -24,6 +25,7 @@ from febio_cae.domain import (
     UnitDirection,
 )
 from febio_cae.domain.codec import decode_record, encode_record
+
 from .conftest import _evidence
 
 
@@ -54,6 +56,7 @@ def connected(
                     area,
                     tuple(sum(p[j] for p in vertices) / 3 for j in range(3)),
                     boundary_points_si=vertices,
+                    attributes=("planar-triangle-v1",),
                 )
             )
         return replace(report, bodies=(replace(report.bodies[0], faces=tuple(faces)),))
@@ -186,6 +189,8 @@ def test_gap_changes_applied_geometry_and_recipe(connected: Any) -> None:
             n.coordinates_si[2] for n in artifact.nodes if n.node_id in ids
         ) == pytest.approx(expected)
     assert first.provenance.mesh_recipe_digest != second.provenance.mesh_recipe_digest
+    record = next(r for r in second.quality_records if r.metric_id == "initial-contact-placement")
+    assert json.loads(record.reason)["requested_gap_si"] == 0.002
 
 
 @pytest.mark.parametrize("bad", ["sloped", "overlap", "no_footprint"])
