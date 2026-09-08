@@ -1,5 +1,44 @@
 # Registered lifecycle and explicit CLI phase report
 
+## R2 candidate (supersedes historical R1 sections below)
+
+`REMOTE_CONFIGURED`; no integration or push. Repair base `9005194594360d38202c9b204680644854c72efc`; integrated base `c23dc59d4dae4810acd51fe2156b7d190d645acb`. Test-only commits: `5337269`, `cbf16f3`, `89cbbbc`, `20daa69`. Production SHA: `af6261a8b17addd6f87dc4dcb1315a017bb7d266`. Final report-only SHA is recorded in the ignored execution manifest and PM handoff; all gates apply unchanged to this documentation-only successor.
+
+Changed production paths under `src/febio_cae`: `application/service.py`, `cli/case.py`, `storage/_ownership.py`, `storage/catalog.py`, `storage/registry.py`. Changed tests: `tests/component/application/test_persistence_authority.py`, `tests/component/application/test_registered_execution.py`, `tests/component/application/test_registered_r2.py`, `tests/component/cli/test_case_cli.py`, `tests/component/storage/registered_process_worker.py`. This report is the eleventh path. Frozen domain/ports and packaging remain unchanged.
+
+### R2 repair mapping
+
+- H1: service-controlled registered execution, immutable input/mesh/bundle lineage, persisted lifecycle transitions, sealed required outputs, registered reader invocation, current hashes and numeric-result provenance. Positive synthetic synchronous production reaches publication and reopened result resolution; forged ownership, unissued reader publication, incomplete outputs and later tampering are rejected. This internal injection seam is not a native runner.
+- H2/H3: reserve-before-write and a case-scoped Windows kernel byte-range lock serialize source/revision publication and recovery. Actual bounded Python publishers compete; a live publisher survives another opener; four abrupt child exits recover after kernel ownership release. PID/events, ownership acquisition/release, argv and reaped exits are retained. Timeout is never proof of death.
+- H4/H6: Windows handles pin root ancestors, final directories and source bytes throughout operations/freeze. Deterministic rename/junction substitution and independent source mutation are denied. Persisted root identity is checked on reuse. Unsupported platforms fail closed; these tests do not establish arbitrary platform equivalence.
+- H5/H9: Mapping-contained evidence is traversed, declared units are checked as physical quantities, exact explicit face resolution is required, and verified observations are retained through freeze.
+- H7/H8/M1: revision/current-generation context and replay digests constrain patches; issued answer targets are enforced atomically; valid neighboring updates and identical retained evidence remain usable.
+- M2: service initialization is inside the CLI structured environment-error boundary.
+- M3: the historical test amend is disclosed below; CT evidence remains local/component, not full or real acceptance.
+
+### R2 chronology and verification
+
+Records under `.local/coordination/runs/` preserve actual argv, cwd, timestamps, pre/post SHA and dirty status, raw streams and exits. `R2-red-01` was an environment/setup failure (missing basetemp parent), not behavioral RED; `R2-red-02` still contained fixture/CLI argument errors. Corrected `R2-red-03` ran at `9005194` with dirty tests: `python -m pytest tests/component/application tests/component/storage tests/component/cli --basetemp .local/verification/R2-red-03`, 44 collected, 16 failed/28 passed, exit 1. Tests were subsequently committed separately. `R2-reader-red-01` genuinely failed 1 test/6 deselected, exit 1, with in-progress production changes present; it is not clean-commit RED. Supplemental execution/process/cache coverage preceded the final production commit. Intermediate failed GREEN attempts remain failures. `R2-numeric-green-01` used an invalid fixture codec; corrected `R2-numeric-green-02` passed 1 test/6 deselected, exit 0.
+
+Focused `R2-green-03`: `python -m pytest tests/component/application tests/component/storage tests/component/cli --basetemp .local/verification/R2-green-03`, 54 passed, exit 0, before production commit. Authoritative final gates at clean `af6261a8b17addd6f87dc4dcb1315a017bb7d266`:
+
+| Gate | Child command (absolute Python 3.12 executable retained in manifest) | Result |
+|---|---|---|
+| Tests | `python -m pytest --basetemp .local/verification/R2-full-final-01` | 1,102 passed in 85.71 s, exit 0 |
+| Format | `python -m ruff format --check .` | exit 0 |
+| Lint | `python -m ruff check .` | exit 0 |
+| Types | `python -m mypy src tests` | 84 source files, exit 0 |
+| CAE boundary | `python scripts/scan_cae_data.py --root .` | exit 0 |
+| Build | `python -m build` | exit 0 |
+
+Fresh external cwd: `C:/Users/backo/.codex/verification/P1-R2-installed-01`; `PYTHONPATH`/`PYTHONHOME` cleared. `python -I -m venv <external>/venv` and absolute venv `python -I -m pip install --no-deps <repository>/dist/febio_cae-0.1.0-py3-none-any.whl` exited 0. Installed `febio-cae.exe --version` printed `febio-cae 0.1.0`, exit 0. Absolute venv `python -I <repository>/.local/coordination/installed_consumer.py` exited 0, checking site-packages origins and eight installed CLI subprocesses: connected create/inspect/spec/reopen, stale-generation rejection, unavailable validate/freeze and structured initialization error. Expected boundary exits (8 and 4) were asserted, not counted as successful analysis.
+
+Wheel: 134,118 bytes, SHA256 `7b86be3df10af871a64911c494436af219441c6824f2688d2bbbeaa7e685c55a`; sdist: 104,581 bytes, SHA256 `ef9b65ef38e6af1c10c5a712673b81568508ec63e16b4719a64b147d8967ec1d`. `.local/coordination/r2-execution-manifest.json` indexes exact metadata, raw-stream hashes, process journals, installed consumer records, artifacts and final SHAs. Local coordination files are not product dependencies.
+
+Status: independent exact-SHA review and PM integrated gates pending, not acceptance or P1 completion. Synthetic/local Windows and installed CLI evidence only. Native STEP/FEBio/FBS/Studio, complete installed analysis, full CT-01/02/03 acceptance, real `02_CAE` and BottomFrame E2E remain unverified. No native tools/real models, integration/push or R2 history rewrite occurred.
+
+## Historical R1 report (not current acceptance)
+
 ## Candidate
 
 - Branch: `codex/p1-registered-cli`
@@ -89,6 +128,7 @@ The functional test and production commits remain separate in the final history:
 - `18d870d` — selection/profile authority regressions
 - `bd5a050` — selection re-resolution and profile digest/status enforcement
 - `70039c4` — five preflight authority-boundary regressions
+- Historical correction: `97c5443ca55f9ddd5364520fd72bad5e5063071f` was amended to `70039c4558ca40ea40d8bde90e0e8dd102f929c4` (`commit (amend)` in retained reflog). The previous report omitted this test-commit rewrite. It is historical evidence, not clean RED evidence or an authorized R2 action.
 - `016297a` — type annotation required by the nested-evidence regression
 - `2944fd7` — five preflight production repairs
 - `c352521` — previous report-only candidate, superseded by the corrected report commit created from it
