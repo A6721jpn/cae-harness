@@ -4,15 +4,19 @@ from __future__ import annotations
 
 import hashlib
 import stat
+import time
 import uuid
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, fields, is_dataclass
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, fields, is_dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any, cast
 
 from febio_cae.domain.artifacts import (
+    FileEntry,
     GeometryInspectionRequest,
     GeometrySelectionRequest,
+    MeshArtifact,
     SourceAssetContent,
     SourceAssetRef,
 )
@@ -22,22 +26,28 @@ from febio_cae.domain.case_patch import CasePatch
 from febio_cae.domain.case_revision import CaseRevision
 from febio_cae.domain.compatibility import CapabilityStatus, CompatibilityProfile
 from febio_cae.domain.evidence import EvidenceRef
-from febio_cae.domain.lifecycle import ServiceDiagnostic, ServiceErrorCategory
+from febio_cae.domain.execution import AttemptRecord, ExecutionBundle
+from febio_cae.domain.lifecycle import RunState, ServiceDiagnostic, ServiceErrorCategory
 from febio_cae.domain.partial_case_spec import PartialCaseSpec
 from febio_cae.domain.ports import (
     CompatibilityRegistryPort,
     GeometryPort,
     PortError,
     PortErrorCategory,
+    TrustedOwnerContext,
 )
 from febio_cae.domain.questions import IssuedQuestion
-from febio_cae.domain.selection import ResolutionSnapshot, SelectionRef
+from febio_cae.domain.results import ResultManifest
+from febio_cae.domain.selection import FaceSetRule, ResolutionSnapshot, SelectionRef
+from febio_cae.domain.units import Quantity
 from febio_cae.storage.catalog import CaseCatalog, CaseCatalogError
 from febio_cae.storage.profiles import SQLiteCompatibilityRegistry
 from febio_cae.storage.registry import (
     CaseStorage,
     StorageConflictError,
     StorageIntegrityError,
+    check_answer_values,
+    nested_evidence,
 )
 from febio_cae.storage.state import ProductState
 
@@ -136,20 +146,31 @@ def _registered_selections(values: PartialCaseSpec) -> tuple[SelectionRef, ...]:
 
 
 def _nested_evidence(values: PartialCaseSpec) -> tuple[EvidenceRef, ...]:
-    found: list[EvidenceRef] = []
+    return nested_evidence(values)
 
-    def visit(value: object) -> None:
-        if isinstance(value, EvidenceRef):
-            found.append(value)
-        elif isinstance(value, (tuple, list)):
-            for item in value:
-                visit(item)
-        elif is_dataclass(value):
-            for item in fields(value):
-                visit(getattr(value, item.name))
 
-    visit(values)
-    return tuple(found)
+def _merge_evidence(*groups: Sequence[EvidenceRef]) -> tuple[EvidenceRef, ...]:
+    unique = {canonical_bytes(item.to_dict()): item for group in groups for item in group}
+    return tuple(unique.values())
+
+
+def _resolved_values(value: Any, resolutions: Mapping[bytes, ResolutionSnapshot]) -> Any:
+    if isinstance(value, SelectionRef):
+        return replace(value, resolution=resolutions[value.to_bytes()])
+    if isinstance(value, Mapping):
+        return {key: _resolved_values(child, resolutions) for key, child in value.items()}
+    if isinstance(value, (tuple, list)):
+        return tuple(_resolved_values(child, resolutions) for child in value)
+    if is_dataclass(value):
+        return replace(
+            cast(Any, value),
+            **{
+                field.name: _resolved_values(getattr(value, field.name), resolutions)
+                for field in fields(value)
+                if field.init
+            },
+        )
+    return value
 
 
 class RegisteredCaseService:
@@ -316,7 +337,7 @@ class RegisteredCaseService:
         current = storage.current_draft(case_id)
         resolved_evidence = self._resolve_declarations(storage, source_declarations, evidence)
         merged_values = self._merge_values(current.values, values)
-        merged_evidence = (*current.evidence, *resolved_evidence)
+        merged_evidence = _merge_evidence(current.evidence, resolved_evidence)
         draft = CaseDraft(
             case_id=case_id,
             draft_id=f"draft-{uuid.uuid4().hex[:12]}",
@@ -371,6 +392,14 @@ class RegisteredCaseService:
         question = storage.get_question(question_id)
         if question.case_id != case_id or question.generation != expected_generation:
             raise ServiceConflictError("question is bound to another case or generation")
+        try:
+            check_answer_values(
+                current.values,
+                self._merge_values(current.values, values),
+                tuple(question.target_fields),
+            )
+        except StorageConflictError as error:
+            raise ServiceConflictError(str(error)) from error
         resolved = self._resolve_declarations(storage, source_declarations, evidence)
         provided = {repr(item.to_dict()) for item in resolved}
         if any(repr(item.to_dict()) not in provided for item in question.question_time_evidence):
@@ -383,7 +412,7 @@ class RegisteredCaseService:
             parent_revision_id=current.parent_revision_id,
             parent_spec_digest=current.parent_spec_digest,
             values=self._merge_values(current.values, values),
-            evidence=(*current.evidence, *resolved),
+            evidence=_merge_evidence(current.evidence, resolved),
         )
         try:
             return storage.consume_question(
@@ -392,12 +421,20 @@ class RegisteredCaseService:
         except StorageConflictError as error:
             raise ServiceConflictError(str(error)) from error
 
-    def apply_patch(self, case_id: str, patch: CasePatch) -> CaseDraft:
+    def apply_patch(
+        self, case_id: str, patch: CasePatch, *, expected_generation: int | None = None
+    ) -> CaseDraft:
         storage = self._storage(case_id)
         current = storage.current_draft(case_id)
         parent = storage.get_revision(case_id, patch.parent_revision_id)
         if parent.spec_digest != patch.parent_spec_digest:
             raise ServiceConflictError("patch parent digest is stale")
+        if expected_generation is None:
+            expected_generation = storage.revision_generation(parent.revision_id)
+        if expected_generation != current.generation:
+            raise ServiceConflictError("patch requires the current explicit draft context")
+        if current.parent_revision_id not in {None, parent.revision_id}:
+            raise ServiceConflictError("patch parent differs from the current intent lineage")
         self._resolve_declarations(storage, (), patch.evidence)
         fields = (
             "geometry",
@@ -412,7 +449,7 @@ class RegisteredCaseService:
             "quality_policy",
             "budget",
         )
-        values = {field: getattr(parent.spec, field) for field in fields}
+        values = {field: getattr(current.values, field) for field in fields}
         for edit in patch.edits:
             values[edit.field] = edit.value if edit.present else None
         draft = CaseDraft(
@@ -423,10 +460,14 @@ class RegisteredCaseService:
             parent_revision_id=parent.revision_id,
             parent_spec_digest=parent.spec_digest,
             values=PartialCaseSpec(**values),
-            evidence=patch.evidence,
+            evidence=_merge_evidence(current.evidence, patch.evidence),
         )
         try:
-            return storage.set_draft(draft, expected_generation=current.generation)
+            return storage.set_draft(
+                draft,
+                expected_generation=expected_generation,
+                patch_digest=hashlib.sha256(patch.to_bytes()).hexdigest(),
+            )
         except StorageConflictError as error:
             raise ConcurrentUpdateError(str(error)) from error
 
@@ -454,6 +495,7 @@ class RegisteredCaseService:
         storage = self._storage(case_id)
         draft = storage.current_draft(case_id)
         diagnostics: list[ServiceDiagnostic] = []
+        resolutions: dict[bytes, ResolutionSnapshot] = {}
         for evidence in (*draft.evidence, *_nested_evidence(draft.values)):
             try:
                 asset = storage.source_asset(evidence.reference)
@@ -540,6 +582,17 @@ class RegisteredCaseService:
                 inspection = self.geometry.inspect(
                     GeometryInspectionRequest(source_ref, (geometry.body_id.value,)), source
                 )
+                if (
+                    Quantity(1, inspection.declared_unit).to_si()
+                    != Quantity(1, geometry.step_unit).to_si()
+                ):
+                    diagnostics.append(
+                        _diagnostic(
+                            ServiceErrorCategory.CONFLICT,
+                            "declared STEP unit conflicts with inspected source",
+                            "geometry.step_unit",
+                        )
+                    )
                 if inspection.inspection_digest != geometry.inspection_digest:
                     diagnostics.append(
                         _diagnostic(
@@ -561,10 +614,25 @@ class RegisteredCaseService:
                         resolved = self.geometry.resolve_selection(
                             GeometrySelectionRequest(source_ref, selection), source
                         )
+                        resolutions[selection.to_bytes()] = resolved
                         if not isinstance(resolved, ResolutionSnapshot) or (
                             resolved.geometry_digest != selection.geometry_digest
                             or resolved.body_id != selection.body_id
                             or resolved.frame != selection.frame
+                            or (
+                                isinstance(selection.rule, FaceSetRule)
+                                and {face.face_id for face in resolved.faces}
+                                != set(selection.rule.face_ids)
+                            )
+                            or (
+                                selection.resolution is not None
+                                and canonical_bytes(
+                                    resolved.to_dict(), unordered_paths=(("faces",),)
+                                )
+                                != canonical_bytes(
+                                    selection.resolution.to_dict(), unordered_paths=(("faces",),)
+                                )
+                            )
                         ):
                             diagnostics.append(
                                 _diagnostic(
@@ -704,12 +772,29 @@ class RegisteredCaseService:
                     _diagnostic(ServiceErrorCategory.NEEDS_PHYSICAL_INPUT, str(error), "values"),
                 ),
             )
-        return ServiceResult("VALIDATED", case_id, draft=draft)
+        return ServiceResult(
+            "VALIDATED",
+            case_id,
+            draft=replace(draft, values=_resolved_values(draft.values, resolutions)),
+        )
 
     def validate_case(self, case_id: str) -> ServiceResult:
         return self._validate(case_id)
 
     def freeze_case(
+        self, case_id: str, *, caller_payload: Mapping[str, object] | None = None
+    ) -> ServiceResult:
+        try:
+            with self._storage(case_id).evidence_snapshot():
+                return self._freeze_pinned(case_id, caller_payload=caller_payload)
+        except (StorageIntegrityError, OSError) as error:
+            return ServiceResult(
+                "NEEDS_INPUT",
+                case_id,
+                diagnostics=(_diagnostic(ServiceErrorCategory.INTEGRITY, str(error), "evidence"),),
+            )
+
+    def _freeze_pinned(
         self, case_id: str, *, caller_payload: Mapping[str, object] | None = None
     ) -> ServiceResult:
         if caller_payload is not None and any(
@@ -747,6 +832,94 @@ class RegisteredCaseService:
         if not callable(register):
             raise ServiceConflictError("configured compatibility registry is read-only")
         return register(profile)
+
+    def _execute_registered(
+        self,
+        case_id: str,
+        revision_id: str,
+        *,
+        build: Callable[
+            [CaseRevision, Path], tuple[MeshArtifact, ExecutionBundle, Mapping[str, bytes]]
+        ],
+        produce: Callable[[ExecutionBundle, dict[str, bytes]], Mapping[str, bytes]],
+        read: Callable[
+            [AttemptRecord, ExecutionBundle, tuple[FileEntry, ...], CaseStorage], ResultManifest
+        ],
+    ) -> ResultManifest:
+        """Internal synchronous byte-producer integration, with service-owned writers.
+
+        These injected callables are trusted application dependencies, never CLI
+        payloads. This route does not start or authorize an external process.
+        """
+        storage = self._storage(case_id)
+        with (
+            storage.evidence_snapshot(),
+            storage.revision_snapshot(case_id, revision_id) as revision,
+        ):
+            validated = self._validate(case_id)
+            draft = validated.draft
+            if (
+                validated.status != "VALIDATED"
+                or draft is None
+                or storage.revision_generation(revision_id) != draft.generation
+                or draft.values.to_case_spec().to_bytes() != revision.spec.to_bytes()
+                or tuple(draft.evidence) != tuple(revision.evidence)
+            ):
+                raise PortError(
+                    PortErrorCategory.CONFLICT,
+                    "execution requires the current validated frozen revision",
+                )
+            owner = TrustedOwnerContext(
+                case_id,
+                f"run-{uuid.uuid4().hex[:12]}",
+                f"attempt-{uuid.uuid4().hex[:12]}",
+                draft.generation,
+            )
+            destination = (
+                storage.root / f"cases/{case_id}/runs/{owner.run_id}/attempts/{owner.attempt_id}"
+            )
+            started = time.monotonic()
+            mesh, bundle, inputs = build(revision, destination)
+            profile = self.compatibility.get_profile(revision.spec.solver_policy.profile.profile_id)
+            if (
+                mesh.provenance.source_geometry_digest != revision.spec.geometry.source_step_digest
+                or revision.spec.geometry.body_id.value not in mesh.provenance.source_body_ids
+                or mesh.provenance.mesh_recipe_digest
+                != hashlib.sha256(revision.spec.mesh_policy.to_bytes()).hexdigest()
+                or not mesh.quality_records
+                or any(item.status != "PASS" for item in mesh.quality_records)
+                or bundle.thread_count > revision.spec.budget.cpu_workers
+            ):
+                raise PortError(
+                    PortErrorCategory.INTEGRITY, "mesh or resource lineage differs from revision"
+                )
+            storage.claim(owner)
+            storage._register_execution(owner, bundle, mesh, profile, inputs)
+            storage._transition_attempt(owner, RunState.PREPARING)
+            storage._transition_attempt(owner, RunState.RUNNING)
+            try:
+                outputs = dict(produce(bundle, dict(inputs)))
+            except Exception:
+                storage._transition_attempt(owner, RunState.INTERRUPTED)
+                raise
+            storage._transition_attempt(owner, RunState.DRAINING)
+            try:
+                if time.monotonic() - started > revision.spec.budget.max_elapsed.to_si().value:
+                    raise PortError(
+                        PortErrorCategory.EXECUTION, "execution exhausted elapsed budget"
+                    )
+                storage._seal_outputs(owner, outputs)
+            except Exception:
+                storage._transition_attempt(owner, RunState.FAILED)
+                raise
+            storage._transition_attempt(owner, RunState.VALIDATING)
+            try:
+                manifest = storage.publish_manifest(owner, storage._read_candidate(owner, read))
+            except Exception:
+                storage._transition_attempt(owner, RunState.FAILED)
+                raise
+            storage._transition_attempt(owner, RunState.SUCCEEDED)
+            return manifest
 
 
 __all__ = [

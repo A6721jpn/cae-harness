@@ -3,25 +3,35 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import sqlite3
 import stat
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import ExitStack, contextmanager
+from dataclasses import fields, is_dataclass
 from datetime import UTC, datetime
+from functools import wraps
 from pathlib import Path
+from typing import cast
 
 from febio_cae.domain.artifacts import (
     FileEntry,
+    MeshArtifact,
     ResolvedFileContent,
     SourceAssetContent,
     SourceAssetRef,
 )
+from febio_cae.domain.canonical import canonical_bytes
 from febio_cae.domain.case_draft import CaseDraft
 from febio_cae.domain.case_revision import CaseRevision
 from febio_cae.domain.codec import decode_record, encode_record
+from febio_cae.domain.compatibility import CapabilityStatus, CompatibilityProfile
+from febio_cae.domain.evidence import EvidenceRef
 from febio_cae.domain.execution import AttemptRecord, ExecutionBundle
+from febio_cae.domain.lifecycle import RunState
 from febio_cae.domain.partial_case_spec import PartialCaseSpec
 from febio_cae.domain.ports import (
     PortError,
@@ -31,6 +41,7 @@ from febio_cae.domain.ports import (
 from febio_cae.domain.questions import IssuedQuestion
 from febio_cae.domain.results import NumericResultData, ReadStatus, ResultDataRef, ResultManifest
 
+from ._ownership import identity, lease, pin_directories, pinned_read
 from .catalog import validate_case_id
 
 
@@ -54,14 +65,71 @@ def _now() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 
-def _connect(path: Path) -> sqlite3.Connection:
+@contextmanager
+def _connect(path: Path) -> Iterator[sqlite3.Connection]:
     connection = sqlite3.connect(path, timeout=30.0, isolation_level=None)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA journal_mode=WAL")
     connection.execute("PRAGMA synchronous=FULL")
     connection.execute("PRAGMA foreign_keys=ON")
     connection.execute("PRAGMA busy_timeout=30000")
-    return connection
+    try:
+        yield connection
+    finally:
+        connection.close()
+
+
+def _serialized[**P, R](method: Callable[P, R]) -> Callable[P, R]:
+    @wraps(method)
+    def call(*args: P.args, **kwargs: P.kwargs) -> R:
+        storage = cast("CaseStorage", args[0])
+        with storage.transaction():
+            return method(*args, **kwargs)
+
+    return call
+
+
+def nested_evidence(value: object) -> tuple[EvidenceRef, ...]:
+    if isinstance(value, EvidenceRef):
+        return (value,)
+    if isinstance(value, Mapping):
+        return tuple(item for child in value.values() for item in nested_evidence(child))
+    if isinstance(value, (tuple, list)):
+        return tuple(item for child in value for item in nested_evidence(child))
+    if is_dataclass(value):
+        return tuple(
+            item for field in fields(value) for item in nested_evidence(getattr(value, field.name))
+        )
+    return ()
+
+
+def check_answer_values(
+    current: PartialCaseSpec, incoming: PartialCaseSpec, targets: tuple[str, ...]
+) -> None:
+    def check(before: object, after: object, path: str) -> None:
+        if before == after or any(
+            path == target or path.startswith(target + ".") for target in targets
+        ):
+            return
+        if isinstance(before, dict) and isinstance(after, dict):
+            for key in before.keys() | after.keys():
+                check(before.get(key), after.get(key), f"{path}.{key}" if path else key)
+            return
+        if isinstance(before, list) and isinstance(after, list) and len(before) == len(after):
+            for index, (old, new) in enumerate(zip(before, after, strict=True)):
+                check(old, new, f"{path}.{index}")
+            return
+        raise StorageConflictError(f"answer changes unissued target {path}")
+
+    for field in fields(current):
+        if field.init:
+            before = getattr(current, field.name)
+            after = getattr(incoming, field.name)
+            check(
+                None if before is None else before.to_dict(),
+                None if after is None else after.to_dict(),
+                field.name,
+            )
 
 
 def _safe_identifier(value: str, field: str) -> str:
@@ -117,10 +185,17 @@ def _owned_path(root: Path, relative: str) -> Path:
 
 
 def _write_atomic(root: Path, relative: str, content: bytes, *, token: str | None = None) -> Path:
+    with pin_directories(root):
+        target = _owned_path(root, relative)
+        with pin_directories(target.parent, create=True):
+            return _write_pinned(root, relative, content, token=token)
+
+
+def _write_pinned(root: Path, relative: str, content: bytes, *, token: str | None = None) -> Path:
     target = _owned_path(root, relative)
     target.parent.mkdir(parents=True, exist_ok=True)
     _assert_no_links(target.parent, root)
-    suffix = token or uuid.uuid4().hex
+    suffix = token or uuid.uuid4().hex[:12]
     temporary = target.with_name(f".{target.name}.{suffix}.tmp")
     try:
         with temporary.open("xb") as handle:
@@ -148,7 +223,8 @@ def _read_owned(root: Path, relative: str) -> bytes:
     if not target.is_file():
         raise StorageIntegrityError(f"registered file is missing: {relative}")
     _assert_no_links(target, root)
-    return target.read_bytes()
+    with pinned_read(target) as stream:
+        return stream.read()
 
 
 class CaseStorage:
@@ -160,14 +236,72 @@ class CaseStorage:
         self.root = Path(root).absolute()
         if not self.root.is_dir() or _is_reparse(self.root):
             raise StorageIntegrityError("registered case root is unavailable")
+        self._root_identity = identity(self.root)
         self.registry_path = self.root / "registry.sqlite3"
         _assert_no_links(self.registry_path, self.root)
         self.failure_injector = failure_injector
-        self._initialize_schema()
-        self._recover_publications()
+        self._reading_attempt: AttemptRecord | None = None
+        with pin_directories(self.root):
+            self._initialize_schema()
+        with self.transaction(blocking=False, recovery=True) as acquired:
+            if acquired:
+                self._recover_publications()
+
+    @contextmanager
+    def transaction(self, *, blocking: bool = True, recovery: bool = False) -> Iterator[bool]:
+        try:
+            with pin_directories(self.root):
+                if identity(self.root) != self._root_identity:
+                    raise StorageIntegrityError("registered root identity changed")
+                with lease(self.root, blocking=blocking, recovery=recovery) as acquired:
+                    yield acquired
+        except OSError as error:
+            raise StorageIntegrityError(str(error)) from error
+
+    @contextmanager
+    def evidence_snapshot(self) -> Iterator[None]:
+        """Deny writes/deletes to every registered source through freeze/recovery."""
+        with self.transaction(), ExitStack() as stack:
+            with _connect(self.registry_path) as connection:
+                rows = connection.execute("SELECT * FROM sources").fetchall()
+            for row in rows:
+                stream = stack.enter_context(
+                    pinned_read(_owned_path(self.root, row["relative_path"]))
+                )
+                if hashlib.sha256(stream.read()).hexdigest() != row["content_digest"]:
+                    raise StorageIntegrityError("registered source bytes were modified")
+            yield
+
+    @contextmanager
+    def revision_snapshot(self, case_id: str, revision_id: str) -> Iterator[CaseRevision]:
+        with self.transaction():
+            relative = f"cases/{case_id}/revisions/{revision_id}/revision.json"
+            with pinned_read(_owned_path(self.root, relative)):
+                yield self.get_revision(case_id, revision_id)
 
     @classmethod
     def initialize(
+        cls,
+        root: Path | str,
+        *,
+        case_id: str,
+        source_asset: SourceAssetRef,
+        source_kind: str,
+        source_content: bytes,
+        created_at: str,
+    ) -> CaseStorage:
+        with pin_directories(Path(root).absolute(), create=True), lease(Path(root).absolute()):
+            return cls._initialize_pinned(
+                root,
+                case_id=case_id,
+                source_asset=source_asset,
+                source_kind=source_kind,
+                source_content=source_content,
+                created_at=created_at,
+            )
+
+    @classmethod
+    def _initialize_pinned(
         cls,
         root: Path | str,
         *,
@@ -210,10 +344,11 @@ class CaseStorage:
             evidence=(),
         )
         relative = f"cases/{case_id}/sources/{source_asset.asset_id}.bin"
-        _write_atomic(root_path, relative, source_content)
         payload = encode_record(draft)
         with _connect(storage.registry_path) as connection:
             connection.execute("BEGIN IMMEDIATE")
+            if connection.execute("SELECT 1 FROM case_state LIMIT 1").fetchone():
+                raise StorageConflictError("case root is already initialized")
             connection.execute(
                 """
                 INSERT INTO case_state(
@@ -241,12 +376,23 @@ class CaseStorage:
                     relative,
                 ),
             )
+            _write_atomic(root_path, relative, source_content)
             connection.commit()
         return storage
 
     def _initialize_schema(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
         with _connect(self.registry_path) as connection:
+            if connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE name='root_identity'"
+            ).fetchone():
+                recorded = connection.execute(
+                    "SELECT identity FROM root_identity WHERE singleton=1"
+                ).fetchone()
+                if recorded is not None:
+                    if recorded["identity"] != repr(self._root_identity):
+                        raise StorageIntegrityError("registered root identity changed")
+                    return
             connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS case_state (
@@ -316,8 +462,32 @@ class CaseStorage:
                     data_id TEXT PRIMARY KEY,
                     payload BLOB NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS root_identity (singleton INTEGER PRIMARY KEY, identity TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS applied_patches (digest TEXT PRIMARY KEY, generation INTEGER NOT NULL);
+                CREATE TABLE IF NOT EXISTS revision_contexts (
+                    revision_id TEXT PRIMARY KEY, generation INTEGER, draft_id TEXT
+                );
+                CREATE TABLE IF NOT EXISTS execution_lineage (
+                    attempt_id TEXT PRIMARY KEY, bundle BLOB NOT NULL,
+                    mesh BLOB NOT NULL, profile BLOB NOT NULL,
+                    required_outputs BLOB NOT NULL, sealed_files BLOB,
+                    read_candidate BLOB,
+                    writer_closed INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS attempt_history (
+                    sequence INTEGER PRIMARY KEY AUTOINCREMENT, attempt_id TEXT NOT NULL,
+                    payload BLOB NOT NULL
+                );
                 """
             )
+            recorded = connection.execute(
+                "SELECT identity FROM root_identity WHERE singleton=1"
+            ).fetchone()
+            root_id = repr(self._root_identity)
+            if recorded is None:
+                connection.execute("INSERT INTO root_identity VALUES(1,?)", (root_id,))
+            elif recorded["identity"] != root_id:
+                raise StorageIntegrityError("registered root identity changed")
             for column, definition in (
                 ("expected_generation", "INTEGER"),
                 ("expected_draft_id", "TEXT"),
@@ -358,6 +528,13 @@ class CaseStorage:
 
     def _recover_publications(self) -> None:
         with _connect(self.registry_path) as connection:
+            if not connection.execute("SELECT 1 FROM publications LIMIT 1").fetchone():
+                return
+        with self.evidence_snapshot():
+            self._recover_publications_pinned()
+
+    def _recover_publications_pinned(self) -> None:
+        with _connect(self.registry_path) as connection, ExitStack() as paths:
             rows = connection.execute(
                 "SELECT * FROM publications ORDER BY created_at,transaction_id"
             ).fetchall()
@@ -368,6 +545,7 @@ class CaseStorage:
                 for row in rows:
                     relative = str(row["relative_path"])
                     final = _owned_path(self.root, relative)
+                    paths.enter_context(pin_directories(final.parent, create=True))
                     payload = bytes(row["payload"])
                     if row["state"] == "COMMITTED":
                         connection.execute(
@@ -376,6 +554,7 @@ class CaseStorage:
                         )
                         continue
                     revision = decode_record(payload, CaseRevision)
+                    self._verify_revision_sources(revision)
                     expected_generation = row["expected_generation"]
                     if expected_generation is not None:
                         current = self._case_row(connection, revision.case_id)
@@ -436,6 +615,10 @@ class CaseStorage:
                                 raise StorageIntegrityError(
                                     "prepared revision conflicts with an existing registered revision"
                                 ) from error
+                        connection.execute(
+                            "INSERT OR IGNORE INTO revision_contexts VALUES(?,?,?)",
+                            (revision.revision_id, expected_generation, row["expected_draft_id"]),
+                        )
                     temporary = final.with_name(f".{final.name}.{row['transaction_id']}.tmp")
                     if temporary.exists():
                         temporary.unlink()
@@ -454,6 +637,7 @@ class CaseStorage:
             raise StorageIntegrityError(f"case registry has no state for {case_id!r}")
         return row
 
+    @_serialized
     def current_draft(self, case_id: str) -> CaseDraft:
         validate_case_id(case_id)
         with _connect(self.registry_path) as connection:
@@ -468,6 +652,7 @@ class CaseStorage:
         except Exception as error:
             raise StorageIntegrityError("current draft payload is corrupt") from error
 
+    @_serialized
     def get_revision(self, case_id: str, revision_id: str) -> CaseRevision:
         validate_case_id(case_id)
         _safe_identifier(revision_id, "revision_id")
@@ -489,7 +674,10 @@ class CaseStorage:
             raise StorageIntegrityError("registered revision file does not match SQLite")
         return revision
 
-    def set_draft(self, draft: CaseDraft, *, expected_generation: int) -> CaseDraft:
+    @_serialized
+    def set_draft(
+        self, draft: CaseDraft, *, expected_generation: int, patch_digest: str | None = None
+    ) -> CaseDraft:
         payload = encode_record(draft)
         with _connect(self.registry_path) as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -502,6 +690,15 @@ class CaseStorage:
                     )
                 if draft.generation != expected_generation + 1:
                     raise StorageConflictError("new draft generation is not the next generation")
+                if patch_digest is not None:
+                    if connection.execute(
+                        "SELECT 1 FROM applied_patches WHERE digest=?", (patch_digest,)
+                    ).fetchone():
+                        raise StorageConflictError("patch was already applied")
+                    connection.execute(
+                        "INSERT INTO applied_patches VALUES(?,?)",
+                        (patch_digest, expected_generation),
+                    )
                 connection.execute(
                     "INSERT INTO drafts(draft_id,case_id,generation,payload) VALUES(?,?,?,?)",
                     (draft.draft_id, draft.case_id, draft.generation, payload),
@@ -521,6 +718,7 @@ class CaseStorage:
                 raise
         return draft
 
+    @_serialized
     def issue_question(self, question: IssuedQuestion) -> IssuedQuestion:
         payload = encode_record(question)
         case_id = question.case_id
@@ -528,7 +726,12 @@ class CaseStorage:
         with _connect(self.registry_path) as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
-                self._case_row(connection, case_id)
+                current = self._case_row(connection, case_id)
+                if (
+                    current["current_generation"] != question.generation
+                    or current["current_draft_id"] != question.draft_id
+                ):
+                    raise StorageConflictError("question context is stale")
                 connection.execute(
                     "INSERT INTO questions(question_id,case_id,draft_id,generation,payload) VALUES(?,?,?,?,?)",
                     (
@@ -548,6 +751,7 @@ class CaseStorage:
                 raise
         return question
 
+    @_serialized
     def get_question(self, question_id: str) -> IssuedQuestion:
         _safe_identifier(question_id, "question_id")
         with _connect(self.registry_path) as connection:
@@ -561,6 +765,7 @@ class CaseStorage:
         except Exception as error:
             raise StorageIntegrityError("issued question payload is corrupt") from error
 
+    @_serialized
     def consume_question(
         self,
         question_id: str,
@@ -589,6 +794,19 @@ class CaseStorage:
                     raise StorageConflictError(
                         "answered draft generation is not the next generation"
                     )
+                previous = connection.execute(
+                    "SELECT payload FROM drafts WHERE draft_id=?", (current["current_draft_id"],)
+                ).fetchone()
+                assert previous is not None
+                old_draft = decode_record(bytes(previous["payload"]), CaseDraft)
+                issued = decode_record(bytes(row["payload"]), IssuedQuestion)
+                check_answer_values(old_draft.values, draft.values, tuple(issued.target_fields))
+                if (draft.parent_revision_id, draft.parent_spec_digest, draft.input_intent) != (
+                    old_draft.parent_revision_id,
+                    old_draft.parent_spec_digest,
+                    old_draft.input_intent,
+                ):
+                    raise StorageConflictError("answer changed unissued draft context")
                 consumed = connection.execute(
                     "UPDATE questions SET consumed=1 WHERE question_id=? AND consumed=0",
                     (question_id,),
@@ -612,6 +830,14 @@ class CaseStorage:
     def register_revision(self, revision: CaseRevision) -> CaseRevision:
         return self._publish_revision(revision, expected_generation=None)
 
+    @_serialized
+    def revision_generation(self, revision_id: str) -> int | None:
+        with _connect(self.registry_path) as connection:
+            row = connection.execute(
+                "SELECT generation FROM revision_contexts WHERE revision_id=?", (revision_id,)
+            ).fetchone()
+        return None if row is None else row["generation"]
+
     def register_revision_if_current(
         self, revision: CaseRevision, *, expected_generation: int
     ) -> CaseRevision:
@@ -620,6 +846,33 @@ class CaseStorage:
     def _publish_revision(
         self, revision: CaseRevision, *, expected_generation: int | None
     ) -> CaseRevision:
+        with self.evidence_snapshot():
+            self._verify_revision_sources(revision)
+            parent = _owned_path(
+                self.root,
+                f"cases/{revision.case_id}/revisions/{revision.revision_id}/revision.json",
+            ).parent
+            with pin_directories(parent, create=True):
+                return self._publish_revision_pinned(
+                    revision, expected_generation=expected_generation
+                )
+
+    def _verify_revision_sources(self, revision: CaseRevision) -> None:
+        for evidence in nested_evidence(revision):
+            asset = self.source_asset(evidence.reference)
+            if (
+                asset.content_digest != evidence.content_digest
+                or self.source_kind(evidence.reference) != evidence.source_kind
+            ):
+                raise StorageIntegrityError("revision evidence differs from registered source")
+            self.resolve_source(asset)
+        if self.source_asset("cad").content_digest != revision.spec.geometry.source_step_digest:
+            raise StorageIntegrityError("revision CAD identity differs from registration")
+
+    def _publish_revision_pinned(
+        self, revision: CaseRevision, *, expected_generation: int | None
+    ) -> CaseRevision:
+        self._recover_publications()
         payload = encode_record(revision)
         relative = f"cases/{revision.case_id}/revisions/{revision.revision_id}/revision.json"
         transaction_id = uuid.uuid4().hex[:12]
@@ -735,6 +988,14 @@ class CaseStorage:
                     "UPDATE publications SET state='COMMITTED' WHERE transaction_id=?",
                     (transaction_id,),
                 )
+                connection.execute(
+                    "INSERT INTO revision_contexts VALUES(?,?,?)",
+                    (
+                        revision.revision_id,
+                        expected_generation,
+                        expected_draft_id if expected_generation is not None else None,
+                    ),
+                )
                 connection.commit()
             except StorageConflictError:
                 connection.rollback()
@@ -748,6 +1009,7 @@ class CaseStorage:
             connection.execute("DELETE FROM publications WHERE transaction_id=?", (transaction_id,))
         return revision
 
+    @_serialized
     def source_asset(self, asset_id: str) -> SourceAssetRef:
         _safe_identifier(asset_id, "asset_id")
         with _connect(self.registry_path) as connection:
@@ -762,6 +1024,7 @@ class CaseStorage:
             media_type=str(row["media_type"]),
         )
 
+    @_serialized
     def source_kind(self, asset_id: str) -> str:
         _safe_identifier(asset_id, "asset_id")
         with _connect(self.registry_path) as connection:
@@ -772,6 +1035,7 @@ class CaseStorage:
             raise StorageConflictError(f"unknown source asset {asset_id!r}")
         return str(row["source_kind"])
 
+    @_serialized
     def ingest_source(
         self,
         *,
@@ -790,6 +1054,7 @@ class CaseStorage:
         reference = SourceAssetRef(asset_id, digest, media_type)
         relative = f"cases/{self._case_id()}/sources/{asset_id}.bin"
         with _connect(self.registry_path) as connection:
+            connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 "SELECT * FROM sources WHERE asset_id=?", (asset_id,)
             ).fetchone()
@@ -800,15 +1065,15 @@ class CaseStorage:
                     or row["media_type"] != media_type
                 ):
                     raise StorageConflictError("source identity is already registered differently")
+                self.resolve_source(reference)
+                connection.commit()
                 return reference
-        _write_atomic(self.root, relative, content)
-        with _connect(self.registry_path) as connection:
-            connection.execute("BEGIN IMMEDIATE")
             try:
                 connection.execute(
                     "INSERT INTO sources(asset_id,case_id,source_kind,media_type,content_digest,relative_path) VALUES(?,?,?,?,?,?)",
                     (asset_id, self._case_id(), source_kind, media_type, digest, relative),
                 )
+                _write_atomic(self.root, relative, content)
                 connection.commit()
             except sqlite3.IntegrityError:
                 connection.rollback()
@@ -827,6 +1092,7 @@ class CaseStorage:
             raise StorageIntegrityError("case registry is not initialized")
         return str(row["case_id"])
 
+    @_serialized
     def resolve_source(self, source_asset: SourceAssetRef) -> SourceAssetContent:
         if not isinstance(source_asset, SourceAssetRef):
             raise PortError(
@@ -848,6 +1114,7 @@ class CaseStorage:
             raise PortError(PortErrorCategory.INTEGRITY, "registered source bytes were modified")
         return SourceAssetContent(source_asset, content)
 
+    @_serialized
     def claim(self, owner: TrustedOwnerContext) -> TrustedOwnerContext:
         if owner.case_id != self._case_id():
             raise PortError(PortErrorCategory.CONFLICT, "owner case is not this registered case")
@@ -855,6 +1122,11 @@ class CaseStorage:
         with _connect(self.registry_path) as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
+                current = self._case_row(connection, owner.case_id)
+                if owner.owner_generation != current["current_generation"]:
+                    raise PortError(PortErrorCategory.CONFLICT, "owner generation is stale")
+                for field in ("run_id", "attempt_id"):
+                    _safe_identifier(getattr(owner, field), field)
                 connection.execute(
                     "INSERT INTO owners(run_id,case_id,attempt_id,owner_generation,payload) VALUES(?,?,?,?,?)",
                     (
@@ -876,6 +1148,7 @@ class CaseStorage:
                 raise
         return owner
 
+    @_serialized
     def validate(self, owner: TrustedOwnerContext, attempt: AttemptRecord) -> TrustedOwnerContext:
         if owner.case_id != self._case_id():
             raise PortError(PortErrorCategory.CONFLICT, "owner case is not this registered case")
@@ -898,14 +1171,247 @@ class CaseStorage:
             ).fetchone()
         if row is None:
             raise PortError(PortErrorCategory.CONFLICT, "owner claim is not registered")
-        with _connect(self.registry_path) as connection:
-            connection.execute(
-                "UPDATE owners SET payload=? WHERE run_id=?",
-                (encode_record(attempt), owner.run_id),
+        if bytes(row["payload"]) != encode_record(attempt):
+            raise PortError(
+                PortErrorCategory.CONFLICT, "attempt is not the registered lifecycle snapshot"
             )
+        self._lineage(attempt)
         return owner
 
+    def _attempt(self, owner: TrustedOwnerContext) -> AttemptRecord:
+        with _connect(self.registry_path) as connection:
+            row = connection.execute(
+                "SELECT payload FROM owners WHERE run_id=? AND attempt_id=? AND case_id=? AND owner_generation=?",
+                (owner.run_id, owner.attempt_id, owner.case_id, owner.owner_generation),
+            ).fetchone()
+        try:
+            if row is None:
+                raise ValueError("unknown owner")
+            return decode_record(bytes(row["payload"]), AttemptRecord)
+        except ValueError as error:
+            raise PortError(
+                PortErrorCategory.CONFLICT, "no registered execution attempt"
+            ) from error
+
+    def _lineage(self, attempt: AttemptRecord) -> tuple[ExecutionBundle, sqlite3.Row]:
+        with _connect(self.registry_path) as connection:
+            row = connection.execute(
+                "SELECT * FROM execution_lineage WHERE attempt_id=?", (attempt.attempt_id,)
+            ).fetchone()
+        if row is None:
+            raise PortError(PortErrorCategory.CONFLICT, "execution lineage is not registered")
+        bundle = decode_record(bytes(row["bundle"]), ExecutionBundle)
+        revision = self.get_revision(attempt.case_id, attempt.revision_id)
+        mesh = decode_record(bytes(row["mesh"]), MeshArtifact)
+        if (
+            bundle.bundle_digest != attempt.bundle_digest
+            or bundle.revision_id != revision.revision_id
+            or bundle.case_id != revision.case_id
+            or bundle.spec_digest != revision.spec_digest
+            or bundle.mesh_digest != mesh.artifact_digest
+        ):
+            raise PortError(PortErrorCategory.INTEGRITY, "execution lineage changed")
+        self._verify_revision_sources(revision)
+        for entry in bundle.files:
+            self._file_content(attempt, entry)
+        return bundle, row
+
+    def _file_content(self, attempt: AttemptRecord, entry: FileEntry) -> ResolvedFileContent:
+        relative = f"cases/{attempt.case_id}/runs/{attempt.run_id}/attempts/{attempt.attempt_id}/{entry.logical_path}"
+        try:
+            return ResolvedFileContent(entry, _read_owned(self.root, relative))
+        except (StorageIntegrityError, OSError, ValueError) as error:
+            raise PortError(PortErrorCategory.INTEGRITY, str(error)) from error
+
+    @_serialized
+    def _register_execution(
+        self,
+        owner: TrustedOwnerContext,
+        bundle: ExecutionBundle,
+        mesh: MeshArtifact,
+        profile: CompatibilityProfile,
+        inputs: Mapping[str, bytes],
+    ) -> AttemptRecord:
+        revision = self.get_revision(owner.case_id, bundle.revision_id)
+        if (
+            self.current_draft(owner.case_id).generation != owner.owner_generation
+            or self.revision_generation(revision.revision_id) != owner.owner_generation
+            or bundle.case_id != owner.case_id
+            or bundle.spec_digest != revision.spec_digest
+            or bundle.mesh_digest != mesh.artifact_digest
+            or bundle.tool != profile.solver
+            or bundle.profile_id != profile.profile_id
+            or hashlib.sha256(profile.to_bytes()).hexdigest()
+            != revision.spec.solver_policy.profile.record_digest
+            or any(item.status is not CapabilityStatus.SUPPORTED for item in profile.capabilities)
+        ):
+            raise PortError(PortErrorCategory.CONFLICT, "execution preparation lineage is stale")
+        self._verify_revision_sources(revision)
+        if set(inputs) != {entry.logical_path for entry in bundle.files}:
+            raise PortError(PortErrorCategory.INTEGRITY, "compiled input membership differs")
+        base = f"cases/{owner.case_id}/runs/{owner.run_id}/attempts/{owner.attempt_id}"
+        destination = _owned_path(self.root, base)
+        if Path(bundle.cwd).absolute() != destination or destination.exists():
+            raise PortError(
+                PortErrorCategory.CONFLICT, "execution requires a fresh owned destination"
+            )
+        attempt = AttemptRecord(
+            owner.attempt_id,
+            owner.run_id,
+            owner.case_id,
+            bundle.revision_id,
+            owner.owner_generation,
+            bundle.bundle_digest,
+            RunState.CREATED,
+            None,
+            bundle.settings,
+        )
+        with _connect(self.registry_path) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            owner_row = connection.execute(
+                "SELECT payload FROM owners WHERE run_id=? AND attempt_id=?",
+                (owner.run_id, owner.attempt_id),
+            ).fetchone()
+            if (
+                owner_row is None
+                or connection.execute(
+                    "SELECT 1 FROM execution_lineage WHERE attempt_id=?", (owner.attempt_id,)
+                ).fetchone()
+            ):
+                raise PortError(
+                    PortErrorCategory.CONFLICT, "execution owner is absent or already prepared"
+                )
+            connection.execute(
+                "INSERT INTO execution_lineage(attempt_id,bundle,mesh,profile,required_outputs) VALUES(?,?,?,?,?)",
+                (
+                    owner.attempt_id,
+                    encode_record(bundle),
+                    encode_record(mesh),
+                    encode_record(profile),
+                    canonical_bytes(revision.spec.outputs.to_dict()),
+                ),
+            )
+            for entry in bundle.files:
+                ResolvedFileContent(entry, inputs[entry.logical_path])
+                _write_atomic(self.root, f"{base}/{entry.logical_path}", inputs[entry.logical_path])
+            connection.execute(
+                "UPDATE owners SET payload=? WHERE run_id=?", (encode_record(attempt), owner.run_id)
+            )
+            connection.execute(
+                "INSERT INTO attempt_history(attempt_id,payload) VALUES(?,?)",
+                (attempt.attempt_id, encode_record(attempt)),
+            )
+            connection.commit()
+        return attempt
+
+    @_serialized
+    def _transition_attempt(self, owner: TrustedOwnerContext, target: RunState) -> AttemptRecord:
+        attempt = self._attempt(owner)
+        self.validate(owner, attempt)
+        if target is RunState.SUCCEEDED:
+            with _connect(self.registry_path) as connection:
+                rows = connection.execute(
+                    "SELECT manifest_id FROM manifests WHERE attempt_id=?", (attempt.attempt_id,)
+                ).fetchall()
+            if len(rows) != 1:
+                raise PortError(PortErrorCategory.CONFLICT, "success requires one published result")
+            self.get_manifest(rows[0]["manifest_id"])
+        updated = attempt.transition_to(target)
+        with _connect(self.registry_path) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "UPDATE owners SET payload=? WHERE run_id=?", (encode_record(updated), owner.run_id)
+            )
+            connection.execute(
+                "INSERT INTO attempt_history(attempt_id,payload) VALUES(?,?)",
+                (attempt.attempt_id, encode_record(updated)),
+            )
+            connection.commit()
+        return updated
+
+    @_serialized
+    def _seal_outputs(
+        self, owner: TrustedOwnerContext, outputs: Mapping[str, bytes]
+    ) -> tuple[FileEntry, ...]:
+        """Internal synchronous byte producer route; only this service opens writers."""
+        attempt = self._attempt(owner)
+        if attempt.state is not RunState.DRAINING:
+            raise PortError(
+                PortErrorCategory.CONFLICT, "outputs require a draining registered attempt"
+            )
+        _, row = self._lineage(attempt)
+        required = json.loads(bytes(row["required_outputs"]))
+        ids = {item["request_id"] for item in required["requests"]}
+        if set(outputs) != ids or any(not isinstance(value, bytes) for value in outputs.values()):
+            raise PortError(
+                PortErrorCategory.INTEGRITY, "producer omitted required output membership"
+            )
+        if row["sealed_files"] is not None:
+            raise PortError(PortErrorCategory.CONFLICT, "outputs are already sealed")
+        entries = []
+        for output_id in sorted(ids):
+            _safe_identifier(output_id, "output_id")
+            data = outputs[output_id]
+            entry = FileEntry(
+                f"outputs/{output_id}.bin", hashlib.sha256(data).hexdigest(), len(data), output_id
+            )
+            relative = f"cases/{attempt.case_id}/runs/{attempt.run_id}/attempts/{attempt.attempt_id}/{entry.logical_path}"
+            _write_atomic(self.root, relative, data)
+            entries.append(entry)
+        with _connect(self.registry_path) as connection:
+            connection.execute(
+                "UPDATE execution_lineage SET sealed_files=?,writer_closed=1 WHERE attempt_id=?",
+                (canonical_bytes([entry.to_dict() for entry in entries]), attempt.attempt_id),
+            )
+        return tuple(entries)
+
+    def _sealed_entries(self, row: sqlite3.Row) -> tuple[FileEntry, ...]:
+        if not row["writer_closed"] or row["sealed_files"] is None:
+            raise PortError(PortErrorCategory.CONFLICT, "registered output writers are not closed")
+        return tuple(
+            decode_record(canonical_bytes(item), FileEntry)
+            for item in json.loads(bytes(row["sealed_files"]))
+        )
+
+    @_serialized
+    def _read_candidate(
+        self,
+        owner: TrustedOwnerContext,
+        reader: Callable[
+            [AttemptRecord, ExecutionBundle, tuple[FileEntry, ...], CaseStorage], ResultManifest
+        ],
+    ) -> ResultManifest:
+        attempt = self._attempt(owner)
+        bundle, lineage = self._lineage(attempt)
+        if attempt.state is not RunState.VALIDATING or lineage["read_candidate"] is not None:
+            raise PortError(
+                PortErrorCategory.CONFLICT, "reader requires an unread validating attempt"
+            )
+        self._reading_attempt = attempt
+        try:
+            manifest = reader(attempt, bundle, self._sealed_entries(lineage), self)
+        finally:
+            self._reading_attempt = None
+        with _connect(self.registry_path) as connection:
+            connection.execute(
+                "UPDATE execution_lineage SET read_candidate=? WHERE attempt_id=?",
+                (encode_record(manifest), attempt.attempt_id),
+            )
+        return manifest
+
+    @_serialized
     def publish_manifest(
+        self, owner: TrustedOwnerContext, manifest: ResultManifest
+    ) -> ResultManifest:
+        with self.evidence_snapshot(), ExitStack() as stack:
+            attempt = self._attempt(owner)
+            bundle, lineage = self._lineage(attempt)
+            for entry in (*bundle.files, *self._sealed_entries(lineage)):
+                relative = f"cases/{attempt.case_id}/runs/{attempt.run_id}/attempts/{attempt.attempt_id}/{entry.logical_path}"
+                stack.enter_context(pinned_read(_owned_path(self.root, relative)))
+            return self._publish_manifest_pinned(owner, manifest)
+
+    def _publish_manifest_pinned(
         self, owner: TrustedOwnerContext, manifest: ResultManifest
     ) -> ResultManifest:
         if owner.case_id != self._case_id():
@@ -915,6 +1421,63 @@ class CaseStorage:
         if manifest.read_result.status is not ReadStatus.VALIDATED:
             raise PortError(PortErrorCategory.INTEGRITY, "manifest read result is not validated")
         payload = encode_record(manifest)
+        attempt = self._attempt(owner)
+        self.validate(owner, attempt)
+        _, lineage = self._lineage(attempt)
+        if lineage["read_candidate"] is None or bytes(lineage["read_candidate"]) != payload:
+            raise PortError(
+                PortErrorCategory.CONFLICT, "manifest was not returned by the registered reader"
+            )
+        sealed = self._sealed_entries(lineage)
+        if attempt.state is not RunState.VALIDATING or attempt.process is not None:
+            raise PortError(
+                PortErrorCategory.CONFLICT, "registered terminal writer state is required"
+            )
+        if set(manifest.files) != set(sealed):
+            raise PortError(PortErrorCategory.INTEGRITY, "manifest omits or changes sealed outputs")
+        required = json.loads(bytes(lineage["required_outputs"]))
+        requests = {item["request_id"]: item for item in required["requests"]}
+        observations = {item.output_id: item for item in manifest.read_result.observations}
+        if set(observations) != set(requests):
+            raise PortError(PortErrorCategory.INTEGRITY, "manifest omits required observations")
+        for output_id, request in requests.items():
+            observation = observations[output_id]
+            if (
+                observation.location != request["location"]
+                or observation.measure_id != request["measure_id"]
+                or observation.frame.value != request["frame"]
+                or observation.state_count < len(required["saved_times"])
+            ):
+                raise PortError(
+                    PortErrorCategory.INTEGRITY,
+                    "observation differs from registered output request",
+                )
+        profile = decode_record(bytes(lineage["profile"]), CompatibilityProfile)
+        if manifest.read_result.reader != profile.reader:
+            raise PortError(
+                PortErrorCategory.INTEGRITY, "manifest reader differs from registered profile"
+            )
+        mappings = {item.canonical_id: item for item in profile.output_mappings}
+        for output_id, request in requests.items():
+            mapping = mappings.get(request["quantity_id"])
+            observation = observations[output_id]
+            if mapping is None or (
+                observation.unit,
+                observation.value_type,
+                observation.measure_id,
+                observation.location,
+                observation.frame,
+            ) != (
+                mapping.unit,
+                mapping.value_type,
+                mapping.measure_id,
+                mapping.location,
+                mapping.frame,
+            ):
+                raise PortError(
+                    PortErrorCategory.INTEGRITY,
+                    "reader observation differs from registered mapping",
+                )
         with _connect(self.registry_path) as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
@@ -981,16 +1544,27 @@ class CaseStorage:
                 raise
         return manifest
 
+    @_serialized
     def resolve_file(
         self, entry: FileEntry, bundle: ExecutionBundle, attempt: AttemptRecord
     ) -> ResolvedFileContent:
+        owner = TrustedOwnerContext(
+            attempt.case_id, attempt.run_id, attempt.attempt_id, attempt.owner_generation
+        )
+        self.validate(owner, attempt)
+        registered, lineage = self._lineage(attempt)
+        if registered.to_bytes() != bundle.to_bytes():
+            raise PortError(PortErrorCategory.INTEGRITY, "bundle differs from registered lineage")
         if bundle.case_id != self._case_id() or attempt.case_id != bundle.case_id:
             raise PortError(PortErrorCategory.CONFLICT, "bundle or attempt is outside this case")
         if attempt.bundle_digest != bundle.bundle_digest:
             raise PortError(
                 PortErrorCategory.INTEGRITY, "attempt bundle digest does not match bundle"
             )
-        if not any(item == entry for item in bundle.files):
+        members = tuple(bundle.files) + (
+            self._sealed_entries(lineage) if lineage["writer_closed"] else ()
+        )
+        if entry not in members:
             raise PortError(
                 PortErrorCategory.INTEGRITY, "file entry is not registered in the bundle"
             )
@@ -1004,21 +1578,79 @@ class CaseStorage:
         except (StorageIntegrityError, ValueError) as error:
             raise PortError(PortErrorCategory.INTEGRITY, str(error)) from error
 
+    @_serialized
+    def get_manifest(self, manifest_id: str) -> ResultManifest:
+        with _connect(self.registry_path) as connection:
+            row = connection.execute(
+                "SELECT payload FROM manifests WHERE manifest_id=?", (manifest_id,)
+            ).fetchone()
+            owner_row = connection.execute(
+                "SELECT payload FROM owners WHERE attempt_id=(SELECT attempt_id FROM manifests WHERE manifest_id=?)",
+                (manifest_id,),
+            ).fetchone()
+        if row is None or owner_row is None:
+            raise PortError(PortErrorCategory.INTEGRITY, "result manifest is not registered")
+        manifest = decode_record(bytes(row["payload"]), ResultManifest)
+        attempt = decode_record(bytes(owner_row["payload"]), AttemptRecord)
+        _, lineage = self._lineage(attempt)
+        if set(manifest.files) != set(self._sealed_entries(lineage)):
+            raise PortError(PortErrorCategory.INTEGRITY, "manifest output membership changed")
+        for entry in manifest.files:
+            self._file_content(attempt, entry)
+        return manifest
+
+    @_serialized
     def register_numeric_data(self, data: NumericResultData) -> NumericResultData:
+        attempt = self._reading_attempt
+        if (
+            attempt is None
+            or data.reference.attempt_id != attempt.attempt_id
+            or data.reference.bundle_digest != attempt.bundle_digest
+        ):
+            raise PortError(
+                PortErrorCategory.CONFLICT, "numeric data requires a registered reader invocation"
+            )
+        _, lineage = self._lineage(attempt)
+        profile = decode_record(bytes(lineage["profile"]), CompatibilityProfile)
+        if data.mapping not in profile.output_mappings:
+            raise PortError(PortErrorCategory.INTEGRITY, "numeric mapping is not registered")
         data.verify_content_digest()
         payload = encode_record(data)
         with _connect(self.registry_path) as connection:
+            row = connection.execute(
+                "SELECT payload FROM numeric_data WHERE data_id=?", (data.reference.data_id,)
+            ).fetchone()
+            if row is not None and bytes(row["payload"]) != payload:
+                raise PortError(
+                    PortErrorCategory.CONFLICT, "numeric data is already registered differently"
+                )
             connection.execute(
-                "INSERT OR REPLACE INTO numeric_data(data_id,payload) VALUES(?,?)",
+                "INSERT OR IGNORE INTO numeric_data(data_id,payload) VALUES(?,?)",
                 (data.reference.data_id, payload),
             )
         return data
 
+    @_serialized
     def resolve(self, reference: ResultDataRef) -> NumericResultData:
         with _connect(self.registry_path) as connection:
+            manifests = connection.execute(
+                "SELECT manifest_id FROM manifests WHERE attempt_id=?", (reference.attempt_id,)
+            ).fetchall()
             row = connection.execute(
                 "SELECT payload FROM numeric_data WHERE data_id=?", (reference.data_id,)
             ).fetchone()
+        registered = False
+        for candidate in manifests:
+            manifest = self.get_manifest(candidate["manifest_id"])
+            if manifest.bundle_digest == reference.bundle_digest and any(
+                item.data_ref == reference for item in manifest.read_result.observations
+            ):
+                registered = True
+                break
+        if not registered:
+            raise PortError(
+                PortErrorCategory.CONFLICT, "numeric data is outside registered result lineage"
+            )
         if row is None:
             raise PortError(PortErrorCategory.INTEGRITY, "numeric result data is not registered")
         try:
@@ -1032,7 +1664,9 @@ class CaseStorage:
             raise PortError(PortErrorCategory.INTEGRITY, "numeric result identity does not match")
         return result
 
+    @_serialized
     def resolve_manifest_output(self, manifest_id: str, output_id: str) -> NumericResultData:
+        self.get_manifest(manifest_id)
         with _connect(self.registry_path) as connection:
             row = connection.execute(
                 "SELECT payload FROM manifests WHERE manifest_id=?", (manifest_id,)

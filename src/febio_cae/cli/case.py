@@ -71,6 +71,10 @@ def _exit_for(result: ServiceResult) -> int:
 
 
 def _error_payload(error: Exception) -> tuple[dict[str, object], int]:
+    if isinstance(error, OSError):
+        from febio_cae.domain.ports import PortErrorCategory
+
+        return _error_payload(PortError(PortErrorCategory.ENVIRONMENT, str(error)))
     if isinstance(error, ConcurrentUpdateError):
         return (
             {
@@ -133,8 +137,8 @@ def _error_payload(error: Exception) -> tuple[dict[str, object], int]:
 
 
 def run_case(arguments: Namespace) -> int:
-    service = RegisteredCaseService(state_dir=arguments.state_dir)
     try:
+        service = RegisteredCaseService(state_dir=arguments.state_dir)
         if arguments.case_action == "create":
             created = service.create_case(case_root=arguments.case_root, cad_path=arguments.cad)
             payload = _created_payload(created)

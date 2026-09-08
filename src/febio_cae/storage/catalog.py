@@ -5,7 +5,11 @@ from __future__ import annotations
 import re
 import sqlite3
 import stat
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
+
+from ._ownership import identity, pin_directories
 
 
 class CaseCatalogError(RuntimeError):
@@ -23,14 +27,18 @@ def validate_case_id(value: object) -> str:
     return value
 
 
-def _connect(path: Path) -> sqlite3.Connection:
+@contextmanager
+def _connect(path: Path) -> Iterator[sqlite3.Connection]:
     connection = sqlite3.connect(path, timeout=30.0, isolation_level=None)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA journal_mode=WAL")
     connection.execute("PRAGMA synchronous=FULL")
     connection.execute("PRAGMA foreign_keys=ON")
     connection.execute("PRAGMA busy_timeout=30000")
-    return connection
+    try:
+        yield connection
+    finally:
+        connection.close()
 
 
 def _is_reparse(path: Path) -> bool:
@@ -60,18 +68,21 @@ class CaseCatalog:
                 )
                 """
             )
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(cases)")}
+            if "root_identity" not in columns:
+                connection.execute("ALTER TABLE cases ADD COLUMN root_identity TEXT")
 
     def register(self, case_id: str, case_root: Path, created_at: str) -> None:
         validate_case_id(case_id)
         root = case_root.absolute()
         if not root.is_dir() or _is_reparse(root):
             raise CaseCatalogError("registered case root is unavailable or is a reparse point")
-        with _connect(self.path) as connection:
+        with pin_directories(root), _connect(self.path) as connection:
             try:
                 connection.execute("BEGIN IMMEDIATE")
                 connection.execute(
-                    "INSERT INTO cases(case_id,case_root,created_at) VALUES(?,?,?)",
-                    (case_id, str(root), created_at),
+                    "INSERT INTO cases(case_id,case_root,created_at,root_identity) VALUES(?,?,?,?)",
+                    (case_id, str(root), created_at, repr(identity(root))),
                 )
                 connection.commit()
             except sqlite3.IntegrityError as error:
@@ -85,7 +96,7 @@ class CaseCatalog:
         validate_case_id(case_id)
         with _connect(self.path) as connection:
             row = connection.execute(
-                "SELECT case_root FROM cases WHERE case_id=?", (case_id,)
+                "SELECT case_root,root_identity FROM cases WHERE case_id=?", (case_id,)
             ).fetchone()
         if row is None:
             raise CaseCatalogError(f"unknown registered case: {case_id}")
@@ -94,6 +105,12 @@ class CaseCatalog:
             raise CaseCatalogError(
                 "registered case root is unavailable or is a link or reparse point"
             )
+        try:
+            with pin_directories(root):
+                if row["root_identity"] != repr(identity(root)):
+                    raise CaseCatalogError("registered root identity changed or requires migration")
+        except OSError as error:
+            raise CaseCatalogError(str(error)) from error
         return root
 
 
