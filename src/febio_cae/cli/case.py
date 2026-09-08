@@ -140,6 +140,23 @@ def run_case(arguments: Namespace) -> int:
     service = None
     try:
         service = RegisteredCaseService(state_dir=arguments.state_dir)
+        if arguments.case_action == "preview":
+            from .preview import capture_observation
+
+            payload = service.observe_preview(
+                arguments.case_id,
+                arguments.manifest_id,
+                studio_executable=arguments.studio,
+                window_id=arguments.window_id,
+                timeout_seconds=arguments.timeout,
+                capture=capture_observation,
+            )
+            _print(payload) if arguments.json else print(payload["task_status"])
+            return 0 if payload["task_status"] == "COMPLETE" else 6
+        if arguments.case_action == "preview-status":
+            payload = service.preview_status(arguments.case_id, arguments.preview_id)
+            _print(payload) if arguments.json else print(payload["task_status"])
+            return 0
         if arguments.case_action == "run-demo":
             payload = service.run_demo(
                 arguments.case_id,
@@ -193,6 +210,21 @@ def run_case(arguments: Namespace) -> int:
         ValueError,
     ) as error:
         payload, code = _error_payload(error)
+        if arguments.case_action == "preview" and isinstance(error, TimeoutError):
+            code = 7
+            payload["status"] = "NEEDS_PREVIEW"
+            payload["task_status"] = "NEEDS_PREVIEW"
+            payload["preview_status"] = "FAILED"
+            payload["case_id"] = arguments.case_id
+            payload["diagnostics"] = [
+                {
+                    "schema_version": "1",
+                    "code": "cancelled",
+                    "message": str(error),
+                    "field": None,
+                    "retryable": False,
+                }
+            ]
         if arguments.case_action == "run-demo" and service is not None:
             pending = 1
             for _ in range(3):

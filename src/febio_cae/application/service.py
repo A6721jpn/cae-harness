@@ -909,6 +909,39 @@ class RegisteredCaseService:
             _registered_selections(partial(revision.spec)),
         )
 
+    def observe_preview(
+        self,
+        case_id: str,
+        manifest_id: str,
+        *,
+        studio_executable: str,
+        window_id: int,
+        timeout_seconds: float,
+        capture: Callable[[dict[str, Any], float], dict[str, Any]],
+    ) -> dict[str, object]:
+        from febio_cae.storage.preview import RegisteredPreviewStore
+
+        from ._preview import observe_preview
+        from ._preview_windows import WindowsStudioProbe
+
+        probe = WindowsStudioProbe(studio_executable)
+        session = probe.identify(window_id)
+        return observe_preview(
+            RegisteredPreviewStore(self._storage(case_id)),
+            manifest_id,
+            session,
+            session_probe=probe,
+            capture=capture,
+            timeout_seconds=timeout_seconds,
+        )
+
+    def preview_status(self, case_id: str, preview_id: str) -> dict[str, object]:
+        from febio_cae.storage.preview import RegisteredPreviewStore
+
+        from ._preview import preview_summary
+
+        return preview_summary(RegisteredPreviewStore(self._storage(case_id)), preview_id)
+
     def run_demo(
         self, case_id: str, revision_id: str, *, executable: str, preflight: bool = False
     ) -> dict[str, object]:
