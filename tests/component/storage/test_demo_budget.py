@@ -6,7 +6,7 @@ from typing import Any
 import pytest
 
 from febio_cae.application.service import RegisteredCaseService
-from febio_cae.storage import CaseStorage, StorageConflictError
+from febio_cae.storage import CaseStorage, StorageConflictError, StorageIntegrityError
 
 
 def _reserve() -> Any:
@@ -60,7 +60,7 @@ def test_gmsh_budget_is_already_exhausted(tmp_path: Path) -> None:
 def test_unknown_case_and_kind_do_not_allocate(tmp_path: Path) -> None:
     storage, case_id = _case(tmp_path)
     reserve = _reserve()
-    with pytest.raises((StorageConflictError, ValueError)):
+    with pytest.raises(StorageIntegrityError):
         reserve(storage, "case-unknown", "febio", "one")
     with pytest.raises(ValueError):
         reserve(storage, case_id, "new-cohort", "one")
