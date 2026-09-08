@@ -55,7 +55,7 @@ from febio_cae.storage.registry import (
 )
 from febio_cae.storage.state import ProductState
 
-from ._execution import _RunnerOwner
+from ._execution import _CleanupObligation, _pending_cleanup, _RunnerOwner
 from ._geometry import PlacedSelection, _PlacedGeometry
 from .specs import SourceDeclaration
 
@@ -906,6 +906,10 @@ class RegisteredCaseService:
         the compiled lineage. Only actual issued runner snapshots are persisted.
         """
         storage = self._storage(case_id)
+        if any(item.owner.case_id == case_id for item in _pending_cleanup.values()):
+            raise PortError(
+                PortErrorCategory.CONFLICT, "an exact runner cleanup obligation is pending"
+            )
         with (
             storage.evidence_snapshot(),
             storage.revision_snapshot(case_id, revision_id) as revision,
@@ -992,14 +996,33 @@ class RegisteredCaseService:
             except BaseException:
                 if issued is not None and issued.state in {RunState.RUNNING, RunState.DRAINING}:
                     # Keep the issued object for cleanup; never cancel a forged poll result.
-                    cancelled = runner.cancel(issued, owner).attempt
-                    storage._accept_runner_poll(owner, issued, cancelled)
+                    obligation = _CleanupObligation(runner, storage, owner, issued)
+                    _pending_cleanup[owner.attempt_id] = obligation
+                    if obligation.retry():
+                        del _pending_cleanup[owner.attempt_id]
                 elif issued is not None and issued.state is RunState.VALIDATING:
                     storage._transition_attempt(owner, RunState.FAILED)
                 elif issued is None:
                     storage._transition_attempt(owner, RunState.PREPARING)
                     storage._transition_attempt(owner, RunState.FAILED)
                 raise
+
+    def _retry_pending_cleanup(self) -> int:
+        """One bounded cancellation per retained runner; unfinished handles stay owned.
+
+        This is an in-process continuation, not a claim that native ownership can
+        be reconstructed from a persisted PID after a controller process exits.
+        """
+        for key, obligation in tuple(_pending_cleanup.items()):
+            try:
+                root = self.catalog.resolve(obligation.owner.case_id)
+            except CaseCatalogError:
+                continue
+            if root != obligation.storage.root:
+                continue
+            if obligation.retry():
+                del _pending_cleanup[key]
+        return len(_pending_cleanup)
 
     def _execute_registered(
         self,

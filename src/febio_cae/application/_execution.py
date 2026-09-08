@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from febio_cae.domain import AttemptRecord, ResultManifest, RunState
-from febio_cae.domain.ports import PortError, PortErrorCategory, TrustedOwnerContext
+from febio_cae.domain.ports import PortError, PortErrorCategory, RunnerPort, TrustedOwnerContext
 from febio_cae.storage.registry import CaseStorage
 
 
@@ -34,3 +34,22 @@ class _RunnerOwner:
         self, owner: TrustedOwnerContext, manifest: ResultManifest
     ) -> ResultManifest:
         raise PortError(PortErrorCategory.CONFLICT, "only the application publishes results")
+
+
+@dataclass
+class _CleanupObligation:
+    runner: RunnerPort
+    storage: CaseStorage
+    owner: TrustedOwnerContext
+    attempt: AttemptRecord
+
+    def retry(self) -> bool:
+        observed = self.runner.cancel(self.attempt, self.owner).attempt
+        self.storage._accept_runner_poll(self.owner, self.attempt, observed)
+        self.attempt = observed
+        return observed.state in {RunState.CANCELLED, RunState.FAILED}
+
+
+# Process-owned strong references survive a service object's reconstruction.
+# These are live native handles, not serializable/recoverable ownership claims.
+_pending_cleanup: dict[str, _CleanupObligation] = {}
