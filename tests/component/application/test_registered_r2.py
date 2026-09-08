@@ -8,6 +8,7 @@ import queue
 import subprocess
 import sys
 import threading
+import time
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -38,7 +39,7 @@ from febio_cae.domain.ports import PortError, TrustedOwnerContext
 from febio_cae.domain.selection import FaceSetRule
 from febio_cae.domain.spatial import FaceId
 from febio_cae.domain.units import Quantity
-from febio_cae.storage.registry import CaseStorage, StorageIntegrityError
+from febio_cae.storage.registry import CaseStorage, StorageConflictError, StorageIntegrityError
 
 
 def test_h1_claim_binds_current_generation(tmp_path: Path) -> None:
@@ -319,7 +320,7 @@ def _worker(
     driver = Path(__file__).parents[1] / "storage/registered_process_worker.py"
     env = os.environ.copy()
     env["PYTHONPATH"] = str(Path(__file__).parents[3] / "src")
-    return subprocess.Popen(
+    child = subprocess.Popen(
         [sys.executable, str(driver), str(root), action, argument, boundary],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
@@ -327,6 +328,20 @@ def _worker(
         text=True,
         env=env,
     )
+    _process_records[child.pid] = root.parent / f"process-{child.pid}.jsonl"
+    _record_process(child, {"event": "spawn", "argv": child.args})
+    return child
+
+
+_process_records: dict[int, Path] = {}
+
+
+def _record_process(child: subprocess.Popen[str], record: dict[str, Any]) -> None:
+    path = _process_records[child.pid]
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write(
+            json.dumps({"launcher_pid": child.pid, "time_ns": time.time_ns(), **record}) + "\n"
+        )
 
 
 def _event(child: subprocess.Popen[str]) -> dict[str, Any]:
@@ -336,11 +351,17 @@ def _event(child: subprocess.Popen[str]) -> dict[str, Any]:
     threading.Thread(target=lambda: lines.put(stream.readline()), daemon=True).start()
     line = lines.get(timeout=10)
     assert line, "worker exited before its handshake"
-    return json.loads(line)
+    result = json.loads(line)
+    _record_process(child, result)
+    return result
 
 
 def _finish(child: subprocess.Popen[str], line: str = "continue\n") -> tuple[str, str]:
-    return child.communicate(line, timeout=15)
+    out, err = child.communicate(line, timeout=15)
+    _record_process(
+        child, {"event": "reaped", "exit": child.returncode, "stdout": out, "stderr": err}
+    )
+    return out, err
 
 
 @pytest.mark.parametrize("action", ["revision", "source"])
@@ -382,8 +403,10 @@ def test_h2_competing_publication_preserves_winner(tmp_path: Path, action: str) 
                 child.communicate(timeout=10)
 
 
-@pytest.mark.parametrize("crash", [False, True])
-def test_h3_live_publisher_and_abandoned_recovery(tmp_path: Path, crash: bool) -> None:
+@pytest.mark.parametrize(
+    "crash", [None, "after_prepare", "after_file_write", "after_file_replace", "after_commit"]
+)
+def test_h3_live_publisher_and_abandoned_recovery(tmp_path: Path, crash: str | None) -> None:
     service, created, storage = _created(tmp_path)
     _populate_complete(service, created)
     revision = CaseRevision(
@@ -396,22 +419,28 @@ def test_h3_live_publisher_and_abandoned_recovery(tmp_path: Path, crash: bool) -
     )
     payload = tmp_path / "revision.json"
     payload.write_bytes(encode_record(revision))
-    boundary = "after_file_replace" if crash else "after_file_write"
+    boundary = crash or "after_file_write"
     child = _worker(storage.root, "revision", str(payload), boundary)
+    opener: subprocess.Popen[str] | None = None
     try:
         assert _event(child)["event"] == "opened"
         assert _event(child)["event"] == boundary
         opener = _worker(storage.root, "open", "none")
-        out, err = opener.communicate(timeout=10)
+        out, err = _finish(opener, "")
         assert opener.returncode == 0, (out, err)
         out, err = _finish(child, "crash\n" if crash else "continue\n")
         assert child.returncode == (73 if crash else 0), (out, err)
         reopened = CaseStorage(storage.root)
-        assert (
-            reopened.get_revision(created.case_id, revision.revision_id).to_bytes()
-            == revision.to_bytes()
-        )
+        if crash in {"after_prepare", "after_file_write"}:
+            with pytest.raises(StorageConflictError):
+                reopened.get_revision(created.case_id, revision.revision_id)
+        else:
+            assert (
+                reopened.get_revision(created.case_id, revision.revision_id).to_bytes()
+                == revision.to_bytes()
+            )
     finally:
-        if child.poll() is None:
-            child.kill()
-            child.communicate(timeout=10)
+        for process in (child, opener):
+            if process is not None and process.poll() is None:
+                process.kill()
+                _finish(process, "")

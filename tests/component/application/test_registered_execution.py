@@ -19,7 +19,14 @@ from febio_cae.domain.artifacts import (
     MeshQualityRecord,
 )
 from febio_cae.domain.ports import PortError, TrustedOwnerContext
-from febio_cae.domain.results import OutputObservation, ReadResult, ReadStatus, ResultManifest
+from febio_cae.domain.results import (
+    NumericResultData,
+    OutputObservation,
+    ReadResult,
+    ReadStatus,
+    ResultDataRef,
+    ResultManifest,
+)
 from febio_cae.storage.registry import CaseStorage
 
 
@@ -84,7 +91,16 @@ def _build(
 
 
 @pytest.mark.parametrize(
-    "failure", ["none", "missing-output", "running", "retarget", "tampered", "partial-manifest", "unissued-reader"]
+    "failure",
+    [
+        "none",
+        "missing-output",
+        "running",
+        "retarget",
+        "tampered",
+        "partial-manifest",
+        "unissued-reader",
+    ],
 )
 def test_registered_execution_publication_boundary(tmp_path: Path, failure: str) -> None:
     service, created, _ = _created(tmp_path)
@@ -92,6 +108,7 @@ def test_registered_execution_publication_boundary(tmp_path: Path, failure: str)
     frozen = service.freeze_case(created.case_id).revision
     assert frozen is not None
     required = tuple(item.request_id for item in frozen.spec.outputs.requests)
+    numeric: list[NumericResultData] = []
 
     def produce(bundle: ExecutionBundle, inputs: dict[str, bytes]) -> dict[str, bytes]:
         assert inputs["input.feb"] == b"synthetic compiled input"
@@ -128,6 +145,33 @@ def test_registered_execution_publication_boundary(tmp_path: Path, failure: str)
             )
             for request in frozen.spec.outputs.requests
         )
+        if failure == "none":
+            candidate = NumericResultData(
+                ResultDataRef(
+                    "numeric",
+                    "0" * 64,
+                    "numeric-result-v1",
+                    "numeric/result.json",
+                    bundle.bundle_digest,
+                    attempt.attempt_id,
+                ),
+                _profile(bundle.profile_id).output_mappings[0],
+                "time",
+                "s",
+                (0.0, 1.0),
+                ("node-1",),
+                ("z",),
+                ((0.0,), (2.0,)),
+            )
+            candidate = replace(
+                candidate,
+                reference=replace(
+                    candidate.reference, content_digest=candidate.expected_content_digest
+                ),
+            )
+            storage.register_numeric_data(candidate)
+            numeric.append(candidate)
+            observations = (replace(observations[0], data_ref=candidate.reference),)
         manifest = ResultManifest(
             "manifest",
             attempt.attempt_id,
@@ -158,3 +202,12 @@ def test_registered_execution_publication_boundary(tmp_path: Path, failure: str)
         assert {item.role for item in manifest.files} == set(required)
         reopened = CaseStorage(created.case_root)
         assert reopened.get_manifest(manifest.manifest_id) == manifest
+        if failure == "none":
+            assert reopened.resolve_manifest_output(manifest.manifest_id, required[0]) == numeric[0]
+            with pytest.raises(PortError):
+                reopened.register_numeric_data(numeric[0])
+            # Later output mutation invalidates both the manifest and decoded cache.
+            output = next(created.case_root.glob("cases/*/runs/*/attempts/*/outputs/*.bin"))
+            output.write_bytes(b"later mutation")
+            with pytest.raises(PortError):
+                reopened.resolve_manifest_output(manifest.manifest_id, required[0])
