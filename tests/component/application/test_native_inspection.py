@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import importlib
 import json
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -259,4 +261,24 @@ def test_owned_deadline_failure(
     assert clock[0] < 0.06  # Resource work consumes the same enclosing 0.05s budget.
     assert not owned._pending and payload["pending_cleanup"] == 0
     assert "deadline" in payload["diagnostics"][0]["message"]
+    assert initial.service.current_draft(initial.created.case_id) == initial.created.draft
+
+    from febio_cae.storage.registry import CaseStorage
+
+    original_snapshot = CaseStorage.evidence_snapshot
+
+    @contextmanager
+    def slow_snapshot(storage: CaseStorage) -> Iterator[None]:
+        with original_snapshot(storage):
+            clock[0] += 0.1
+            yield
+
+    clock[0] = 0.0
+    events.clear()
+    monkeypatch.setattr(CaseStorage, "evidence_snapshot", slow_snapshot)
+    code, payload = invoke(initial, capsys, "--wall-seconds", "0.05")
+    assert code == 4 and payload["status"] == "UNSUPPORTED_ENVIRONMENT"
+    assert payload["diagnostics"][0]["code"] == "environment"
+    assert "deadline" in payload["diagnostics"][0]["message"]
+    assert events == [] and not owned._pending
     assert initial.service.current_draft(initial.created.case_id) == initial.created.draft
