@@ -204,3 +204,60 @@ Exact Medium rereview and PM integration are pending. The next source unit
 remains public execution/preflight integration with finite solver ownership;
 this correction does not expand that scope or authorize native execution.
 All native, real LLM, real E2E and BottomFrame limitations above still apply.
+
+## M1-CLI public response correction
+
+Medium rereview of `92ffd2042adfe319755761395115a9501962e05d` accepted the
+admission guard but returned REJECT for the remaining M1-CLI finding: the CLI
+converted PortError/CONFLICT to JSON INVALID_INPUT and exit 2. The diagnostic
+category alone was correct. The original rereview is retained in ignored
+`public-planar-m1-medium-review.md`; the preceding M1 history is unchanged.
+
+The narrow correction in `src/febio_cae/cli/case.py` maps PortErrorCategory.CONFLICT
+to JSON CONFLICT and exit 8. Other error mappings and the fixed admission guard
+are unchanged. The existing stale regression now calls actual public
+`main(["case", "--state-dir", STATE, "run-demo", CASE, "--revision-id", REVISION,
+"--solver", IDENTITY_FILE, "--preflight", "--json"])` and asserts both response
+status and exit code, as well as no compiler call. No test case was added.
+
+- Base: `92ffd2042adfe319755761395115a9501962e05d`.
+- Extended test: `ed73244235edba9fe48f4dc369a9e42906e6a0e0`.
+- Fixed candidate: `6a0d78c675403c2d34cf98faf3006fcee9535366`.
+- Final report-only SHA is recorded in `public-planar-m1-cli-handoff.md`.
+
+The same checkout and Python 3.12.10 executable described above were used.
+Paired raw logs and exact argv/cwd/Python/SHA/dirty/time/exit metadata are in
+ignored `.local/verification/`.
+
+| Record | Exact command | Result |
+|---|---|---|
+| `mc-red` | `python -m pytest tests/component/application/test_planar_preparation.py -k stale --basetemp .local/v/mcr` | 1 failed, 7 deselected, exit 1 at clean test SHA; actual `(2, INVALID_INPUT)` versus required `(8, CONFLICT)` |
+| `mc-green` | `python -m pytest tests/component/application/test_planar_preparation.py --basetemp .local/v/mcg` | 8 passed, exit 0 with working mapping change |
+| `mc-full` | `python -m pytest --basetemp .local/v/mcf` | 1474 passed in 767.51 seconds, exit 0; clean fixed SHA before/after |
+| `mc-format` | `python -m ruff format --check .` | 220 files formatted, exit 0 |
+| `mc-lint` | `python -m ruff check .` | all checks passed, exit 0 |
+| `mc-types` | `python -m mypy src tests` | 172 source files, exit 0 |
+| `mc-boundary` | `python scripts/scan_cae_data.py --root .` | 222 tracked files, no issues, exit 0 |
+| `mc-build` | `python -m build` | sdist and wheel built, exit 0 |
+
+All executable candidate gates above ran with product files fixed at
+`6a0d78c675403c2d34cf98faf3006fcee9535366`; there was one full-suite run and no
+subsequent product change. These fresh results supersede prior candidate gates.
+
+The exact rebuilt `dist/febio_cae-0.1.0-py3-none-any.whl` from `mc-build.log`
+has SHA-256 `2f77f75f4f57e33aba2f471fa3ddcd963e0c6246cf6b653b817f33a7e34a1e6b`.
+Fresh `python -m venv .local/verification/mc-env`, its Python `-m pip install
+--no-index <absolute-new-wheel>`, and its `febio-cae.exe --version` all exited 0;
+version output was `febio-cae 0.1.0`. From fresh `.local/verification/mc-cwd`,
+installed Python `-I <absolute-mc_installed_check.py>
+<absolute-mcg/test_stale_prepared_generation0>` exited 0. This check verifies
+site-packages import origins and calls the actual public CLI entry function
+with the retained isolated stale fixture: JSON status CONFLICT, CLI exit 8,
+compiler construction not reached, no Gmsh import and zero native starts.
+The check script itself exits 0 only after asserting the CLI's exit 8.
+Records: `mc-venv`, `mc-install`, `mc-installed-version`, `mc-installed-boundary`,
+`mc-wheel-hash.json`.
+
+Only the CLI mapping, existing test and this report changed in M1-CLI.
+Exact Medium rereview and PM integration remain pending; REMOTE_CONFIGURED,
+native/real-data restrictions and remaining project work are unchanged.
