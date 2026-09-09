@@ -319,3 +319,90 @@ Gmsh4.15.2/OCC8.0.1/AP214、wall600秒・生成1回・100000四面体/250000節�
 この単位は、最小の公開子版回帰RED/GREENと安価な静的検査・CAE境界を通したcleanなコードを先に独立Mediumレビューへ渡す。修正が収束した後、同じ担当が必須全体テスト・ビルド・fresh installed境界を一度実行し、最終証拠と文書の適用範囲を確認してからPMが統合する。CODE_REVIEW_PENDING段階では全体テスト・ビルド・installed確認を必須のPENDINGとして明記し、免除・合格とは扱わない。実行許可はsourceとnative-free検査のみであり、native・LLM・実02_CAE・BottomFrame操作は含めない。
 
 この単位の現在状態（2026-09-09追記）: `e63776ca384600c4e556690199c87ee56c3c4241` は独立MediumのCODE_ACCEPT済み。同じclean候補で全件1475件、format・lint・型検査・CAE境界223ファイル・build・fresh wheelインストールと公開子版preflight境界が新たに合格した。製品・テストはCODE_ACCEPTから不変であり、最終証拠・文書レビューとPM受け入れ・V2統合はPENDINGとする。正確なコマンド・wheel hash・分離範囲は[最終フェーズ記録](../reviews/2026-09-09-prepared-material-descendants.md)に記載する。必須実E2E・最終BottomFrameの未検証状態は変わらない。
+
+
+Plan 13 status correction: prepared-material descendants were independently reviewed, accepted and pushed to V2 at `57caa690695959f805d31e17112bea623a20fa11`. The earlier pending integration statement is superseded. Next source task is the bounded P4 contract below; real E2Es remain unverified.
+
+
+## P4 bounded source contract (2026-09-09 freeze)
+
+The first public natural-language boundary is `case intent`, `case answer`, and
+`case edit`. Each requires case ID, `--expected-generation`, `--operation-id`,
+`--llm-settings`, and `--text`; answer additionally requires `--question`, edit
+requires `--base`. Existing explicit `case spec` registers prerequisite typed
+conditions and numerical policy; this slice adds no profile bootstrap framework.
+
+Grounding accepts only whole affirmative field-labelled clauses, independently
+matching normalized value, unit, entity and scope, or explicit adoption of an
+already registered typed component with verified nested evidence and references.
+Initial material fields are model, Young's modulus, Poisson ratio, strain
+applicability and rate applicability. Japanese aliases are 材料モデル, ヤング率,
+ポアソン比, ひずみ適用性 and 速度適用性. Unsupported prose, negation, hypotheses,
+ambiguity and contradictions remain unresolved; quotes, number occurrence,
+provider labels and model confidence are not physical authority. No inferred
+physical defaults or generic confirmation of invented values are permitted.
+
+Complete grounded components enter the existing draft. Incomplete physical
+conditions produce ONE generation-bound grouped question, targeting whole
+components when absent. Retained explicit facts are shown and not asked again;
+raw statements remain immutable source evidence, never an alternate partial
+material draft. Answers rederive bounded retained facts with new explicit facts,
+consume the current question once, and issue a new group if still incomplete.
+No full provider history is sent. Existing validate/freeze remains authoritative.
+Initial edit supports only an explicit isotropic Young's modulus replacement,
+bound before spending and publication to the exact current frozen parent, its
+spec digest and current draft; application constructs CasePatch and verifies all
+other physical/mesh-generating fields unchanged. No automatic freeze or execution.
+
+Settings explicitly specify OpenAI Responses provider, model, key environment
+variable NAME, Budget, input/output token limits and socket timeout. Missing
+key/model/tool/profile is environment/unsupported (exit 4); numerical configuration
+errors are input diagnostics (exit 2). Only missing required physics creates
+NEEDS_INPUT/questions (exit 3). Public generation conflicts use exit 8. Narrow
+existing validation classification corrections and pre-source lease checks are
+permitted; frozen DTOs, codecs and validators are unchanged.
+
+Budget remains per operation plus retries, not case lifetime. An explicit settings
+Budget is a journaled bootstrap allocation before a draft Budget exists; thereafter
+effective caps are minima, and explicit zero disables. One count request and at
+most one generation use two durably debited request slots without retry, fallback
+or re-entry resend. Admission reserves 2*I+O: I for counting is a LOCAL allowance,
+not measured model usage or provider billing; I+O reserves generation. Release
+only capacity justified by valid measured generation usage; uncertainty retains
+capacity. This makes no financial guarantee. The operation journal records exact
+ID/context/instruction/settings/request/schema identities, transitions, usage and
+actual returned model. Changed payload with the same ID conflicts; identical
+re-entry returns recorded outcome or uncertainty without sending/applying again.
+Concurrent starts and crashed APPLYING publication remain conservative.
+
+Reject known stale questions, parents and evidence before HTTP, recheck before
+generation and under a short reentrant case lease before ANY draft/question/source
+write. No case lease spans HTTP. Persist usage even when final CAS rejects.
+Requests and responses are bounded to 256 KiB; children to 256 MiB and one CPU.
+Elapsed/call/token/socket limits are explicit positive finite values (allocation
+zero disables), and output limit is at least 16. Sequential count/generation
+children reuse the unchanged geometry preparation `_run_owned` helper with ONE
+enclosing deadline and remaining duration; late results are rejected, cleanup
+ownership retained. Local termination does not establish remote cancellation.
+
+Transport uses standard-library HTTPS to fixed api.openai.com/v1, no redirects
+or transparent retries. Canonical common model/input/instructions/strict closed
+schema fields are identical for count and generation; count includes schema and
+an over-cap count prevents generation without truncation. Generation explicitly
+sets store/background/stream false and disables tools; no history/conversation IDs.
+Only expected reasoning metadata plus exactly one completed assistant proposal
+text is accepted. Refusal/incomplete/malformed results cannot mutate specs; valid
+known usage remains charged. Count receives no invented store parameter. No model
+substitution. The key is resolved only in memory, never argv/files/logs/errors.
+Source tests inject private transport/credentials without live secrets or network;
+no public fake-provider option exists.
+
+Official protocol references: [count input tokens](https://platform.openai.com/docs/api-reference/responses/input-tokens),
+[create response](https://platform.openai.com/docs/api-reference/responses/create),
+[structured outputs](https://platform.openai.com/docs/guides/structured-outputs).
+
+P4 SOURCE CODE_READY requires the two focused autonomy test files, directly
+affected question/CAS/CLI regressions, format/lint/types and CAE boundary. After
+Medium CODE acceptance, full pytest/build/fresh wheel verification remains
+REQUIRED and PENDING, followed by exact evidence review and PM integration.
+Source tests do not establish AI-02, native/real E2Es or final BottomFrame success.
