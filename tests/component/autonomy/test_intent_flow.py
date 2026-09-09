@@ -266,7 +266,8 @@ def test_numerical_diagnostics_and_uncertain_reentry(
     result = invoke(
         capsys, created, path, "intent", 1, "timeout", "material.model = isotropic_linear_elastic"
     )
-    assert result[0] == 2 and result[1]["operation"]["reserved_tokens"] == 2200
+    assert result[0] == 4 and result[1]["operation"]["reserved_tokens"] == 2200
+    assert result[1]["diagnostics"][0]["code"] == "environment"
     assert (
         invoke(
             capsys,

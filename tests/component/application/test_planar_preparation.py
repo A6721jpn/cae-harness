@@ -296,7 +296,9 @@ def test_stale_prepared_generation_is_rejected_before_compilation(
     assert not compiled
 
 
+@pytest.mark.parametrize("route", ["typed", "natural"])
 def test_prepared_material_child(
+    route: str,
     request: pytest.FixtureRequest,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -330,6 +332,8 @@ def test_prepared_material_child(
     monkeypatch.setattr(profiles, "_profile", profile)
     service, created, payload, backend, _ = request.getfixturevalue("prepared_input")
     _isolate(monkeypatch, backend)
+    if route == "natural":
+        payload["values"]["budget"].update(max_llm_calls=2, max_llm_tokens=2200)
     prepared = service.prepare_planar(created.case_id, payload, expected_generation=0)
     parent = service.get_revision(created.case_id, prepared["revision_id"])
     storage = service._storage(created.case_id)
@@ -376,13 +380,70 @@ def test_prepared_material_child(
             created.case_id, json.loads(capsys.readouterr().out)["revision_id"]
         )
 
-    child = freeze_patch(
-        parent,
-        CasePatchEdit(
-            "material", replace(parent.spec.material, youngs_modulus=Quantity(2e6, "Pa")), True
-        ),
-        parent.spec.material.youngs_modulus_evidence,
-    )
+    if route == "natural":
+        from febio_cae.adapters.llm import openai_responses
+
+        boundary = importlib.import_module("tests.component.autonomy.test_openai_boundary")
+        settings_path = tmp_path / "llm.json"
+        settings_path.write_text(json.dumps(boundary.settings()), encoding="utf-8")
+        statement = "material.youngs_modulus = 2 MPa"
+
+        def http(endpoint: str, body: dict[str, Any], *_: Any) -> dict[str, Any]:
+            if endpoint.endswith("input_tokens"):
+                return {"input_tokens": 100}
+            source = json.loads(body["input"])["sources"][0]
+            return boundary.response(
+                [
+                    {
+                        "field": "material.youngs_modulus",
+                        "value": "2",
+                        "unit": "MPa",
+                        "source": source["id"],
+                        "clause": statement,
+                        "entity": parent.spec.geometry.body_id.value,
+                        "scope": "case",
+                    }
+                ]
+            )
+
+        monkeypatch.setattr(openai_responses, "_http", http)
+        monkeypatch.setattr(openai_responses, "_resolve_key", lambda _: "private-injected")
+        assert (
+            main(
+                [
+                    "case",
+                    "edit",
+                    created.case_id,
+                    "--text",
+                    statement,
+                    "--expected-generation",
+                    str(service.current_draft(created.case_id).generation),
+                    "--operation-id",
+                    "prepared-E-edit",
+                    "--llm-settings",
+                    str(settings_path),
+                    "--base",
+                    parent.revision_id,
+                    "--json",
+                ]
+            )
+            == 0
+        ), capsys.readouterr().out
+        capsys.readouterr()
+        assert main(["case", "validate", created.case_id, "--json"]) == 0
+        capsys.readouterr()
+        assert main(["case", "freeze", created.case_id, "--json"]) == 0
+        child = service.get_revision(
+            created.case_id, json.loads(capsys.readouterr().out)["revision_id"]
+        )
+    else:
+        child = freeze_patch(
+            parent,
+            CasePatchEdit(
+                "material", replace(parent.spec.material, youngs_modulus=Quantity(2e6, "Pa")), True
+            ),
+            parent.spec.material.youngs_modulus_evidence,
+        )
     assert child.parent_revision_id == parent.revision_id
     args = [
         "case",
