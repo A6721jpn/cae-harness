@@ -128,3 +128,60 @@ Next is independent fixed-code rereview. Full mandatory gates, build, fresh
 installed smoke, final evidence acceptance and PM integration/push remain
 required and pending. All actual native/qualification/AI-02/figures/E2E and
 BottomFrame gates remain pending; this is synthetic source evidence only.
+
+## Final local gates after CODE_ACCEPT
+
+Independent Medium accepted exact code `87d1b4385a5db002f79fc6cdea64d935a551a3c1` (I1 resolved).
+All mandatory local gates below completed on that clean accepted candidate
+under Python 3.12.10; source/tests/packaging and both authorities stayed frozen.
+
+| Command | UTC start / end | Result | Exit |
+| --- | --- | --- | --- |
+| `python -m pytest --basetemp .local/v/insfinal` | 2026-09-09T09:29:03.4537744Z / 2026-09-09T09:43:07.5246291Z | 1487 passed | 0 |
+| `python -m ruff format --check .` | 2026-09-09T09:29:03.4114986Z / 2026-09-09T09:29:03.6343082Z | 235 files formatted | 0 |
+| `python -m ruff check .` | 2026-09-09T09:29:03.4710374Z / 2026-09-09T09:29:03.6940246Z | all checks passed | 0 |
+| `python -m mypy src tests` | 2026-09-09T09:29:03.5097011Z / 2026-09-09T09:29:03.9419024Z | 184 source files | 0 |
+| `python scripts/scan_cae_data.py --root .` | 2026-09-09T09:29:03.4446215Z / 2026-09-09T09:29:15.5290033Z | 237 tracked; PASS | 0 |
+| `python -m build` | 2026-09-09T09:29:03.4557798Z / 2026-09-09T09:29:12.4786943Z | wheel and sdist | 0 |
+| `python -m venv .local/ini` | 2026-09-09T09:31:24.4070284Z / 2026-09-09T09:31:29.4241022Z | previously absent Python 3.12.10 environment | 0 |
+| `.local/ini/Scripts/python.exe -I -m pip install --no-index --no-deps dist/febio_cae-0.1.0-py3-none-any.whl` | 2026-09-09T09:31:29.5965337Z / 2026-09-09T09:31:31.3765343Z | noneditable new wheel install | 0 |
+| `Fresh absolute febio-cae.exe --version` | 2026-09-09T09:32:29.7782493Z / 2026-09-09T09:32:30.0456644Z | febio-cae 0.1.0 | 0 |
+| `Fresh Python -I; ignored installed public inspection helper` | 2026-09-09T09:32:31.9912077Z / 2026-09-09T09:32:32.9541769Z | 1 synthetic scenario, 3 public calls, 70 imports | 0 |
+
+New wheel: 284562 bytes; SHA256
+`7b1747c84d5d18ce06ecef4070768e6b14616d689cb4e3cee8314355fa207caa`.
+A previously absent short-path venv received the new wheel without editable
+installation or source shadowing. Absolute console version ran from scratch
+with PYTHONPATH/PYTHONHOME unset for that child. Installed smoke used -I.
+
+One finite synthetic public create -> native inspect -> metadata inspect
+scenario passed three public commands. It verifies source-bound body/face/
+unit/digest observations, unchanged draft/generation, zero compatibility and
+mesh-quality registrations, no frozen revision and zero mesh generations.
+Only existing SyntheticBackend and private child/resource seams are injected;
+real installed CLI/service/source admission/serialization/reconstruction run.
+All 70 loaded febio_cae module/namespace origins are fresh site-packages.
+All 95 wheel Python members match accepted checkout and installed bytes.
+
+The exact default installed child argv was also executed through unchanged
+owned-process protection (5 seconds, 256 MiB). Its invalid private protocol
+was rejected before produce/native loading with the exact integrity ERROR
+response, child exit 0, empty stdout/stderr and no pending cleanup. Exit 0
+here is successful transport of an expected rejection, not native success.
+This verifies entrypoint/packaging/cleanup, not Gmsh/OCCT/AP214 capability.
+
+There were no failed final-stage gate or installed-helper attempts.
+Two report-generator attempts failed on PowerShell encodings (CP932 install
+metadata and UTF-16 test log). Original records are retained; only local
+decoding/config-string handling was corrected. No gate was rerun. Earlier
+source-stage RED/fix failures remain in their original evidence and are not
+recounted. No second full suite is required for the report-only final commit.
+The ignored final handoff records exact FINAL, raw command metadata, wheel
+member/source equivalence (Git content CRLF-normalized only), unchanged
+tracked code/authority blobs and the changed-document CAE scan.
+
+Independent Medium final artifact/evidence acceptance and PM-only V2
+integration/nonforce push remain pending. Actual Gmsh/OCCT/AP214, trusted
+qualification/FB03/FBS, AI02/live API, investigation figures, Studio/
+Computer Use, every actual E2E and final BottomFrame remain unverified.
+Local/installed synthetic success does not declare project completion.
