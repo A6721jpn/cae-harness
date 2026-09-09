@@ -212,6 +212,19 @@ def run_demo(
     if preflight:
         with storage.evidence_snapshot(), storage.revision_snapshot(case_id, revision_id):
             validated = service._validate(case_id)
+            if isinstance(registration, PlanarPreparationRegistration):
+                draft = validated.draft
+                if (
+                    validated.status != "VALIDATED"
+                    or draft is None
+                    or storage.revision_generation(revision_id) != draft.generation
+                    or draft.values.to_case_spec().to_bytes() != revision.spec.to_bytes()
+                    or tuple(draft.evidence) != tuple(revision.evidence)
+                ):
+                    raise PortError(
+                        PortErrorCategory.CONFLICT,
+                        "preflight requires current validated frozen revision",
+                    )
             if validated.status != "VALIDATED":
                 raise ValueError("demo current validation failed")
             _, bundle, _ = build(revision, storage.root / "preflight-not-published")
