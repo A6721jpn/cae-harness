@@ -746,7 +746,8 @@ def _require_ap214_header(content: bytes) -> None:
     # AP214's standard schema identifier may carry its ISO edition identifier.
     if (
         re.fullmatch(
-            r"'AUTOMOTIVE_DESIGN(?:\s+\{\s*1\s+0\s+10303\s+214\s+[123]\s+1\s+1\s*\})?'",
+            r"'AUTOMOTIVE_DESIGN(?:\s+\{\s*1\s+0\s+10303\s+214\s+"
+            r"(?:[123]\s+1\s+1|1\s+1\s+1\s+1)\s*\})?'",
             values[1],
             re.IGNORECASE,
         )
