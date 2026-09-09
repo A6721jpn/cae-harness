@@ -1,5 +1,7 @@
 # P0-A bootstrap verification
 
+> 過去記録：本文は記録対象時点の証拠を保持する。旧体制・次タスクの記載は現行の作業指示ではない。現行体制は[記録の扱い](README.md)と[開発契約](../../AGENTS.md)に従う。
+
 日付: 2026-09-07
 対象: FEBio CAE Harness V2 の P0-A（Python 3.12 headless CLI bootstrap）
 判定範囲: version、doctor、CAEデータ境界スキャナー、wheel配布、installed smoke

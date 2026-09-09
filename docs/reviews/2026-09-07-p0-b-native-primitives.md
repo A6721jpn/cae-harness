@@ -1,5 +1,7 @@
 # P0-B Gmsh native primitive probe記録
 
+> 過去記録：本文は記録対象時点の証拠を保持する。旧体制・次タスクの記載は現行の作業指示ではない。現行体制は[記録の扱い](README.md)と[開発契約](../../AGENTS.md)に従う。
+
 日付: 2026-09-07
 対象: P0-B 環境同定およびGmsh OpenCASCADE 3 primitiveの独立合成probe
 調査開始base: `9392c29ebf6bd8eeacda307059a39ff4392c11d7`

@@ -1,5 +1,7 @@
 # Registered numerical criteria and explicit selection context
 
+> 過去記録：本文は記録対象時点の証拠を保持する。旧体制・次タスクの記載は現行の作業指示ではない。現行体制は[記録の扱い](README.md)と[開発契約](../../AGENTS.md)に従う。
+
 Review candidate only. `REMOTE_CONFIGURED`; no integration/push. Base: `113dda6c95ad756788cedd52a7448de4ca0b87f9` (R2 remains independently unaccepted). Test commits: `f186bd5986206839dd6d8670b93fc7e9aa20d9fa`, `400514f` (full SHAs in manifest). Production: `e16dc2e39ff7ec4568fc96e7952f90d4a4ec8bfb`. Final report-only successor SHA is in the local manifest/handoff; all clean production gates apply unchanged.
 
 ## Implemented boundary

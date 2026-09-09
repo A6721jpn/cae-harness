@@ -1,5 +1,7 @@
 # P2 mesh validity intermediate repair
 
+> 過去記録：本文は記録対象時点の証拠を保持する。旧体制・次タスクの記載は現行の作業指示ではない。現行体制は[記録の扱い](README.md)と[開発契約](../../AGENTS.md)に従う。
+
 This intermediate candidate remains unaccepted. H1, H7 and M1 have scoped repairs;
 H2 now fails explicitly for unsupported curved-tool quality but sphere/cylinder
 generation remains required and open. No native execution occurred.

@@ -2,6 +2,8 @@
 
 Python 3.12のheadlessプロトタイプ、`febio-cae 0.1.0`の公開コマンドを説明する。製品仕様の決定元は[設計仕様書](specs/2026-08-27-febio-llm-cae-harness-design-v2.md)と[実装・検証計画](plans/2026-08-27-febio-cae-harness-greenfield-plan.md)。本書は仕様を追加しない。
 
+開発・修正の担当と判断権限は2026-09-09改訂の[開発契約](../AGENTS.md)に従う（PM兼PdM: Astra X-high、単独実装: Astra Low、別タスクの独立レビュー: Astra Medium）。この体制変更による公開CLIの構文変更はない。
+
 ## インストール済みCLIの確認
 
 ```powershell

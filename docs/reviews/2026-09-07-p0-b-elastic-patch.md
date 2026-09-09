@@ -1,5 +1,7 @@
 # P0-B native elastic patch probe記録
 
+> 過去記録：本文は記録対象時点の証拠を保持する。旧体制・次タスクの記載は現行の作業指示ではない。現行体制は[記録の扱い](README.md)と[開発契約](../../AGENTS.md)に従う。
+
 日付: 2026-09-07
 対象: P0-B の Gmsh Tet10 → FEBio 4.12.0 native elastic patch 互換性観測
 調査開始base: `6e731712b5a69a9ebcffaa2251fac87bad496f23`

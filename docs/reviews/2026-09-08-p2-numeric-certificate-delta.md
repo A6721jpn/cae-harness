@@ -1,5 +1,7 @@
 # P2 H7 exact-arithmetic certificate delta
 
+> 過去記録：本文は記録対象時点の証拠を保持する。旧体制・次タスクの記載は現行の作業指示ではない。現行体制は[記録の扱い](README.md)と[開発契約](../../AGENTS.md)に従う。
+
 Scoped candidate for independent review; H7 and whole P2 acceptance are not closed.
 Base: `535688ab619ceb1b9ddc68b9e93d1d08cfd7e363`.
 Code and clean gates: `c962ae9bc2ab7e723f4b7174a20525f2643c25cc`.

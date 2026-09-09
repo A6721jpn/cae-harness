@@ -1,5 +1,7 @@
 # P1-B9 solver policy and numerical intent
 
+> 過去記録：本文は記録対象時点の証拠を保持する。旧体制・次タスクの記載は現行の作業指示ではない。現行体制は[記録の扱い](README.md)と[開発契約](../../AGENTS.md)に従う。
+
 Date: 2026-09-07
 Scope: FEBio CAE Harness V2 immutable solver numerical intent and time-subdivision data
 Decision boundary: this report covers local domain tests, static gates, package build, and installed-package smoke only.

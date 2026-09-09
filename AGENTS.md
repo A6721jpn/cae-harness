@@ -1,5 +1,9 @@
 # FEBio CAE Harness Development Contract
 
+テストは最低限に。初期計画にないテストや機能追加は最小限に。最短で最速で計画通りの開発を遂行せよ。
+
+Effective: 2026-09-09. This contract supersedes earlier development role and dispatch instructions.
+
 ## Authority and scope
 
 - The only product authorities are:
@@ -14,12 +18,23 @@
 - V2 has an independent history containing only the new V2 design and implementation.
   Do not reuse or inspect legacy CAE Harness code, tests, schemas, releases, branches,
   worktrees, or case assets. Limit fetches and integration to V2 and its development branches.
-- The development PM is `gpt-6-astra` / `medium`, implementation workers are independent
-  `gpt-5.6-luna` / `max` tasks created and continued through the Luna Spawn skill, and
-  the code reviewer is an independent `gpt-6-astra` / `medium` task.
-- Message model settings belong to the destination task. Use Luna/max only when
-  creating or continuing a worker; reports to the PM preserve Astra/medium.
-- The PM owns scope and integration. Workers own assigned implementation files. The
+- The PM also serves as PdM and uses `gpt-6-astra` / `xhigh`. Exactly one implementation
+  task uses `gpt-6-astra` / `low`. A separate, independent code-review task uses
+  `gpt-6-astra` / `medium`. Do not dispatch additional or parallel coding workers.
+- Continue the existing designated tasks through the Codex task tools, explicitly
+  setting the destination role's model and effort on work dispatch. Do not use the
+  Luna Spawn route. Reports preserve destination settings; a PM report must not
+  switch the PM to the sender's effort. Verify effective settings from runtime
+  metadata; a title or requested setting alone is not execution evidence.
+- The PM/PdM decides product priorities, scope, task order, technical tradeoffs,
+  acceptance criteria and finite development/execution budgets within user-authorized
+  requirements. Record consequential decisions and update the two product authorities
+  before implementation when behavior or acceptance changes. Routine engineering
+  decisions do not require another permission request. This authority does not
+  invent physical conditions, authorize unapproved real-data/native operations,
+  waive required real E2E, or describe unverified behavior as accepted.
+- The PM/PdM owns scope and integration. The sole implementer owns assigned product
+  files; the PM owns governance documents and does not concurrently edit those product files. The
   reviewer inspects exact commits read-only and reports findings to the PM. Only the PM
   integrates reviewed, clean, passing changes into V2 and pushes V2 without force.
 - Keep task IDs, runtime metadata, launcher prompts, and local coordination state outside
@@ -43,12 +58,21 @@
   smallest change, then record the GREEN command, count, and exit code.
 - Do not count interrupted runs, collection errors, environment errors, skipped required
   checks, or unexecuted tests as passing evidence.
-- Keep common contracts single-owner until frozen. After that boundary is fixed, isolate
-  solver/FBS, input/model, autonomy, and build/launch work in separate worktrees.
+- Keep common contracts single-owner. The sole implementer works sequentially across
+  input/model, solver/FBS, autonomy and build/launch, using explicit file boundaries
+  and reviewed base commits. Logical module boundaries do not authorize more workers.
 - Worker tasks must state the base commit, allowed files, forbidden changes, RED and GREEN
   commands, completion criteria, unverified items, and required clean commit handoff.
 - Accept only small, reviewed, clean commits. Do not hand off uncommitted changes or large
   snapshots.
+- Use the smallest meaningful RED/GREEN checks for the planned behavior and observed
+  defects. Do not add speculative features or redundant test matrices. Run required
+  local gates once on the final implementation candidate; repeat only checks justified
+  by a changed candidate, environment, failure or unresolved risk. A documentation-only
+  change needs content/link/diff checks and independent review, not product RED/GREEN,
+  pytest, build or a new installed environment. Retain valid existing tests.
+- Coordinate on completion, failure or a decision request. Do not create acknowledgement
+  loops, repeated unchanged polling, or additional tasks solely to wait.
 
 ## Required local gates
 

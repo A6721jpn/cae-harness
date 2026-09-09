@@ -1,5 +1,7 @@
 # P0-B XPLT reader observation記録
 
+> 過去記録：本文は記録対象時点の証拠を保持する。旧体制・次タスクの記載は現行の作業指示ではない。現行体制は[記録の扱い](README.md)と[開発契約](../../AGENTS.md)に従う。
+
 日付: 2026-09-07
 対象: P0-B `attempt-06` のFEBio 4.12.0 XPLTを、独立bounded readerで観測し、同じrunの直接text出力と照合した記録
 調査開始base: `ff24fb02e71387a3cca32da0f2328eaadd9fd9a3`

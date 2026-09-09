@@ -1,5 +1,7 @@
 # R2 residual repair — H2 design decision required
 
+> 過去記録：本文は記録対象時点の証拠を保持する。旧体制・次タスクの記載は現行の作業指示ではない。現行体制は[記録の扱い](README.md)と[開発契約](../../AGENTS.md)に従う。
+
 **BLOCKED / DO NOT INTEGRATE.** H1 numeric publication and H3 repeated freeze/edit behavior are repaired in the tested local seam. H2 rejects preexisting database aliases and detects links before subsequent SQL operations, but does not exclude a hardlink added inside a native SQLite call. A fresh clean-commit counterexample still changes the sibling file. Passing ordinary tests do not close this failure.
 
 `REMOTE_CONFIGURED`; no integration/push. Base: `a4fec5451cb83a184809a90099495fddc02a4b26`. Test commits: `a8498b15989eac48939e6746cbad4df482f819a7`, `77938c2a0325c8aceb6ea6c7f3dd09c0e787cb29`. Production: `3f4ffcad285630af85f6b1de82864cc2569b71b8`. Final report-only successor is recorded in the execution manifest/handoff; clean production evidence applies unchanged. R2 and AC remain unaccepted; their previous candidate objects, reports, manifests and preserved artifacts remain intact.

@@ -1,5 +1,7 @@
 # P3 solver adapters: corrected evidence and mixed-test migration
 
+> 過去記録：本文は記録対象時点の証拠を保持する。旧体制・次タスクの記載は現行の作業指示ではない。現行体制は[記録の扱い](README.md)と[開発契約](../../AGENTS.md)に従う。
+
 Date: 2026-09-08. Branch: `codex/p3-solver-adapters`.
 REMOTE_CONFIGURED: `https://github.com/A6721jpn/cae-harness`
 (the authorized repository; configured URL omits the optional .git suffix).

@@ -1,5 +1,7 @@
 # P2 concrete placed-selection bridge
 
+> 過去記録：本文は記録対象時点の証拠を保持する。旧体制・次タスクの記載は現行の作業指示ではない。現行体制は[記録の扱い](README.md)と[開発契約](../../AGENTS.md)に従う。
+
 Base: `0f2bade8eeafc63f3c4bbad7bb2d54d85805a376`.
 Production: `fea85fd`, import/type-only follow-up: `7a395cc`.
 REMOTE_CONFIGURED: authorized origin remains `https://github.com/A6721jpn/cae-harness.git`; integration is PM-owned V2.

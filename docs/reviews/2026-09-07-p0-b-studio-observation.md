@@ -1,5 +1,7 @@
 # P0-B FEBio Studio XPLT観察記録
 
+> 過去記録：本文は記録対象時点の証拠を保持する。旧体制・次タスクの記載は現行の作業指示ではない。現行体制は[記録の扱い](README.md)と[開発契約](../../AGENTS.md)に従う。
+
 日付: 2026-09-07 / ブランチ: `codex/p0-b-studio-observation` / 観察開始base: `f903575283136ffe45ff0c703bc3f6fab3462285` / remote: `https://github.com/A6721jpn/cae-harness.git`（`REMOTE_CONFIGURED`）
 追跡変更: このMarkdownのみ。全UI・画像・native入力・metadataはignoredな`.local/verification/P0B-studio-observation-01`に保存した。
 

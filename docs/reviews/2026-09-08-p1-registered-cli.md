@@ -1,5 +1,7 @@
 # Registered lifecycle and explicit CLI phase report
 
+> 過去記録：本文は記録対象時点の証拠を保持する。旧体制・次タスクの記載は現行の作業指示ではない。現行体制は[記録の扱い](README.md)と[開発契約](../../AGENTS.md)に従う。
+
 ## R2 candidate (supersedes historical R1 sections below)
 
 `REMOTE_CONFIGURED`; no integration or push. Repair base `9005194594360d38202c9b204680644854c72efc`; integrated base `c23dc59d4dae4810acd51fe2156b7d190d645acb`. Test-only commits: `5337269`, `cbf16f3`, `89cbbbc`, `20daa69`. Production SHA: `af6261a8b17addd6f87dc4dcb1315a017bb7d266`. Final report-only SHA is recorded in the ignored execution manifest and PM handoff; all gates apply unchanged to this documentation-only successor.

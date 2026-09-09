@@ -1,5 +1,7 @@
 # P2 C2-M1 session-admission correction
 
+> 過去記録：本文は記録対象時点の証拠を保持する。旧体制・次タスクの記載は現行の作業指示ではない。現行体制は[記録の扱い](README.md)と[開発契約](../../AGENTS.md)に従う。
+
 Ready for exact delta review, not whole P2 acceptance. Base
 `e4c46700a638992fd715401d6ef1e7fbf7788ee0`; production and fresh-gate source
 `893fa4c695d6c985fc2b97e1eb11a5f96c2da3c2`. Final report-bearing SHA is delivered

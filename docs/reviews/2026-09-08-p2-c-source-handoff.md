@@ -1,5 +1,7 @@
 # P2 C consolidated adapter-source handoff
 
+> 過去記録：本文は記録対象時点の証拠を保持する。旧体制・次タスクの記載は現行の作業指示ではない。現行体制は[記録の扱い](README.md)と[開発契約](../../AGENTS.md)に従う。
+
 Ready for combined independent source review, not P2 completion. Fresh required
 local gates pass for clean `5b3ea16562349e2e44ecc0654f5decf6df5958d4`.
 This handoff adds only this report and a historical M3 chronology correction;
