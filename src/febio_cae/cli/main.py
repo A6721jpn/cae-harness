@@ -62,6 +62,26 @@ def _build_parser() -> argparse.ArgumentParser:
     spec.add_argument("--file", required=True)
     spec.add_argument("--expected-generation", required=True, type=int)
     spec.add_argument("--json", action="store_true")
+    for action in ("intent", "answer", "edit"):
+        natural = case_commands.add_parser(
+            action,
+            help="bounded affirmative clauses; no inferred physics",
+            description="Whole field = value clauses only. Material model/E/nu/applicability or explicit registered component adoption. E edit only; no automatic execution.",
+        )
+        natural.add_argument("case_id")
+        natural.add_argument("--text", required=True)
+        natural.add_argument("--expected-generation", required=True, type=int)
+        natural.add_argument("--operation-id", required=True)
+        natural.add_argument(
+            "--llm-settings",
+            required=True,
+            help="explicit provider/model/key ENV NAME/Budget/input/output/socket JSON; local 2*I+O reservation, not provider billing",
+        )
+        natural.add_argument("--json", action="store_true")
+        if action == "answer":
+            natural.add_argument("--question", required=True)
+        if action == "edit":
+            natural.add_argument("--base", required=True)
     patch = case_commands.add_parser("patch", help="apply a parent-bound typed CasePatch")
     patch.add_argument("case_id")
     patch.add_argument("--file", required=True)

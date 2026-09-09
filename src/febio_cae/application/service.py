@@ -350,24 +350,29 @@ class RegisteredCaseService:
         if not isinstance(values, PartialCaseSpec):
             raise ServiceConflictError("values must be a PartialCaseSpec")
         storage = self._storage(case_id)
-        current = storage.current_draft(case_id)
-        resolved_evidence = self._resolve_declarations(storage, source_declarations, evidence)
-        merged_values = self._merge_values(current.values, values)
-        merged_evidence = _merge_evidence(current.evidence, resolved_evidence)
-        draft = CaseDraft(
-            case_id=case_id,
-            draft_id=f"draft-{uuid.uuid4().hex[:12]}",
-            generation=expected_generation + 1,
-            input_intent=input_intent if input_intent else current.input_intent,
-            parent_revision_id=current.parent_revision_id,
-            parent_spec_digest=current.parent_spec_digest,
-            values=merged_values,
-            evidence=merged_evidence,
-        )
-        try:
-            return storage.set_draft(draft, expected_generation=expected_generation)
-        except StorageConflictError as error:
-            raise ConcurrentUpdateError(str(error)) from error
+        with storage.transaction():
+            current = storage.current_draft(case_id)
+            if current.generation != expected_generation:
+                raise ConcurrentUpdateError(
+                    "expected draft generation is stale before source declarations"
+                )
+            resolved_evidence = self._resolve_declarations(storage, source_declarations, evidence)
+            merged_values = self._merge_values(current.values, values)
+            merged_evidence = _merge_evidence(current.evidence, resolved_evidence)
+            draft = CaseDraft(
+                case_id=case_id,
+                draft_id=f"draft-{uuid.uuid4().hex[:12]}",
+                generation=expected_generation + 1,
+                input_intent=input_intent if input_intent else current.input_intent,
+                parent_revision_id=current.parent_revision_id,
+                parent_spec_digest=current.parent_spec_digest,
+                values=merged_values,
+                evidence=merged_evidence,
+            )
+            try:
+                return storage.set_draft(draft, expected_generation=expected_generation)
+            except StorageConflictError as error:
+                raise ConcurrentUpdateError(str(error)) from error
 
     def issue_question(
         self,
@@ -404,38 +409,48 @@ class RegisteredCaseService:
         source_declarations: Sequence[SourceDeclaration] = (),
     ) -> CaseDraft:
         storage = self._storage(case_id)
-        current = storage.current_draft(case_id)
-        question = storage.get_question(question_id)
-        if question.case_id != case_id or question.generation != expected_generation:
-            raise ServiceConflictError("question is bound to another case or generation")
-        try:
-            check_answer_values(
-                current.values,
-                self._merge_values(current.values, values),
-                tuple(question.target_fields),
+        with storage.transaction():
+            current = storage.current_draft(case_id)
+            if current.generation != expected_generation:
+                raise ConcurrentUpdateError(
+                    "expected draft generation is stale before source declarations"
+                )
+            bound = storage.get_question(question_id)
+            if bound.draft_id != current.draft_id or bound.generation != current.generation:
+                raise ConcurrentUpdateError("question is stale before source declarations")
+            question = storage.get_question(question_id)
+            if question.case_id != case_id or question.generation != expected_generation:
+                raise ServiceConflictError("question is bound to another case or generation")
+            try:
+                check_answer_values(
+                    current.values,
+                    self._merge_values(current.values, values),
+                    tuple(question.target_fields),
+                )
+            except StorageConflictError as error:
+                raise ServiceConflictError(str(error)) from error
+            resolved = self._resolve_declarations(storage, source_declarations, evidence)
+            provided = {repr(item.to_dict()) for item in resolved}
+            if any(
+                repr(item.to_dict()) not in provided for item in question.question_time_evidence
+            ):
+                raise ServiceConflictError("question-time evidence must be retained in the answer")
+            draft = CaseDraft(
+                case_id=case_id,
+                draft_id=f"draft-{uuid.uuid4().hex[:12]}",
+                generation=expected_generation + 1,
+                input_intent=current.input_intent,
+                parent_revision_id=current.parent_revision_id,
+                parent_spec_digest=current.parent_spec_digest,
+                values=self._merge_values(current.values, values),
+                evidence=_merge_evidence(current.evidence, resolved),
             )
-        except StorageConflictError as error:
-            raise ServiceConflictError(str(error)) from error
-        resolved = self._resolve_declarations(storage, source_declarations, evidence)
-        provided = {repr(item.to_dict()) for item in resolved}
-        if any(repr(item.to_dict()) not in provided for item in question.question_time_evidence):
-            raise ServiceConflictError("question-time evidence must be retained in the answer")
-        draft = CaseDraft(
-            case_id=case_id,
-            draft_id=f"draft-{uuid.uuid4().hex[:12]}",
-            generation=expected_generation + 1,
-            input_intent=current.input_intent,
-            parent_revision_id=current.parent_revision_id,
-            parent_spec_digest=current.parent_spec_digest,
-            values=self._merge_values(current.values, values),
-            evidence=_merge_evidence(current.evidence, resolved),
-        )
-        try:
-            return storage.consume_question(
-                question_id, draft, expected_generation=expected_generation
-            )
-        except StorageConflictError as error:
-            raise ServiceConflictError(str(error)) from error
+            try:
+                return storage.consume_question(
+                    question_id, draft, expected_generation=expected_generation
+                )
+            except StorageConflictError as error:
+                raise ServiceConflictError(str(error)) from error
 
     def apply_patch(
         self, case_id: str, patch: CasePatch, *, expected_generation: int | None = None
@@ -486,6 +501,44 @@ class RegisteredCaseService:
             )
         except StorageConflictError as error:
             raise ConcurrentUpdateError(str(error)) from error
+
+    def process_intent(
+        self,
+        case_id: str,
+        *,
+        action: str,
+        text: str,
+        expected_generation: int,
+        operation_id: str,
+        settings: dict[str, Any],
+        question_id: str | None = None,
+        base: str | None = None,
+    ) -> dict[str, Any]:
+        from ._intent import _failure, execute
+
+        try:
+            return execute(
+                self,
+                case_id,
+                action=action,
+                text=text,
+                expected_generation=expected_generation,
+                operation_id=operation_id,
+                settings=settings,
+                question_id=question_id,
+                base=base,
+            )
+
+        except (
+            OSError,
+            ValueError,
+            TypeError,
+            PortError,
+            ServiceConflictError,
+            StorageConflictError,
+            StorageIntegrityError,
+        ) as error:
+            return _failure(case_id, error)
 
     def inspect_case(self, case_id: str) -> ServiceResult:
         storage = self._storage(case_id)
@@ -753,7 +806,7 @@ class RegisteredCaseService:
         if solver is None:
             diagnostics.append(
                 _diagnostic(
-                    ServiceErrorCategory.NEEDS_PHYSICAL_INPUT,
+                    ServiceErrorCategory.INVALID_INPUT,
                     "solver profile and controls are unresolved",
                     "solver_policy",
                 )
@@ -835,14 +888,21 @@ class RegisteredCaseService:
                         _diagnostic(_service_category(error.category), str(error), field)
                     )
 
-        if draft.unresolved_fields:
-            diagnostics.append(
-                _diagnostic(
-                    ServiceErrorCategory.NEEDS_PHYSICAL_INPUT,
-                    "unresolved required fields: " + ", ".join(draft.unresolved_fields),
-                    "values",
-                )
+        for numerical, category in (
+            (False, ServiceErrorCategory.NEEDS_PHYSICAL_INPUT),
+            (True, ServiceErrorCategory.INVALID_INPUT),
+        ):
+            unresolved = tuple(
+                name
+                for name in draft.unresolved_fields
+                if (name in {"mesh_policy", "solver_policy", "budget"}) == numerical
             )
+            if unresolved:
+                diagnostics.append(
+                    _diagnostic(
+                        category, "unresolved required fields: " + ", ".join(unresolved), "values"
+                    )
+                )
         if diagnostics:
             status = (
                 "UNSUPPORTED_ENVIRONMENT"
@@ -854,6 +914,8 @@ class RegisteredCaseService:
                     }
                     for item in diagnostics
                 )
+                else "INVALID_INPUT"
+                if any(item.code is ServiceErrorCategory.INVALID_INPUT for item in diagnostics)
                 else "NEEDS_INPUT"
             )
             return ServiceResult(

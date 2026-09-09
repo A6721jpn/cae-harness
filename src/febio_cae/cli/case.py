@@ -113,7 +113,9 @@ def _error_payload(error: Exception) -> tuple[dict[str, object], int]:
         )
     else:
         category = (
-            "invalid_input" if isinstance(error, (SpecInputError, ValueError)) else "conflict"
+            "invalid_input"
+            if isinstance(error, (SpecInputError, ValueError, TypeError))
+            else "conflict"
         )
         exit_code = 2 if category == "invalid_input" else 8
     status = "UNSUPPORTED_ENVIRONMENT" if exit_code == 4 else "INVALID_INPUT"
@@ -145,6 +147,31 @@ def run_case(arguments: Namespace) -> int:
     service = None
     try:
         service = RegisteredCaseService(state_dir=arguments.state_dir)
+        if arguments.case_action in {"intent", "answer", "edit"}:
+            from febio_cae.application.intent_contracts import strict_json
+
+            settings_path = Path(arguments.llm_settings)
+            with settings_path.open("rb") as stream:
+                settings = strict_json(stream.read(256 * 1024 + 1))
+            payload = service.process_intent(
+                arguments.case_id,
+                action=arguments.case_action,
+                text=arguments.text,
+                expected_generation=arguments.expected_generation,
+                operation_id=arguments.operation_id,
+                settings=settings,
+                question_id=getattr(arguments, "question", None),
+                base=getattr(arguments, "base", None),
+            )
+            _print(payload) if arguments.json else print(payload["status"])
+            if any(item.get("code") == "integrity" for item in payload.get("diagnostics", [])):
+                return 6
+            return {
+                "UPDATED": 0,
+                "NEEDS_INPUT": 3,
+                "UNSUPPORTED_ENVIRONMENT": 4,
+                "CONFLICT": 8,
+            }.get(payload["status"], 2)
         if arguments.case_action == "prepare-planar":
             payload = service.prepare_planar(
                 arguments.case_id,
@@ -228,6 +255,7 @@ def run_case(arguments: Namespace) -> int:
         PortError,
         ServiceConflictError,
         SpecInputError,
+        TypeError,
         StorageIntegrityError,
         StorageConflictError,
         ValueError,
