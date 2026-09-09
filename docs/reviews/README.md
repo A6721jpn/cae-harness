@@ -9,3 +9,5 @@
 記録済みの限定的な成功を一般的なnative互換性や実モデル成功へ拡張しない。現行候補の受け入れでは証拠の対象SHA・適用範囲を確認し、未検証の必須実E2Eと最終BottomFrameを省略しない。
 
 - [2026-09-09 Prepared material descendants: code stage](2026-09-09-prepared-material-descendants.md)
+
+- [2026-09-09 P4 intent source: CODE_READY](2026-09-09-p4-intent-source.md)
