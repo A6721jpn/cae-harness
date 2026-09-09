@@ -116,10 +116,13 @@ def _error_payload(error: Exception) -> tuple[dict[str, object], int]:
             "invalid_input" if isinstance(error, (SpecInputError, ValueError)) else "conflict"
         )
         exit_code = 2 if category == "invalid_input" else 8
+    status = "UNSUPPORTED_ENVIRONMENT" if exit_code == 4 else "INVALID_INPUT"
+    if isinstance(error, PortError) and error.category is error.category.CONFLICT:
+        status, exit_code = "CONFLICT", 8
     return (
         {
             "schema_version": "1",
-            "status": "UNSUPPORTED_ENVIRONMENT" if exit_code == 4 else "INVALID_INPUT",
+            "status": status,
             "case_id": None,
             "revision_id": None,
             "run_id": None,
