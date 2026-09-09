@@ -91,3 +91,41 @@ acceptance, run all mandatory gates and fresh installed public-boundary evidence
 then exact evidence review and PM-only V2 integration/push. AI-02 and every
 required real/native E2E, including final BottomFrame, remain separate unverified
 gates requiring their authorized execution.
+
+
+## Fix 1 after independent CODE_REJECT (M1 / M2)
+
+The independent review of `612c65799e5b23ca5a9cf08a7b0cdb10578612c4`
+identified two P2 defects. Fix source commit `b0beef56fdac34deec357a327e5d746ef53d6d24` follows test-first commit
+`cd2063c9eff86aea91ce0d30d3a3d5db5ffbbe1c` and is ready for sequential CODE rereview, not accepted or integrated.
+
+M1: the E-only CasePatch now attaches only its `material.youngs_modulus` evidence,
+which still references the complete immutable edit source. Generic intent evidence
+remains available to initial intent and answer; PREPARED ancestry and fixed-evidence
+restrictions are unchanged. The existing synthetic prepared-child fixture now also
+exercises the natural-language route through public edit, validate/freeze and
+prepared preflight, retaining the existing mesh-change rejection and unchanged
+root receipt/mesh checks. This is isolated synthetic preparation/compiler evidence.
+
+M2: sanitized OSError, including TimeoutError, maps to environment diagnosis and
+public exit 4. Reservation/usage recording and no-resend behavior are unchanged;
+invalid numerical settings and malformed proposals remain input failures. The
+existing public timeout/re-entry assertion now expects exit 4 and environment.
+
+Paired focused commands (Python 3.12.10, same candidate cwd):
+
+- RED: `python -m pytest tests/component/autonomy tests/component/application/test_planar_preparation.py::test_prepared_material_child[natural] --basetemp .local/v/p4fix1r`
+  collected 8, with exactly M1 and M2 failing (2 failed / 6 passed), exit 1.
+- GREEN: `python -m pytest tests/component/autonomy tests/component/application/test_planar_preparation.py::test_prepared_material_child[natural] --basetemp .local/v/p4fix1g`
+  passed all 8, exit 0. Counts are not added to earlier runs.
+
+Raw logs and exact SHA/dirty/UTC metadata are `p4fix1-red*` and `p4fix1-green*`
+in ignored `.local/verification`. Static/CAE gate results, exact final candidate,
+source/test hashes and preserved-boundary evidence are in the ignored
+`p4-intent-source-fix1-handoff.md` there. The two authorities, domain/codec,
+transport/process primitives and PREPARED storage authority remain frozen.
+
+Full suite/build/fresh-wheel installation and final acceptance review remain
+REQUIRED/PENDING until Medium accepts the fixed code. Live API, native/real E2Es
+and final BottomFrame remain unverified; no credentials, real HTTP, native probe,
+actual case data, external repository operation, merge or push occurred.
