@@ -94,3 +94,37 @@ Actual Gmsh/OCCT/AP214 native inspection, trusted profile qualification authorit
 FB-03/FBS, AI-02/live API, Studio/Computer Use, investigation figures, all actual
 E2Es and final BottomFrame remain pending. There is no provisioning command or
 placeholder catalog and no claim of complete REQ-04/P2/P6 or project completion.
+
+## Fix 1: snapshot deadline classification after CODE_REJECT
+
+Independent Medium rejected `2c4b445f94d5b824670fce8815f649695b481a4b`
+for P2/I1: TimeoutError from an inspection deadline inside an evidence snapshot
+crossed the existing storage OSError conversion and became integrity/exit 6.
+The application now wraps only its own remaining-time check and converts
+TimeoutError to an environment PortError before it crosses any storage context.
+Storage errors are not classified by message text; actual corruption remains 6,
+generation conflict remains 8, and the original shared deadline calculation,
+adapter, process ownership and storage primitives are unchanged.
+
+Test-first commit `8c9b580` extends the existing deadline test, keeping four
+collected cases. A controlled clock advances while the real evidence snapshot
+is active; the production remaining-time calculation expires before native
+launch. The test does not replace the deadline function with an unconditional
+exception. Existing owned-child timeout/cleanup and source-corruption/stale
+generation assertions are retained.
+
+| Exact command | Collected/result | Exit |
+| --- | --- | --- |
+| `python -m pytest tests/component/application/test_native_inspection.py --basetemp .local/v/insfix1r` | 4 collected; snapshot expiry failed (1 failed, 3 passed) | 1 |
+| `python -m pytest tests/component/application/test_native_inspection.py --basetemp .local/v/insfix1g` | 4 passed, 1.59 seconds | 0 |
+
+Raw paired logs and UTC/cwd/SHA/dirty/Python metadata are retained in ignored
+`inspection-fix1-red*` and `inspection-fix1-green*` evidence. The final exact
+commit, cheap format/lint/type/CAE results, changed-file hashes and unchanged
+boundary proof are in the ignored fix-1 handoff. Only this report, the existing
+test module and application/_inspection.py change in this correction.
+
+Next is independent fixed-code rereview. Full mandatory gates, build, fresh
+installed smoke, final evidence acceptance and PM integration/push remain
+required and pending. All actual native/qualification/AI-02/figures/E2E and
+BottomFrame gates remain pending; this is synthetic source evidence only.
