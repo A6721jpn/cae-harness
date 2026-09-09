@@ -1,0 +1,1 @@
+"""Replaceable language proposal adapters."""
