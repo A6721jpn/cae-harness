@@ -137,3 +137,70 @@ general STEP support, native memory pressure, solver/FBS format-3 compatibility,
 real LLM, required real E2E and final BottomFrame E2E remain unverified.
 No real 02_CAE/BottomFrame input was read or changed, native tool installed or
 started, or live LLM called in this phase. The project is not complete.
+
+## M1 review correction and reverification
+
+Independent Medium review of `508b2f281a15fc2ed5dbaef44db4861e54e279dd`
+returned REJECT for M1: a historical generation-1 PREPARED revision could
+receive PREFLIGHT_PASSED after the current draft advanced to generation 2.
+The existing execution path already rejected this mismatch; the finding was
+incorrect preflight admission, not evidence of a stale solver launch. The
+original review and isolated reproduction remain in the ignored verification
+record `public-planar-medium-review.md`.
+
+The correction is limited to the public prepared-origin preflight branch in
+`src/febio_cae/application/_demo.py`. Within its existing evidence/revision
+snapshot, before build or compiler construction, it now requires VALIDATED
+status, a current draft, and matching generation, serialized spec and evidence,
+using the same comparisons as execution. Mismatch raises the existing
+PortError/CONFLICT contract. Legacy demo behavior and execution checks are
+unchanged. One regression was added to the existing preparation test file.
+
+- Correction base: `508b2f281a15fc2ed5dbaef44db4861e54e279dd`.
+- Test commit: `f7394266ff9694bd7e112f071cc697175816a160`.
+- Fixed product: `0b71bdf9d30015c14fc543fb80e128de282f017e`.
+- This report-only follow-up is identified by `public-planar-m1-handoff.md`.
+
+The same Python 3.12.10 executable and checkout cwd described above were used.
+Each following record has raw output and exact argv/cwd/Python/SHA/dirty/time/
+exit metadata under ignored `.local/verification/`.
+
+| Record | Exact command | Result |
+|---|---|---|
+| `m1-red` | `python -m pytest tests/component/application/test_planar_preparation.py -k stale --basetemp .local/v/m1r` | 1 failed, 7 deselected, exit 1; clean test commit |
+| `m1-green` | `python -m pytest tests/component/application/test_planar_preparation.py --basetemp .local/v/m1g` | 8 passed, exit 0; product working change |
+| `m1-full` | `python -m pytest --basetemp .local/v/m1f` | 1474 passed, exit 0, 734.31 seconds; clean fixed product before/after |
+| `m1-format-clean` | `python -m ruff format --check .` | 220 files formatted, exit 0 |
+| `m1-lint` | `python -m ruff check .` | all checks passed, exit 0 |
+| `m1-types` | `python -m mypy src tests` | 172 source files, exit 0 |
+| `m1-boundary` | `python scripts/scan_cae_data.py --root .` | 222 tracked files, no issues, exit 0 |
+| `m1-build` | `python -m build` | sdist and wheel built, exit 0 |
+
+RED failed at DID NOT RAISE PortError after the isolated compiler was admitted,
+not at import/setup. GREEN confirms CONFLICT and that compiler construction is
+not reached for the stale generation. The first format check (`m1-format`)
+exited 1 because newly edited working-file lines had mixed line endings.
+Ruff normalization and index refresh restored clean state without changing
+the committed blob; the passing rerun is recorded above. No full suite was
+duplicated. This fresh 1474-test suite supersedes the prior 1473-test evidence
+for the corrected executable candidate.
+
+The new exact wheel named by `m1-build.log` is
+`dist/febio_cae-0.1.0-py3-none-any.whl`, SHA-256
+`c7f6dc1cd20f32cda910c4db4cfc83c0f12a4e5b347086fc9787d2ab8a39c552`.
+Fresh `python -m venv .local/verification/m1-env`, that venv's Python
+`-m pip install --no-index <absolute-new-wheel>`, and its `febio-cae.exe
+--version` all exited 0; version was `febio-cae 0.1.0`. From fresh
+`.local/verification/m1-cwd`, its Python ran `-I <absolute-m1_installed_check.py>
+<absolute-m1g/test_stale_prepared_generation0>`, exit 0. It reuses only the
+isolated GREEN fixture, verifies imports originate under the new venv's
+site-packages, and confirms historical generation 1/current generation 2 is
+rejected with CONFLICT before compiler construction. Native starts were zero
+and Gmsh was not imported. Records: `m1-venv`, `m1-install`,
+`m1-installed-version`, `m1-installed-boundary`, `m1-wheel-hash.json`.
+
+`REMOTE_CONFIGURED` remains unchanged; no worker merge/push was performed.
+Exact Medium rereview and PM integration are pending. The next source unit
+remains public execution/preflight integration with finite solver ownership;
+this correction does not expand that scope or authorize native execution.
+All native, real LLM, real E2E and BottomFrame limitations above still apply.
