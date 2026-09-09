@@ -308,7 +308,9 @@ P7後、ST-01の設計変数・CAD編集レシピ・目的・制約を具体化�
 
 `case --state-dir STATE prepare-planar CASE_ID --file REQUEST --expected-generation N --json`を既存SpecUpdateRequestと現在の実backend処理へ接続する。物理条件を明示した平面・box・AsPlacedに限定し、要求からmesh・SUPPORTED・producer receiptを登録しない。geometryの生成digestとinspection digest、および対応部品選択のgeometry digestだけはprivate入力でnullを許し、今回の子inspectionで解決する。非null不一致は拒否し、共通domain schemaや物理的意味を変更しない。
 
-Gmsh4.15.2/OCC8.0.1/AP214、wall600秒・生成1回・100000四面体/250000節点を既定とし、明示的な有限上限変更だけを許す。CPUは検出した利用可能数と明示上限、メモリは開始時利用可能物理量80%（総量以下）を用い、所有子プロセスで時間・メモリを強制して記録する。solver3600秒/1試行は後続工程の目標であり準備では起動しない。既存lease/CASとcase-local PREPARING/FAILED/PREPARED記録を使い、現input/spec/evidence/generation/backend/mesh/recipe/outputへ結び付ける。freeze後の失敗でもPREPAREDのない公開経路の実行・preflightを拒否し、既存demoは保持する。
+Gmsh4.15.2/OCC7.8.1/AP214、wall600秒・生成1回・100000四面体/250000節点を既定とし、明示的な有限上限変更だけを許す。CPUは検出した利用可能数と明示上限、メモリは開始時利用可能物理量80%（総量以下）を用い、所有子プロセスで時間・メモリを強制して記録する。solver3600秒/1試行は後続工程の目標であり準備では起動しない。既存lease/CASとcase-local PREPARING/FAILED/PREPARED記録を使い、現input/spec/evidence/generation/backend/mesh/recipe/outputへ結び付ける。freeze後の失敗でもPREPAREDのない公開経路の実行・preflightを拒否し、既存demoは保持する。
+
+2026-09-09 candidate-pair decision: the active public inspection/preparation baseline is Gmsh 4.15.2 / owned linked OCCT 7.8.1 / AP214, replacing the unsupported 8.0.1 expectation. The pinned official Windows wheel was measured in a separate identity-only owned session as `OCC version: 7.8.1`; the earlier pre-geometry producer failure remains failed. No OCCT-8-only requirement was found. This is an identity-grounded candidate correction only: retain strict exact/missing/ambiguous/wrong-version admission, unchanged geometry/units/tolerances and qualification gates. Future producer and reader require newly accepted artifacts, fresh evidence and separate release; identity alone does not close any geometry or E2E gate.
 
 最小RED/GREENは公開操作、正常な隔離生成、必要な入力/版不一致、途中公開の拒否と所有プロセスのhard timeoutを検証する。最終候補の必須ゲート一式とfresh wheelの起動・隔離準備境界を実行し、正確なSHAでMediumレビューを受ける。今回の実行はsourceとnative-freeテストのみであり、実Gmsh/OCCT/FEBio/Studio・real LLM・実ケース操作を行わない。次は残る公開実行・preflightの接続とプロセス所有権を、既存の生成記録に基づいて進める。
 
@@ -457,7 +459,7 @@ physical memory (bounded by total). The enclosing operation uses one deadline,
 including request, launch and response work, always passing remaining time.
 
 Only the child loads plain GmshOCCBackend plus StepGeometryMeshAdapter, with
-Gmsh 4.15.2, OCCT 8.0.1 and AP214 admission and measured module/hash/version
+Gmsh 4.15.2, OCCT 7.8.1 and AP214 admission and measured module/hash/version
 identity. Preparation's planar face override is not used. Before reading child
 JSON, stat its private response and enforce max_response_bytes = min(16 MiB,
 effective_memory_bytes // 16), independent of caller input. Strict shape/count/

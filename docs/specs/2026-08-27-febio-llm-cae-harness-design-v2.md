@@ -156,7 +156,9 @@ CAD・メッシュの第一候補はGmshのPython APIとOpenCASCADEである。[
 
 公開STEP準備経路の前提として、Gmsh設定にAP214必須指定、期待するOpenCASCADE版、正のCPU worker数を任意指定できるようにする。AP214指定時はSTEPのHEADER内のFILE_SCHEMAをインポート前に検査する。OpenCASCADE版は所有するGmshセッションの`General.BuildInfo`にあるOCCT版と厳密に照合し、欠落・曖昧・不一致なら未対応として形状操作前に停止する。別途インストールしたOCCTの版は代用しない。CPU数は所有セッション内の`General.NumThreads`へ設定する。既存経路の未指定時の動作と戻り値契約は維持する。
 
-この前提実装は公開CLI接続、実機適合性、メッシュ品質の合格を意味しない。将来の公開準備経路ではGmsh 4.15.2・OCCT 8.0.1とAP214を要求するが、ここでは期待値を設定可能にする段階とし、実機検証前に対応済みとは表示しない。
+この前提実装は公開CLI接続、実機適合性、メッシュ品質の合格を意味しない。将来の公開準備経路ではGmsh 4.15.2・OCCT 7.8.1とAP214を要求するが、ここでは期待値を設定可能にする段階とし、実機検証前に対応済みとは表示しない。
+
+2026-09-09 fixed-pair correction: active public inspection/preparation requires Gmsh 4.15.2, owned linked OCCT 7.8.1 and AP214, superseding the earlier 8.0.1 expectation. A separately bounded identity-only session measured `General.BuildInfo` with exactly `OCC version: 7.8.1` in the pinned official Windows wheel (SHA256 `7b36083bb410fa27c5d0e052929d1a9844a5b09169d66017b72b41aabd49d711`). No OCCT-8-only feature basis was identified in the V2 compatibility evidence. The earlier producer failed before geometry; that failure and historical synthetic evidence remain unchanged. This correction establishes a reproducible candidate identity, not geometric/scientific qualification or SUPPORTED status. Exact owned-session equality, missing/ambiguous/mismatch refusal, generic optional-version behavior, AP214/unit/analytic tolerances and all actual E2E requirements remain unchanged; no arbitrary caller version, fallback or separate OCCT substitution is allowed.
 
 STEP調査はボディ数、閉じたソリッドか、単位、体積、境界面、幾何学的欠陥を報告する。体積・面積・距離・向きは選択を解決するための幾何情報であり、材料や支持の意味を付与しない。
 
@@ -166,7 +168,7 @@ STEP調査はボディ数、閉じたソリッドか、単位、体積、境界�
 
 ### 6.2 剛体生成と接触
 
-公開準備コマンドは`case --state-dir STATE prepare-planar CASE_ID --file REQUEST --expected-generation N --json`とする。既存のSpecUpdateRequest（PartialCaseSpec、evidence、source_declarations）を再利用し、初期範囲を平面・box治具・AsPlacedに限定する。呼出側のMeshArtifact、互換性のSUPPORTED宣言、生成receiptは受け付けず、登録済みSTEPを現在のGmsh 4.15.2・OCC 8.0.1・AP214検査付き操作で処理する。既存の互換性profileは正確なdigestで解決し、この要求から登録・置換しない。
+公開準備コマンドは`case --state-dir STATE prepare-planar CASE_ID --file REQUEST --expected-generation N --json`とする。既存のSpecUpdateRequest（PartialCaseSpec、evidence、source_declarations）を再利用し、初期範囲を平面・box治具・AsPlacedに限定する。呼出側のMeshArtifact、互換性のSUPPORTED宣言、生成receiptは受け付けず、登録済みSTEPを現在のGmsh 4.15.2・OCC 7.8.1・AP214検査付き操作で処理する。既存の互換性profileは正確なdigestで解決し、この要求から登録・置換しない。
 
 初回入力のため、prepare-planarのprivate正規化だけはgeometry.geometry_digest、geometry.inspection_digestと対応する部品SelectionRef.geometry_digestのnullを許す。値は今回の子プロセスが登録済みSTEPから取得したinspectionだけで確定する。非nullの宣言が実測digestと異なる場合は拒否し、黙って置換しない。source digest、body、単位、配置、選択規則、物理条件と根拠は明示のまま保持し、選択が今回のinspectionで一意に解決できない場合は停止する。共通domain schemaのnull許容範囲は広げない。
 
@@ -541,7 +543,7 @@ physical memory (bounded by total). The enclosing operation uses one deadline,
 including request, launch and response work, always passing remaining time.
 
 Only the child loads plain GmshOCCBackend plus StepGeometryMeshAdapter, with
-Gmsh 4.15.2, OCCT 8.0.1 and AP214 admission and measured module/hash/version
+Gmsh 4.15.2, OCCT 7.8.1 and AP214 admission and measured module/hash/version
 identity. Preparation's planar face override is not used. Before reading child
 JSON, stat its private response and enforce max_response_bytes = min(16 MiB,
 effective_memory_bytes // 16), independent of caller input. Strict shape/count/
