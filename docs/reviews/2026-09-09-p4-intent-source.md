@@ -129,3 +129,64 @@ Full suite/build/fresh-wheel installation and final acceptance review remain
 REQUIRED/PENDING until Medium accepts the fixed code. Live API, native/real E2Es
 and final BottomFrame remain unverified; no credentials, real HTTP, native probe,
 actual case data, external repository operation, merge or push occurred.
+
+## Final local gates after CODE_ACCEPT
+
+Independent Medium review accepted exact code candidate
+`ee3a1eb13af761977466ba8c79be2be35d12948c`. The following results supersede
+this report's earlier pending local gates. All ran on that clean candidate under
+Python 3.12.10; source, tests, packaging and both product authorities stayed frozen.
+Times below are UTC on 2026-09-09. Exact cwd, identity, command, SHA/dirty state
+and raw output are retained in ignored local verification evidence.
+
+| Command | UTC start / end | Result | Exit |
+| --- | --- | --- | --- |
+| `python -m pytest --basetemp .local/v/p4final` | 08:22:31.1039666 / 08:36:35.5109546 | 1483 passed; one full invocation | 0 |
+| `python -m ruff format --check .` | 08:29:29.3778192 / 08:29:29.7760102 | 231 files formatted | 0 |
+| `python -m ruff check .` | 08:29:29.3355993 / 08:29:29.7247658 | All checks passed | 0 |
+| `python -m mypy src tests` | 08:29:29.3610478 / 08:29:29.9412737 | 181 source files; no issues | 0 |
+| `python scripts/scan_cae_data.py --root .` | 08:29:29.3580608 / 08:29:41.4421105 | PASS; 233 tracked files | 0 |
+| `python -m build` | 08:29:29.3009962 / 08:29:38.7577726 | wheel and sdist built | 0 |
+| `python -m venv .local/p4i` | 08:31:38.0430459 / 08:31:43.7184964 | Previously absent fresh Python 3.12.10 environment | 0 |
+| `.local/p4i/Scripts/python.exe -I -m pip install --no-index --no-deps dist/febio_cae-0.1.0-py3-none-any.whl` | 08:31:43.8695080 / 08:31:45.6686035 | Installed new wheel | 0 |
+| Fresh environment's absolute `febio-cae.exe --version` | 08:32:25.3230354 / 08:32:25.8558183 | `febio-cae 0.1.0`; isolated scratch cwd | 0 |
+
+The newly built wheel is 278954 bytes, SHA256
+`eee5694f1950e18be2e3195eb9c0ce4449611590e7517da8df876f71034648f1`.
+All 93 Python members match the accepted source byte for byte, with no missing
+or extra Python members. The final handoff records their equivalence to the
+report-only final commit and the changed-document CAE scan; no full-suite repeat
+is needed for this report-only change.
+
+Fresh installed smoke ran with `-I` from a separate scratch directory, without
+editable install or checkout path insertion. It passed two finite synthetic
+scenarios and 13 public CLI command calls (08:34:40.8737306 through
+08:35:31.9384468 UTC, helper exit 0). The first covers intent, grouped pending
+question, current answer, typed draft, validate/freeze and explicit E edit.
+The second covers prepared E edit, validate/freeze and descendant preflight,
+including preserved root receipt/evidence and invalid mesh refusal. Registered
+admission, generation, question, proposal and accounting checks remain active;
+fixture facts/profile, private HTTP/dummy credential and compiler seams are
+synthetic. All 82 loaded `febio_cae` modules/namespaces originate in the fresh
+site-packages; loaded files also match the wheel.
+
+The unmodified installed default adapter child was launched through existing
+bounded process ownership using its real module/argument path and a deliberately
+absent unique dummy key environment name. Expected sanitized child exit 2,
+no response file and no pending cleanup demonstrate controlled offline
+pre-network rejection, not an import failure. No real credential was inspected.
+This does not qualify real HTTPS/model interoperability or remote cancellation.
+
+One prior installed-smoke attempt exited 1 because the ignored verification
+helper treated a namespace module's `__file__ = None` as a path. Its failed logs
+and helper are retained and excluded from pass counts. Only that local audit
+helper was corrected to verify namespace paths; the successful finite rerun used
+a fresh scratch directory and the same wheel. Product source was unchanged.
+
+Raw gate logs/metadata, per-command public evidence, import origins, wheel member
+hashes and the final report-only applicability proof remain in ignored local
+verification files identified by the final handoff. They contain synthetic
+fixtures only. Independent Medium final artifact/evidence acceptance and PM-only
+V2 integration/nonforce push remain pending. Live AI-02/API, native FEBio/FBS/
+Studio/Computer Use, every required actual E2E and final BottomFrame remain
+unverified. This phase does not declare project completion.
