@@ -4,7 +4,9 @@ Base: `9f5d0c1f1f97d92ffa198c7c13e9a24a99e0aff0`.
 Formal decision: `a64db9fe69d20586248e70fe85450f5762eb2559`.
 Collected RED tests: `c8fcd39f0b4b056a7d0e923e8f9cc6bfadd8d646`.
 Product: `a635fb82c738d88cc10309a7d734d65cc8784880`.
-Status: code-review candidate; not native geometry or scientific qualification.
+Code accepted: f1b04b8fc3ea59f54e5355c07d58243baa19983f.
+Status: mandatory code/build/install gates passed; new producer failed serialized
+point admission; reader unexecuted; not native or scientific qualification.
 
 The pinned official Gmsh 4.15.2 Windows distribution reports linked OCC 7.8.1.
 Public initial inspection and planar preparation previously required 8.0.1 and
@@ -89,13 +91,79 @@ was repeated; tests, lint, types and boundary results remain applicable. Raw
 failure/correction/final format evidence is retained separately, not counted
 as an initial pass. No full suite, build or installation ran in this code stage.
 
+## Final mandatory gates and installation
+
+Independent review returned CODE_ACCEPT for the exact accepted code above and
+PREREG_READY for the frozen new producer/reader plan. The following commands ran
+once on that clean code, with no source/test/packaging/authority edits:
+
+| Command | Result | Exit |
+|---|---|---:|
+| python -m pytest --basetemp .local/v/occfinal | 1487 passed, 840.85 seconds | 0 |
+| python -m ruff format --check . | 236 files already formatted | 0 |
+| python -m ruff check . | All checks passed | 0 |
+| python -m mypy src tests | No issues in 184 source files | 0 |
+| python scripts/scan_cae_data.py --root . | PASS, 238 checked | 0 |
+| python -m build | sdist and wheel built | 0 |
+| Fresh Python 3.12.10 -I -m venv | New isolated environment | 0 |
+| Installed Python -I -m pip install --no-index --no-deps --no-cache-dir with the two pinned local wheels | Noneditable installation | 0 |
+| Absolute installed febio-cae --version | febio-cae 0.1.0 | 0 |
+
+The old product wheel was archived and verified before build: 284562 bytes,
+SHA256 7b1747c84d5d18ce06ecef4070768e6b14616d689cb4e3cee8314355fa207caa.
+The new product wheel is 284609 bytes, SHA256
+e95aa28e74a254bf280aac5110b8c48c08186dbcdbae894b8c737a7d2eb28ba6.
+All 95 Python members match current source and installed bytes exactly, and
+accepted Git content after newline normalization. Actual imported product module
+and namespace origins are inside the new environment. System site packages are
+disabled, child PYTHONPATH/PYTHONHOME removed, and the official Gmsh module/DLL
+hashes match the preceding table without native import during the audit.
+Exact argv, UTC, Python, working directories and paired raw logs remain ignored
+local evidence. Earlier attempts and the original environment are preserved.
+
+Only this report changes after the accepted code; code gates apply through
+unchanged source/test/packaging/authority Git objects and normalized tracked
+content, with a separate final report boundary scan. These passing synthetic
+and installation gates do not imply real geometry success.
+
+## Separately released new producer: failed
+
+After all mandatory gates and installation binding passed, the producer received
+an explicit release and ran exactly once: child/wrapper exit 1, pending cleanup
+0, 60-second ceiling, CPU 1 and owned memory ceiling 1 GiB. The unchanged helper
+raised RuntimeError("unexpected serialized point or scale") at serialized point
+admission. STEP bytes were written, but producer.json was not produced.
+The failed STEP is 15377 bytes, SHA256
+64c647f43b7027b1abc32b0235c151af1482cacad03a049953adcaede4c8ca14.
+This identifies failed evidence, not an admitted geometry fixture.
+
+Static inspection of saved bytes finds the first rejected entity is
+#39 = CARTESIAN_POINT('',(0.,0.)). It is referenced by LINE #38 in
+DEFINITIONAL_REPRESENTATION #37, with explicit 2D parametric context #42, used by
+PCURVE #31. The preregistered regex inspected every CARTESIAN_POINT and required
+three coordinates, thereby confusing auxiliary 2D curve points with 3D solid
+vertices. Saved bytes declare AP214 and millimetres. No native query was added.
+
+Smallest proposed next preregistration correction, not applied: distinguish
+explicitly typed/context-bound auxiliary 2D points from solid vertex coordinates,
+and apply the unchanged 3D bounds/eight-corner checks to CARTESIAN_POINT entities
+referenced by the solid's VERTEX_POINT topology; reject malformed or ambiguous
+references. Do not rescale, relabel units or loosen numerical tolerances.
+
+The failure location shows finalize-return and the post-finalize initialized
+check were traversed, but the measured producer success record was never saved.
+No saved BuildInfo, volume, centroid, bounds or successful corner-admission result
+is claimed for this attempt. The public reader was not released or run; no
+registry/case was created. New session ledger: producer 1, reader 0, mesh 0;
+historical failed producer 1 and identity diagnostic 1 remain separate.
+No retry, helper/product/test edit or additional native operation was performed.
+
 ## Pending work
 
-Independent exact-code review, mandatory full suite/build/fresh install, and a
-separately released new producer/reader remain pending. Preserve the old accepted
-wheel before any later build overwrites its filename. New native evidence must
-use a newly accepted artifact and fresh scratch, retain fixed 1x2x3 mm geometry,
-AP214/unit/corner admission and analytic tolerances, and bind actual STEP bytes
-before reader release. Identity evidence alone closes no geometric/scientific,
-profile, FB03/FBS, AI02/API, figure, Studio/Computer Use, required actual E2E or
-final BottomFrame gate.
+Independent final artifact/evidence review and PM integration/nonforce push remain
+pending. Any corrected preregistration and new producer/reader execution require a
+new review and release. Public SI topology, source/inspection digests, unchanged
+draft/generation/profile and reader cleanup remain unexecuted. Native
+qualification remains UNVERIFIED. Geometric/scientific qualification, profile,
+FB03/FBS, AI02/API, figures, Studio/Computer Use, required actual E2Es and final
+BottomFrame remain pending; this is not project completion.
