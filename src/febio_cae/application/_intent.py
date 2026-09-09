@@ -205,13 +205,11 @@ def _failure(case_id: str, error: Exception) -> dict[str, Any]:
         if code == "conflict":
             status = "CONFLICT"
         message = str(error)
+    elif isinstance(error, OSError):
+        status, code = "UNSUPPORTED_ENVIRONMENT", "environment"
+        message = "bounded LLM transport outcome is uncertain"
     else:
-        status, code = "INVALID_INPUT", "invalid_input"
-        message = (
-            "bounded LLM transport outcome is uncertain"
-            if isinstance(error, OSError)
-            else str(error)
-        )
+        status, code, message = "INVALID_INPUT", "invalid_input", str(error)
     return {
         "schema_version": "1",
         "status": status,
@@ -446,7 +444,9 @@ def execute(
                     parent.revision_id,
                     parent.spec_digest,
                     (CasePatchEdit("material", edited_material, True),),
-                    tuple(refs),
+                    # This reference retains the entire immutable edit source while
+                    # preserving PREPARED's fixed non-E evidence authority.
+                    (evidence(fact, sources),),
                 )
                 # All other fields are retained by construction; the existing patch authority publishes.
                 updated = service.apply_patch(
