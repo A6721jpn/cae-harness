@@ -579,3 +579,10 @@ Record genuine RED then GREEN and cheap static/CAE gates before exact CODE revie
 Full mandatory gates/build/fresh installed smoke follow CODE acceptance once,
 then final evidence review and PM integration. Source evidence does not qualify
 real Gmsh/OCCT/AP214, REQ-04/P2/P6 completion or any actual E2E.
+
+Measurement composition clarification: the private inspection adapter may use
+a measurement-only GmshOCCBackend subclass calling unchanged
+super()._prepare_owned_session, then record module path/hash/version/BuildInfo
+from that same live owned session. Plain backend means unchanged body/face/
+geometry algorithms and admission; no planar face override, second session or
+probe, public backend API change, or frozen-file edit is permitted.

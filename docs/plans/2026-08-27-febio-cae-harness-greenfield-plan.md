@@ -503,3 +503,10 @@ post-integration eight tests and CAE boundary passed. Live AI-02/API remains
 pending, together with actual native/profile/FB-03/Studio/Computer Use and all
 mandatory actual E2Es including final BottomFrame. Next is this bounded initial
 inspection source slice, not profile bootstrap or project completion.
+
+Measurement composition clarification: the private inspection adapter may use
+a measurement-only GmshOCCBackend subclass calling unchanged
+super()._prepare_owned_session, then record module path/hash/version/BuildInfo
+from that same live owned session. Plain backend means unchanged body/face/
+geometry algorithms and admission; no planar face override, second session or
+probe, public backend API change, or frozen-file edit is permitted.
