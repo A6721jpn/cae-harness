@@ -77,7 +77,7 @@ def _isolate(monkeypatch: pytest.MonkeyPatch, backend: Any) -> None:
         "module": "synthetic-only",
         "module_sha256": "f" * 64,
         "gmsh_version": "4.15.2",
-        "occt_version": "8.0.1",
+        "occt_version": "7.8.1",
         "build_info": "synthetic injected backend",
     }
     monkeypatch.setattr(worker, "_make_backend", lambda cpu: backend)
@@ -95,6 +95,11 @@ def test_current_operation_publishes_bound_preparation(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     service, created, request, backend, step = prepared_input
+    worker = importlib.import_module("febio_cae.adapters.geometry.preparation")
+    config = worker._make_backend(2).config
+    assert config.expected_version == "4.15.2"
+    assert config.expected_occt_version == "7.8.1"
+    assert config.require_step_ap214 and config.cpu_workers == 2
     _isolate(monkeypatch, backend)
     request_path = tmp_path / "request.json"
     request_path.write_text(json.dumps(request), encoding="utf-8")
@@ -143,7 +148,15 @@ def test_preparation_refuses_source_or_backend_mismatch(
     elif bad == "geometry":
         request["values"]["geometry"]["geometry_digest"] = "e" * 64
     else:
-        backend.evidence["occt_version"] = "7.9.1"
+        for version in ("8.0.1", "7.9.1", None):
+            if version is None:
+                del backend.evidence["occt_version"]
+            else:
+                backend.evidence["occt_version"] = version
+            with pytest.raises((ValueError, RuntimeError)):
+                service.prepare_planar(created.case_id, request, expected_generation=0)
+            assert not backend.mesh_requests
+        return
     with pytest.raises((ValueError, RuntimeError)):
         service.prepare_planar(created.case_id, request, expected_generation=0)
     assert not backend.mesh_requests

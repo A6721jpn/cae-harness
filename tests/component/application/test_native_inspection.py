@@ -36,8 +36,8 @@ def initial(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
         "module": "synthetic-module-only",
         "module_sha256": "a" * 64,
         "gmsh_version": "4.15.2",
-        "occt_version": "8.0.1",
-        "build_info": "Synthetic fixture; OCC version: 8.0.1",
+        "occt_version": "7.8.1",
+        "build_info": "Synthetic fixture; OCC version: 7.8.1",
     }
     limits = {
         "available_cpus": 2,
@@ -51,6 +51,7 @@ def initial(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
         service=service,
         created=created,
         worker=worker,
+        real_backend_factory=worker._make_backend,
         application=application,
         backend=backend,
         limits=limits,
@@ -114,6 +115,10 @@ def invoke(initial: Any, capsys: pytest.CaptureFixture[str], *options: str) -> t
 def test_initial_native_topology_without_spec(
     initial: Any, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    config = initial.real_backend_factory(2).config
+    assert config.expected_version == "4.15.2"
+    assert config.expected_occt_version == "7.8.1"
+    assert config.require_step_ap214 and config.cpu_workers == 2
     before = initial.service.current_draft(initial.created.case_id).to_dict()
     assert before["values"]["geometry"] is None
     code, payload = invoke(initial, capsys)
@@ -190,10 +195,22 @@ def test_source_report_and_generation_admission(
 def test_unsupported_policy_and_response_bounds(
     initial: Any, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    initial.backend.evidence["occt_version"] = "wrong"
-    code, payload = invoke(initial, capsys)
-    assert code == 4 and payload["status"] == "UNSUPPORTED_ENVIRONMENT"
-    initial.backend.evidence["occt_version"] = "8.0.1"
+    evidence = dict(initial.backend.evidence)
+    for version in ("8.0.1", "wrong", None):
+        initial.backend.evidence = dict(evidence)
+        if version is None:
+            del initial.backend.evidence["occt_version"]
+        else:
+            initial.backend.evidence["occt_version"] = version
+            initial.backend.evidence["build_info"] = f"Synthetic fixture; OCC version: {version}"
+        code, payload = invoke(initial, capsys)
+        if version is None:
+            assert code == 6 and payload["diagnostics"][0]["code"] == "integrity"
+        else:
+            assert code == 4 and payload["status"] == "UNSUPPORTED_ENVIRONMENT"
+        assert payload["pending_cleanup"] == 0 and not initial.backend.mesh_requests
+        assert initial.service.current_draft(initial.created.case_id) == initial.created.draft
+    initial.backend.evidence = evidence
     calls_before = len(initial.calls)
     for options in (("--wall-seconds", "nan"), ("--wall-seconds", "601"), ("--cpu-workers", "3")):
         code, payload = invoke(initial, capsys, *options)
