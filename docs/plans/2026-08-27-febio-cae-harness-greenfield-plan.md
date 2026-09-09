@@ -300,6 +300,6 @@ P7後、ST-01の設計変数・CAD編集レシピ・目的・制約を具体化�
 
 次の開発単位は公開STEP準備経路である。PM兼PdMが既存成果と依存を確認して有限の作業票を固定し、単独のAstra Low担当へ渡す。新規native実行は対象入力・条件・予算・許可が揃ってから行う。体制改訂そのものを製品経路やP0〜P7の完了証拠にはしない。
 
-最初の小区分はGmsh adapterの準備前検査とする。任意設定`expected_occt_version`、`require_step_ap214`、`cpu_workers`を追加し、AP214のHEADER宣言、所有セッションのOCCT版、CPU数指定を検査する。既存の未指定経路とinspection/mesh契約は保持する。理由は、公開経路へ接続する前に入力形式と実際のnative依存を確認する境界を固定するためである。
+最初の小区分であるGmsh adapterの準備前検査は実装候補となった。任意設定`expected_occt_version`、`require_step_ap214`、`cpu_workers`により、AP214のHEADER宣言、所有セッションのOCCT版、CPU数指定を検査し、既存の未指定経路とinspection/mesh契約を保持する。合成8件、全体1466件、必須ローカルゲートとfresh wheelの起動・import確認は合格し、正確なSHAの独立レビューとPMの受け入れ・統合は未完了である。復旧と再実行を含む証拠は[準備前検査の報告](../reviews/2026-09-09-step-preparation-admission.md)に保持する。次は有限プロセス予算を持つ公開`prepare-planar`と生成者が所有する生成・公開記録の結合であり、公開CLI・native・実E2Eの成功はまだ主張しない。
 
 この小区分の受け入れは、設定APIの収集可能なRED、注入した合成Gmshで正常な検査・設定順序と不正な宣言・版証拠の拒否を確かめる最小限のGREEN、最終候補の必須ローカルゲート、fresh wheelのインストール・起動・import確認、正確なSHAのAstra Mediumレビューとする。追加のnative起動・インストール・ダウンロード・実モデル操作は行わない。検査対象はinspectとmeshの両入口とし、失敗時も所有セッションを解放する。次の小区分で同じAstra Low担当が有限予算付きの公開CLI準備と生成記録の結合を実装する。公開CLI・native・品質・実E2Eの未完了項目は継続する。
