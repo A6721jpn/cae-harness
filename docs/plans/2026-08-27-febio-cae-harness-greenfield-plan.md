@@ -317,3 +317,5 @@ Gmsh4.15.2/OCC8.0.1/AP214、wall600秒・生成1回・100000四面体/250000節�
 次のsource単位はRV-01/CP-01に向けたPREPARED originのYoung率のみの子孫版再利用とする。既存case patch→validate/freeze→run-demo --preflightを使い、登録親の内容とhash・祖先を検証して元の不変PREPARED rootへ結び付ける。等方線形弾性のYoung率と必須根拠だけの変更を許し、mesh生成条件・profile・その他固定条件の変更は祖先receiptで承認しない。既存adoptionで子版結合を導出するが、新規mesh/PREPAREDとは主張せずroot receipt/meshを変更しない。現在草案との一致、M1とM1-CLI、失敗公開拒否を保持する。
 
 この単位は、最小の公開子版回帰RED/GREENと安価な静的検査・CAE境界を通したcleanなコードを先に独立Mediumレビューへ渡す。修正が収束した後、同じ担当が必須全体テスト・ビルド・fresh installed境界を一度実行し、最終証拠と文書の適用範囲を確認してからPMが統合する。CODE_REVIEW_PENDING段階では全体テスト・ビルド・installed確認を必須のPENDINGとして明記し、免除・合格とは扱わない。実行許可はsourceとnative-free検査のみであり、native・LLM・実02_CAE・BottomFrame操作は含めない。
+
+この単位の現在状態（2026-09-09追記）: `e63776ca384600c4e556690199c87ee56c3c4241` は独立MediumのCODE_ACCEPT済み。同じclean候補で全件1475件、format・lint・型検査・CAE境界223ファイル・build・fresh wheelインストールと公開子版preflight境界が新たに合格した。製品・テストはCODE_ACCEPTから不変であり、最終証拠・文書レビューとPM受け入れ・V2統合はPENDINGとする。正確なコマンド・wheel hash・分離範囲は[最終フェーズ記録](../reviews/2026-09-09-prepared-material-descendants.md)に記載する。必須実E2E・最終BottomFrameの未検証状態は変わらない。
