@@ -13,13 +13,22 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from febio_cae.adapters.geometry import preparation
-from febio_cae.adapters.geometry.inspection import remaining, run_inspection
+from febio_cae.adapters.geometry.inspection import remaining as _remaining
+from febio_cae.adapters.geometry.inspection import run_inspection
 from febio_cae.adapters.geometry.preparation import resource_snapshot
 from febio_cae.domain.ports import PortError, PortErrorCategory
 from febio_cae.storage.registry import CaseStorage, StorageConflictError, StorageIntegrityError
 
 if TYPE_CHECKING:
     from .service import RegisteredCaseService
+
+
+def remaining(deadline: float) -> float:
+    # Storage transactions translate OSError; classify our deadline before crossing them.
+    try:
+        return _remaining(deadline)
+    except TimeoutError as error:
+        raise PortError(PortErrorCategory.ENVIRONMENT, str(error)) from error
 
 
 @contextmanager
