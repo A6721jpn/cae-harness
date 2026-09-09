@@ -501,7 +501,8 @@ independently supplied clause `material.youngs_modulus = 1 MPa` is a quantity,
 while `material.poisson_ratio = 0.3 1` supplies a dimensionless ratio. These are
 syntax examples, not defaults or recommended physical values. Canonical model
 values are `isotropic_linear_elastic` and `compressible_neo_hookean`; applicability
-accepts only `applicable`, `applies`, or the documented Japanese affirmative alias.
+accepts only `applicable`, `applies`, or `適用可`. Model value aliases are
+`等方線形弾性` and `圧縮性Neo-Hookean`.
 More detailed unsupported prose stays unresolved. Japanese field aliases listed
 above map to these same canonical material fields.
 
