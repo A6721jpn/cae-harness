@@ -11,3 +11,5 @@
 - [2026-09-09 Prepared material descendants: code stage](2026-09-09-prepared-material-descendants.md)
 
 - [2026-09-09 P4 intent source: CODE_READY](2026-09-09-p4-intent-source.md)
+
+- [2026-09-09 Initial public native inspection: CODE_READY](2026-09-09-public-native-inspection.md)
