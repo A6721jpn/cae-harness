@@ -406,3 +406,32 @@ affected question/CAS/CLI regressions, format/lint/types and CAE boundary. After
 Medium CODE acceptance, full pytest/build/fresh wheel verification remains
 REQUIRED and PENDING, followed by exact evidence review and PM integration.
 Source tests do not establish AI-02, native/real E2Es or final BottomFrame success.
+
+
+### P4 literal syntax and explicit settings
+
+Each fact occupies a whole `field = value` (or `field: value`) line; Unicode NFKC
+normalization is allowed. The entity is the current explicitly registered geometry
+body and scope is this case; the provider must match both. For example, the
+independently supplied clause `material.youngs_modulus = 1 MPa` is a quantity,
+while `material.poisson_ratio = 0.3 1` supplies a dimensionless ratio. These are
+syntax examples, not defaults or recommended physical values. Canonical model
+values are `isotropic_linear_elastic` and `compressible_neo_hookean`; applicability
+accepts only `applicable`, `applies`, or the documented Japanese affirmative alias.
+More detailed unsupported prose stays unresolved. Japanese field aliases listed
+above map to these same canonical material fields.
+
+Component adoption is `support = adopt revision-id.support` (likewise another
+physical component): the revision must already be registered in this same case,
+with verified evidence and compatible explicit component references. Missing
+components from that revision are not copied automatically. Do not mix whole
+material adoption and material subfield assignments in one fact group.
+
+The settings JSON keys are exactly `provider`, `model`, `key_env`, `budget`,
+`input_tokens`, `output_tokens`, `socket_seconds`. `budget` uses the existing
+schema-1 Budget projection (`max_elapsed`, `max_attempts`, `cpu_workers`,
+`max_llm_calls`, `max_llm_tokens`). Model and key environment name have no defaults.
+Retained source evidence is limited to sixteen sources and 64 KiB total text;
+exceeding this bound diagnoses input instead of truncating or sending history.
+Bootstrap allocation does not populate the CaseSpec Budget. Supply missing
+numerical policy through explicit `case spec` before validation/freeze.
