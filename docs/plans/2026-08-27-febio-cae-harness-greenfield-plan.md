@@ -436,3 +436,70 @@ Retained source evidence is limited to sixteen sources and 64 KiB total text;
 exceeding this bound diagnoses input instead of truncating or sending history.
 Bootstrap allocation does not populate the CaseSpec Budget. Supply missing
 numerical policy through explicit `case spec` before validation/freeze.
+
+
+### Initial public native inspection (approved bounded source contract)
+
+The public command is `case --state-dir STATE inspect CASE_ID --native
+[--wall-seconds SECONDS] [--cpu-workers N] --json`; metadata-only inspect stays
+unchanged. Native inspection works directly after create without GeometryIntent,
+selected body, physical inputs, profiles or credentials. It reports observation,
+not qualification, and does not assign body/support/contact/ROI meaning.
+
+A thin service entry delegates to an application-local immutable InspectionPolicy.
+Wall seconds must be finite positive, default/ceiling 600; CPU is an optional
+positive integer not exceeding current availability. Boolean, non-finite, zero
+or excessive policies fail as input (exit 2) before launching. No caller-supplied
+module, executable, version, digest or backend report is accepted. One owned
+child, zero mesh generations and no retries use the unchanged preparation
+resource_snapshot/_run_owned primitives: available CPU/affinity and 80% available
+physical memory (bounded by total). The enclosing operation uses one deadline,
+including request, launch and response work, always passing remaining time.
+
+Only the child loads plain GmshOCCBackend plus StepGeometryMeshAdapter, with
+Gmsh 4.15.2, OCCT 8.0.1 and AP214 admission and measured module/hash/version
+identity. Preparation's planar face override is not used. Before reading child
+JSON, stat its private response and enforce max_response_bytes = min(16 MiB,
+effective_memory_bytes // 16), independent of caller input. Strict shape/count/
+finite checks and existing inspection_from_dict/adapter digest reconstruction
+validate the complete response; oversized or invalid topology is rejected, never
+truncated. Preserve observed bodies/faces/units/frame/SI geometry/defects and
+source/inspection-scoped IDs, not permanent semantic IDs.
+
+Resolve registered STEP and generation using a short existing evidence snapshot;
+verify before launch, release all leases during the child, then reacquire a short
+snapshot and recheck source bytes/digest and current draft generation before
+returning. Concurrent generation changes produce CONFLICT 8, source corruption
+integrity 6, missing/mismatched tools/AP214 or owned timeout environment 4.
+Failures must not fall back to REGISTERED metadata success. No draft, intent,
+generation, frozen/PREPARED or authoritative registry mutation occurs. Unique
+case-local scratch holds transient operation/ownership evidence only; preparation
+still performs its own current inspection.
+
+Return schema-1 envelope (case_id, null revision_id/run_id, diagnostics,
+next_actions), observed generation, existing domain geometry inspection,
+validated backend topology, measured backend identity and effective limits.
+INSPECTED means observation only; native_qualification remains UNVERIFIED and
+physical decisions unresolved. Investigation figures remain separately pending.
+No qualification/profile provisioning, catalog placeholder, new process framework,
+wider placement, preview-open or general lifecycle/retry work is included.
+Actual qualification authority is missing and is not a human physics question.
+Python 3.12, CLI-only operation, no runtime Orca/Codex dependency and all existing
+geometry/domain/codec/store/producer/ownership boundaries remain unchanged.
+
+Source acceptance uses four collected public synthetic cases: initial inspection
+without geometry/profile and unchanged draft/zero mesh; stale/tampered source or
+report including generation change; unsupported child diagnosis including finite
+policy/oversized response boundaries; and finite owned deadline/cleanup failure.
+Record genuine RED then GREEN and cheap static/CAE gates before exact CODE review.
+Full mandatory gates/build/fresh installed smoke follow CODE acceptance once,
+then final evidence review and PM integration. Source evidence does not qualify
+real Gmsh/OCCT/AP214, REQ-04/P2/P6 completion or any actual E2E.
+
+P4 intent/answer/E-edit source is independently accepted and pushed on V2 at
+`3f837e7337a1a7d089d2c2d71bdd8ea5ee595aa6`, including PREPARED E-only
+descendants. Full 1483 tests and fresh installed synthetic evidence passed;
+post-integration eight tests and CAE boundary passed. Live AI-02/API remains
+pending, together with actual native/profile/FB-03/Studio/Computer Use and all
+mandatory actual E2Es including final BottomFrame. Next is this bounded initial
+inspection source slice, not profile bootstrap or project completion.
