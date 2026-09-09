@@ -218,7 +218,10 @@ def test_preparation_uses_finite_owned_process_deadline(tmp_path: Path) -> None:
 
 
 def test_stale_prepared_generation_is_rejected_before_compilation(
-    request: pytest.FixtureRequest, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    request: pytest.FixtureRequest,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     from dataclasses import replace
     from types import SimpleNamespace
@@ -273,4 +276,21 @@ def test_stale_prepared_generation_is_rejected_before_compilation(
             created.case_id, prepared["revision_id"], executable=str(solver), preflight=True
         )
     assert error.value.category is PortErrorCategory.CONFLICT
+    code = main(
+        [
+            "case",
+            "--state-dir",
+            str(tmp_path / "state"),
+            "run-demo",
+            created.case_id,
+            "--revision-id",
+            prepared["revision_id"],
+            "--solver",
+            str(solver),
+            "--preflight",
+            "--json",
+        ]
+    )
+    response = json.loads(capsys.readouterr().out)
+    assert (code, response["status"]) == (8, "CONFLICT")
     assert not compiled
