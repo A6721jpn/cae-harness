@@ -87,7 +87,7 @@ def prepare_planar(
                 raise ValueError("reviewed compatibility profile digest/status mismatch")
         generation_quality = storage.resolve_mesh_quality(preliminary.mesh_policy.quality_profile)
         if not isinstance(generation_quality, MeshQualityRegistration):
-            raise ValueError(
+            raise ValueError(  # noqa: TRY004 - unsupported registered input category
                 "preparation requires a registered generation profile, not a replay admission"
             )
         cpu_limit = min(
