@@ -214,6 +214,18 @@ def run_case(arguments: Namespace) -> int:
             _print(payload) if arguments.json else print(created.case_id)
             return 0
         if arguments.case_action == "inspect":
+            if arguments.native:
+                payload = service.inspect_native(
+                    arguments.case_id,
+                    wall_seconds=arguments.wall_seconds,
+                    cpu_workers=arguments.cpu_workers,
+                )
+                _print(payload) if arguments.json else print(payload["status"])
+                if any(item["code"] == "integrity" for item in payload["diagnostics"]):
+                    return 6
+                return {"INSPECTED": 0, "UNSUPPORTED_ENVIRONMENT": 4, "CONFLICT": 8}.get(
+                    payload["status"], 2
+                )
             result = service.inspect_case(arguments.case_id)
             _print(result.to_dict()) if arguments.json else print(result.status)
             # Metadata inspection itself succeeded even if an optional native inspection is absent.

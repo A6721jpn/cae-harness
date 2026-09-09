@@ -540,6 +540,13 @@ class RegisteredCaseService:
         ) as error:
             return _failure(case_id, error)
 
+    def inspect_native(
+        self, case_id: str, *, wall_seconds: float = 600, cpu_workers: int | None = None
+    ) -> dict[str, Any]:
+        from ._inspection import inspect_native
+
+        return inspect_native(self, case_id, wall_seconds=wall_seconds, cpu_workers=cpu_workers)
+
     def inspect_case(self, case_id: str) -> ServiceResult:
         storage = self._storage(case_id)
         draft = storage.current_draft(case_id)

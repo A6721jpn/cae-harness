@@ -50,6 +50,9 @@ def _build_parser() -> argparse.ArgumentParser:
     inspect = case_commands.add_parser("inspect", help="read registered case metadata")
     inspect.add_argument("case_id")
     inspect.add_argument("--json", action="store_true")
+    inspect.add_argument("--native", action="store_true", help="observe registered STEP topology")
+    inspect.add_argument("--wall-seconds", type=float, default=600)
+    inspect.add_argument("--cpu-workers", type=int, default=None)
     prepare = case_commands.add_parser(
         "prepare-planar", help="prepare the explicit registered planar case"
     )
