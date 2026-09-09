@@ -142,6 +142,14 @@ def run_case(arguments: Namespace) -> int:
     service = None
     try:
         service = RegisteredCaseService(state_dir=arguments.state_dir)
+        if arguments.case_action == "prepare-planar":
+            payload = service.prepare_planar(
+                arguments.case_id,
+                _read_json(Path(arguments.file)),
+                expected_generation=arguments.expected_generation,
+            )
+            _print(payload) if arguments.json else print(payload["status"])
+            return 0
         if arguments.case_action == "preview":
             from .preview import capture_observation
 

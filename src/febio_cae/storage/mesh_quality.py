@@ -179,6 +179,26 @@ class PlanarDemoRegistration:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class PlanarPreparationRegistration(PlanarDemoRegistration):
+    """Current-operation origin, distinct from legacy synthetic demo assets."""
+
+    preparation_id: str
+
+    def __post_init__(self) -> None:
+        PlanarDemoRegistration.__post_init__(self)
+        if len(self.preparation_id) != 32 or any(
+            c not in "0123456789abcdef" for c in self.preparation_id
+        ):
+            raise ValueError("invalid preparation identity")
+
+    def to_bytes(self) -> bytes:
+        data = json.loads(PlanarDemoRegistration.to_bytes(self))
+        data["admission_kind"] = "current-planar-preparation"
+        data["preparation_id"] = self.preparation_id
+        return canonical_bytes(data)
+
+
 MeshQualityRecord = MeshQualityRegistration | PlanarDemoRegistration
 
 
@@ -187,7 +207,7 @@ def decode_mesh_quality(payload: bytes) -> MeshQualityRecord:
     if "admission_kind" not in data:
         return MeshQualityRegistration.from_bytes(payload)
     profile = data["generation_profile"]
-    result = PlanarDemoRegistration(
+    values = (
         data["profile_id"],
         data["source_step_digest"],
         data["geometry_digest"],
@@ -195,6 +215,11 @@ def decode_mesh_quality(payload: bytes) -> MeshQualityRecord:
         data["original_recipe_digest"],
         NumericalProfileRef(profile["profile_id"], profile["purpose"], profile["record_digest"]),
         tuple(EvidenceRef(**e) for e in data["admission_evidence"]),
+    )
+    result = (
+        PlanarPreparationRegistration(*values, data["preparation_id"])
+        if data.get("admission_kind") == "current-planar-preparation"
+        else PlanarDemoRegistration(*values)
     )
     if result.to_bytes() != payload:
         raise ValueError("invalid or noncanonical planar admission")

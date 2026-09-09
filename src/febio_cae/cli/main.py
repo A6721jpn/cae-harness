@@ -50,6 +50,13 @@ def _build_parser() -> argparse.ArgumentParser:
     inspect = case_commands.add_parser("inspect", help="read registered case metadata")
     inspect.add_argument("case_id")
     inspect.add_argument("--json", action="store_true")
+    prepare = case_commands.add_parser(
+        "prepare-planar", help="prepare the explicit registered planar case"
+    )
+    prepare.add_argument("case_id")
+    prepare.add_argument("--file", required=True)
+    prepare.add_argument("--expected-generation", required=True, type=int)
+    prepare.add_argument("--json", action="store_true")
     spec = case_commands.add_parser("spec", help="apply an explicit typed specification")
     spec.add_argument("case_id")
     spec.add_argument("--file", required=True)

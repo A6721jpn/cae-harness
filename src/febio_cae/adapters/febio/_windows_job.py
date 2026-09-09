@@ -97,7 +97,12 @@ class WindowsJobProcess:
         stderr: BinaryIO,
         *,
         environment: dict[str, str] | None = None,
+        memory_limit_bytes: int | None = None,
     ) -> None:
+        if memory_limit_bytes is not None and (
+            type(memory_limit_bytes) is not int or memory_limit_bytes <= 0
+        ):
+            raise ValueError("memory_limit_bytes must be a positive integer")
         self._api = _kernel()
         self._win = importlib.import_module("_winapi")
         self._job: int | None = None
@@ -114,6 +119,10 @@ class WindowsJobProcess:
             self._check(bool(self._job))
             limits = _ExtendedLimits()
             limits.basic.flags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE only.
+            if memory_limit_bytes is not None:
+                limits.basic.flags |= 0x100 | 0x200  # PROCESS_MEMORY | JOB_MEMORY
+                limits.process_memory = memory_limit_bytes
+                limits.job_memory = memory_limit_bytes
             self._check(
                 self._api.SetInformationJobObject(
                     self._job, 9, ctypes.byref(limits), ctypes.sizeof(limits)

@@ -39,7 +39,7 @@ from febio_cae.domain import (
 )
 from febio_cae.domain.codec import decode_record, encode_record
 from febio_cae.storage import CaseStorage
-from febio_cae.storage.mesh_quality import PlanarDemoRegistration
+from febio_cae.storage.mesh_quality import PlanarDemoRegistration, PlanarPreparationRegistration
 
 if TYPE_CHECKING:
     from .service import RegisteredCaseService
@@ -135,7 +135,17 @@ def run_demo(
         )
     mesh = service._planar_execution_mesh(storage, registration, revision)
     service._verify_execution_mesh(storage, registration, revision, mesh)
-    geometry = recorded_geometry(storage, registration)
+    if isinstance(registration, PlanarPreparationRegistration):
+        from febio_cae.storage.preparation import PreparationStore
+
+        from ._preparation import geometry_from_output
+
+        geometry = geometry_from_output(
+            PreparationStore(storage).prepared(registration, revision),
+            storage.resolve_source(storage.source_asset("cad")),
+        )
+    else:
+        geometry = recorded_geometry(storage, registration)
     service.geometry = geometry
     service._placed_selection = geometry.resolve_placed_selection
     profile = service.compatibility.get_profile(revision.spec.solver_policy.profile.profile_id)
@@ -143,10 +153,9 @@ def run_demo(
     if hashlib.sha256(solver_path.read_bytes()).hexdigest() != profile.solver.executable_digest:
         raise ValueError("solver executable differs from registered identity")
     reader_payload = Path(xplt_reader.__file__).read_bytes()
-    if hashlib.sha256(
-        reader_payload
-    ).hexdigest() != profile.reader.executable_digest or reader_payload != source(
-        "registered-reader-source"
+    if hashlib.sha256(reader_payload).hexdigest() != profile.reader.executable_digest or (
+        not isinstance(registration, PlanarPreparationRegistration)
+        and reader_payload != source("registered-reader-source")
     ):
         raise ValueError("active reader bytes differ from registered identity")
     stores: list[_BundleBytes] = []

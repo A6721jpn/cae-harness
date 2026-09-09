@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import importlib
 import hashlib
+import importlib
 import json
 from pathlib import Path
 from typing import Any
@@ -29,7 +29,6 @@ def prepared_input(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Any
     service = RegisteredCaseService(state_dir=tmp_path / "state")
     created = service.create_case(case_root=tmp_path / "case", cad_path=cad)
     raw = fixtures.make_case_spec("0" * 64).to_dict()
-    raw.pop("schema_version")
     digest = hashlib.sha256(step).hexdigest()
 
     def explicit(value: Any) -> None:
@@ -90,11 +89,33 @@ def _isolate(monkeypatch: pytest.MonkeyPatch, backend: Any) -> None:
 
 
 def test_current_operation_publishes_bound_preparation(
-    prepared_input: tuple[Any, ...], monkeypatch: pytest.MonkeyPatch
+    prepared_input: tuple[Any, ...],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     service, created, request, backend, step = prepared_input
     _isolate(monkeypatch, backend)
-    result = service.prepare_planar(created.case_id, request, expected_generation=0)
+    request_path = tmp_path / "request.json"
+    request_path.write_text(json.dumps(request), encoding="utf-8")
+    assert (
+        main(
+            [
+                "case",
+                "--state-dir",
+                str(tmp_path / "state"),
+                "prepare-planar",
+                created.case_id,
+                "--file",
+                str(request_path),
+                "--expected-generation",
+                "0",
+                "--json",
+            ]
+        )
+        == 0
+    )
+    result = json.loads(capsys.readouterr().out)
     assert result["status"] == "PREPARED"
     assert len(backend.mesh_requests) == 1
     assert service.resolve_source(created.case_id, "cad").content == step
@@ -108,6 +129,7 @@ def test_current_operation_publishes_bound_preparation(
         for q in mesh.quality_records
     )
     assert revision.spec.geometry.geometry_digest == backend.geometry_digest
+    assert service.validate_case(created.case_id).status == "VALIDATED"
 
 
 @pytest.mark.parametrize("bad", ["source", "geometry", "version"])
@@ -138,7 +160,7 @@ def test_freeze_without_publication_cannot_supply_execution_mesh(
         raise OSError("injected final publication failure")
 
     monkeypatch.setattr(records.PreparationStore, "publish", fail)
-    with pytest.raises(OSError, match="publication"):
+    with pytest.raises(RuntimeError, match="publication"):
         service.prepare_planar(created.case_id, request, expected_generation=0)
     record = records.PreparationStore(service._storage(created.case_id)).latest(created.case_id)
     assert record["status"] == "FAILED" and record["revision_id"]
@@ -147,6 +169,10 @@ def test_freeze_without_publication_cannot_supply_execution_mesh(
     registration = storage.resolve_revision_mesh_quality(revision)
     with pytest.raises((ValueError, RuntimeError), match="PREPARED"):
         service._planar_execution_mesh(storage, registration, revision)
+    with pytest.raises((ValueError, RuntimeError), match="PREPARED"):
+        service.run_demo(
+            created.case_id, revision.revision_id, executable="never-opened.exe", preflight=True
+        )
 
 
 def test_public_prepare_reports_invalid_request_without_native_start(

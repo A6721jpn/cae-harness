@@ -238,6 +238,13 @@ class RegisteredCaseService:
     def current_draft(self, case_id: str) -> CaseDraft:
         return self._storage(case_id).current_draft(case_id)
 
+    def prepare_planar(
+        self, case_id: str, payload: object, *, expected_generation: int
+    ) -> dict[str, object]:
+        from ._preparation import prepare_planar
+
+        return prepare_planar(self, case_id, payload, expected_generation)
+
     def get_revision(self, case_id: str, revision_id: str) -> CaseRevision:
         return self._storage(case_id).get_revision(case_id, revision_id)
 
@@ -557,6 +564,36 @@ class RegisteredCaseService:
 
         geometry_port = self.geometry
         placed_selection = self._placed_selection
+        if geometry_port is None:
+            from febio_cae.storage.mesh_quality import PlanarPreparationRegistration
+            from febio_cae.storage.preparation import PreparationStore
+
+            from ._preparation import geometry_from_output
+
+            origin_id = draft.parent_revision_id or storage.current_frozen_revision(case_id)
+            if origin_id is not None:
+                origin = storage.get_revision(case_id, origin_id)
+                try:
+                    origin_quality = storage.resolve_revision_mesh_quality(origin)
+                except (
+                    PortError,
+                    StorageConflictError,
+                    StorageIntegrityError,
+                    ValueError,
+                    OSError,
+                ):
+                    origin_quality = None
+                if isinstance(origin_quality, PlanarPreparationRegistration):
+                    try:
+                        output = PreparationStore(storage).prepared(origin_quality, origin)
+                        geometry_port = geometry_from_output(
+                            output, storage.resolve_source(storage.source_asset("cad"))
+                        )
+                        placed_selection = geometry_port.resolve_placed_selection
+                    except (StorageIntegrityError, ValueError, OSError) as error:
+                        diagnostics.append(
+                            _diagnostic(ServiceErrorCategory.INTEGRITY, str(error), "geometry")
+                        )
         if geometry_port is None and draft.parent_revision_id is not None:
             try:
                 parent = storage.get_revision(case_id, draft.parent_revision_id)
@@ -1009,6 +1046,12 @@ class RegisteredCaseService:
     ) -> MeshArtifact:
         """Rebind material-only descendants, preserving the registered root mesh/receipt."""
         from febio_cae.domain.codec import decode_record, encode_record
+        from febio_cae.storage.mesh_quality import PlanarPreparationRegistration
+
+        if isinstance(registration, PlanarPreparationRegistration):
+            from febio_cae.storage.preparation import PreparationStore
+
+            return PreparationStore(storage).mesh(registration, revision)
 
         def source(asset_id: str) -> bytes:
             return storage.resolve_source(storage.source_asset(asset_id)).content
