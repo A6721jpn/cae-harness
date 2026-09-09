@@ -166,6 +166,14 @@ STEP調査はボディ数、閉じたソリッドか、単位、体積、境界�
 
 ### 6.2 剛体生成と接触
 
+公開準備コマンドは`case --state-dir STATE prepare-planar CASE_ID --file REQUEST --expected-generation N --json`とする。既存のSpecUpdateRequest（PartialCaseSpec、evidence、source_declarations）を再利用し、初期範囲を平面・box治具・AsPlacedに限定する。呼出側のMeshArtifact、互換性のSUPPORTED宣言、生成receiptは受け付けず、登録済みSTEPを現在のGmsh 4.15.2・OCC 8.0.1・AP214検査付き操作で処理する。既存の互換性profileは正確なdigestで解決し、この要求から登録・置換しない。
+
+初回入力のため、prepare-planarのprivate正規化だけはgeometry.geometry_digest、geometry.inspection_digestと対応する部品SelectionRef.geometry_digestのnullを許す。値は今回の子プロセスが登録済みSTEPから取得したinspectionだけで確定する。非nullの宣言が実測digestと異なる場合は拒否し、黙って置換しない。source digest、body、単位、配置、選択規則、物理条件と根拠は明示のまま保持し、選択が今回のinspectionで一意に解決できない場合は停止する。共通domain schemaのnull許容範囲は広げない。
+
+準備の既定上限はwall time 600秒、メッシュ生成1回、四面体100000要素、250000節点とする。privateなpreparation要求拡張で有限の時間・件数上限を明示できるが、無制限値、隠れた再試行、自動粗分割は認めない。CPUは実行時の利用可能論理CPU数を検出してより低い明示値を尊重する。メモリは開始時の利用可能物理メモリの80%を総物理メモリ以下で計算し、正確なbytesを記録して所有子プロセスの境界で強制する。wall deadlineも所有子プロセスを終了させて強制し、処理後の経過時間確認だけで代用しない。solverの3600秒・1試行は後続solver工程の目標であり、準備でsolverを起動する理由にも精度保証にもならない。
+
+生成側だけがcase-localのPREPARING/FAILED/PREPARED記録を発行し、入力digest、spec/evidence/snapshot/generation、module identityと実測版、inspection/mesh/recipe/outputのdigestと結果を結び付ける。既存のevidence leaseとCASを使い、最終receiptを原子的に公開する。freeze後の採用・公開に失敗した版は不完全なままであり、この公開経路の版は対応するPREPARED記録なしに実行・preflightできない。複数DBにまたがるrollback保証や汎用transaction層は追加しない。既存demo経路とその合成証拠は維持し、準備完了とnative適合性・表面精度・解析成功を区別する。
+
 球は半径、円柱は半径・高さ、直方体は3寸法を持つ。位置・姿勢と運動方向は独立したパラメータである。初期配置を接触させる処理は、指定した相手領域・方向・隙間から一意に計算できる場合だけ実施し、計算した配置を記録する。
 
 治具と部品は独立してメッシュ化し、接触境界の節点を共有・溶接しない。治具にはFEBioの剛体定義を使う。並進3成分・回転3成分を、拘束・指定運動・明示的自由のいずれかへ解決する。初期対応では横移動・回転を固定した一方向の運動profileを用意し、指定した物理条件と一致する場合に使用する。

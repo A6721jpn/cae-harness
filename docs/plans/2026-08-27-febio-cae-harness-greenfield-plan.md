@@ -300,6 +300,15 @@ P7後、ST-01の設計変数・CAD編集レシピ・目的・制約を具体化�
 
 次の開発単位は公開STEP準備経路である。PM兼PdMが既存成果と依存を確認して有限の作業票を固定し、単独のAstra Low担当へ渡す。新規native実行は対象入力・条件・予算・許可が揃ってから行う。体制改訂そのものを製品経路やP0〜P7の完了証拠にはしない。
 
-最初の小区分であるGmsh adapterの準備前検査は実装候補となった。任意設定`expected_occt_version`、`require_step_ap214`、`cpu_workers`により、AP214のHEADER宣言、所有セッションのOCCT版、CPU数指定を検査し、既存の未指定経路とinspection/mesh契約を保持する。合成8件、全体1466件、必須ローカルゲートとfresh wheelの起動・import確認は合格し、正確なSHAの独立レビューとPMの受け入れ・統合は未完了である。復旧と再実行を含む証拠は[準備前検査の報告](../reviews/2026-09-09-step-preparation-admission.md)に保持する。次は有限プロセス予算を持つ公開`prepare-planar`と生成者が所有する生成・公開記録の結合であり、公開CLI・native・実E2Eの成功はまだ主張しない。
+最初の小区分であるGmsh adapterの準備前検査は54dc2c0927f0953925205f06262d4b27d48916b7で独立レビューACCEPT後、V2へ統合・push済みとなった。任意設定`expected_occt_version`、`require_step_ap214`、`cpu_workers`により、AP214のHEADER宣言、所有セッションのOCCT版、CPU数指定を検査し、既存の未指定経路とinspection/mesh契約を保持する。合成8件、全体1466件、必須ローカルゲートとfresh wheelの起動・import確認は合格し、統合先でも準備検査8件とCAE境界216ファイルの検査が合格した。ユーザーのAGENTS.md変更は保持した。復旧と再実行を含む証拠は[準備前検査の報告](../reviews/2026-09-09-step-preparation-admission.md)に保持する。次は有限プロセス予算を持つ公開`prepare-planar`と生成者が所有する生成・公開記録の結合であり、公開CLI・native・実E2Eの成功はまだ主張しない。
 
 この小区分の受け入れは、設定APIの収集可能なRED、注入した合成Gmshで正常な検査・設定順序と不正な宣言・版証拠の拒否を確かめる最小限のGREEN、最終候補の必須ローカルゲート、fresh wheelのインストール・起動・import確認、正確なSHAのAstra Mediumレビューとする。追加のnative起動・インストール・ダウンロード・実モデル操作は行わない。検査対象はinspectとmeshの両入口とし、失敗時も所有セッションを解放する。次の小区分で同じAstra Low担当が有限予算付きの公開CLI準備と生成記録の結合を実装する。公開CLI・native・品質・実E2Eの未完了項目は継続する。
+
+### 公開準備の実装単位
+
+`case --state-dir STATE prepare-planar CASE_ID --file REQUEST --expected-generation N --json`を既存SpecUpdateRequestと現在の実backend処理へ接続する。物理条件を明示した平面・box・AsPlacedに限定し、要求からmesh・SUPPORTED・producer receiptを登録しない。geometryの生成digestとinspection digest、および対応部品選択のgeometry digestだけはprivate入力でnullを許し、今回の子inspectionで解決する。非null不一致は拒否し、共通domain schemaや物理的意味を変更しない。
+
+Gmsh4.15.2/OCC8.0.1/AP214、wall600秒・生成1回・100000四面体/250000節点を既定とし、明示的な有限上限変更だけを許す。CPUは検出した利用可能数と明示上限、メモリは開始時利用可能物理量80%（総量以下）を用い、所有子プロセスで時間・メモリを強制して記録する。solver3600秒/1試行は後続工程の目標であり準備では起動しない。既存lease/CASとcase-local PREPARING/FAILED/PREPARED記録を使い、現input/spec/evidence/generation/backend/mesh/recipe/outputへ結び付ける。freeze後の失敗でもPREPAREDのない公開経路の実行・preflightを拒否し、既存demoは保持する。
+
+最小RED/GREENは公開操作、正常な隔離生成、必要な入力/版不一致、途中公開の拒否と所有プロセスのhard timeoutを検証する。最終候補の必須ゲート一式とfresh wheelの起動・隔離準備境界を実行し、正確なSHAでMediumレビューを受ける。今回の実行はsourceとnative-freeテストのみであり、実Gmsh/OCCT/FEBio/Studio・real LLM・実ケース操作を行わない。次は残る公開実行・preflightの接続とプロセス所有権を、既存の生成記録に基づいて進める。
+
