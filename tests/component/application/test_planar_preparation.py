@@ -294,3 +294,123 @@ def test_stale_prepared_generation_is_rejected_before_compilation(
     response = json.loads(capsys.readouterr().out)
     assert (code, response["status"]) == (8, "CONFLICT")
     assert not compiled
+
+
+def test_prepared_material_child(
+    request: pytest.FixtureRequest,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    import test_persistence_authority as profiles
+
+    from febio_cae.adapters.febio import xplt_reader
+    from febio_cae.application import _demo
+    from febio_cae.domain import CompatibilityProfile, Quantity, ToolIdentity
+    from febio_cae.domain.case_patch import CasePatch, CasePatchEdit
+
+    solver = tmp_path / "identity-only.txt"
+    solver.write_bytes(b"synthetic identity; never executed")
+    original_profile = profiles._profile
+
+    def profile(name: str) -> CompatibilityProfile:
+        return replace(
+            original_profile(name),
+            solver=ToolIdentity("synthetic", "1", hashlib.sha256(solver.read_bytes()).hexdigest()),
+            reader=ToolIdentity(
+                "synthetic-reader",
+                "1",
+                hashlib.sha256(Path(xplt_reader.__file__).read_bytes()).hexdigest(),
+            ),
+        )
+
+    monkeypatch.setattr(profiles, "_profile", profile)
+    service, created, payload, backend, _ = request.getfixturevalue("prepared_input")
+    _isolate(monkeypatch, backend)
+    prepared = service.prepare_planar(created.case_id, payload, expected_generation=0)
+    parent = service.get_revision(created.case_id, prepared["revision_id"])
+    storage = service._storage(created.case_id)
+    originals = {p: p.read_bytes() for p in (storage.root / "preparation").rglob("*.json")}
+    root_bytes = parent.to_bytes()
+    compiled: list[str] = []
+
+    class Compiler:
+        def __init__(self, **kwargs: Any) -> None:
+            pass
+
+        def compile(self, current: Any, mesh: Any, profile: Any) -> Any:
+            compiled.append(current.revision_id)
+            assert mesh.nodes and mesh.elements
+            return SimpleNamespace(files=(), to_dict=lambda: {"synthetic_compiler": True})
+
+    monkeypatch.setattr(_demo, "CompilerAdapter", Compiler)
+    monkeypatch.setenv("FEBIO_CAE_STATE_DIR", str(tmp_path / "state"))
+
+    def freeze_patch(revision: Any, edit: Any, evidence: Any) -> Any:
+        patch = CasePatch(revision.revision_id, revision.spec_digest, (edit,), (evidence,))
+        path = tmp_path / "patch.json"
+        path.write_bytes(patch.to_bytes())
+        assert (
+            main(
+                [
+                    "case",
+                    "patch",
+                    created.case_id,
+                    "--file",
+                    str(path),
+                    "--expected-generation",
+                    str(service.current_draft(created.case_id).generation),
+                    "--json",
+                ]
+            )
+            == 0
+        )
+        capsys.readouterr()
+        assert main(["case", "validate", created.case_id, "--json"]) == 0
+        capsys.readouterr()
+        assert main(["case", "freeze", created.case_id, "--json"]) == 0
+        return service.get_revision(
+            created.case_id, json.loads(capsys.readouterr().out)["revision_id"]
+        )
+
+    child = freeze_patch(
+        parent,
+        CasePatchEdit(
+            "material", replace(parent.spec.material, youngs_modulus=Quantity(2e6, "Pa")), True
+        ),
+        parent.spec.material.youngs_modulus_evidence,
+    )
+    assert child.parent_revision_id == parent.revision_id
+    args = [
+        "case",
+        "run-demo",
+        created.case_id,
+        "--revision-id",
+        child.revision_id,
+        "--solver",
+        str(solver),
+        "--preflight",
+        "--json",
+    ]
+    assert main(args) == 0, capsys.readouterr().out
+    capsys.readouterr()
+    assert compiled == [child.revision_id]
+    changed = freeze_patch(
+        child,
+        CasePatchEdit(
+            "mesh_policy", replace(child.spec.mesh_policy, global_size=Quantity(100, "mm")), True
+        ),
+        replace(
+            child.spec.material.youngs_modulus_evidence, target_field="mesh_policy.global_size"
+        ),
+    )
+    args[args.index("--revision-id") + 1] = changed.revision_id
+    assert main(args) != 0
+    capsys.readouterr()
+    assert compiled == [child.revision_id]
+    assert len(backend.mesh_requests) == 1
+    assert service.get_revision(created.case_id, parent.revision_id).to_bytes() == root_bytes
+    assert all(path.read_bytes() == data for path, data in originals.items())
