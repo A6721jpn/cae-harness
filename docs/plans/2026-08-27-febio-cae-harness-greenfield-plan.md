@@ -312,3 +312,4 @@ Gmsh4.15.2/OCC8.0.1/AP214、wall600秒・生成1回・100000四面体/250000節�
 
 最小RED/GREENは公開操作、正常な隔離生成、必要な入力/版不一致、途中公開の拒否と所有プロセスのhard timeoutを検証する。最終候補の必須ゲート一式とfresh wheelの起動・隔離準備境界を実行し、正確なSHAでMediumレビューを受ける。今回の実行はsourceとnative-freeテストのみであり、実Gmsh/OCCT/FEBio/Studio・real LLM・実ケース操作を行わない。次は残る公開実行・preflightの接続とプロセス所有権を、既存の生成記録に基づいて進める。
 
+公開準備のsource候補は3c667dce70904dc095579768292c4620eccda042で実装し、コメントだけのLint明示を4a3e7ece02d019cef65024a7354227889c4e97a6に記録した。公開CLIを含む隔離7件、全体1473件、必須静的検査・CAE境界・ビルド・fresh wheelの起動と隔離準備境界が合格した。詳細と失敗履歴は[公開準備の報告](../reviews/2026-09-09-public-planar-preparation.md)を参照する。独立MediumレビューとV2統合は未実施であり、実native準備・solver・実E2Eの成功を意味しない。次のsource作業はPREPARED記録から公開実行・preflightと有限solver予算・所有権を接続することである。

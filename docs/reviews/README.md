@@ -1,5 +1,7 @@
 # 検証・レビュー記録の扱い
 
+- [2026-09-09 公開 planar preparation のsource検証](2026-09-09-public-planar-preparation.md)
+
 このディレクトリの日付付き文書は、記録対象時点の検証・判断の証拠である。当時のモデル、担当、SHA、件数、コマンド、結果、未検証項目を保持する。過去の「次タスク」や並行分担は現行の作業指示ではない。
 
 2026-09-09以降の開発体制は[開発契約](../../AGENTS.md)と[実装・検証計画](../plans/2026-08-27-febio-cae-harness-greenfield-plan.md)に従う。PM兼PdMはAstra X-high、実装は単独のAstra Low、独立レビューは別タスクのAstra Mediumが担う。旧体制の記載は現在の発注やモデル設定の根拠として使わない。
