@@ -73,7 +73,11 @@ def test_configured_preparation_precedes_import_and_cleans_up(
     backend, fake = _backend(
         monkeypatch, expected_occt_version="8.0.1", require_step_ap214=True, cpu_workers=2
     )
-    for schema in ("AUTOMOTIVE_DESIGN", "AUTOMOTIVE_DESIGN { 1 0 10303 214 3 1 1 }"):
+    for schema in (
+        "AUTOMOTIVE_DESIGN",
+        "AUTOMOTIVE_DESIGN { 1 0 10303 214 3 1 1 }",
+        "AUTOMOTIVE_DESIGN { 1 0 10303 214 1 1 1 1 }",
+    ):
         fake.events.clear()
         result = _run(backend, operation, _source(f"/* comment */ FILE_SCHEMA(('{schema}'));"))
         assert result is not None
@@ -104,6 +108,8 @@ def test_ap214_refusals_happen_before_module_loading(
         _source("FILE_SCHEMA(('AUTOMOTIVE_DESIGN','OTHER'));"),
         _source("FILE_SCHEMA(('AUTOMOTIVE_DESIGN_EXTRA'));"),
         _source("FILE_SCHEMA(('AUTOMOTIVE_DESIGN { 1 0 10303 242 3 1 1 }'));"),
+        _source("FILE_SCHEMA(('AUTOMOTIVE_DESIGN { 1 0 10303 242 1 1 1 1 }'));"),
+        _source("FILE_SCHEMA(('AUTOMOTIVE_DESIGN { 1 0 10303 214 1 1 1 1 1 }'));"),
         _source("FILE_SCHEMA(('AUTOMOTIVE_DESIGN')); /* unterminated"),
         _source().replace(b"HEADER;", b"DATA;"),
     ):
