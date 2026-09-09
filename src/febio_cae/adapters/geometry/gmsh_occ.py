@@ -84,6 +84,9 @@ class GmshOCCConfig:
     expected_version: str = "4.15.2"
     geometry_kernel: str = "OpenCASCADE"
     frame_id: str = "World"
+    expected_occt_version: str | None = None
+    require_step_ap214: bool = False
+    cpu_workers: int | None = None
 
     def __post_init__(self) -> None:
         for value, field_name in (
@@ -99,6 +102,21 @@ class GmshOCCConfig:
             if any(ord(character) < 32 or ord(character) == 127 for character in value):
                 raise ValueError(f"{field_name} contains a control character")
         FrameId(self.frame_id)
+        if self.expected_occt_version is not None:
+            value = self.expected_occt_version
+            if (
+                not isinstance(value, str)
+                or not value
+                or value != value.strip()
+                or any(ord(character) < 32 or ord(character) == 127 for character in value)
+            ):
+                raise ValueError("expected_occt_version must be non-empty, unpadded text")
+        if type(self.require_step_ap214) is not bool:
+            raise ValueError("require_step_ap214 must be a bool")
+        if self.cpu_workers is not None and (
+            type(self.cpu_workers) is not int or self.cpu_workers <= 0
+        ):
+            raise ValueError("cpu_workers must be a positive integer or None")
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,10 +157,13 @@ class GmshOCCBackend:
 
     def inspect(self, content: bytes, requested_body_ids: Sequence[str]) -> BackendInspection:
         source_digest = _source_digest(content)
+        if self.config.require_step_ap214:
+            _require_ap214_header(content)
         gmsh = self._load_module()
         declared_unit, _declared_scale_to_si = _declared_length_unit(content)
         requested = _requested_body_ids(requested_body_ids)
         with _GmshSession(gmsh, self.config.geometry_kernel) as session:
+            self._prepare_owned_session(gmsh)
             session.write(content)
             self._import_step(gmsh, session.path)
             contexts = self._inspect_contexts(gmsh, _OCC_TARGET_SCALE_TO_SI)
@@ -173,6 +194,8 @@ class GmshOCCBackend:
 
     def mesh(self, content: bytes, body_id: str, global_size_si: float) -> BackendMesh:
         source_digest = _source_digest(content)
+        if self.config.require_step_ap214:
+            _require_ap214_header(content)
         gmsh = self._load_module()
         declared_unit, _declared_scale_to_si = _declared_length_unit(content)
         if not isinstance(body_id, str) or not body_id or body_id != body_id.strip():
@@ -185,6 +208,7 @@ class GmshOCCBackend:
             )
 
         with _GmshSession(gmsh, self.config.geometry_kernel) as session:
+            self._prepare_owned_session(gmsh)
             session.write(content)
             self._import_step(gmsh, session.path)
             contexts = self._inspect_contexts(gmsh, _OCC_TARGET_SCALE_TO_SI)
@@ -221,6 +245,43 @@ class GmshOCCBackend:
                 _OCC_TARGET_SCALE_TO_SI,
                 float(global_size_si),
             )
+
+    def _prepare_owned_session(self, gmsh: Any) -> None:
+        # Called only after exclusive session admission and initialization.
+        expected = self.config.expected_occt_version
+        if expected is not None:
+            try:
+                build_info = gmsh.option.getString("General.BuildInfo")
+            except (AttributeError, RuntimeError, TypeError, ValueError, OSError) as error:
+                raise BackendError(
+                    BackendErrorCategory.UNSUPPORTED_CAPABILITY,
+                    "Gmsh OCCT build version evidence is unavailable",
+                ) from error
+            # General.BuildInfo uses semicolon-separated labelled fields, with
+            # the native OpenCASCADE version labelled 'OCC version'. Never use
+            # build options, module attributes, or a separately installed OCCT.
+            versions = (
+                [
+                    field.partition(":")[2].strip()
+                    for field in build_info.split(";")
+                    if field.partition(":")[0].strip() == "OCC version"
+                ]
+                if isinstance(build_info, str)
+                else []
+            )
+            if len(versions) != 1 or versions[0] != expected:
+                raise BackendError(
+                    BackendErrorCategory.UNSUPPORTED_CAPABILITY,
+                    f"Gmsh OCCT build version is absent, ambiguous, or does not match {expected!r}",
+                )
+        if self.config.cpu_workers is not None:
+            try:
+                gmsh.option.setNumber("General.NumThreads", self.config.cpu_workers)
+            except (AttributeError, RuntimeError, TypeError, ValueError, OSError) as error:
+                raise BackendError(
+                    BackendErrorCategory.UNSUPPORTED_CAPABILITY,
+                    "Gmsh could not set the configured CPU worker count",
+                ) from error
 
     def _load_module(self) -> Any:
         try:
@@ -620,6 +681,80 @@ def _source_digest(content: bytes) -> str:
             BackendErrorCategory.INVALID_INPUT, "STEP content must be non-empty bytes"
         )
     return hashlib.sha256(content).hexdigest()
+
+
+def _require_ap214_header(content: bytes) -> None:
+    """Read HEADER records, without treating comments or string contents as code.
+
+    This is a schema admission check, not a full STEP DATA validator. Native
+    import remains responsible for validating the shape representation.
+    """
+    text = content.decode(_STEP_TEXT_ENCODING)
+    token_re = re.compile(r"\s+|/\*.*?\*/|'(?:[^']|'')*'|[A-Za-z_][A-Za-z0-9_-]*|[();,]", re.DOTALL)
+    position = 0
+
+    def token() -> str:
+        nonlocal position
+        while position < len(text):
+            match = token_re.match(text, position)
+            if match is None:
+                break
+            position = match.end()
+            value = match.group()
+            if value.isspace() or value.startswith("/*"):
+                continue
+            return value if value.startswith("'") else value.upper()
+        raise BackendError(BackendErrorCategory.INVALID_INPUT, "malformed STEP HEADER")
+
+    def require(expected: str) -> None:
+        if token() != expected:
+            raise BackendError(BackendErrorCategory.INVALID_INPUT, "malformed STEP HEADER")
+
+    require("ISO-10303-21")
+    require(";")
+    require("HEADER")
+    require(";")
+    schemas: list[list[str]] = []
+    while (name := token()) != "ENDSEC":
+        if re.fullmatch(r"[A-Z_][A-Z0-9_]*", name) is None:
+            raise BackendError(BackendErrorCategory.INVALID_INPUT, "malformed STEP HEADER record")
+        require("(")
+        depth = 1
+        values = []
+        while depth:
+            value = token()
+            if value == ";":
+                raise BackendError(
+                    BackendErrorCategory.INVALID_INPUT, "malformed STEP HEADER record"
+                )
+            depth += (value == "(") - (value == ")")
+            if depth:
+                values.append(value)
+        require(";")
+        if name == "FILE_SCHEMA":
+            schemas.append(values)
+    require(";")
+    require("DATA")
+    require(";")
+    if len(schemas) != 1:
+        raise BackendError(
+            BackendErrorCategory.INVALID_INPUT, "STEP HEADER must declare exactly one FILE_SCHEMA"
+        )
+    values = schemas[0]
+    if len(values) != 3 or values[0] != "(" or values[2] != ")":
+        raise BackendError(BackendErrorCategory.INVALID_INPUT, "ambiguous STEP FILE_SCHEMA")
+    # AP214's standard schema identifier may carry its ISO edition identifier.
+    if (
+        re.fullmatch(
+            r"'AUTOMOTIVE_DESIGN(?:\s+\{\s*1\s+0\s+10303\s+214\s+[123]\s+1\s+1\s*\})?'",
+            values[1],
+            re.IGNORECASE,
+        )
+        is None
+    ):
+        raise BackendError(
+            BackendErrorCategory.UNSUPPORTED_CAPABILITY, "STEP FILE_SCHEMA is not AP214"
+        )
 
 
 def _declared_length_unit(content: bytes) -> tuple[str, float]:
