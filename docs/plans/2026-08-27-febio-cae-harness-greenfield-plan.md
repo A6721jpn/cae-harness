@@ -312,4 +312,8 @@ Gmsh4.15.2/OCC8.0.1/AP214、wall600秒・生成1回・100000四面体/250000節�
 
 最小RED/GREENは公開操作、正常な隔離生成、必要な入力/版不一致、途中公開の拒否と所有プロセスのhard timeoutを検証する。最終候補の必須ゲート一式とfresh wheelの起動・隔離準備境界を実行し、正確なSHAでMediumレビューを受ける。今回の実行はsourceとnative-freeテストのみであり、実Gmsh/OCCT/FEBio/Studio・real LLM・実ケース操作を行わない。次は残る公開実行・preflightの接続とプロセス所有権を、既存の生成記録に基づいて進める。
 
-公開準備のsource候補は3c667dce70904dc095579768292c4620eccda042で実装し、コメントだけのLint明示を4a3e7ece02d019cef65024a7354227889c4e97a6に記録した。公開CLIを含む隔離7件、全体1473件、必須静的検査・CAE境界・ビルド・fresh wheelの起動と隔離準備境界が合格した。詳細と失敗履歴は[公開準備の報告](../reviews/2026-09-09-public-planar-preparation.md)を参照する。独立MediumレビューとV2統合は未実施であり、実native準備・solver・実E2Eの成功を意味しない。次のsource作業はPREPARED記録から公開実行・preflightと有限solver予算・所有権を接続することである。
+公開準備はM1の世代・spec・evidence一致検査と公開CONFLICT/exit8の修正を含む9c7095c4899f6b83c4c68fa38ae73688160e3e5cで独立MediumレビューACCEPT後、V2へ統合・push済みとなった。最終候補の全体1474件と必須ゲート・fresh wheel確認、およびroot統合検査8件・CAE境界222ファイルが合格した。詳細と失敗履歴は[公開準備の報告](../reviews/2026-09-09-public-planar-preparation.md)を参照する。実native準備・一般的なsolver適合性・実E2Eの成功は意味しない。公開run-demoは既にPREPAREDから実行・preflightへ接続しており、同じ実行経路を重複追加しない。
+
+次のsource単位はRV-01/CP-01に向けたPREPARED originのYoung率のみの子孫版再利用とする。既存case patch→validate/freeze→run-demo --preflightを使い、登録親の内容とhash・祖先を検証して元の不変PREPARED rootへ結び付ける。等方線形弾性のYoung率と必須根拠だけの変更を許し、mesh生成条件・profile・その他固定条件の変更は祖先receiptで承認しない。既存adoptionで子版結合を導出するが、新規mesh/PREPAREDとは主張せずroot receipt/meshを変更しない。現在草案との一致、M1とM1-CLI、失敗公開拒否を保持する。
+
+この単位は、最小の公開子版回帰RED/GREENと安価な静的検査・CAE境界を通したcleanなコードを先に独立Mediumレビューへ渡す。修正が収束した後、同じ担当が必須全体テスト・ビルド・fresh installed境界を一度実行し、最終証拠と文書の適用範囲を確認してからPMが統合する。CODE_REVIEW_PENDING段階では全体テスト・ビルド・installed確認を必須のPENDINGとして明記し、免除・合格とは扱わない。実行許可はsourceとnative-free検査のみであり、native・LLM・実02_CAE・BottomFrame操作は含めない。
