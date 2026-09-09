@@ -141,7 +141,7 @@ def run_demo(
         from ._preparation import geometry_from_output
 
         geometry = geometry_from_output(
-            PreparationStore(storage).prepared(registration, revision),
+            PreparationStore(storage).origin_output(registration, revision),
             storage.resolve_source(storage.source_asset("cad")),
         )
     else:

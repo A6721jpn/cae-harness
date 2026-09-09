@@ -585,7 +585,7 @@ class RegisteredCaseService:
                     origin_quality = None
                 if isinstance(origin_quality, PlanarPreparationRegistration):
                     try:
-                        output = PreparationStore(storage).prepared(origin_quality, origin)
+                        output = PreparationStore(storage).origin_output(origin_quality, origin)
                         geometry_port = geometry_from_output(
                             output, storage.resolve_source(storage.source_asset("cad"))
                         )
