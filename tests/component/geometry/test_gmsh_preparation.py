@@ -61,8 +61,9 @@ def test_optional_configuration_defaults_and_strict_values() -> None:
         ("cpu_workers", [True, 0, -1, 1.5, "2"]),
     ):
         for value in values:
+            settings: dict[str, Any] = {field: value}
             with pytest.raises(ValueError):
-                GmshOCCConfig(**{field: value})
+                GmshOCCConfig(**settings)
 
 
 @pytest.mark.parametrize("operation", ["inspect", "mesh"])
@@ -124,7 +125,7 @@ def test_occt_evidence_refused_before_import_and_session_reusable(
         "Build host: OCC version: 8.0.1;",
     ):
         fake.events.clear()
-        monkeypatch.setattr(fake.option, "getString", lambda name: evidence)
+        monkeypatch.setattr(fake.option, "getString", lambda name, evidence=evidence: evidence)
         with pytest.raises(BackendError) as caught:
             _run(backend, operation, _source())
         assert caught.value.category == BackendErrorCategory.UNSUPPORTED_CAPABILITY
