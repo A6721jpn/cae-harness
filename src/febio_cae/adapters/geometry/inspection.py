@@ -34,7 +34,7 @@ class _ObservedGmsh(GmshOCCBackend):
 
     def __init__(self, cpu: int) -> None:
         super().__init__(
-            GmshOCCConfig(expected_occt_version="8.0.1", require_step_ap214=True, cpu_workers=cpu)
+            GmshOCCConfig(expected_occt_version="7.8.1", require_step_ap214=True, cpu_workers=cpu)
         )
         self.evidence: dict[str, str] = {}
 
@@ -45,7 +45,7 @@ class _ObservedGmsh(GmshOCCBackend):
             "module": str(module),
             "module_sha256": hashlib.sha256(module.read_bytes()).hexdigest(),
             "gmsh_version": gmsh.__version__,
-            "occt_version": "8.0.1",
+            "occt_version": "7.8.1",
             "build_info": gmsh.option.getString("General.BuildInfo"),
         }
 
@@ -72,8 +72,8 @@ def _identity(value: Any) -> dict[str, str]:
     ]
     if (
         value["gmsh_version"] != "4.15.2"
-        or value["occt_version"] != "8.0.1"
-        or versions != ["8.0.1"]
+        or value["occt_version"] != "7.8.1"
+        or versions != ["7.8.1"]
     ):
         raise PortError(
             PortErrorCategory.UNSUPPORTED_CAPABILITY, "inspection Gmsh/OCCT evidence mismatch"

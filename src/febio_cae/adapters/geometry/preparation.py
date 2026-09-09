@@ -120,7 +120,7 @@ def _run_owned(
 class _MeasuredGmsh(GmshOCCBackend):
     def __init__(self, cpu: int) -> None:
         super().__init__(
-            GmshOCCConfig(expected_occt_version="8.0.1", require_step_ap214=True, cpu_workers=cpu)
+            GmshOCCConfig(expected_occt_version="7.8.1", require_step_ap214=True, cpu_workers=cpu)
         )
         self.evidence: dict[str, Any] = {}
 
@@ -131,7 +131,7 @@ class _MeasuredGmsh(GmshOCCBackend):
             "module": str(module),
             "module_sha256": hashlib.sha256(module.read_bytes()).hexdigest(),
             "gmsh_version": gmsh.__version__,
-            "occt_version": "8.0.1",
+            "occt_version": "7.8.1",
             "build_info": gmsh.option.getString("General.BuildInfo"),
         }
         if self.evidence and self.evidence != current:
@@ -229,7 +229,7 @@ def produce(
     report = adapter.inspection_details(inspection)
     if (
         backend.evidence.get("gmsh_version") != "4.15.2"
-        or backend.evidence.get("occt_version") != "8.0.1"
+        or backend.evidence.get("occt_version") != "7.8.1"
     ):
         raise ValueError("preparation requires exact current Gmsh/OCCT version evidence")
     parsed = normalize_request(

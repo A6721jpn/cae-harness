@@ -135,7 +135,7 @@ def prepare_planar(
                     raise ValueError("producer source/generation binding mismatch")
                 if (
                     producer["backend"].get("gmsh_version") != "4.15.2"
-                    or producer["backend"].get("occt_version") != "8.0.1"
+                    or producer["backend"].get("occt_version") != "7.8.1"
                 ):
                     raise ValueError("producer version evidence mismatch")
                 if (
