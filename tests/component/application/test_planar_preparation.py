@@ -215,3 +215,62 @@ def test_preparation_uses_finite_owned_process_deadline(tmp_path: Path) -> None:
             memory_bytes=128 * 1024 * 1024,
         )
     assert time.monotonic() - started < 5
+
+
+def test_stale_prepared_generation_is_rejected_before_compilation(
+    request: pytest.FixtureRequest, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    import test_persistence_authority as profiles
+
+    from febio_cae.adapters.febio import xplt_reader
+    from febio_cae.application import _demo
+    from febio_cae.domain import CompatibilityProfile, PortError, PortErrorCategory, ToolIdentity
+
+    solver = tmp_path / "identity-only.txt"
+    solver.write_bytes(b"synthetic identity; never executed")
+    original_profile = profiles._profile
+
+    def profile(name: str) -> CompatibilityProfile:
+        return replace(
+            original_profile(name),
+            solver=ToolIdentity("synthetic", "1", hashlib.sha256(solver.read_bytes()).hexdigest()),
+            reader=ToolIdentity(
+                "synthetic-reader",
+                "1",
+                hashlib.sha256(Path(xplt_reader.__file__).read_bytes()).hexdigest(),
+            ),
+        )
+
+    monkeypatch.setattr(profiles, "_profile", profile)
+    service, created, payload, backend, _ = request.getfixturevalue("prepared_input")
+    _isolate(monkeypatch, backend)
+    prepared = service.prepare_planar(created.case_id, payload, expected_generation=0)
+    draft = service.current_draft(created.case_id)
+    advanced = service.set_spec(
+        created.case_id,
+        values=draft.values,
+        expected_generation=draft.generation,
+        evidence=draft.evidence,
+        input_intent="new generation awaiting freeze",
+    )
+    assert advanced.generation == draft.generation + 1
+    compiled: list[str] = []
+
+    class Compiler:
+        def __init__(self, **kwargs: Any) -> None:
+            pass
+
+        def compile(self, current: Any, mesh: Any, profile: Any) -> Any:
+            compiled.append(current.revision_id)
+            return SimpleNamespace(files=(), to_dict=lambda: {"synthetic_compiler": True})
+
+    monkeypatch.setattr(_demo, "CompilerAdapter", Compiler)
+    with pytest.raises(PortError) as error:
+        service.run_demo(
+            created.case_id, prepared["revision_id"], executable=str(solver), preflight=True
+        )
+    assert error.value.category is PortErrorCategory.CONFLICT
+    assert not compiled
