@@ -104,7 +104,7 @@ def _quality_preview(tmp_path: Path, *, factor: float = 1) -> tuple[Any, str, An
     from febio_cae.adapters.febio import QualityAdapter
     from febio_cae.storage.preview import RegisteredPreviewStore
 
-    service, created, storage, revision = prepared(tmp_path, _configure)
+    service, _created, storage, revision = prepared(tmp_path, _configure)
     original = storage.ingest_source
 
     def defer_quality(**kwargs: Any) -> Any:
