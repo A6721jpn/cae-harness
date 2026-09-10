@@ -512,3 +512,22 @@ super()._prepare_owned_session, then record module path/hash/version/BuildInfo
 from that same live owned session. Plain backend means unchanged body/face/
 geometry algorithms and admission; no planar face override, second session or
 probe, public backend API change, or frozen-file edit is permitted.
+
+### P3 bounded signed-force arithmetic increment
+
+Implement the optional `signed_force_sum` contract in design section 8.3 using
+existing criterion/evaluation records: explicit sum aggregation, same scalar
+component/frame and ordered full saved-state coverage, force units, canonical
+signed values and disjoint (location, entity) contributions even through aliases.
+Retain all existing data bindings. Evaluate the maximum absolute per-state signed
+sum in N against exactly one explicit finite nonnegative force-valued max_value;
+valid data yields PASS/FAIL and absent/incompatible/overlapping/nonfinite evidence
+stays UNVERIFIED. No defaults, sign/axis corrections or changes to peak_abs_value.
+
+Use focused synthetic RED/GREEN for opposite versus equal signs, intermediate
+imbalance and invalid required evidence, followed by mandatory local gates. This
+increment is scalar arithmetic only: force-system completeness, physical side and
+applicability, mandatory public-quality coverage, solver residual validation and
+native sign qualification remain pending. Studio correspondence alone is not
+sign proof. Keep profiles unchanged; no REQ-11/P3/FB-03/E2E completion claim. Native
+validation and the required real-model E2Es remain separate dependencies.

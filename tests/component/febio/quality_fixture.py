@@ -250,3 +250,63 @@ def quality_case(
             decode_record(encode_record(numeric), NumericResultData),
         )
     return QualityCase(revision, mesh, profile, manifest, consumer)
+
+
+def signed_force_case(tmp_path: Path, tool_values: tuple[float, ...]) -> QualityCase:
+    """Explicit synthetic canonical forces; no native force-sign qualification."""
+    case = quality_case(tmp_path, times=(0.0, 0.5, 1.0))
+    numeric = case.numeric()
+    mapping = replace(numeric.mapping, unit="N")
+    case.profile = replace(
+        case.profile,
+        output_mappings=tuple(
+            mapping if item.canonical_id == mapping.canonical_id else item
+            for item in case.profile.output_mappings
+        ),
+    )
+    outputs = case.revision.spec.outputs
+    part = replace(outputs.requests[0], display_unit="N")
+    tool = next(item for item in outputs.requests if item.request_id == "request_tool")
+    first = replace(outputs.evaluations[0], aggregation_id="sum")
+    second = replace(
+        first,
+        evaluation_id="tool_sum",
+        output_request_id=tool.request_id,
+        selection=tool.selection,
+        evidence=evidence("outputs.evaluations.tool_sum", "signed-force-arithmetic"),
+    )
+    criterion = replace(
+        case.revision.spec.quality_policy.criteria[0],
+        metric_id="signed_force_sum",
+        evaluation_ids=(first.evaluation_id, second.evaluation_id),
+        thresholds=(QualityThreshold("max_value", Quantity(0.1, "N")),),
+    )
+    case.revision = replace(
+        case.revision,
+        spec=replace(
+            case.revision.spec,
+            outputs=replace(
+                outputs,
+                requests=tuple(
+                    part if r.request_id == part.request_id else r for r in outputs.requests
+                ),
+                evaluations=(first, second),
+            ),
+            quality_policy=replace(case.revision.spec.quality_policy, criteria=(criterion,)),
+        ),
+    )
+    case.replace_numeric(
+        replace(
+            numeric,
+            mapping=mapping,
+            values=tuple(
+                tuple(value for _ in numeric.entity_ids for value in (0.0, 0.0, 1.0))
+                for _ in numeric.axis_values
+            ),
+        )
+    )
+    tool_numeric = case.numeric("contact_force")
+    case.replace_numeric(
+        replace(tool_numeric, values=tuple((0.0, 0.0, value) for value in tool_values))
+    )
+    return case

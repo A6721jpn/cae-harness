@@ -269,6 +269,35 @@ CLIがクラッシュした場合は永続記録と所有プロセスを照合�
 
 数値許容値はQualityPolicyに保存する。実物の許容ひずみ等は数値収束許容値とは別の物理的基準であり、推測しない。局所最大応力の特異性がある場合、最大値の安定だけを一般的な合格条件とせず、根拠のある領域・集計・収束指標を定める。
 
+#### Optional signed scalar force sum (P3 bounded arithmetic)
+
+`signed_force_sum` uses existing QualityCriterion/EvaluationRequest records. Each
+participating evaluation explicitly declares `aggregation_id=sum`, the same scalar
+physical component identifier and coordinate frame, and identical ordered full
+saved-state coverage. Required numeric outputs have force dimension and preserve
+already canonical signed values. Existing attempt/manifest/content/profile/ROI/
+entity/state bindings remain mandatory. Contributions are disjoint by `(output
+location, entity identity)`, including request aliases; different location
+namespaces do not make equal numeric IDs duplicates. Missing selected entities or
+states, overlapping contributions and incompatible evidence remain UNVERIFIED.
+No implicit sign, load, zero fill, axis conversion or native profile correction is
+introduced.
+
+For each saved state, sum signed scalar components over all selected entities and
+evaluations; measure `max_t(abs(sum_i F_i(t)))` in N. Do not sum absolute magnitudes
+or cancel between states. Require exactly one finite nonnegative force-valued
+`max_value` threshold and the existing explicit criterion evidence/applicability;
+there is no default tolerance. A valid residual at or below the limit is PASS;
+above it is FAIL. Missing, incompatible, overlapping, mismatched or nonfinite
+required evidence is UNVERIFIED. Existing overall-status precedence and
+MeasuredValue conventions apply; `peak_abs_value` remains unchanged.
+
+This optional scalar arithmetic does not establish complete physical force-system
+coverage, vector equilibrium, solver residuals or native sign correctness. Physical
+force-system completeness/side/applicability, mandatory public-quality coverage
+and solver residual validation remain P3 obligations. It does not insert policies,
+activate compatibility profiles or establish REQ-11/P3/FB-03/E2E completion.
+
 ### 8.4 プレビューとタスク完了
 
 `preview --open`は登録済みXPLTのハッシュを確認して外部FEBio Studioを起動する。プレビュー状態は`REQUESTED / LAUNCHED / CONFIRMED / FAILED`とする。プロセス起動だけではCONFIRMEDにしない。

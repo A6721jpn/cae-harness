@@ -285,3 +285,110 @@ def test_mesh_geometry_provenance_must_match_the_supplied_revision(tmp_path: Pat
     assert result.overall_status is AssessmentStatus.UNVERIFIED
     assert not result.criteria[0].measured
     assert "geometry" in result.criteria[0].reason
+
+
+@pytest.mark.parametrize(
+    "forces,residual,status",
+    [
+        ((-2.0, -2.0, -2.0), 0.0, AssessmentStatus.PASS),
+        ((2.0, 2.0, 2.0), 4.0, AssessmentStatus.FAIL),
+        ((-2.0, -1.0, -3.0), 1.0, AssessmentStatus.FAIL),
+    ],
+)
+def test_signed_force_sum_preserves_sign_and_each_state(
+    tmp_path: Path, forces: tuple[float, ...], residual: float, status: AssessmentStatus
+) -> None:
+    from .quality_fixture import signed_force_case
+
+    result = assess(signed_force_case(tmp_path, forces))
+    assert result.overall_status is status
+    assert result.criteria[0].status is status
+    assert result.criteria[0].measured[0].value == pytest.approx(residual)
+    assert result.criteria[0].measured[0].unit == "N"
+
+
+@pytest.mark.parametrize(
+    "defect",
+    [
+        "missing-state",
+        "subset",
+        "foreign",
+        "alias-overlap",
+        "component",
+        "dimension",
+        "negative-limit",
+    ],
+)
+def test_signed_force_sum_invalid_evidence_is_unverified(tmp_path: Path, defect: str) -> None:
+    from .fixtures import evidence
+    from .quality_fixture import signed_force_case
+
+    case = signed_force_case(tmp_path, (-2.0, -2.0, -2.0))
+    outputs = case.revision.spec.outputs
+    first, second = outputs.evaluations
+    if defect == "missing-state":
+        numeric = case.numeric("contact_force")
+        case.replace_numeric(replace(numeric, axis_values=(0.0, 0.4, 1.0)))
+    elif defect == "foreign":
+        numeric = case.numeric("contact_force")
+        case.replace_numeric(
+            replace(numeric, reference=replace(numeric.reference, attempt_id="other"))
+        )
+    elif defect == "subset":
+        outputs = replace(
+            outputs, evaluations=(first, replace(second, state_times=(Quantity(1, "s"),)))
+        )
+    elif defect == "alias-overlap":
+        original = outputs.requests[0]
+        alias = replace(
+            original,
+            request_id="alias",
+            evidence=evidence("outputs.requests.alias", "explicit-alias"),
+        )
+        outputs = replace(
+            outputs,
+            requests=(*outputs.requests, alias),
+            evaluations=(
+                first,
+                replace(second, output_request_id="alias", selection=first.selection),
+            ),
+        )
+    elif defect == "component":
+        outputs = replace(
+            outputs,
+            requests=tuple(
+                replace(r, component_id="x") if r.request_id == "request_tool" else r
+                for r in outputs.requests
+            ),
+        )
+    elif defect == "dimension":
+        stress = next(r for r in outputs.requests if r.request_id == "request_stress")
+        outputs = replace(
+            outputs,
+            evaluations=(
+                replace(first, output_request_id=stress.request_id, selection=stress.selection),
+                second,
+            ),
+        )
+    else:
+        policy = case.revision.spec.quality_policy
+        case.revision = replace(
+            case.revision,
+            spec=replace(
+                case.revision.spec,
+                quality_policy=replace(
+                    policy,
+                    criteria=(
+                        replace(
+                            policy.criteria[0],
+                            thresholds=(QualityThreshold("max_value", Quantity(-1, "N")),),
+                        ),
+                    ),
+                ),
+            ),
+        )
+    case.revision = replace(case.revision, spec=replace(case.revision.spec, outputs=outputs))
+    result = assess(case)
+    assert result.overall_status is AssessmentStatus.UNVERIFIED
+    assert result.criteria[0].status is AssessmentStatus.UNVERIFIED
+    assert not result.criteria[0].measured
