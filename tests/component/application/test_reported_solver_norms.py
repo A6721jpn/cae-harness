@@ -53,6 +53,8 @@ def _log(mode: str) -> bytes:
         t = str(step / 10) if step < 10 else "1"
         lines.append(f"===== beginning time step {step} : {t} =====")
         count = 11 if step == 1 else 2
+        if step == 10 and mode in {"review_r1_augmentation", "review_r1_summary"}:
+            count = 1
         for iteration in range(1, count + 1):
             final = iteration == count
             current = "1.000000e-04" if final else "2.000000e+00"
@@ -74,7 +76,11 @@ def _log(mode: str) -> bytes:
             ]
             if step == 1 and iteration == 10:
                 lines += ["Max nr of iterations reached.", "Stiffness matrix will now be reformed."]
-        gap = "2.000000e-08" if mode in {"contrary", "review_r1"} and step == 9 else "1.000000e-09"
+        gap = (
+            "2.000000e-08"
+            if (mode == "contrary" or mode.startswith("review_r1")) and step == 9
+            else "1.000000e-09"
+        )
         lines += [
             "........................ augmentation # 1",
             " sliding interface # 1",
@@ -90,13 +96,17 @@ def _log(mode: str) -> bytes:
             lines.insert(-1, "retrying time step with cutback")
         if mode == "review_r2" and step == 1:
             lines.append("contact interface 2 - Type: sliding-elastic")
+        if step == 10 and mode == "review_r1_augmentation":
+            del lines[-5:]  # EOF after D multiplier, before maximum gap
+        if step == 10 and mode == "review_r1_summary":
+            del lines[-2:]  # EOF after valid iteration count, before reformation count
     if mode == "review_r1":
         lines += [
             "===== beginning time step 10 : 1 =====",
             "1",
             "Nonlinear solution status: time= 1",
         ]
-    else:
+    elif mode not in {"review_r1_augmentation", "review_r1_summary"}:
         lines += ["N O R M A L   T E R M I N A T I O N"]
     return ("\r\n".join(lines) + "\r\n").encode("ascii")
 
@@ -339,7 +349,9 @@ def test_reported_solver_norms_public_final_cycles(
         assert _log("pass")[slice(*row["current_span"])] == row["current"].encode()
 
 
-@pytest.mark.parametrize("mode", ["contrary", "review_r1"])
+@pytest.mark.parametrize(
+    "mode", ["contrary", "review_r1", "review_r1_augmentation", "review_r1_summary"]
+)
 def test_reported_solver_norms_final_fail_survives_missing_step(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
 ) -> None:
@@ -349,6 +361,9 @@ def test_reported_solver_norms_final_fail_survives_missing_step(
         assert report["final_status"] == "FAIL"
         assert [step["step"] for step in report["accepted_steps"]] == list(range(1, 10))
         assert report["reasons"]  # missing/truncated step10 does not become complete coverage
+        if mode == "review_r1_augmentation":
+            partial = next(b for b in report["blocks"] if b["kind"] == "incomplete_augmentation")
+            assert partial["rows"][0]["status"] == "UNVERIFIED"
         assert response["quality_status"] == "FAIL" and response["task_status"] == "FAILED"
         assert response["run_status"] == "SUCCEEDED"
 
