@@ -519,3 +519,39 @@ def test_rigid_multibody_set_is_truthfully_unsupported_before_staging(tmp_path: 
         _compile(tmp_path, revision, mesh, profile)
     assert caught.value.category is PortErrorCategory.UNSUPPORTED_CAPABILITY
     assert not list((tmp_path / "bundles").rglob("*.feb"))
+
+
+def test_reported_solver_norms_optional_controls(tmp_path: Path) -> None:
+    revision, mesh, profile = _case()
+    _, old, _ = _compile(tmp_path / "old", revision, mesh, profile)
+    assert old.find("Control/solver/qn_method") is None
+    assert old.find("Contact/contact/minaug") is None
+    controls = (
+        *revision.spec.solver_policy.controls,
+        SolverControl("minaug", 0),
+        SolverControl("maxaug", 10),
+        SolverControl("reform_augment", True),
+        SolverControl("max_ups", 10),
+    )
+    revision = replace(
+        revision,
+        spec=replace(
+            revision.spec, solver_policy=replace(revision.spec.solver_policy, controls=controls)
+        ),
+    )
+    _, root, _ = _compile(tmp_path / "new", revision, mesh, profile)
+    assert root.findtext("Contact/contact/minaug") == "0"
+    assert root.findtext("Contact/contact/maxaug") == "10"
+    assert root.findtext("Control/solver/reform_augment") == "1"
+    assert _required(root, "Control/solver/qn_method").get("type") == "BFGS"
+    assert root.findtext("Control/solver/qn_method/max_ups") == "10"
+    assert root.find("Control/solver/max_ups") is None
+    invalid = tuple(replace(c, value=11) if c.name == "minaug" else c for c in controls)
+    bad = replace(
+        revision,
+        spec=replace(
+            revision.spec, solver_policy=replace(revision.spec.solver_policy, controls=invalid)
+        ),
+    )
+    with pytest.raises(PortError):
+        _compile(tmp_path / "bad", bad, mesh, profile)

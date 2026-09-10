@@ -616,3 +616,39 @@ Solver termination is independent. FAILED/CANCELLED runs receive no fabricated
 manifest; the existing read-failure path may retain sealed attempt files without a
 manifest. Capture of nonzero-exit/cancelled logs and observed native grammar,
 residual qualification and required real E2Es remain pending.
+
+
+### Public reported solver norms (bounded P3 printed-value policy)
+
+Existing demo, run-status and preview required_quality responses expose a derived
+reported_solver_norms report from the exact registered manifest/owned log/input,
+solver executable/version, profile, revision and mesh context. Preserve raw block
+text/order and original token byte spans, including nonfinal cycles, and select
+only unambiguously accepted final nonlinear plus subsequent augmentation blocks.
+Expected solved increments come from compiled input controls, not XPLT saved states.
+Initially support only the observed FEBio4.12.0 solid/static ten fixed0.1 increments
+ending at1, one sliding-elastic interface, explicit consistent enabled controls,
+min_residual0 and known caps. Unknown/retried/adaptive/multiple-interface/cap or
+inconsistent association remains UNVERIFIED. Observed max_ups reformation is not a
+retry. Each nonlinear row retains INITIAL/CURRENT/REQUIRED; augmentation retains
+CURRENT/REQUIRED. Never freeze a changing required value from an earlier row.
+
+Compare exact finite nonnegative printed CURRENT against positive printed REQUIRED:
+strictly below is reported-row PASS, strictly above FAIL, equality/zero/nonfinite,
+disabled/shortcut/unsupported evidence UNVERIFIED. No epsilon, inferred norm units,
+internal formula or full-precision convergence claim. Maximum gap remains the
+literal native quantity, not averaged L2 or physical penetration. A trusted final
+contrary row makes effective quality FAIL/task FAILED despite unrelated unknowns;
+nonfinal/rejected or untrusted admission cannot manufacture finalFAIL. Report-level
+PASS means only printed comparisons; mandatory solver_residual and
+native_qualification remain UNVERIFIED. No automatic COMPLETE or capability-driven
+ASK_AND_BLOCK. Existing arithmetic registration, integrity and physical display
+remain separate; status exit0 continues to mean successful status retrieval.
+
+Allow only optional contact minaug (integer>=0)/maxaug (integer>0, minaug<=maxaug),
+optional boolean solver reform_augment, and optional positive integer max_ups under
+fixed solver/qn_method type=BFGS. Preserve omission; add no defaults or profile flags.
+No new persisted schema, process/runner behavior or log publication path. Fresh
+bounded actual producer qualification and a formal completeness decision remain
+required before mandatory residual PASS; synthetic software checks are not native
+qualification. All other quality obligations and required real E2Es remain pending.
