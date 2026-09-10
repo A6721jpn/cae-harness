@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import struct
 from dataclasses import replace
 
@@ -105,7 +106,7 @@ class QualityAdapter:
             return CriterionAssessment(
                 criterion_id, "applicability", AssessmentStatus.NOT_APPLICABLE, (), reason_prefix
             )
-        if metric_id != "peak_abs_value":
+        if metric_id not in {"peak_abs_value", "signed_force_sum"}:
             return CriterionAssessment(
                 criterion_id,
                 "numeric",
@@ -116,6 +117,11 @@ class QualityAdapter:
         evaluations = {item.evaluation_id: item for item in revision.spec.outputs.evaluations}
         values: list[float] = []
         units: set[str] = set()
+        signed_sum = metric_id == "signed_force_sum"
+        contributions: set[tuple[str, str]] = set()
+        component: str | None = None
+        saved_times = tuple(float(t.to_si().value) for t in revision.spec.outputs.saved_times)
+        state_forces: list[list[float]] = [[] for _ in saved_times]
         try:
             if not criterion.evaluation_ids:
                 raise ValueError("numeric criterion has no declared evaluations")
@@ -128,7 +134,7 @@ class QualityAdapter:
                         PortErrorCategory.QUALITY,
                         f"declared evaluation is missing: {evaluation_id}",
                     )
-                if evaluation.aggregation_id != "peak":
+                if evaluation.aggregation_id != ("sum" if signed_sum else "peak"):
                     raise ValueError(f"unsupported aggregation: {evaluation.aggregation_id}")
                 request = next(
                     (
@@ -143,6 +149,10 @@ class QualityAdapter:
                         PortErrorCategory.QUALITY,
                         f"declared output request is missing: {evaluation.output_request_id}",
                     )
+                if signed_sum:
+                    if component is not None and request.component_id != component:
+                        raise ValueError("signed_force_sum requires the same scalar component")
+                    component = request.component_id
                 mapping = profile.mapping_for(request.quantity_id)
                 observation = next(
                     (
@@ -195,10 +205,37 @@ class QualityAdapter:
                         PortErrorCategory.QUALITY,
                         f"required result scope is absent for evaluation {evaluation_id}",
                     )
+                if signed_sum:
+                    if requested_times != saved_times:
+                        raise ValueError(
+                            "signed_force_sum requires ordered full saved-state coverage"
+                        )
+                    if Quantity(0, numeric.mapping.unit).dimension != Quantity(0, "N").dimension:
+                        raise ValueError("signed_force_sum requires force outputs")
+                    selected = {(request.location, entity) for entity in wanted}
+                    if contributions & selected:
+                        raise ValueError("signed_force_sum contributions overlap")
+                    contributions.update(selected)
                 units.add(Quantity(0.0, numeric.mapping.unit).to_si().unit)
                 width = len(numeric.component_ids)
-                for state_index in state_indices:
+                for saved_index, state_index in enumerate(state_indices):
                     row = numeric.values[state_index]
+                    if signed_sum:
+                        forces = [
+                            float(
+                                Quantity(
+                                    row[entity_index * width + component_index],
+                                    numeric.mapping.unit,
+                                )
+                                .to_si()
+                                .value
+                            )
+                            for entity_index in entity_indices
+                        ]
+                        if not all(math.isfinite(force) for force in forces):
+                            raise ValueError("signed_force_sum requires finite forces")
+                        state_forces[saved_index].extend(forces)
+                        continue
                     values.extend(
                         abs(
                             Quantity(
@@ -209,15 +246,23 @@ class QualityAdapter:
                         )
                         for entity_index in entity_indices
                     )
+            if signed_sum:
+                if not state_forces or any(not forces for forces in state_forces):
+                    raise ValueError("signed_force_sum has no complete contributions")
+                values = [abs(math.fsum(forces)) for forces in state_forces]
+                if not all(math.isfinite(value) for value in values):
+                    raise ValueError("signed_force_sum residual is nonfinite")
             if len(units) != 1 or not values:
                 raise ValueError("numeric evaluations must contain one comparable SI dimension")
             thresholds = {item.parameter_id: item.value.to_si() for item in criterion.thresholds}
             if set(thresholds) != {"max_value"}:
-                raise ValueError("peak_abs_value requires exactly a max_value threshold")
+                raise ValueError(f"{metric_id} requires exactly a max_value threshold")
             unit = next(iter(units))
             if thresholds["max_value"].unit != unit:
                 raise ValueError("threshold and numeric output dimensions differ")
             limit = float(thresholds["max_value"].value)
+            if signed_sum and (not math.isfinite(limit) or limit < 0):
+                raise ValueError("signed_force_sum requires a finite nonnegative force limit")
         except (PortError, ValueError, TypeError, OverflowError, struct.error) as error:
             return CriterionAssessment(
                 criterion_id,

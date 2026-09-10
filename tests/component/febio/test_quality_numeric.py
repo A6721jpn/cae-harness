@@ -293,6 +293,7 @@ def test_mesh_geometry_provenance_must_match_the_supplied_revision(tmp_path: Pat
         ((-2.0, -2.0, -2.0), 0.0, AssessmentStatus.PASS),
         ((2.0, 2.0, 2.0), 4.0, AssessmentStatus.FAIL),
         ((-2.0, -1.0, -3.0), 1.0, AssessmentStatus.FAIL),
+        ((-2.0, -1.0, -2.0), 1.0, AssessmentStatus.FAIL),
     ],
 )
 def test_signed_force_sum_preserves_sign_and_each_state(
