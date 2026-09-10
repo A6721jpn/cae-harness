@@ -393,20 +393,40 @@ def _scan(
             augmentation = _AUGMENT.fullmatch(line)
             if augmentation:
                 if (
-                    i + 4 >= len(lines)
-                    or active["last"] != "nonlinear"
+                    active["last"] != "nonlinear"
                     or int(augmentation[1]) != active["augmentation"] + 1
                     or active["summary"]
                 ):
-                    raise ValueError("inconsistent/truncated augmentation order")
-                if lines[i + 1].strip() != "sliding interface # 1" or not re.fullmatch(
-                    r"CURRENT\s+REQUIRED", lines[i + 2].strip()
+                    raise ValueError("inconsistent augmentation order")
+                if int(augmentation[1]) >= controls.get("maxaug", math.inf):
+                    raise ValueError("unsupported augmentation-cap advance")
+                for j, pattern in (
+                    (1, r"sliding interface # 1"),
+                    (2, r"CURRENT\s+REQUIRED"),
                 ):
-                    raise ValueError("unsupported augmentation interface/header")
+                    if i + j < len(lines) and not re.fullmatch(pattern, lines[i + j].strip()):
+                        raise ValueError("unsupported augmentation interface/header")
                 rows = [
                     _row(lines[i + j], name, offsets[i + j], False)
                     for j, name in enumerate(("D multiplier", "maximum gap"), 3)
+                    if i + j < len(lines)
                 ]
+                if i + 4 >= len(lines):
+                    for row in rows:
+                        row.update(
+                            status="UNVERIFIED", reason="incomplete augmentation association"
+                        )
+                    add(
+                        "incomplete_augmentation",
+                        i,
+                        len(lines),
+                        step=active["step"],
+                        augmentation=int(augmentation[1]),
+                        rows=rows,
+                    )
+                    reasons.append(f"line {i + 1}: truncated augmentation block")
+                    i = len(lines)
+                    continue
                 active["augmentation_block"] = add(
                     "augmentation",
                     i,
@@ -417,25 +437,26 @@ def _scan(
                     rows=rows,
                 )
                 active.update(augmentation=int(augmentation[1]), last="augmentation")
-                if active["augmentation"] >= controls.get("maxaug", math.inf):
-                    raise ValueError("unsupported augmentation-cap advance")
                 i += 5
                 continue
             if line == "convergence summary":
-                if active["last"] != "augmentation" or active["summary"] or i + 2 >= len(lines):
-                    raise ValueError("unexpected/truncated convergence summary")
-                iterations = re.fullmatch(
-                    r"number of iterations\s*:\s*([0-9]+)", lines[i + 1].strip()
-                )
-                reformations = re.fullmatch(
+                if active["last"] != "augmentation" or active["summary"]:
+                    raise ValueError("unexpected convergence summary")
+                if i + 1 < len(lines):
+                    iterations = re.fullmatch(
+                        r"number of iterations\s*:\s*([0-9]+)", lines[i + 1].strip()
+                    )
+                    if iterations is None or int(iterations[1]) != active["iteration"]:
+                        raise ValueError("inconsistent summary counts")
+                if i + 2 < len(lines) and not re.fullmatch(
                     r"number of reformations\s*:\s*[0-9]+", lines[i + 2].strip()
-                )
-                if (
-                    iterations is None
-                    or int(iterations[1]) != active["iteration"]
-                    or reformations is None
                 ):
                     raise ValueError("inconsistent summary counts")
+                if i + 2 >= len(lines):
+                    add("incomplete_summary", i, len(lines), step=active["step"])
+                    reasons.append(f"line {i + 1}: truncated convergence summary")
+                    i = len(lines)
+                    continue
                 add("summary", i, i + 3, step=active["step"])
                 active["summary"] = True
                 i += 3
