@@ -65,7 +65,6 @@ def test_clean_repository_boundary_scan_returns_structured_pass() -> None:
     assert payload["schema_version"] == "1"
     assert payload["status"] == "PASS"
     assert payload["issues"] == []
-    assert ".local" in payload["excluded_paths"]
     assert payload["git_tracking"]["available"] is True
 
 

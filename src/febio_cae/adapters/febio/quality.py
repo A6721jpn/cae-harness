@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import math
-import struct
 from dataclasses import replace
 
 from febio_cae.domain import (
@@ -28,6 +27,7 @@ from febio_cae.domain import (
     SelectionRef,
 )
 from febio_cae.domain.canonical import canonical_bytes
+from febio_cae.domain.results import numeric_state_indices
 
 
 class QualityAdapter:
@@ -263,7 +263,7 @@ class QualityAdapter:
             limit = float(thresholds["max_value"].value)
             if signed_sum and (not math.isfinite(limit) or limit < 0):
                 raise ValueError("signed_force_sum requires a finite nonnegative force limit")
-        except (PortError, ValueError, TypeError, OverflowError, struct.error) as error:
+        except (PortError, ValueError, TypeError, OverflowError) as error:
             return CriterionAssessment(
                 criterion_id,
                 "numeric",
@@ -325,31 +325,9 @@ class QualityAdapter:
     def _state_indices(
         numeric: NumericResultData, requested_times: tuple[float, ...]
     ) -> tuple[int, ...]:
-        if (
-            numeric.axis_id != "state_time"
-            or Quantity(0, numeric.axis_unit).dimension != Quantity(0, "s").dimension
-        ):
+        if numeric.axis_id != "state_time":
             raise ValueError("numeric axis must represent state time")
-        indices: list[int] = []
-        for target in requested_times:
-            # Supported FEBio XPLT saves float32 time. Accept that exact
-            # representation, not a broad tolerance that could hide a missing endpoint.
-            native_target = struct.unpack("<f", struct.pack("<f", target))[0]
-            if target != 0 and native_target == 0:
-                raise ValueError("requested time underflows the supported native representation")
-            # Compare in the stored axis unit to avoid an extra conversion's
-            # roundoff. No proximity tolerance may turn an earlier state into an endpoint.
-            targets = {
-                float(Quantity(value, "s").convert_to(numeric.axis_unit).value)
-                for value in (target, native_target)
-            }
-            matches = [index for index, axis in enumerate(numeric.axis_values) if axis in targets]
-            if len(matches) != 1:
-                raise PortError(PortErrorCategory.QUALITY, "requested result state is absent")
-            indices.append(matches[0])
-        if len(set(indices)) != len(indices):
-            raise ValueError("distinct requested times collapse onto one numeric state")
-        return tuple(indices)
+        return numeric_state_indices(numeric, requested_times)
 
     @staticmethod
     def _entity_ids(selection: SelectionRef, location: str, mesh: MeshArtifact) -> set[str]:

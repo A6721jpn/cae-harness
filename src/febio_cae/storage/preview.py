@@ -23,6 +23,7 @@ from febio_cae.domain import (
 from febio_cae.domain.canonical import canonical_bytes
 from febio_cae.domain.codec import decode_record, encode_record
 from febio_cae.domain.ports import PortError, PortErrorCategory
+from febio_cae.domain.results import numeric_state_indices
 
 from ._sqlite import connect
 from .registry import CaseStorage, StorageConflictError, _safe_identifier
@@ -88,7 +89,7 @@ class RegisteredPreviewStore:
             final_time = max(t.to_si().value for t in revision.spec.outputs.saved_times)
             if numeric.axis_id != "state_time" or numeric.axis_unit != "s":
                 raise ValueError("preview state mapping requires registered seconds axis")
-            final_id = tuple(numeric.axis_values).index(final_time)
+            final_id = numeric_state_indices(numeric, (float(final_time),))[0]
             if (
                 output.component_id != "z"
                 or "z" not in numeric.component_ids

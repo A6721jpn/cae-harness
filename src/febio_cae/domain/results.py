@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import math
 import re
+import struct
+from bisect import bisect_left, bisect_right
 from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
@@ -14,6 +16,7 @@ from .artifacts import FileEntry, validate_logical_path
 from .canonical import canonical_bytes
 from .compatibility import OutputMapping, ToolIdentity
 from .spatial import FrameId
+from .units import Quantity
 
 SCHEMA_VERSION = "1"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -199,6 +202,51 @@ class NumericResultData:
 
     def to_bytes(self) -> bytes:
         return canonical_bytes(self.to_dict())
+
+
+def numeric_state_indices(
+    numeric: NumericResultData, requested_times: tuple[float, ...]
+) -> tuple[int, ...]:
+    """Match SI times exactly, including their supported XPLT binary32 representation."""
+    if Quantity(0, numeric.axis_unit).dimension != Quantity(0, "s").dimension:
+        raise ResultsValidationError("numeric axis must represent state time")
+    si_axis = (
+        tuple(
+            float(Quantity(value, numeric.axis_unit).to_si().value) for value in numeric.axis_values
+        )
+        if numeric.axis_unit != "s"
+        else None
+    )
+    indices: list[int] = []
+    for target in requested_times:
+        try:
+            native_target = struct.unpack("<f", struct.pack("<f", target))[0]
+        except (OverflowError, struct.error) as error:
+            raise ResultsValidationError("requested time is not binary32-representable") from error
+        if target != 0 and native_target == 0:
+            raise ResultsValidationError("requested time underflows the native representation")
+        # Preserve exact equality in either unit direction, never a proximity tolerance.
+        targets = {
+            float(Quantity(value, "s").convert_to(numeric.axis_unit).value)
+            for value in (target, native_target)
+        }
+        matches: set[int] = set()
+        for value in targets:
+            index = bisect_left(numeric.axis_values, value)
+            if index < len(numeric.axis_values) and numeric.axis_values[index] == value:
+                matches.add(index)
+        if si_axis is not None:
+            first, last = bisect_left(si_axis, target), bisect_right(si_axis, target)
+            if last - first > 1:
+                raise ResultsValidationError("requested result state is ambiguous in SI units")
+            if first != last:
+                matches.add(first)
+        if len(matches) != 1:
+            raise ResultsValidationError("requested result state is absent or ambiguous")
+        indices.append(matches.pop())
+    if len(set(indices)) != len(indices):
+        raise ResultsValidationError("distinct requested times collapse onto one numeric state")
+    return tuple(indices)
 
 
 @dataclass(frozen=True, slots=True)

@@ -40,7 +40,13 @@ from febio_cae.domain.ports import (
     TrustedOwnerContext,
 )
 from febio_cae.domain.questions import IssuedQuestion
-from febio_cae.domain.results import NumericResultData, ReadStatus, ResultDataRef, ResultManifest
+from febio_cae.domain.results import (
+    NumericResultData,
+    ReadStatus,
+    ResultDataRef,
+    ResultManifest,
+    numeric_state_indices,
+)
 from febio_cae.domain.units import Dimension, Quantity
 
 from ._ownership import identity, lease, pin_directories, pinned_read
@@ -1971,6 +1977,8 @@ class CaseStorage:
     ) -> None:
         """Validate the actual reader-issued rows in the publishing transaction."""
         required = json.loads(bytes(lineage["required_outputs"]))
+        revision = self.get_revision(attempt.case_id, attempt.revision_id)
+        endpoint = revision.spec.motion.samples[-1].time.to_si().value
         requests = {item["request_id"]: item for item in required["requests"]}
         observations = {item.output_id: item for item in manifest.read_result.observations}
         profile = decode_record(bytes(lineage["profile"]), CompatibilityProfile)
@@ -1978,6 +1986,12 @@ class CaseStorage:
         if set(observations) != set(requests):
             raise PortError(PortErrorCategory.INTEGRITY, "required numeric outputs differ")
         try:
+            expected = {
+                float(Quantity(item["value"], item["unit"]).to_si().value)
+                for item in required["saved_times"]
+            }
+            expected.add(float(endpoint))
+            expected_times = tuple(sorted(expected))
             for output_id, request in requests.items():
                 observation = observations[output_id]
                 ref = observation.data_ref
@@ -2018,15 +2032,7 @@ class CaseStorage:
                     )
                 ):
                     raise ValueError("observation contradicts actual numeric axes/count/mapping")
-                actual = {
-                    Quantity(value, data.axis_unit).to_si().value for value in data.axis_values
-                }
-                expected = {
-                    Quantity(item["value"], item["unit"]).to_si().value
-                    for item in required["saved_times"]
-                }
-                if not expected.issubset(actual):
-                    raise ValueError("actual numeric states omit required saved times")
+                numeric_state_indices(data, expected_times)
         except (ValueError, TypeError, KeyError) as error:
             raise PortError(PortErrorCategory.INTEGRITY, str(error)) from error
 

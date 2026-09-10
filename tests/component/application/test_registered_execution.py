@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from test_persistence_authority import _created, _populate_complete, _profile
+from test_persistence_authority import _created, _populate_complete, _profile, complete_spec
 
 from febio_cae.domain import ExecutionBundle, FileEntry, RunState
 from febio_cae.domain.artifacts import (
@@ -103,17 +103,62 @@ def _build(
         "unissued-reader",
         "foreign-numeric",
         "undercovered-numeric",
+        "missing-endpoint",
+        "native-endpoint",
+        "earlier-native-state",
+        "converted-axis",
         "wrong-axis",
         "missing-numeric",
     ],
 )
 def test_registered_execution_publication_boundary(tmp_path: Path, failure: str) -> None:
     service, created, _ = _created(tmp_path)
-    _populate_complete(service, created)
+    spec = complete_spec()
+    if failure in {"missing-endpoint", "native-endpoint", "earlier-native-state", "converted-axis"}:
+        spec = replace(
+            spec,
+            outputs=replace(
+                spec.outputs,
+                saved_times=spec.outputs.saved_times[:1],
+                evaluations=tuple(
+                    replace(item, state_times=spec.outputs.saved_times[:1])
+                    for item in spec.outputs.evaluations
+                ),
+            ),
+        )
+    if failure in {"native-endpoint", "earlier-native-state", "converted-axis"}:
+        final = spec.motion.samples[-1]
+        spec = replace(
+            spec,
+            motion=replace(
+                spec.motion,
+                samples=(
+                    *spec.motion.samples[:-1],
+                    replace(
+                        final,
+                        time=replace(final.time, value=350, unit="ms")
+                        if failure == "converted-axis"
+                        else replace(final.time, value=0.1),
+                    ),
+                ),
+            ),
+        )
+    _populate_complete(service, created, spec)
     frozen = service.freeze_case(created.case_id).revision
     assert frozen is not None
     required = tuple(item.request_id for item in frozen.spec.outputs.requests)
     numeric: list[NumericResultData] = []
+    times = (
+        (0.0,)
+        if failure in {"undercovered-numeric", "missing-endpoint"}
+        else (0.0, 0.10000000149011612)
+        if failure == "native-endpoint"
+        else (0.0, 0.09999999403953552)
+        if failure == "earlier-native-state"
+        else (0.0, 350.0)
+        if failure == "converted-axis"
+        else (0.0, 1.0)
+    )
 
     def produce(bundle: ExecutionBundle, inputs: dict[str, bytes]) -> dict[str, bytes]:
         assert inputs["input.feb"] == b"synthetic compiled input"
@@ -146,7 +191,7 @@ def test_registered_execution_publication_boundary(tmp_path: Path, failure: str)
                 request.display_unit,
                 request.frame,
                 request.measure_id,
-                len(frozen.spec.outputs.saved_times),
+                len(times),
             )
             for request in frozen.spec.outputs.requests
         )
@@ -166,11 +211,11 @@ def test_registered_execution_publication_boundary(tmp_path: Path, failure: str)
                 else "state_time"
                 if failure == "state-time"
                 else "time",
-                "s",
-                (0.0,) if failure == "undercovered-numeric" else (0.0, 1.0),
+                "ms" if failure == "converted-axis" else "s",
+                times,
                 ("node-1",),
                 ("z",),
-                ((0.0,),) if failure == "undercovered-numeric" else ((0.0,), (2.0,)),
+                tuple((float(index) * 2.0,) for index in range(len(times))),
             )
             candidate = replace(
                 candidate,
@@ -208,6 +253,8 @@ def test_registered_execution_publication_boundary(tmp_path: Path, failure: str)
         "partial-manifest",
         "foreign-numeric",
         "undercovered-numeric",
+        "missing-endpoint",
+        "earlier-native-state",
         "wrong-axis",
         "missing-numeric",
     }:

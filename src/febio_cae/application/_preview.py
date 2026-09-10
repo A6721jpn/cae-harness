@@ -19,6 +19,7 @@ from febio_cae.domain.canonical import canonical_bytes
 from febio_cae.domain.codec import encode_record
 from febio_cae.domain.lifecycle import TaskStatus
 from febio_cae.domain.ports import PortError, PortErrorCategory
+from febio_cae.domain.results import numeric_state_indices
 from febio_cae.storage import StorageConflictError, StorageIntegrityError
 from febio_cae.storage._ownership import pinned_read
 from febio_cae.storage.preview import RegisteredPreviewStore
@@ -57,7 +58,7 @@ def preview_summary(store: RegisteredPreviewStore, preview_id: str) -> dict[str,
         )
         if force.axis_id != "state_time" or force.axis_unit != "s":
             raise ValueError("registered force must use a seconds state-time axis")
-        final_force = force.values[tuple(force.axis_values).index(target.final_time)]
+        final_force = force.values[numeric_state_indices(force, (target.final_time,))[0]]
         connected = all(math.isfinite(v) for v in final_force) and any(v != 0 for v in final_force)
     complete = (
         receipt["status"] == "CONFIRMED"

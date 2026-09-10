@@ -112,6 +112,25 @@ def _quality_preview(
 
     def configure(service: Any, spec: Any) -> Any:
         spec = _configure(service, spec)
+        if mode == "native_time":
+            times = (Quantity(0, "s"), Quantity(0.1, "s"))
+            spec = replace(
+                spec,
+                motion=replace(
+                    spec.motion,
+                    samples=(
+                        spec.motion.samples[0],
+                        replace(spec.motion.samples[-1], time=times[-1]),
+                    ),
+                ),
+                outputs=replace(
+                    spec.outputs,
+                    saved_times=times,
+                    evaluations=tuple(
+                        replace(item, state_times=times) for item in spec.outputs.evaluations
+                    ),
+                ),
+            )
         criterion = spec.quality_policy.criteria[0]
         if mode == "signed":
             criterion = replace(
@@ -209,7 +228,8 @@ def _quality_preview(
         if mode == "solver_log":
             manifest = _demo_log_result(service, storage, revision, tmp_path, patch)
         else:
-            manifest = _result(service, storage, revision, "preview", (0, 0.5, 1), factor)
+            times = (0.0, 0.10000000149011612) if mode == "native_time" else (0, 0.5, 1)
+            manifest = _result(service, storage, revision, "preview", times, factor)
     store = RegisteredPreviewStore(storage)
     target = store.target(manifest.manifest_id)
     quality = QualityAdapter().assess(manifest, revision, target.mesh, target.profile, storage)
@@ -232,6 +252,17 @@ def _quality_preview(
         "fresh-nonce",
     )
     return store, receipt.receipt_id, quality
+
+
+def test_preview_uses_native_saved_endpoint_for_displacement_and_force(tmp_path: Path) -> None:
+    from febio_cae.application._preview import preview_summary
+
+    store, preview_id, _ = _quality_preview(tmp_path, mode="native_time")
+    summary = preview_summary(store, preview_id)
+    assert summary["run_status"] == "SUCCEEDED"
+    assert summary["preview_status"] == "CONFIRMED"
+    assert summary["finite_nonzero_tool_force"] is True
+    assert summary["task_status"] == "NEEDS_QUALITY"
 
 
 @pytest.mark.parametrize("mode", ["peak", "signed", "named_exemption"])
