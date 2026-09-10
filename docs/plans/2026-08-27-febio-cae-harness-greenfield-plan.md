@@ -531,3 +531,24 @@ applicability, mandatory public-quality coverage, solver residual validation and
 native sign qualification remain pending. Studio correspondence alone is not
 sign proof. Keep profiles unchanged; no REQ-11/P3/FB-03/E2E completion claim. Native
 validation and the required real-model E2Es remain separate dependencies.
+
+### P3 preview registered-quality consistency
+
+Public preview completion uses the same registered-quality identity gate as
+run-status: the exact recomputed assessment must match the registered assessment
+for that result. Absence is effective quality UNVERIFIED/noncomplete with an
+explanatory quality_reason; disagreement or corruption is an integrity error.
+An exact match retains the recomputed status, including FAIL. Preview observation
+and solver status remain independent and are preserved. Reading a summary never
+registers missing quality. The embedded quality is the recomputed declared-criterion
+assessment; quality_status describes its registered usability for completion.
+Registered declared-criterion PASS alone is not evidence of complete mandatory
+physical/numerical coverage; force-system completeness, applicability, native sign
+and solver-residual obligations remain pending. No policy or status enum changes.
+
+Use focused synthetic registration tests before implementation: missing quality
+registration cannot complete even with confirmed preview and successful solver;
+exact registration restores the existing status and preserves FAIL; mismatched
+or corrupt registration is rejected. Summary reads do not create quality assets.
+This increment aligns the existing registration gate, not mandatory physical
+coverage or native/E2E qualification. Keep those dependencies pending.

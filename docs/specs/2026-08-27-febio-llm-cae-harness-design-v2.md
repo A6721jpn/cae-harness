@@ -306,6 +306,18 @@ CONFIRMEDには、対象ファイル、Studio版、最終状態、必要な変�
 
 解析タスクの完了は、要求終端への到達、結果の完全性、必須数値品質、要求されたプレビュー確認を満たした時点とする。物理的な実物検証が別途必要なら、その未検証状態を結果と併記する。プレビュー未確認を物理条件不足のASK_AND_BLOCKへ変換しない。
 
+Public preview completion uses the same registered-quality identity gate as
+run-status: the exact recomputed assessment must match the registered assessment
+for that result. Absence is effective quality UNVERIFIED/noncomplete with an
+explanatory quality_reason; disagreement or corruption is an integrity error.
+An exact match retains the recomputed status, including FAIL. Preview observation
+and solver status remain independent and are preserved. Reading a summary never
+registers missing quality. The embedded quality is the recomputed declared-criterion
+assessment; quality_status describes its registered usability for completion.
+Registered declared-criterion PASS alone is not evidence of complete mandatory
+physical/numerical coverage; force-system completeness, applicability, native sign
+and solver-residual obligations remain pending. No policy or status enum changes.
+
 ## 9. 部分変更と比較
 
 部分変更は親版ダイジェストを持つ`CasePatch`とする。変更可能なパス・型・根拠を検証し、親版が異なる差分を適用しない。元の版、入力、結果は不変とする。Studio等で外部編集した`.feb`は初期版では自動同期せず、管理仕様との不一致を診断する。
