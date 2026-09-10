@@ -1664,7 +1664,7 @@ class CaseStorage:
         try:
             with ExitStack() as pins:
                 for logical_path, limit, role in (
-                    ("output/results.xplt", 32 * 1024 * 1024, "result"),
+                    ("output/results.xplt", 128 * 1024 * 1024, "result"),
                     ("output/solver.log", 8 * 1024 * 1024, "solver_log"),
                 ):
                     relative = (

@@ -38,9 +38,9 @@ from febio_cae.domain.codec import decode_record, encode_record
 
 _OUTPUT_PATH = "output/results.xplt"
 _CODEC_ID = "numeric-result-v1"
-_MAX_FILE = 32 * 1024 * 1024
+_MAX_FILE = 128 * 1024 * 1024
 _MAX_BLOCK = 16 * 1024 * 1024
-_MAX_BLOCKS = 10000
+_MAX_BLOCKS = 900000
 _NODE_DICTIONARY = 0x01023000
 _DOMAIN_DICTIONARY = 0x01024000
 _VECTOR = ("x", "y", "z")
