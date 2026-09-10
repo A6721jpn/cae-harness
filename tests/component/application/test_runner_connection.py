@@ -29,7 +29,7 @@ from febio_cae.domain.ports import PortError, PortErrorCategory
 
 @pytest.mark.parametrize("failure", ["none", "foreign-poll", "bad-geometry", "pending-cleanup"])
 def test_registered_runner_connects_issued_state_and_numeric_reader(
-    tmp_path: Path, failure: str
+    tmp_path: Path, failure: str, *, solver_log: bool = False
 ) -> None:
     service, created, storage = _created(tmp_path)
     _populate_complete(service, created)
@@ -75,6 +75,8 @@ def test_registered_runner_connects_issued_state_and_numeric_reader(
             )
             (path / "output").mkdir(parents=True)
             (path / "output/results.xplt").write_bytes(b"synthetic only")
+            if solver_log:
+                (path / "output/solver.log").write_bytes(b"synthetic bound log")
             return AttemptRecord(
                 owner.attempt_id,
                 owner.run_id,
@@ -206,6 +208,16 @@ def test_registered_runner_connects_issued_state_and_numeric_reader(
         )
         assert events == ["start", "poll", "read"]
         assert storage.get_manifest(manifest.manifest_id) == manifest
+        if solver_log:
+            assert len(manifest.files) == 2
+            log = next(e for e in manifest.files if e.role == "solver_log")
+            assert log.size_bytes == len(b"synthetic bound log")
         reference = manifest.read_result.observations[0].data_ref
         assert reference is not None
         assert storage.resolve(reference).axis_id == "state_time"
+
+
+def test_solver_log_binding_connected_publication(tmp_path: Path) -> None:
+    test_registered_runner_connects_issued_state_and_numeric_reader(
+        tmp_path, "none", solver_log=True
+    )

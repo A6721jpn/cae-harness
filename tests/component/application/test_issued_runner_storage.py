@@ -106,3 +106,53 @@ def test_failed_runner_cannot_seal_native_xplt(tmp_path: Path) -> None:
     storage._accept_runner_poll(owner, issued, failed)
     with pytest.raises(PortError):
         storage._seal_native_output(owner)
+
+
+@pytest.mark.parametrize("log", [b"synthetic log", None])
+def test_solver_log_binding_owned_capture(tmp_path: Path, log: bytes | None) -> None:
+    from febio_cae.storage import CaseStorage
+
+    storage, owner, _, issued, root, bundle = _prepared(tmp_path)
+    storage._accept_runner_start(owner, issued)
+    (root / "output").mkdir(parents=True)
+    (root / "output/results.xplt").write_bytes(b"synthetic xplt")
+    if log is not None:
+        (root / "output/solver.log").write_bytes(log)
+    with pytest.raises(PortError):
+        storage._seal_native_output(owner)
+    validating = issued.transition_to(RunState.DRAINING).transition_to(RunState.VALIDATING)
+    storage._accept_runner_poll(owner, issued, validating)
+    entries = storage._seal_native_output(owner)
+    assert len(entries) == (2 if log is not None else 1)
+    reopened = CaseStorage(storage.root)
+    assert reopened.resolve_file(entries[0], bundle, validating).content == b"synthetic xplt"
+    if log is not None:
+        assert entries[1].logical_path == "output/solver.log"
+        assert entries[1].role == "solver_log"
+        assert reopened.resolve_file(entries[1], bundle, validating).content == log
+    else:
+        (root / "output/solver.log").write_bytes(b"late log")
+    with pytest.raises(PortError):
+        reopened._seal_native_output(owner)
+
+
+def test_solver_log_binding_size_refuses_partial_publication(tmp_path: Path) -> None:
+    from febio_cae.domain.ports import PortErrorCategory
+
+    storage, owner, _, issued, root, _ = _prepared(tmp_path)
+    storage._accept_runner_start(owner, issued)
+    (root / "output").mkdir(parents=True)
+    (root / "output/results.xplt").write_bytes(b"synthetic xplt")
+    (root / "output/solver.log").write_bytes(b"x" * (8 * 1024 * 1024 + 1))
+    validating = issued.transition_to(RunState.DRAINING).transition_to(RunState.VALIDATING)
+    storage._accept_runner_poll(owner, issued, validating)
+    with pytest.raises(PortError) as failure:
+        storage._seal_native_output(owner)
+    assert failure.value.category is PortErrorCategory.INTEGRITY
+    _, lineage = storage._lineage(validating)
+    assert lineage["sealed_files"] is None and not lineage["writer_closed"]
+    destination = (
+        storage.root
+        / f"cases/{owner.case_id}/runs/{owner.run_id}/attempts/{owner.attempt_id}/output"
+    )
+    assert not destination.exists()

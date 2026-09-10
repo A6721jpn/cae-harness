@@ -152,6 +152,49 @@ def _quality_preview(
             criteria = (criterion, exemption)
         return replace(spec, quality_policy=replace(spec.quality_policy, criteria=criteria))
 
+    if mode == "solver_log":
+        import hashlib
+
+        from febio_cae.adapters.febio import xplt_reader
+
+        solver = tmp_path / "synthetic-solver"
+        solver.write_bytes(b"never executed")
+        base_configure = configure
+
+        def configure(service: Any, spec: Any) -> Any:
+            spec = base_configure(service, spec)
+            profile = service.compatibility.get_profile(spec.solver_policy.profile.profile_id)
+            profile = replace(
+                profile,
+                profile_id="log-demo",
+                solver=replace(
+                    profile.solver,
+                    executable_digest=hashlib.sha256(solver.read_bytes()).hexdigest(),
+                ),
+                reader=replace(
+                    profile.reader,
+                    executable_digest=hashlib.sha256(
+                        Path(xplt_reader.__file__).read_bytes()
+                    ).hexdigest(),
+                ),
+            )
+            service.register_profile(profile)
+            digest = hashlib.sha256(profile.to_bytes()).hexdigest()
+            return replace(
+                spec,
+                **{
+                    name: replace(
+                        getattr(spec, name),
+                        profile=replace(
+                            getattr(spec, name).profile,
+                            profile_id=profile.profile_id,
+                            record_digest=digest,
+                        ),
+                    )
+                    for name in ("solver_policy", "outputs", "quality_policy")
+                },
+            )
+
     service, _created, storage, revision = prepared(tmp_path, configure)
     original = storage.ingest_source
 
@@ -163,7 +206,10 @@ def _quality_preview(
 
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(storage, "ingest_source", defer_quality)
-        manifest = _result(service, storage, revision, "preview", (0, 0.5, 1), factor)
+        if mode == "solver_log":
+            manifest = _demo_log_result(service, storage, revision, tmp_path, patch)
+        else:
+            manifest = _result(service, storage, revision, "preview", (0, 0.5, 1), factor)
     store = RegisteredPreviewStore(storage)
     target = store.target(manifest.manifest_id)
     quality = QualityAdapter().assess(manifest, revision, target.mesh, target.profile, storage)
@@ -302,3 +348,88 @@ def test_mandatory_quality_coverage_preserves_known_fail(tmp_path: Path, registe
         row["status"] == "UNVERIFIED"
         for row in cast(dict[str, Any], result["required_quality"])["numerical"]
     )
+
+
+def _demo_log_result(service: Any, storage: Any, revision: Any, tmp_path: Path, patch: Any) -> Any:
+    """Real demo read closure over the existing synthetic issued storage fixture."""
+    from types import SimpleNamespace
+
+    from test_comparison import _result
+
+    from febio_cae.application import _demo
+
+    storage.ingest_source(
+        asset_id="registered-reader-source",
+        source_kind="registered_document",
+        media_type="text/plain",
+        content=Path(_demo.xplt_reader.__file__).read_bytes(),
+    )
+    original_seal = storage._seal_native_output
+    original_read = storage._read_candidate
+    context: dict[str, Any] = {}
+
+    def seal(owner: Any) -> Any:
+        attempt = storage._attempt(owner)
+        root = Path(storage._native_context(attempt)["process_root"])
+        (root / "output/solver.log").write_bytes(b"synthetic opaque log")
+        entries = original_seal(owner)
+        assert len(entries) == 2
+        return entries
+
+    class Reader:
+        def __init__(self, **kwargs: Any) -> None:
+            pass
+
+        def read(self, attempt: Any, bundle: Any) -> Any:
+            _, lineage = storage._lineage(attempt)
+            xplt = tuple(e for e in storage._sealed_entries(lineage) if e.role == "result")
+            # Existing fixture supplies real registered numeric data, no native parser claim.
+            return context["synthetic_read"](attempt, bundle, xplt, storage)
+
+    def execute(case_id: str, revision_id: str, **kwargs: Any) -> Any:
+        def read(owner: Any, synthetic_read: Any) -> Any:
+            context["synthetic_read"] = synthetic_read
+            return original_read(owner, kwargs["read"])
+
+        patch.setattr(storage, "_read_candidate", read)
+        return _result(service, storage, revision, "preview", (0, 0.5, 1), 1)
+
+    patch.setattr(storage, "_seal_native_output", seal)
+    patch.setattr(service, "_execute_ports", execute)
+    patch.setattr(_demo, "XpltReaderAdapter", Reader)
+    patch.setattr(
+        _demo,
+        "LocalResultDataStore",
+        lambda: SimpleNamespace(
+            register_source=lambda *args, **kwargs: None,
+            resolve=storage.resolve,
+        ),
+    )
+    response = _demo.run_demo(
+        service,
+        revision.case_id,
+        revision.revision_id,
+        executable=str(tmp_path / "synthetic-solver"),
+        preflight=False,
+    )
+    assert response["quality_status"] == "UNVERIFIED"
+    assert response["task_status"] == "NEEDS_QUALITY"
+    return storage.get_manifest(response["manifest"]["manifest_id"])
+
+
+def test_solver_log_binding_demo_and_confirmed_preview(tmp_path: Path) -> None:
+    from febio_cae.domain.ports import PortErrorCategory
+
+    store, preview_id, _ = _quality_preview(tmp_path, mode="solver_log")
+    target = store.target(store.get(preview_id)["receipt"]["manifest_id"])
+    log = next(e for e in target.manifest.files if e.role == "solver_log")
+    assert log.logical_path == "output/solver.log"
+    assert store.get(preview_id)["receipt"]["status"] == "CONFIRMED"
+    destination = (
+        store.storage.root
+        / f"cases/{target.attempt.case_id}/runs/{target.attempt.run_id}/attempts/{target.attempt.attempt_id}/{log.logical_path}"
+    )
+    destination.write_bytes(b"changed log")
+    with pytest.raises(PortError) as failure:
+        store.get(preview_id)
+    assert failure.value.category is PortErrorCategory.INTEGRITY

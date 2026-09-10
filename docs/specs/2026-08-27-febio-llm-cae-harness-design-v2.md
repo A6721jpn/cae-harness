@@ -662,3 +662,25 @@ super()._prepare_owned_session, then record module path/hash/version/BuildInfo
 from that same live owned session. Plain backend means unchanged body/face/
 geometry algorithms and admission; no planar face override, second session or
 probe, public backend API change, or frozen-file edit is permitted.
+
+
+### Owned solver-log binding (P3 bounded capture)
+
+On the existing issued-owned, drained VALIDATING path, seal the optional fixed
+output/solver.log alongside required output/results.xplt using existing FileEntry,
+closed sealed_files and exact manifest membership. XPLT remains bounded at 32 MiB;
+the opaque log has an independent 8 MiB resource cap and is never truncated.
+Only genuine final-file absence under the verified owned parent is optional.
+Present empty logs are retained; present invalid, oversized, unreadable or modified
+logs are INTEGRITY failures, not missing evidence or numerical nonconvergence.
+Validate all payloads before copying and register the closed set once. No late log
+attachment, new persisted schema, compiler control or parsed convergence claim.
+
+The public demo reader includes all sealed entries in its candidate manifest while
+numeric observations remain XPLT-derived. Registered log tampering invalidates later
+manifest/preview reads. An absent log permits otherwise valid XPLT publication but
+supplies no residual evidence; mandatory quality remains UNVERIFIED/NEEDS_QUALITY.
+Solver termination is independent. FAILED/CANCELLED runs receive no fabricated
+manifest; the existing read-failure path may retain sealed attempt files without a
+manifest. Capture of nonzero-exit/cancelled logs and observed native grammar,
+residual qualification and required real E2Es remain pending.
