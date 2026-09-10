@@ -267,6 +267,7 @@ def _scan(
     trusted = True
     active: dict[str, Any] | None = None
     seen: set[int] = set()
+    interface_seen = False
 
     def add(kind: str, start: int, end: int, **data: Any) -> int:
         identifier = len(blocks)
@@ -287,6 +288,17 @@ def _scan(
         line = lines[i].strip()
         begin = _BEGIN.fullmatch(line)
         try:
+            if line.lower().startswith(("contact interface", "sliding interface")):
+                if (
+                    line != "contact interface 1 - Type: sliding-elastic"
+                    or interface_seen
+                    or seen
+                    or active is not None
+                ):
+                    raise ValueError("unexpected interface declaration outside augmentation")
+                interface_seen = True
+                i += 1
+                continue
             if begin:
                 n, t = int(begin[1]), begin[2]
                 if (
@@ -326,18 +338,16 @@ def _scan(
                 i += 1
                 continue
             if re.fullmatch(r"[1-9][0-9]*", line):
-                if i + 9 >= len(lines):
-                    raise ValueError("truncated nonlinear block")
-                status = _STATUS.fullmatch(lines[i + 1].strip())
                 iteration = int(line)
-                if (
-                    status is None
-                    or status[1] != active["time"]
-                    or iteration != active["iteration"] + 1
-                    or active["summary"]
-                ):
+                if iteration != active["iteration"] + 1 or active["summary"]:
                     raise ValueError("inconsistent nonlinear iteration/time/order")
+                if i + 1 < len(lines):
+                    status = _STATUS.fullmatch(lines[i + 1].strip())
+                    if status is None or status[1] != active["time"]:
+                        raise ValueError("inconsistent nonlinear iteration/time/order")
                 for j, counter in enumerate(_COUNTERS, 2):
+                    if i + j >= len(lines):
+                        break
                     match = re.fullmatch(
                         re.escape(counter) + r"\s*=\s*([0-9]+)", lines[i + j].strip()
                     )
@@ -346,16 +356,34 @@ def _scan(
                         and int(match[1]) >= controls.get("max_refs", math.inf)
                     ):
                         raise ValueError("unsupported counter/reformation-cap record")
-                if not re.fullmatch(
-                    r"step from line search\s*=\s*[0-9]+\.[0-9]{6}", lines[i + 5].strip()
-                ) or not re.fullmatch(
-                    r"convergence norms\s*:\s*INITIAL\s+CURRENT\s+REQUIRED", lines[i + 6].strip()
+                for j, pattern in (
+                    (5, r"step from line search\s*=\s*[0-9]+\.[0-9]{6}"),
+                    (6, r"convergence norms\s*:\s*INITIAL\s+CURRENT\s+REQUIRED"),
                 ):
-                    raise ValueError("unsupported nonlinear header/counters")
+                    if i + j < len(lines) and not re.fullmatch(pattern, lines[i + j].strip()):
+                        raise ValueError("unsupported nonlinear header/counters")
                 rows = [
                     _row(lines[i + j], name, offsets[i + j], True)
                     for j, name in enumerate(("residual", "energy", "displacement"), 7)
+                    if i + j < len(lines)
                 ]
+                if i + 9 >= len(lines):
+                    # A valid prefix at EOF leaves this increment unresolved; it does not
+                    # contradict earlier accepted increments. Malformed present lines above
+                    # still invalidate the stream, including retry/interface contradictions.
+                    for row in rows:
+                        row.update(status="UNVERIFIED", reason="incomplete nonlinear association")
+                    add(
+                        "incomplete_nonlinear",
+                        i,
+                        len(lines),
+                        step=active["step"],
+                        iteration=iteration,
+                        rows=rows,
+                    )
+                    reasons.append(f"line {i + 1}: truncated nonlinear block")
+                    i = len(lines)
+                    continue
                 active["nonlinear_block"] = add(
                     "nonlinear", i, i + 10, step=active["step"], iteration=iteration, rows=rows
                 )
