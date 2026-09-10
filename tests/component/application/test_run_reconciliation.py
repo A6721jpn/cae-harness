@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from test_issued_runner_storage import _prepared
@@ -48,7 +48,7 @@ def test_resume_refuses_native_identity_without_adoption(tmp_path: Path) -> None
     assert storage._attempt(owner).to_bytes() == before
 
 
-def test_successful_run_without_quality_preview_is_not_a_complete_task(tmp_path: Path) -> None:
+def test_mandatory_quality_coverage_without_preview(tmp_path: Path) -> None:
     execute(tmp_path, "state-time")
     service = RegisteredCaseService(state_dir=tmp_path / "state")
     with sqlite3.connect(tmp_path / "case/registry.sqlite3") as connection:
@@ -57,7 +57,16 @@ def test_successful_run_without_quality_preview_is_not_a_complete_task(tmp_path:
     result = service.run_status(case_id, run_id)
     assert result["run_status"] == "SUCCEEDED"
     assert result["quality_status"] == "UNVERIFIED" and result["preview_status"] is None
-    assert result["task_status"] != "COMPLETE"
+    assert result["task_status"] == "NEEDS_QUALITY"
+    assert result["quality_registration_status"] == "UNVERIFIED"
+    assert "quality" in result
+    coverage = cast(dict[str, Any], result["required_quality"])
+    assert len(coverage["numerical"]) == 6
+    assert all(
+        row["status"] == "UNVERIFIED" and row["reason"]
+        for row in cast(dict[str, Any], result["required_quality"])["numerical"]
+    )
+    assert all("ASK_AND_BLOCK" not in str(value) for value in result.values())
     with sqlite3.connect(tmp_path / "case/registry.sqlite3") as connection:
         assert connection.execute("SELECT payload FROM owners").fetchall() == before
 

@@ -541,10 +541,11 @@ explanatory quality_reason; disagreement or corruption is an integrity error.
 An exact match retains the recomputed status, including FAIL. Preview observation
 and solver status remain independent and are preserved. Reading a summary never
 registers missing quality. The embedded quality is the recomputed declared-criterion
-assessment; quality_status describes its registered usability for completion.
+assessment; quality_registration_status preserves that registered usability;
+quality_status is extended by the mandatory coverage increment below.
 Registered declared-criterion PASS alone is not evidence of complete mandatory
 physical/numerical coverage; force-system completeness, applicability, native sign
-and solver-residual obligations remain pending. No policy or status enum changes.
+and solver-residual obligations remain pending. This registration check changes no policy or persisted arithmetic schema.
 
 Use focused synthetic registration tests before implementation: missing quality
 registration cannot complete even with confirmed preview and successful solver;
@@ -552,3 +553,44 @@ exact registration restores the existing status and preserves FAIL; mismatched
 or corrupt registration is rejected. Summary reads do not create quality assets.
 This increment aligns the existing registration gate, not mandatory physical
 coverage or native/E2E qualification. Keep those dependencies pending.
+
+### P3 mandatory coverage/completion gate
+
+Public post-run summaries independently enumerate execution/result completeness,
+contact quality, motion/support/contact-set fidelity, quasi-static equilibrium,
+solver residuals and mesh dependence, regardless of the declared criterion list.
+Missing implementation or qualified evidence is UNVERIFIED with category-specific
+reasons and prevents COMPLETE. The initial gate has no qualified PASS or
+NOT_APPLICABLE producer; arithmetic methods, criterion names, arbitrary evidence
+references and registered profile labels cannot discharge an obligation. Current
+public paths therefore cannot attain mandatory numerical COMPLETE until qualified
+verifiers exist. No physics, signs, thresholds or applicability exclusions are guessed.
+
+Expose derived required_quality with the exact resolved revision/spec, mesh,
+profile, attempt/bundle/manifest and arithmetic-assessment identities/digests.
+Keep CriterionAssessment-shaped numerical rows separate from the physical
+applicability/experimental-validation row, which does not participate in numerical
+aggregation. These response projections do not modify or persist the arithmetic
+QualityAssessment or its digest and accept no caller-provided qualification flags.
+
+quality_status is the effective numerical result; quality_registration_status
+preserves the registered-assessment usability and embedded quality stays unchanged.
+A known FAIL in trusted recomputed arithmetic or required evidence takes precedence
+over missing registration/unresolved coverage. Missing registration itself remains
+UNVERIFIED in its separate field; corrupt or mismatched registration is INTEGRITY.
+Solver success and confirmed preview remain independent facts. Successful runs with
+unresolved mandatory numerical quality use task_status NEEDS_QUALITY; known quality
+failure uses FAILED. NEEDS_PREVIEW is reserved for satisfied quality with required
+preview still unconfirmed. No new exit code or stored run-state transition is added.
+Missing capability/qualification does not itself create ASK_AND_BLOCK; genuinely
+unresolved required case physics continues through existing grounded validation.
+Physical corroboration alone is not a universal prerequisite for numerical completion.
+
+Use focused bound synthetic public-summary RED/GREEN: registered peak/signed-sum
+PASS and confirmed preview still need required numerical quality; omitted/renamed
+criteria or reason-only exemptions cannot shrink the inventory; known FAIL persists;
+run-status without a preview reports the same unresolved quality gap. Preserve
+arithmetic registration/digests and independent physical applicability. Do not test
+or claim a fictitious qualified PASS path. Native force-system/sign, residual and
+mesh-dependence qualification and all required real E2Es remain pending. This gate
+closes silent omission, not the missing verification capabilities or P3/REQ-11/FB-03.

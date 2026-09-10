@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from test_runner_connection import (
@@ -97,14 +97,65 @@ def test_confirmed_preview_rechecks_evidence_and_xplt_on_read(tmp_path: Path) ->
         store.get(receipt.receipt_id)
 
 
-def _quality_preview(tmp_path: Path, *, factor: float = 1) -> tuple[Any, str, Any]:
+def _quality_preview(
+    tmp_path: Path, *, factor: float = 1, mode: str = "peak"
+) -> tuple[Any, str, Any]:
     from test_comparison import _configure, _result
     from test_planar_edit_validation import prepared
 
     from febio_cae.adapters.febio import QualityAdapter
     from febio_cae.storage.preview import RegisteredPreviewStore
 
-    service, _created, storage, revision = prepared(tmp_path, _configure)
+    from dataclasses import replace
+
+    from test_persistence_authority import _evidence
+
+    from febio_cae.domain import QualityThreshold, Quantity
+
+    def configure(service: Any, spec: Any) -> Any:
+        spec = _configure(service, spec)
+        criterion = spec.quality_policy.criteria[0]
+        if mode == "signed":
+            criterion = replace(
+                criterion,
+                metric_id="signed_force_sum",
+                thresholds=(QualityThreshold("max_value", Quantity(3, "N")),),
+            )
+            force = spec.outputs.requests[1]
+            spec = replace(
+                spec,
+                outputs=replace(
+                    spec.outputs,
+                    evaluations=(
+                        replace(
+                            spec.outputs.evaluations[0],
+                            output_request_id=force.request_id,
+                            selection=force.selection,
+                            aggregation_id="sum",
+                        ),
+                    ),
+                ),
+            )
+        criteria = (criterion,)
+        if mode == "named_exemption":
+            criterion = replace(
+                criterion,
+                criterion_id="quasistatic_equilibrium",
+                evidence=_evidence("quality_policy.criteria.quasistatic_equilibrium"),
+            )
+            exemption = replace(
+                criterion,
+                criterion_id="mesh_dependence",
+                metric_id="not_applicable",
+                evaluation_ids=(),
+                thresholds=(),
+                applicability_reason="synthetic declared exemption, not qualified coverage",
+                evidence=_evidence("quality_policy.criteria.mesh_dependence"),
+            )
+            criteria = (criterion, exemption)
+        return replace(spec, quality_policy=replace(spec.quality_policy, criteria=criteria))
+
+    service, _created, storage, revision = prepared(tmp_path, configure)
     original = storage.ingest_source
 
     def defer_quality(**kwargs: Any) -> Any:
@@ -140,17 +191,18 @@ def _quality_preview(tmp_path: Path, *, factor: float = 1) -> tuple[Any, str, An
     return store, receipt.receipt_id, quality
 
 
-def test_registered_quality_missing_then_exact_registration(tmp_path: Path) -> None:
+@pytest.mark.parametrize("mode", ["peak", "signed", "named_exemption"])
+def test_mandatory_quality_coverage_registered_arithmetic(tmp_path: Path, mode: str) -> None:
     from febio_cae.application._preview import preview_summary
     from febio_cae.domain.codec import encode_record
 
-    store, preview_id, quality = _quality_preview(tmp_path)
+    store, preview_id, quality = _quality_preview(tmp_path, mode=mode)
     asset_id = "quality-" + quality.assessment_id[:24]
     missing = preview_summary(store, preview_id)
     with pytest.raises(StorageConflictError):
         store.storage.source_asset(asset_id)  # Reading must not publish quality.
     assert missing["quality_status"] == "UNVERIFIED"
-    assert missing["task_status"] != "COMPLETE"
+    assert missing["task_status"] == "NEEDS_QUALITY"
     assert missing["preview_status"] == "CONFIRMED" and missing["run_status"] == "SUCCEEDED"
     assert missing["quality"] == quality.to_dict() and quality.overall_status.value == "PASS"
     assert missing["finite_nonzero_tool_force"] is True
@@ -162,7 +214,43 @@ def test_registered_quality_missing_then_exact_registration(tmp_path: Path) -> N
         content=encode_record(quality),
     )
     exact = preview_summary(store, preview_id)
-    assert exact["quality_status"] == "PASS" and exact["task_status"] == "COMPLETE"
+    assert exact["quality_status"] == "UNVERIFIED" and exact["task_status"] == "NEEDS_QUALITY"
+    assert exact["quality_registration_status"] == "PASS"
+    assert exact["quality"] == quality.to_dict()
+    assert exact["preview_status"] == "CONFIRMED" and exact["run_status"] == "SUCCEEDED"
+    coverage = cast(dict[str, Any], exact["required_quality"])
+    expected = {
+        "execution_result_completeness",
+        "contact_quality",
+        "motion_support_contact_fidelity",
+        "quasistatic_equilibrium",
+        "solver_residual",
+        "mesh_dependence",
+    }
+    assert {row["criterion_id"] for row in coverage["numerical"]} == expected
+    assert all(
+        row["status"] == "UNVERIFIED" and row["reason"] and not row["measured"]
+        for row in coverage["numerical"]
+    )
+    assert coverage["physical_applicability"]["dimension"] == "applicability"
+    assert coverage["physical_applicability"]["criterion_id"] not in expected
+    target = store.target(quality.manifest_id)
+    import hashlib
+
+    assert coverage["bindings"] == {
+        "case_id": target.revision.case_id,
+        "revision_id": target.revision.revision_id,
+        "spec_digest": target.revision.spec_digest,
+        "mesh_digest": target.mesh.artifact_digest,
+        "profile_id": target.profile.profile_id,
+        "profile_digest": hashlib.sha256(target.profile.to_bytes()).hexdigest(),
+        "attempt_id": target.manifest.attempt_id,
+        "bundle_digest": target.manifest.bundle_digest,
+        "manifest_id": target.manifest.manifest_id,
+        "manifest_digest": hashlib.sha256(target.manifest.to_bytes()).hexdigest(),
+        "assessment_id": quality.assessment_id,
+        "policy_digest": quality.policy_digest,
+    }
     assert store.storage.resolve_source(
         store.storage.source_asset(asset_id)
     ).content == encode_record(quality)
@@ -194,17 +282,26 @@ def test_registered_quality_disagreement_is_integrity(tmp_path: Path, corrupt: b
     assert error.value.category is PortErrorCategory.INTEGRITY
 
 
-def test_registered_quality_exact_fail_stays_failed(tmp_path: Path) -> None:
+@pytest.mark.parametrize("registered", [False, True])
+def test_mandatory_quality_coverage_preserves_known_fail(tmp_path: Path, registered: bool) -> None:
     from febio_cae.application._preview import preview_summary
     from febio_cae.domain.codec import encode_record
 
     store, preview_id, quality = _quality_preview(tmp_path, factor=100)
-    store.storage.ingest_source(
-        asset_id="quality-" + quality.assessment_id[:24],
-        source_kind="registered_document",
-        media_type="application/json",
-        content=encode_record(quality),
-    )
+    if registered:
+        store.storage.ingest_source(
+            asset_id="quality-" + quality.assessment_id[:24],
+            source_kind="registered_document",
+            media_type="application/json",
+            content=encode_record(quality),
+        )
     result = preview_summary(store, preview_id)
     assert result["quality_status"] == "FAIL" and result["task_status"] == "FAILED"
     assert result["preview_status"] == "CONFIRMED" and result["run_status"] == "SUCCEEDED"
+    assert "required_quality" in result
+    assert result["quality_registration_status"] == ("FAIL" if registered else "UNVERIFIED")
+    assert result["quality"] == quality.to_dict()
+    assert all(
+        row["status"] == "UNVERIFIED"
+        for row in cast(dict[str, Any], result["required_quality"])["numerical"]
+    )

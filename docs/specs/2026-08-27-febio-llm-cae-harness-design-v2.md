@@ -298,6 +298,38 @@ force-system completeness/side/applicability, mandatory public-quality coverage
 and solver residual validation remain P3 obligations. It does not insert policies,
 activate compatibility profiles or establish REQ-11/P3/FB-03/E2E completion.
 
+#### Mandatory public quality coverage
+
+Public post-run summaries independently enumerate execution/result completeness,
+contact quality, motion/support/contact-set fidelity, quasi-static equilibrium,
+solver residuals and mesh dependence, regardless of the declared criterion list.
+Missing implementation or qualified evidence is UNVERIFIED with category-specific
+reasons and prevents COMPLETE. The initial gate has no qualified PASS or
+NOT_APPLICABLE producer; arithmetic methods, criterion names, arbitrary evidence
+references and registered profile labels cannot discharge an obligation. Current
+public paths therefore cannot attain mandatory numerical COMPLETE until qualified
+verifiers exist. No physics, signs, thresholds or applicability exclusions are guessed.
+
+Expose derived required_quality with the exact resolved revision/spec, mesh,
+profile, attempt/bundle/manifest and arithmetic-assessment identities/digests.
+Keep CriterionAssessment-shaped numerical rows separate from the physical
+applicability/experimental-validation row, which does not participate in numerical
+aggregation. These response projections do not modify or persist the arithmetic
+QualityAssessment or its digest and accept no caller-provided qualification flags.
+
+quality_status is the effective numerical result; quality_registration_status
+preserves the registered-assessment usability and embedded quality stays unchanged.
+A known FAIL in trusted recomputed arithmetic or required evidence takes precedence
+over missing registration/unresolved coverage. Missing registration itself remains
+UNVERIFIED in its separate field; corrupt or mismatched registration is INTEGRITY.
+Solver success and confirmed preview remain independent facts. Successful runs with
+unresolved mandatory numerical quality use task_status NEEDS_QUALITY; known quality
+failure uses FAILED. NEEDS_PREVIEW is reserved for satisfied quality with required
+preview still unconfirmed. No new exit code or stored run-state transition is added.
+Missing capability/qualification does not itself create ASK_AND_BLOCK; genuinely
+unresolved required case physics continues through existing grounded validation.
+Physical corroboration alone is not a universal prerequisite for numerical completion.
+
 ### 8.4 プレビューとタスク完了
 
 `preview --open`は登録済みXPLTのハッシュを確認して外部FEBio Studioを起動する。プレビュー状態は`REQUESTED / LAUNCHED / CONFIRMED / FAILED`とする。プロセス起動だけではCONFIRMEDにしない。
@@ -313,10 +345,11 @@ explanatory quality_reason; disagreement or corruption is an integrity error.
 An exact match retains the recomputed status, including FAIL. Preview observation
 and solver status remain independent and are preserved. Reading a summary never
 registers missing quality. The embedded quality is the recomputed declared-criterion
-assessment; quality_status describes its registered usability for completion.
+assessment; quality_registration_status describes its registered usability, while
+quality_status also enforces the mandatory coverage gate above.
 Registered declared-criterion PASS alone is not evidence of complete mandatory
 physical/numerical coverage; force-system completeness, applicability, native sign
-and solver-residual obligations remain pending. No policy or status enum changes.
+and solver-residual obligations remain pending. This registration check changes no policy or persisted arithmetic schema.
 
 ## 9. 部分変更と比較
 
@@ -365,7 +398,7 @@ LLMは構造化された提案を返し、applicationがスキーマ、参照先
 
 各操作は`--json`を持ち、`schema_version, status, case_id, revision_id, run_id, diagnostics, next_actions`を返す。適用外IDはnullで表す。終了コードは0=操作成功、2=入力または比較条件不正、3=物理条件待ち、4=環境・未対応能力、5=実行失敗、6=結果完全性・必須品質不合格、7=キャンセル・中断、8=競合・古い世代とする。`status`の読取成功はrun成功を意味せず、返却JSON内の状態を解釈する。
 
-runに関する応答には`run_status, quality_status, preview_status, task_status`も含める。`task_status`は既存の記録からapplicationが導出する`READY / NEEDS_INPUT / RUNNING / NEEDS_PREVIEW / COMPLETE / FAILED / INTERRUPTED`であり、呼出し側が書き込む成功フラグにはしない。計算と必須品質が成立していても、要求した表示が未確認ならNEEDS_PREVIEWと返す。`preview --open`の起動成功も読込確認を意味しない。終了コード0とタスク全体のCOMPLETEを区別する。
+runに関する応答には`run_status, quality_status, preview_status, task_status`も含める。`task_status`は既存の記録からapplicationが導出する`READY / NEEDS_INPUT / RUNNING / NEEDS_QUALITY / NEEDS_PREVIEW / COMPLETE / FAILED / INTERRUPTED`であり、呼出し側が書き込む成功フラグにはしない。計算と必須品質が成立していても、要求した表示が未確認ならNEEDS_PREVIEWと返す。`preview --open`の起動成功も読込確認を意味しない。終了コード0とタスク全体のCOMPLETEを区別する。
 
 ## 11. 保存、再現性、データ境界
 
