@@ -656,3 +656,43 @@ No new persisted schema, process/runner behavior or log publication path. Fresh
 bounded actual producer qualification and a formal completeness decision remain
 required before mandatory residual PASS; synthetic software checks are not native
 qualification. All other quality obligations and required real E2Es remain pending.
+
+### Bounded norm-core extraction and manual-reader contract
+
+Implement only the adapter-local assess_reported_norm_observations(source, log,
+*, policy, profile, invocation) and its frozen SolverPolicy/motion-endpoint and
+tool/argv/process input records. Share the complete existing bounded admission,
+scan, final selection, strict Decimal comparison and aggregation with the public
+wrapper; preserve public registered identity checks, error precedence, report
+fields/digests, 8 MiB/ASCII, exact 4.12.0/input/echo/controls/argv/process agreement,
+fixed ten increments and motion endpoints, grammar/caps and incomplete-prefix
+versus contradiction behavior. Core bindings describe only supplied resolved
+files, policy/motion, profile and invocation, never CaseRevision or OS ownership.
+The local checker authenticates receipts separately; native qualification stays
+UNVERIFIED. No reader/domain/schema/quality/controller/CLI change is included.
+
+Restrict the standalone manual-benchmark reader identity exception to the local
+validation harness: actual namespaced study ID as case_id, immutable pre-run
+study-specification version as revision_id, SHA256 of exact canonical complete
+study-specification bytes as spec_digest. The specification must bind accepted
+manual provenance, actual prepared input/mesh/profile and frozen physical,
+numerical/output policy. It is not CaseSpec/CaseRevision or STEP/inspection
+provenance. Never substitute an arbitrary preparation-manifest hash or include a
+future receipt in the pre-run specification digest. A local NumericalProfileRef
+may reference the exact digest of a namespaced immutable accepted solver-scope
+document record, without asserting public registration. The later actual receipt
+separately binds specification, bundle, input, mesh, process/output and true
+owner/drain lineage; the harness verifies these associations and labels local
+records/results explicitly. Constructor acceptance does not establish ownership.
+Existing reader equality/path/tool/thread/entity/state checks stay enabled. Local
+records/reports never enter CaseStorage or the public compiler/controller/
+QualityAdapter, whose production CaseRevision semantics stay unchanged. Local
+arithmetic remains validation-owned under predeclared policy; public quality and
+mandatory/native qualification remain UNVERIFIED until their own evidence exists.
+
+Use exactly eight small pure-call cases: complete manual-style ten-step PASS,
+three admission contradictions, three valid incomplete prefixes preserving prior
+FAIL and one malformed prefix demoting the stream. Review the exact clean commit;
+run the single final full suite/build/fresh install and source-wheel binding only
+after all required slices receive CODE_ACCEPT. Actual manual runtime wiring and
+required native/public E2E remain separately verified dependencies.

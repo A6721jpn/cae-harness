@@ -17,8 +17,11 @@ from febio_cae.domain import (
     CompatibilityProfile,
     ExecutionBundle,
     MeshArtifact,
+    ProcessIdentity,
     Quantity,
     ResultManifest,
+    SolverPolicy,
+    ToolIdentity,
 )
 from febio_cae.domain.artifacts import ResolvedFileContent
 from febio_cae.domain.canonical import canonical_bytes
@@ -62,6 +65,36 @@ class ReportedNorms:
 
     def to_dict(self) -> dict[str, Any]:
         return cast(dict[str, Any], json.loads(self.payload))
+
+
+@dataclass(frozen=True, slots=True)
+class ReportedNormInputPolicy:
+    """Explicit numerical policy and motion endpoints, without geometry claims."""
+
+    solver_policy: SolverPolicy
+    motion_start: Quantity
+    motion_end: Quantity
+
+
+@dataclass(frozen=True, slots=True)
+class ReportedNormInvocation:
+    """Recorded invocation identity; this does not attest OS ownership."""
+
+    tool: ToolIdentity
+    argv: tuple[str, ...]
+    process: ProcessIdentity | None
+
+
+def assess_reported_norm_observations(
+    source: ResolvedFileContent | None,
+    log: ResolvedFileContent | None,
+    *,
+    policy: ReportedNormInputPolicy,
+    profile: CompatibilityProfile,
+    invocation: ReportedNormInvocation,
+) -> ReportedNorms:
+    """Unimplemented TDD seam for the complete geometry-independent consumer."""
+    raise NotImplementedError("complete reported-norm observation core")
 
 
 def _number(value: str) -> float:

@@ -724,3 +724,43 @@ No new persisted schema, process/runner behavior or log publication path. Fresh
 bounded actual producer qualification and a formal completeness decision remain
 required before mandatory residual PASS; synthetic software checks are not native
 qualification. All other quality obligations and required real E2Es remain pending.
+
+### Bounded printed-norm core and standalone manual benchmarks
+
+The adapter-local assess_reported_norm_observations(source, log, *, policy,
+profile, invocation) consumes resolved bytes, frozen SolverPolicy and explicit
+motion endpoint quantities, CompatibilityProfile, and recorded tool/argv/process
+identities without CaseRevision. It shares the complete existing admission,
+scan, accepted-final-cycle selection and strict printed Decimal comparison with
+the public assess_reported_norms wrapper. The fixed 8 MiB/ASCII log, 4.12.0 tool,
+input XML/echo/control agreement, compiler argv, recorded process agreement,
+0.1 x 10 increments, 0..1 motion, no adaptive/retry shortcut, grammar and caps
+remain. A valid incomplete suffix preserves an earlier accepted FAIL; a contrary
+present record invalidates trusted rows. The core observes supplied identities;
+it cannot attest OS ownership, receipt authenticity or current filesystem aliases.
+Its bindings contain only actual resolved file, policy/motion, profile and
+invocation facts, and native qualification remains UNVERIFIED. The public wrapper
+uses this same core while retaining all registered storage, manifest, revision,
+mesh, profile, attempt and bundle checks, error precedence, public fields and
+report digest semantics. Local receipt binding never replaces these public checks.
+
+Only a standalone manual-benchmark validation harness may bind ExecutionBundle
+case_id to an actual namespaced local study ID, revision_id to its immutable
+pre-run study-specification version, and spec_digest to SHA256 of the exact
+canonical complete study-specification bytes. Those bytes bind accepted manual
+provenance, actual prepared input, mesh and profile, and frozen physical,
+numerical and output policy. This is expressly not CaseSpec, CaseRevision or
+STEP/inspection provenance. An arbitrary preparation-manifest hash is not a study
+specification; a future receipt must not enter this pre-run digest. A local
+NumericalProfileRef may identify a namespaced immutable accepted solver-scope
+document record by its exact digest, without claiming public profile registration.
+The post-run receipt separately binds study-specification and bundle digests,
+actual input/mesh/process/output and true owner-generation/drain lineage. The
+local harness verifies these associations before invoking adapters and labels
+records/results as local manual-study evidence; object construction alone grants
+no ownership or run permission. All reader equality/path/tool/thread/entity/state
+checks remain unchanged. These local records/reports are never inserted into
+CaseStorage or used by the public compiler, controller or QualityAdapter, whose
+CaseRevision production semantics remain unchanged. Local arithmetic is checked
+separately against its predeclared policy; printed or local arithmetic PASS does
+not establish public quality, mandatory E2E or native qualification.
