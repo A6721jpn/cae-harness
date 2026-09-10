@@ -48,7 +48,7 @@ def _log(mode: str) -> bytes:
         "contact interface 1 - Type: sliding-elastic",
     ]
     for step in range(1, 11):
-        if mode == "contrary" and step == 10:
+        if mode in {"contrary", "review_r1"} and step == 10:
             continue  # unrelated missing coverage cannot hide step9's trusted final FAIL
         t = str(step / 10) if step < 10 else "1"
         lines.append(f"===== beginning time step {step} : {t} =====")
@@ -74,7 +74,7 @@ def _log(mode: str) -> bytes:
             ]
             if step == 1 and iteration == 10:
                 lines += ["Max nr of iterations reached.", "Stiffness matrix will now be reformed."]
-        gap = "2.000000e-08" if mode == "contrary" and step == 9 else "1.000000e-09"
+        gap = "2.000000e-08" if mode in {"contrary", "review_r1"} and step == 9 else "1.000000e-09"
         lines += [
             "........................ augmentation # 1",
             " sliding interface # 1",
@@ -88,7 +88,16 @@ def _log(mode: str) -> bytes:
         ]
         if mode == "unsupported" and step == 1:
             lines.insert(-1, "retrying time step with cutback")
-    lines += ["N O R M A L   T E R M I N A T I O N"]
+        if mode == "review_r2" and step == 1:
+            lines.append("contact interface 2 - Type: sliding-elastic")
+    if mode == "review_r1":
+        lines += [
+            "===== beginning time step 10 : 1 =====",
+            "1",
+            "Nonlinear solution status: time= 1",
+        ]
+    else:
+        lines += ["N O R M A L   T E R M I N A T I O N"]
     return ("\r\n".join(lines) + "\r\n").encode("ascii")
 
 
@@ -330,17 +339,21 @@ def test_reported_solver_norms_public_final_cycles(
         assert _log("pass")[slice(*row["current_span"])] == row["current"].encode()
 
 
+@pytest.mark.parametrize("mode", ["contrary", "review_r1"])
 def test_reported_solver_norms_final_fail_survives_missing_step(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
 ) -> None:
-    _, _, responses = _public(tmp_path, monkeypatch, "contrary")
+    _, _, responses = _public(tmp_path, monkeypatch, mode)
     for response in responses:
-        assert response["required_quality"]["reported_solver_norms"]["final_status"] == "FAIL"
+        report = response["required_quality"]["reported_solver_norms"]
+        assert report["final_status"] == "FAIL"
+        assert [step["step"] for step in report["accepted_steps"]] == list(range(1, 10))
+        assert report["reasons"]  # missing/truncated step10 does not become complete coverage
         assert response["quality_status"] == "FAIL" and response["task_status"] == "FAILED"
         assert response["run_status"] == "SUCCEEDED"
 
 
-@pytest.mark.parametrize("mode", ["equal", "shortcut", "unsupported", "missing"])
+@pytest.mark.parametrize("mode", ["equal", "shortcut", "unsupported", "missing", "review_r2"])
 def test_reported_solver_norms_unverified_and_integrity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
 ) -> None:
