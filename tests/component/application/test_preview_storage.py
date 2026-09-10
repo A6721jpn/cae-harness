@@ -100,17 +100,15 @@ def test_confirmed_preview_rechecks_evidence_and_xplt_on_read(tmp_path: Path) ->
 def _quality_preview(
     tmp_path: Path, *, factor: float = 1, mode: str = "peak"
 ) -> tuple[Any, str, Any]:
+    from dataclasses import replace
+
     from test_comparison import _configure, _result
+    from test_persistence_authority import _evidence
     from test_planar_edit_validation import prepared
 
     from febio_cae.adapters.febio import QualityAdapter
-    from febio_cae.storage.preview import RegisteredPreviewStore
-
-    from dataclasses import replace
-
-    from test_persistence_authority import _evidence
-
     from febio_cae.domain import QualityThreshold, Quantity
+    from febio_cae.storage.preview import RegisteredPreviewStore
 
     def configure(service: Any, spec: Any) -> Any:
         spec = _configure(service, spec)
@@ -121,7 +119,7 @@ def _quality_preview(
                 metric_id="signed_force_sum",
                 thresholds=(QualityThreshold("max_value", Quantity(3, "N")),),
             )
-            force = spec.outputs.requests[1]
+            force = next(r for r in spec.outputs.requests if r.quantity_id == "contact_force")
             spec = replace(
                 spec,
                 outputs=replace(
@@ -132,11 +130,12 @@ def _quality_preview(
                             output_request_id=force.request_id,
                             selection=force.selection,
                             aggregation_id="sum",
+                            state_times=spec.outputs.saved_times,
                         ),
                     ),
                 ),
             )
-        criteria = (criterion,)
+        criteria: tuple[Any, ...] = (criterion,)
         if mode == "named_exemption":
             criterion = replace(
                 criterion,
@@ -147,8 +146,6 @@ def _quality_preview(
                 criterion,
                 criterion_id="mesh_dependence",
                 metric_id="not_applicable",
-                evaluation_ids=(),
-                thresholds=(),
                 applicability_reason="synthetic declared exemption, not qualified coverage",
                 evidence=_evidence("quality_policy.criteria.mesh_dependence"),
             )

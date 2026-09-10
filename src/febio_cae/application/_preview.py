@@ -17,10 +17,13 @@ from febio_cae.adapters.preview import studio as preview_adapter
 from febio_cae.domain import EvidenceRef, PreviewRequest, PreviewStatus, ToolIdentity
 from febio_cae.domain.canonical import canonical_bytes
 from febio_cae.domain.codec import encode_record
+from febio_cae.domain.lifecycle import TaskStatus
 from febio_cae.domain.ports import PortError, PortErrorCategory
 from febio_cae.storage import StorageConflictError, StorageIntegrityError
 from febio_cae.storage._ownership import pinned_read
 from febio_cae.storage.preview import RegisteredPreviewStore
+
+from ._required_quality import required_quality_summary
 
 
 def preview_summary(store: RegisteredPreviewStore, preview_id: str) -> dict[str, object]:
@@ -33,13 +36,17 @@ def preview_summary(store: RegisteredPreviewStore, preview_id: str) -> dict[str,
     try:
         asset = store.storage.source_asset("quality-" + quality.assessment_id[:24])
     except StorageConflictError:
-        quality_status = "UNVERIFIED"
+        quality_registration_status = "UNVERIFIED"
         quality_reason = "quality assessment registration is required even if preview is confirmed"
     else:
         if store.storage.resolve_source(asset).content != encode_record(quality):
             raise PortError(PortErrorCategory.INTEGRITY, "registered preview quality changed")
-        quality_status = quality.overall_status.value
+        quality_registration_status = quality.overall_status.value
         quality_reason = "registered quality assessment matches the recomputed assessment"
+    quality_status, coverage = required_quality_summary(
+        target.manifest, target.revision, target.mesh, target.profile, quality
+    )
+    quality_reason += "; mandatory numerical coverage is unverified; see required_quality"
     force_request = next(
         (r for r in target.revision.spec.outputs.requests if r.quantity_id == "contact_force"), None
     )
@@ -52,7 +59,12 @@ def preview_summary(store: RegisteredPreviewStore, preview_id: str) -> dict[str,
             raise ValueError("registered force must use a seconds state-time axis")
         final_force = force.values[tuple(force.axis_values).index(target.final_time)]
         connected = all(math.isfinite(v) for v in final_force) and any(v != 0 for v in final_force)
-    complete = receipt["status"] == "CONFIRMED" and quality_status == "PASS" and connected
+    complete = (
+        receipt["status"] == "CONFIRMED"
+        and quality_status == "PASS"
+        and quality_registration_status == "PASS"
+        and connected
+    )
     return {
         "schema_version": "1",
         "case_id": target.attempt.case_id,
@@ -62,11 +74,15 @@ def preview_summary(store: RegisteredPreviewStore, preview_id: str) -> dict[str,
         "run_status": target.attempt.state.value,
         "quality_status": quality_status,
         "quality_reason": quality_reason,
+        "quality_registration_status": quality_registration_status,
+        "required_quality": coverage,
         "preview_status": receipt["status"],
         "task_status": "COMPLETE"
         if complete
         else "FAILED"
         if quality_status == "FAIL"
+        else TaskStatus.NEEDS_QUALITY.value
+        if quality_status == "UNVERIFIED"
         else "NEEDS_PREVIEW",
         "receipt": receipt,
         "quality": quality.to_dict(),

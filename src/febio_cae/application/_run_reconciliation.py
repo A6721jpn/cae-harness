@@ -19,13 +19,15 @@ from febio_cae.storage._sqlite import connect
 from febio_cae.storage.registry import CaseStorage, StorageConflictError
 from febio_cae.storage.run_reconciliation import RunSnapshot, cancel_prelaunch, interrupt, snapshot
 
+from ._required_quality import required_quality_summary
+
 if TYPE_CHECKING:
     from .service import RegisteredCaseService
 
 
 def _completion(
     storage: CaseStorage, current: RunSnapshot
-) -> tuple[str, PreviewStatus | None, TaskStatus]:
+) -> tuple[str, PreviewStatus | None, TaskStatus, dict[str, object]]:
     from febio_cae.storage.preview import RegisteredPreviewStore
 
     from ._preview import preview_summary
@@ -35,23 +37,32 @@ def _completion(
         raise PortError(PortErrorCategory.INTEGRITY, "successful run lacks committed result")
     _, lineage = storage._lineage(attempt)
     revision = storage.get_revision(attempt.case_id, attempt.revision_id)
-    quality = QualityAdapter().assess(
-        manifest,
-        revision,
-        decode_record(bytes(lineage["mesh"]), MeshArtifact),
-        decode_record(bytes(lineage["profile"]), CompatibilityProfile),
-        storage,
-    )
+    mesh = decode_record(bytes(lineage["mesh"]), MeshArtifact)
+    profile = decode_record(bytes(lineage["profile"]), CompatibilityProfile)
+    quality = QualityAdapter().assess(manifest, revision, mesh, profile, storage)
     try:
         asset = storage.source_asset("quality-" + quality.assessment_id[:24])
     except StorageConflictError:
-        quality_status = "UNVERIFIED"
+        quality_registration_status = "UNVERIFIED"
     else:
         if storage.resolve_source(asset).content != encode_record(quality):
             raise PortError(PortErrorCategory.INTEGRITY, "registered run quality changed")
-        quality_status = quality.overall_status.value
+        quality_registration_status = quality.overall_status.value
+    quality_status, coverage = required_quality_summary(manifest, revision, mesh, profile, quality)
+    details: dict[str, object] = {
+        "quality": quality.to_dict(),
+        "quality_registration_status": quality_registration_status,
+        "required_quality": coverage,
+        "quality_reason": "mandatory numerical coverage is unverified; registered arithmetic alone cannot complete the task",
+    }
     preview = None
-    task = TaskStatus.FAILED if quality_status == "FAIL" else TaskStatus.NEEDS_PREVIEW
+    task = (
+        TaskStatus.FAILED
+        if quality_status == "FAIL"
+        else TaskStatus.NEEDS_QUALITY
+        if quality_status == "UNVERIFIED"
+        else TaskStatus.NEEDS_PREVIEW
+    )
     with connect(storage.registry_path) as connection:
         if connection.execute(
             "SELECT 1 FROM sqlite_master WHERE name='registered_previews'"
@@ -61,11 +72,11 @@ def _completion(
                 (manifest.manifest_id,),
             ).fetchone()
     if preview is None:
-        return quality_status, None, task
+        return quality_status, None, task, details
     summary = preview_summary(RegisteredPreviewStore(storage), preview["preview_id"])
     if quality_status == "PASS" and summary["task_status"] == "COMPLETE":
         task = TaskStatus.COMPLETE
-    return quality_status, PreviewStatus(str(summary["preview_status"])), task
+    return quality_status, PreviewStatus(str(summary["preview_status"])), task, details
 
 
 def reconcile(
@@ -107,6 +118,7 @@ def reconcile(
             attempt = current.attempt
         diagnostics = [current.diagnostic] if current.diagnostic is not None else []
         quality_status, preview_status = "UNVERIFIED", None
+        quality_details: dict[str, object] = {}
         task = {
             RunState.CREATED: TaskStatus.READY,
             RunState.FAILED: TaskStatus.FAILED,
@@ -124,7 +136,15 @@ def reconcile(
                 )
             )
         elif attempt.state is RunState.SUCCEEDED:
-            quality_status, preview_status, task = _completion(storage, current)
+            quality_status, preview_status, task, quality_details = _completion(storage, current)
+            if task is TaskStatus.NEEDS_QUALITY:
+                diagnostics.append(
+                    ServiceDiagnostic(
+                        ServiceErrorCategory.UNSUPPORTED_CAPABILITY,
+                        "mandatory numerical verification capability or qualified evidence is unavailable; see required_quality",
+                        "quality_status",
+                    )
+                )
         elif not diagnostics:
             diagnostics.append(
                 ServiceDiagnostic(
@@ -146,7 +166,7 @@ def reconcile(
                 else "verify required quality and registered preview confirmation"
             ]
         )
-        return OperationStatus(
+        result = OperationStatus(
             "UNSUPPORTED_ENVIRONMENT"
             if unsupported
             else attempt.state.value
@@ -162,3 +182,5 @@ def reconcile(
             preview_status,
             task,
         ).to_dict()
+        result.update(quality_details)
+        return result

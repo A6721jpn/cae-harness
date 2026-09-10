@@ -38,8 +38,11 @@ from febio_cae.domain import (
     ResultManifest,
 )
 from febio_cae.domain.codec import decode_record, encode_record
+from febio_cae.domain.lifecycle import TaskStatus
 from febio_cae.storage import CaseStorage
 from febio_cae.storage.mesh_quality import PlanarDemoRegistration, PlanarPreparationRegistration
+
+from ._required_quality import required_quality_summary
 
 if TYPE_CHECKING:
     from .service import RegisteredCaseService
@@ -246,18 +249,26 @@ def run_demo(
         media_type="application/json",
         content=encode_record(quality),
     )
+    quality_status, coverage = required_quality_summary(manifest, revision, mesh, profile, quality)
     force = storage.resolve_manifest_output(manifest.manifest_id, "contact_force")
     final_force = force.values[-1]
     connected = all(math.isfinite(v) for v in final_force) and any(v != 0 for v in final_force)
     return {
-        "status": "NEEDS_PREVIEW"
-        if connected and quality.overall_status.value == "PASS"
-        else "NEEDS_REVIEW",
+        "status": "NEEDS_PREVIEW" if connected and quality_status == "PASS" else "NEEDS_REVIEW",
         "run_status": "SUCCEEDED",
         "case_id": case_id,
         "revision_id": revision_id,
         "manifest": manifest.to_dict(),
         "quality": quality.to_dict(),
+        "quality_status": quality_status,
+        "quality_registration_status": quality.overall_status.value,
+        "required_quality": coverage,
+        "quality_reason": "mandatory numerical coverage is unverified; see required_quality",
+        "task_status": TaskStatus.FAILED.value
+        if quality_status == "FAIL"
+        else TaskStatus.NEEDS_QUALITY.value
+        if quality_status == "UNVERIFIED"
+        else TaskStatus.NEEDS_PREVIEW.value,
         "final_tool_force": list(final_force),
         "finite_nonzero_tool_force": connected,
         "surface_approximation": "UNVERIFIED",
