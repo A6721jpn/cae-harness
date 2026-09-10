@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,43 @@ from test_registered_execution import _build
 from febio_cae.domain import ExecutionSetting, ProcessIdentity, RunState
 from febio_cae.domain.ports import PortError, TrustedOwnerContext
 from febio_cae.storage.registry import CaseStorage
+
+
+def test_xplt_capacity_owned_sealing_and_oversize_no_publication(tmp_path: Path) -> None:
+    (tmp_path / "admitted").mkdir()
+    (tmp_path / "rejected").mkdir()
+    storage, owner, _, issued, root, bundle = _prepared(tmp_path / "admitted")
+    storage._accept_runner_start(owner, issued)
+    (root / "output").mkdir(parents=True)
+    content = b"x" * (32 * 1024 * 1024 + 1)
+    (root / "output/results.xplt").write_bytes(content)
+    validating = issued.transition_to(RunState.DRAINING).transition_to(RunState.VALIDATING)
+    storage._accept_runner_poll(owner, issued, validating)
+    entries = storage._seal_native_output(owner)
+    assert len(entries) == 1
+    resolved = storage.resolve_file(entries[0], bundle, validating)
+    assert resolved.content == content
+    assert entries[0].size_bytes == len(content)
+    assert entries[0].digest == hashlib.sha256(content).hexdigest()
+
+    rejected, owner, _, issued, root, _ = _prepared(tmp_path / "rejected")
+    rejected._accept_runner_start(owner, issued)
+    (root / "output").mkdir(parents=True)
+    # Seek-created sparse payload: refusal must occur before capture/publication.
+    with (root / "output/results.xplt").open("wb") as stream:
+        stream.seek(128 * 1024 * 1024)
+        stream.write(b"x")
+    validating = issued.transition_to(RunState.DRAINING).transition_to(RunState.VALIDATING)
+    rejected._accept_runner_poll(owner, issued, validating)
+    with pytest.raises(PortError, match="oversized result"):
+        rejected._seal_native_output(owner)
+    _, lineage = rejected._lineage(validating)
+    assert lineage["sealed_files"] is None and not lineage["writer_closed"]
+    destination = (
+        rejected.root
+        / f"cases/{owner.case_id}/runs/{owner.run_id}/attempts/{owner.attempt_id}/output"
+    )
+    assert not destination.exists()
 
 
 def _prepared(tmp_path: Path) -> tuple[Any, ...]:

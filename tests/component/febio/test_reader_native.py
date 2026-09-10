@@ -1,6 +1,7 @@
 """Actual-layout synthetic reader behavior through the frozen public codec."""
 
 import hashlib
+import struct
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -27,6 +28,105 @@ from .reader_fixture import setup_reader
 from .runner_fixture import _Ownership
 from .test_compiler_native import _case
 from .test_runner_authority import _cleanup_process, _finish
+
+
+def test_xplt_capacity_native_surface_traversal_and_bounded_counter(tmp_path: Path) -> None:
+    from febio_cae.adapters.febio.xplt_reader import _MAX_BLOCKS, _NativeParser, _ParseError
+
+    from .reader_fixture import block, text, uint
+
+    reader, attempt, bundle, mesh, payload = setup_reader(tmp_path)
+    original = reader.data_store.source_for(attempt, bundle)
+    base = 0x01043000
+    faces = b"".join(
+        block(base + 0x201, struct.pack("<8I", identifier, 6, 0, 1, 2, 3, 4, 5))
+        for identifier in range(1, 10002)
+    )
+    surface = block(
+        base,
+        block(
+            base + 0x100,
+            block(
+                base + 0x101,
+                uint(base + 0x102, 1)
+                + uint(base + 0x103, 10001)
+                + text(base + 0x104, "synthetic-capacity-surface")
+                + uint(base + 0x105, 6),
+            )
+            + block(base + 0x200, faces),
+        ),
+    )
+    mesh_offset = 4 + 8 + struct.unpack_from("<I", payload, 8)[0]
+    mesh_tag, mesh_size = struct.unpack_from("<II", payload, mesh_offset)
+    mesh_end = mesh_offset + 8 + mesh_size
+    content = (
+        payload[:mesh_offset]
+        + block(mesh_tag, payload[mesh_offset + 8 : mesh_end] + surface)
+        + payload[mesh_end:]
+    )
+    reader.data_store = LocalResultDataStore()
+    reader.data_store.register_source(
+        attempt,
+        bundle,
+        ResolvedFileContent(
+            FileEntry(
+                "output/results.xplt", hashlib.sha256(content).hexdigest(), len(content), "result"
+            ),
+            content,
+        ),
+        mesh=mesh,
+        state_times=original.state_times,
+        part_bodies=dict(original.part_bodies),
+        entity_ids=dict(original.entity_ids),
+    )
+    assert reader.read(attempt, bundle).read_result.status is ReadStatus.VALIDATED
+    # Exercise the finite ceiling without allocating 900,000 records.
+    assert _MAX_BLOCKS == 900000
+    parser = _NativeParser(reader.data_store.source_for(attempt, bundle), reader.profile)
+    parser.block_count = _MAX_BLOCKS - 1
+    assert len(parser.blocks(block(1, b""))) == 1
+    with pytest.raises(_ParseError, match="block count"):
+        parser.blocks(block(1, b""))
+
+
+def test_xplt_capacity_registered_file_admission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from febio_cae.adapters.febio import xplt_reader
+
+    reader, attempt, bundle, mesh, _ = setup_reader(tmp_path)
+    original = reader.data_store.source_for(attempt, bundle)
+    store = LocalResultDataStore()
+
+    def register(content: bytes) -> None:
+        store.register_source(
+            attempt,
+            bundle,
+            ResolvedFileContent(
+                FileEntry(
+                    "output/results.xplt",
+                    hashlib.sha256(content).hexdigest(),
+                    len(content),
+                    "result",
+                ),
+                content,
+            ),
+            mesh=mesh,
+            state_times=original.state_times,
+            part_bodies=dict(original.part_bodies),
+            entity_ids=dict(original.entity_ids),
+        )
+
+    # Opaque synthetic bytes prove registration capacity, not XPLT parsing.
+    content = b"x" * (32 * 1024 * 1024 + 1)
+    register(content)
+    assert store.source_for(attempt, bundle).raw.content == content
+    assert xplt_reader._MAX_FILE == 128 * 1024 * 1024
+    store = LocalResultDataStore()
+    monkeypatch.setattr(xplt_reader, "_MAX_FILE", 16)
+    with pytest.raises(PortError, match="size"):
+        register(b"x" * 17)
+    assert not store._sources and not store._data
 
 
 def test_registered_native_layout_maps_nodes_elements_and_rigid_body_then_persists(

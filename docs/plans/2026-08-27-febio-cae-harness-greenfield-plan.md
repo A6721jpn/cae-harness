@@ -600,7 +600,11 @@ closes silent omission, not the missing verification capabilities or P3/REQ-11/F
 
 On the existing issued-owned, drained VALIDATING path, seal the optional fixed
 output/solver.log alongside required output/results.xplt using existing FileEntry,
-closed sealed_files and exact manifest membership. XPLT remains bounded at 32 MiB;
+closed sealed_files and exact manifest membership. XPLT reader admission and owned
+result sealing are bounded at 128 MiB, with 900,000 cumulative parsed blocks and
+an unchanged 16 MiB per-block limit (including nested containers). These finite
+prospective capacities are not native qualification; actual inventory and container
+bytes require separate validation. The independent input/case.feb cap stays 32 MiB;
 the opaque log has an independent 8 MiB resource cap and is never truncated.
 Only genuine final-file absence under the verified owned parent is optional.
 Present empty logs are retained; present invalid, oversized, unreadable or modified
