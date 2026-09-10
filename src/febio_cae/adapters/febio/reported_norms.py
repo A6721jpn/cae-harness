@@ -75,6 +75,16 @@ class ReportedNormInputPolicy:
     motion_start: Quantity
     motion_end: Quantity
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.solver_policy, SolverPolicy):
+            raise TypeError("solver_policy must be a SolverPolicy")
+        for endpoint in (self.motion_start, self.motion_end):
+            if (
+                not isinstance(endpoint, Quantity)
+                or endpoint.dimension != Quantity(0, "s").dimension
+            ):
+                raise TypeError("motion endpoints must be time quantities")
+
 
 @dataclass(frozen=True, slots=True)
 class ReportedNormInvocation:
@@ -84,17 +94,16 @@ class ReportedNormInvocation:
     argv: tuple[str, ...]
     process: ProcessIdentity | None
 
-
-def assess_reported_norm_observations(
-    source: ResolvedFileContent | None,
-    log: ResolvedFileContent | None,
-    *,
-    policy: ReportedNormInputPolicy,
-    profile: CompatibilityProfile,
-    invocation: ReportedNormInvocation,
-) -> ReportedNorms:
-    """Unimplemented TDD seam for the complete geometry-independent consumer."""
-    raise NotImplementedError("complete reported-norm observation core")
+    def __post_init__(self) -> None:
+        if not isinstance(self.tool, ToolIdentity) or (
+            self.process is not None and not isinstance(self.process, ProcessIdentity)
+        ):
+            raise TypeError("invocation requires typed tool/process identities")
+        if isinstance(self.argv, (str, bytes)) or not all(
+            isinstance(arg, str) for arg in self.argv
+        ):
+            raise TypeError("argv must contain argument strings")
+        object.__setattr__(self, "argv", tuple(self.argv))
 
 
 def _number(value: str) -> float:
@@ -107,11 +116,11 @@ def _number(value: str) -> float:
 def _admission(
     content: bytes,
     text: str,
-    revision: CaseRevision,
+    policy: ReportedNormInputPolicy,
     profile: CompatibilityProfile,
-    bundle: ExecutionBundle,
+    invocation: ReportedNormInvocation,
 ) -> dict[str, float]:
-    if profile.solver.version != "4.12.0" or bundle.tool != profile.solver:
+    if profile.solver.version != "4.12.0" or invocation.tool != profile.solver:
         raise ValueError("unsupported solver identity/version")
     if b"<!" in content:
         raise ValueError("unsupported input declarations")
@@ -144,16 +153,15 @@ def _admission(
         raise ValueError("unsupported analysis/adaptive input")
     step = value(control, "step_size")
     count = value(control, "time_steps")
-    spec = revision.spec
-    increments = spec.solver_policy.increments
+    increments = policy.solver_policy.increments
     if (
         (step, count) != (0.1, 10)
         or increments.adaptive
         or increments.initial_step.to_si().value != step
         or increments.max_steps < count
         or increments.max_step_retries != 0
-        or spec.motion.samples[0].time.to_si().value != 0
-        or spec.motion.samples[-1].time.to_si().value != 1
+        or policy.motion_start.to_si().value != 0
+        or policy.motion_end.to_si().value != 1
     ):
         raise ValueError("unsupported or inconsistent fixed increment coverage")
     solver = element(control, "solver")
@@ -163,7 +171,7 @@ def _admission(
     qn = element(solver, "qn_method")
     if qn.get("type") != "BFGS" or solver.find("max_ups") is not None:
         raise ValueError("unsupported quasi-Newton controls")
-    values = {c.name: c.value for c in spec.solver_policy.controls}
+    values = {c.name: c.value for c in policy.solver_policy.controls}
     configured: dict[str, float] = {}
     for name in _CONTROLS:
         selected = values.get(name)
@@ -553,30 +561,15 @@ def _scan(
     return blocks, accepted, list(dict.fromkeys(reasons)), trusted
 
 
-def assess_reported_norms(
-    manifest: ResultManifest,
-    revision: CaseRevision,
-    mesh: MeshArtifact,
+def assess_reported_norm_observations(
+    source: ResolvedFileContent | None,
+    log: ResolvedFileContent | None,
+    *,
+    policy: ReportedNormInputPolicy,
     profile: CompatibilityProfile,
-    context: tuple[
-        AttemptRecord, ExecutionBundle, ResolvedFileContent | None, ResolvedFileContent | None
-    ],
+    invocation: ReportedNormInvocation,
 ) -> ReportedNorms:
-    attempt, bundle, source, log = context
-    if (
-        attempt.attempt_id,
-        bundle.bundle_digest,
-        bundle.spec_digest,
-        bundle.mesh_digest,
-        bundle.profile_id,
-    ) != (
-        manifest.attempt_id,
-        manifest.bundle_digest,
-        revision.spec_digest,
-        mesh.artifact_digest,
-        profile.profile_id,
-    ):
-        raise PortError(PortErrorCategory.INTEGRITY, "reported context identity differs")
+    """Observe resolved bytes and recorded identities; never attest OS ownership."""
     report: dict[str, Any] = {
         "schema_version": "1",
         "claim_id": _POLICY["id"],
@@ -589,24 +582,18 @@ def assess_reported_norms(
         "blocks": [],
         "accepted_steps": [],
         "bindings": {
-            "case_id": revision.case_id,
-            "revision_id": revision.revision_id,
-            "spec_digest": revision.spec_digest,
-            "mesh_digest": mesh.artifact_digest,
             "profile_id": profile.profile_id,
             "profile_digest": hashlib.sha256(profile.to_bytes()).hexdigest(),
             "solver": profile.solver.to_dict(),
-            "solver_policy_digest": hashlib.sha256(
-                revision.spec.solver_policy.to_bytes()
-            ).hexdigest(),
-            "solver_profile": revision.spec.solver_policy.profile.to_dict(),
-            "run_id": attempt.run_id,
-            "attempt_id": attempt.attempt_id,
-            "owner_generation": attempt.owner_generation,
-            "process": None if attempt.process is None else attempt.process.to_dict(),
-            "bundle_digest": bundle.bundle_digest,
-            "manifest_id": manifest.manifest_id,
-            "manifest_digest": hashlib.sha256(manifest.to_bytes()).hexdigest(),
+            "solver_policy_digest": hashlib.sha256(policy.solver_policy.to_bytes()).hexdigest(),
+            "solver_profile": policy.solver_policy.profile.to_dict(),
+            "motion_start": {"value": policy.motion_start.value, "unit": policy.motion_start.unit},
+            "motion_end": {"value": policy.motion_end.value, "unit": policy.motion_end.unit},
+            "invocation": {
+                "tool": invocation.tool.to_dict(),
+                "argv": list(invocation.argv),
+                "process": None if invocation.process is None else invocation.process.to_dict(),
+            },
             "input": None if source is None else source.entry.to_dict(),
             "log": None if log is None else log.entry.to_dict(),
         },
@@ -619,12 +606,12 @@ def assess_reported_norms(
         if source is None or log is None:
             raise ValueError("required registered input or solver log is absent")
         if (
-            attempt.process is None
-            or attempt.process.executable_digest != profile.solver.executable_digest
-            or tuple(attempt.process.argv) != tuple(bundle.argv)
+            invocation.process is None
+            or invocation.process.executable_digest != profile.solver.executable_digest
+            or tuple(invocation.process.argv) != tuple(invocation.argv)
         ):
             raise ValueError("owned supported solver process evidence is absent/inconsistent")
-        if tuple(bundle.argv[1:]) != (
+        if tuple(invocation.argv[1:]) != (
             "-i",
             "input/case.feb",
             "-o",
@@ -637,7 +624,7 @@ def assess_reported_norms(
             raise ValueError("unsupported bound compiler invocation")
         if len(log.content) > 8 * 1024 * 1024 or not text.isascii():
             raise ValueError("unsupported log size/encoding")
-        controls = _admission(source.content, text, revision, profile, bundle)
+        controls = _admission(source.content, text, policy, profile, invocation)
         admitted = True
     except (ValueError, ET.ParseError, InvalidOperation) as error:
         reasons.append(str(error))
@@ -668,5 +655,65 @@ def assess_reported_norms(
             reasons.append("a final row is zero/equal/nonfinite or has unsupported tokens")
         elif not reasons and len(accepted) == 10:
             report["final_status"] = "PASS"
+    report["report_digest"] = hashlib.sha256(canonical_bytes(report)).hexdigest()
+    return ReportedNorms(canonical_bytes(report))
+
+
+def assess_reported_norms(
+    manifest: ResultManifest,
+    revision: CaseRevision,
+    mesh: MeshArtifact,
+    profile: CompatibilityProfile,
+    context: tuple[
+        AttemptRecord, ExecutionBundle, ResolvedFileContent | None, ResolvedFileContent | None
+    ],
+) -> ReportedNorms:
+    attempt, bundle, source, log = context
+    if (
+        attempt.attempt_id,
+        bundle.bundle_digest,
+        bundle.spec_digest,
+        bundle.mesh_digest,
+        bundle.profile_id,
+    ) != (
+        manifest.attempt_id,
+        manifest.bundle_digest,
+        revision.spec_digest,
+        mesh.artifact_digest,
+        profile.profile_id,
+    ):
+        raise PortError(PortErrorCategory.INTEGRITY, "reported context identity differs")
+    report = assess_reported_norm_observations(
+        source,
+        log,
+        policy=ReportedNormInputPolicy(
+            revision.spec.solver_policy,
+            revision.spec.motion.samples[0].time,
+            revision.spec.motion.samples[-1].time,
+        ),
+        profile=profile,
+        invocation=ReportedNormInvocation(bundle.tool, tuple(bundle.argv), attempt.process),
+    ).to_dict()
+    report["bindings"] = {
+        "case_id": revision.case_id,
+        "revision_id": revision.revision_id,
+        "spec_digest": revision.spec_digest,
+        "mesh_digest": mesh.artifact_digest,
+        "profile_id": profile.profile_id,
+        "profile_digest": hashlib.sha256(profile.to_bytes()).hexdigest(),
+        "solver": profile.solver.to_dict(),
+        "solver_policy_digest": hashlib.sha256(revision.spec.solver_policy.to_bytes()).hexdigest(),
+        "solver_profile": revision.spec.solver_policy.profile.to_dict(),
+        "run_id": attempt.run_id,
+        "attempt_id": attempt.attempt_id,
+        "owner_generation": attempt.owner_generation,
+        "process": None if attempt.process is None else attempt.process.to_dict(),
+        "bundle_digest": bundle.bundle_digest,
+        "manifest_id": manifest.manifest_id,
+        "manifest_digest": hashlib.sha256(manifest.to_bytes()).hexdigest(),
+        "input": None if source is None else source.entry.to_dict(),
+        "log": None if log is None else log.entry.to_dict(),
+    }
+    del report["report_digest"]
     report["report_digest"] = hashlib.sha256(canonical_bytes(report)).hexdigest()
     return ReportedNorms(canonical_bytes(report))
