@@ -367,6 +367,17 @@ def _demo_log_result(service: Any, storage: Any, revision: Any, tmp_path: Path, 
     original_seal = storage._seal_native_output
     original_read = storage._read_candidate
     context: dict[str, Any] = {}
+    numeric: dict[str, Any] = {}
+    original_register = storage.register_numeric_data
+
+    def register(data: Any) -> Any:
+        numeric[data.reference.data_id] = data
+        return original_register(data)
+
+    def resolve(reference: Any) -> Any:
+        data = numeric[reference.data_id]
+        assert data.reference == reference
+        return data
 
     def seal(owner: Any) -> Any:
         attempt = storage._attempt(owner)
@@ -394,6 +405,7 @@ def _demo_log_result(service: Any, storage: Any, revision: Any, tmp_path: Path, 
         patch.setattr(storage, "_read_candidate", read)
         return _result(service, storage, revision, "preview", (0, 0.5, 1), 1)
 
+    patch.setattr(storage, "register_numeric_data", register)
     patch.setattr(storage, "_seal_native_output", seal)
     patch.setattr(service, "_execute_ports", execute)
     patch.setattr(_demo, "XpltReaderAdapter", Reader)
@@ -402,7 +414,7 @@ def _demo_log_result(service: Any, storage: Any, revision: Any, tmp_path: Path, 
         "LocalResultDataStore",
         lambda: SimpleNamespace(
             register_source=lambda *args, **kwargs: None,
-            resolve=storage.resolve,
+            resolve=resolve,
         ),
     )
     response = _demo.run_demo(
@@ -414,7 +426,7 @@ def _demo_log_result(service: Any, storage: Any, revision: Any, tmp_path: Path, 
     )
     assert response["quality_status"] == "UNVERIFIED"
     assert response["task_status"] == "NEEDS_QUALITY"
-    return storage.get_manifest(response["manifest"]["manifest_id"])
+    return storage.get_manifest(cast(dict[str, Any], response["manifest"])["manifest_id"])
 
 
 def test_solver_log_binding_demo_and_confirmed_preview(tmp_path: Path) -> None:

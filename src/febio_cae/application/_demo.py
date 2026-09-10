@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -210,7 +211,7 @@ def run_demo(
             if observation.data_ref is None:
                 raise ValueError("reader produced no numeric reference")
             registered.register_numeric_data(data.resolve(observation.data_ref))
-        return manifest
+        return replace(manifest, files=files)
 
     if preflight:
         with storage.evidence_snapshot(), storage.revision_snapshot(case_id, revision_id):

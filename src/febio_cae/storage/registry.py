@@ -1646,7 +1646,7 @@ class CaseStorage:
 
     @_serialized
     def _seal_native_output(self, owner: TrustedOwnerContext) -> tuple[FileEntry, ...]:
-        """Freeze the fixed XPLT file only after controller-recorded owned drain."""
+        """Freeze required XPLT and optional log after controller-recorded owned drain."""
         attempt = self._attempt(owner)
         self.validate(owner, attempt)
         native = self._native_context(attempt)
@@ -1660,24 +1660,64 @@ class CaseStorage:
             raise PortError(
                 PortErrorCategory.CONFLICT, "native output requires unsealed owned drain"
             )
-        relative = (
-            (Path(native["process_root"]) / "output/results.xplt").relative_to(self.root).as_posix()
-        )
-        with pinned_read(_owned_path(self.root, relative)) as stream:
-            if os.fstat(stream.fileno()).st_size > 32 * 1024 * 1024:
-                raise PortError(PortErrorCategory.INTEGRITY, "native XPLT exceeds reader limit")
-            content = stream.read()
-        entry = FileEntry(
-            "output/results.xplt", hashlib.sha256(content).hexdigest(), len(content), "result"
-        )
+        payloads: list[tuple[FileEntry, bytes]] = []
+        try:
+            with ExitStack() as pins:
+                for logical_path, limit, role in (
+                    ("output/results.xplt", 32 * 1024 * 1024, "result"),
+                    ("output/solver.log", 8 * 1024 * 1024, "solver_log"),
+                ):
+                    relative = (
+                        (Path(native["process_root"]) / logical_path)
+                        .relative_to(self.root)
+                        .as_posix()
+                    )
+                    path = _owned_path(self.root, relative)
+                    pins.enter_context(pin_directories(path.parent))
+                    try:
+                        path.lstat()
+                    except FileNotFoundError:
+                        if role == "solver_log":
+                            continue
+                        raise
+                    stream = pins.enter_context(pinned_read(path))
+                    before = os.fstat(stream.fileno())
+                    if not stat.S_ISREG(before.st_mode) or before.st_size > limit:
+                        raise PortError(PortErrorCategory.INTEGRITY, f"invalid or oversized {role}")
+                    content = stream.read(limit + 1)
+                    after = os.fstat(stream.fileno())
+                    if (
+                        len(content) > limit
+                        or len(content) != before.st_size
+                        or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+                        != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+                    ):
+                        raise PortError(
+                            PortErrorCategory.INTEGRITY, f"{role} changed during capture"
+                        )
+                    payloads.append(
+                        (
+                            FileEntry(
+                                logical_path,
+                                hashlib.sha256(content).hexdigest(),
+                                len(content),
+                                role,
+                            ),
+                            content,
+                        )
+                    )
+        except (OSError, StorageIntegrityError) as error:
+            raise PortError(PortErrorCategory.INTEGRITY, str(error)) from error
         base = f"cases/{attempt.case_id}/runs/{attempt.run_id}/attempts/{attempt.attempt_id}"
-        _write_atomic(self.root, f"{base}/{entry.logical_path}", content)
+        for entry, content in payloads:
+            _write_atomic(self.root, f"{base}/{entry.logical_path}", content)
+        entries = tuple(entry for entry, _ in payloads)
         with _connect(self.registry_path) as connection:
             connection.execute(
                 "UPDATE execution_lineage SET sealed_files=?,writer_closed=1 WHERE attempt_id=?",
-                (canonical_bytes([entry.to_dict()]), attempt.attempt_id),
+                (canonical_bytes([entry.to_dict() for entry in entries]), attempt.attempt_id),
             )
-        return (entry,)
+        return entries
 
     @_serialized
     def _transition_attempt(self, owner: TrustedOwnerContext, target: RunState) -> AttemptRecord:
