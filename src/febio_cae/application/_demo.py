@@ -250,7 +250,9 @@ def run_demo(
         media_type="application/json",
         content=encode_record(quality),
     )
-    quality_status, coverage = required_quality_summary(manifest, revision, mesh, profile, quality)
+    quality_status, coverage = required_quality_summary(
+        manifest, revision, mesh, profile, quality, storage
+    )
     force = storage.resolve_manifest_output(manifest.manifest_id, "contact_force")
     final_force = force.values[-1]
     connected = all(math.isfinite(v) for v in final_force) and any(v != 0 for v in final_force)

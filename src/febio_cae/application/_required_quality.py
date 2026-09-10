@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 
+from febio_cae.adapters.febio.reported_norms import assess_reported_norms
 from febio_cae.domain import (
     AssessmentStatus,
     CaseRevision,
@@ -13,6 +14,7 @@ from febio_cae.domain import (
     QualityAssessment,
     ResultManifest,
 )
+from febio_cae.storage import CaseStorage
 
 # This is the formal inventory, not a mapping from caller-selected criterion names.
 _NUMERICAL = (
@@ -55,6 +57,7 @@ def required_quality_summary(
     mesh: MeshArtifact,
     profile: CompatibilityProfile,
     quality: QualityAssessment,
+    storage: CaseStorage,
 ) -> tuple[str, dict[str, object]]:
     """Preserve arithmetic evidence while refusing unsupported mandatory completion.
 
@@ -92,5 +95,13 @@ def required_quality_summary(
         # Physical corroboration is deliberately outside numerical aggregation.
         "physical_applicability": physical.to_dict(),
     }
-    status = "FAIL" if quality.overall_status is AssessmentStatus.FAIL else "UNVERIFIED"
+    report = assess_reported_norms(
+        manifest, revision, mesh, profile, storage.resolve_reported_norms_context(manifest)
+    ).to_dict()
+    coverage["reported_solver_norms"] = report
+    status = (
+        "FAIL"
+        if quality.overall_status is AssessmentStatus.FAIL or report["final_status"] == "FAIL"
+        else "UNVERIFIED"
+    )
     return status, coverage

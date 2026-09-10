@@ -48,8 +48,12 @@ _CONTACT_CONTROLS: Final[frozenset[str]] = frozenset(
         "two_pass",
     }
 )
+_OPTIONAL_CONTACT_CONTROLS = frozenset({"minaug", "maxaug"})
+_QN_CONTROLS = frozenset({"max_ups"})
+
 _SOLVER_CONTROLS: Final[frozenset[str]] = frozenset(
     {
+        "reform_augment",
         "alpha",
         "dtol",
         "etol",
@@ -62,6 +66,7 @@ _SOLVER_CONTROLS: Final[frozenset[str]] = frozenset(
 )
 _BOOLEAN_CONTROLS: Final[frozenset[str]] = frozenset(
     {
+        "reform_augment",
         "auto_penalty",
         "update_penalty",
         "two_pass",
@@ -381,7 +386,9 @@ class CompilerAdapter:
     def _validate_controls(self, revision: CaseRevision) -> None:
         controls = {item.name: item.value for item in revision.spec.solver_policy.controls}
         missing = _CONTACT_CONTROLS - controls.keys()
-        unknown = controls.keys() - (_CONTACT_CONTROLS | _SOLVER_CONTROLS)
+        unknown = controls.keys() - (
+            _CONTACT_CONTROLS | _OPTIONAL_CONTACT_CONTROLS | _SOLVER_CONTROLS | _QN_CONTROLS
+        )
         if missing or unknown:
             self._unsupported(
                 f"explicit supported contact/solver controls required; missing={sorted(missing)}, unknown={sorted(unknown)}"
@@ -390,11 +397,12 @@ class CompilerAdapter:
             if name in _BOOLEAN_CONTROLS:
                 if not isinstance(value, bool):
                     self._unsupported(f"{name} requires an explicit boolean")
-            elif name in {"laugon", "max_refs"}:
+            elif name in {"laugon", "max_refs", "minaug", "maxaug", "max_ups"}:
                 if (
                     type(value) is not int
                     or value < 0
                     or (name == "laugon" and value not in {0, 1})
+                    or (name in {"maxaug", "max_ups"} and value == 0)
                 ):
                     self._unsupported(f"{name} requires a supported integer")
             else:
@@ -413,6 +421,14 @@ class CompilerAdapter:
                     self._unsupported(
                         f"{name} must be nonnegative (penalty/radius strictly positive)"
                     )
+        if (
+            "minaug" in controls
+            and "maxaug" in controls
+            and isinstance(controls["minaug"], int)
+            and isinstance(controls["maxaug"], int)
+            and controls["minaug"] > controls["maxaug"]
+        ):
+            self._unsupported("minaug exceeds maxaug")
         if controls["auto_penalty"] is not True:
             self._unsupported(
                 "this dialect requires explicit auto_penalty=true and a dimensionless penalty factor"
@@ -489,6 +505,11 @@ class CompilerAdapter:
         for setting in spec.solver_policy.controls:
             if setting.name in _SOLVER_CONTROLS:
                 ET.SubElement(solver, setting.name).text = self._control_value(setting.value)
+
+        for setting in spec.solver_policy.controls:
+            if setting.name == "max_ups":
+                qn = ET.SubElement(solver, "qn_method", {"type": "BFGS"})
+                ET.SubElement(qn, "max_ups").text = self._control_value(setting.value)
 
         materials = ET.SubElement(root, "Material")
         if isinstance(spec.material, IsotropicLinearElastic):
@@ -663,7 +684,7 @@ class CompilerAdapter:
             raise PortError(PortErrorCategory.UNSUPPORTED_CAPABILITY, "unsupported friction intent")
         ET.SubElement(contact, "fric_coeff").text = friction_value
         for setting in spec.solver_policy.controls:
-            if setting.name in _CONTACT_CONTROLS:
+            if setting.name in _CONTACT_CONTROLS | _OPTIONAL_CONTACT_CONTROLS:
                 ET.SubElement(contact, setting.name).text = self._control_value(setting.value)
         motion = ET.SubElement(root, "LoadData")
         load = ET.SubElement(motion, "load_controller", {"id": "1", "type": "loadcurve"})

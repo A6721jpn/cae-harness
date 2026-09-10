@@ -48,7 +48,9 @@ def _completion(
         if storage.resolve_source(asset).content != encode_record(quality):
             raise PortError(PortErrorCategory.INTEGRITY, "registered run quality changed")
         quality_registration_status = quality.overall_status.value
-    quality_status, coverage = required_quality_summary(manifest, revision, mesh, profile, quality)
+    quality_status, coverage = required_quality_summary(
+        manifest, revision, mesh, profile, quality, storage
+    )
     details: dict[str, object] = {
         "quality": quality.to_dict(),
         "quality_registration_status": quality_registration_status,

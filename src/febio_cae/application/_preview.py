@@ -44,7 +44,7 @@ def preview_summary(store: RegisteredPreviewStore, preview_id: str) -> dict[str,
         quality_registration_status = quality.overall_status.value
         quality_reason = "registered quality assessment matches the recomputed assessment"
     quality_status, coverage = required_quality_summary(
-        target.manifest, target.revision, target.mesh, target.profile, quality
+        target.manifest, target.revision, target.mesh, target.profile, quality, store.storage
     )
     quality_reason += "; mandatory numerical coverage is unverified; see required_quality"
     force_request = next(

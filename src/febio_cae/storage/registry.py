@@ -2088,6 +2088,45 @@ class CaseStorage:
         return manifest
 
     @_serialized
+    def resolve_reported_norms_context(
+        self, manifest: ResultManifest
+    ) -> tuple[
+        AttemptRecord, ExecutionBundle, ResolvedFileContent | None, ResolvedFileContent | None
+    ]:
+        """Resolve fixed report inputs through registered ownership, never caller paths."""
+        if self.get_manifest(manifest.manifest_id) != manifest:
+            raise PortError(
+                PortErrorCategory.INTEGRITY, "reported manifest differs from registration"
+            )
+        with _connect(self.registry_path) as connection:
+            row = connection.execute(
+                "SELECT payload FROM owners WHERE attempt_id=?", (manifest.attempt_id,)
+            ).fetchone()
+        if row is None:
+            raise PortError(PortErrorCategory.INTEGRITY, "reported attempt is not registered")
+        attempt = decode_record(bytes(row["payload"]), AttemptRecord)
+        bundle, _ = self._lineage(attempt)
+        if attempt.bundle_digest != manifest.bundle_digest:
+            raise PortError(PortErrorCategory.INTEGRITY, "reported bundle differs from manifest")
+        if attempt.process is not None and not self._native_context(attempt)["drained"]:
+            raise PortError(PortErrorCategory.INTEGRITY, "reported native writer is not drained")
+        resolved: list[ResolvedFileContent | None] = []
+        for entries, path, role, cap in (
+            (bundle.files, "input/case.feb", "input", 32 * 1024 * 1024),
+            (manifest.files, "output/solver.log", "solver_log", 8 * 1024 * 1024),
+        ):
+            entry = next((e for e in entries if e.logical_path == path), None)
+            if entry is None:
+                resolved.append(None)
+                continue
+            if entry.role != role or entry.size_bytes > cap:
+                raise PortError(
+                    PortErrorCategory.INTEGRITY, "reported input/log identity or size is invalid"
+                )
+            resolved.append(self.resolve_file(entry, bundle, attempt))
+        return attempt, bundle, resolved[0], resolved[1]
+
+    @_serialized
     def register_numeric_data(self, data: NumericResultData) -> NumericResultData:
         attempt = self._reading_attempt
         if (
