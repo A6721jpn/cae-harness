@@ -34,11 +34,13 @@ def _resolved(path: str, role: str, content: bytes) -> ResolvedFileContent:
     )
 
 
-def _context(*, full_newton: bool = False) -> tuple[
+def _context(
+    *, full_newton: bool = False
+) -> tuple[
     ResolvedFileContent, ReportedNormInputPolicy, CompatibilityProfile, ReportedNormInvocation
 ]:
     max_ups = 0 if full_newton else 10
-    controls = (
+    controls: tuple[SolverControl, ...] = (
         SolverControl("dtol", Quantity(0.001, "1")),
         SolverControl("etol", Quantity(0.01, "1")),
         SolverControl("rtol", Quantity(0.001, "1")),

@@ -439,16 +439,15 @@ class CompilerAdapter:
             self._unsupported("minaug exceeds maxaug")
         has_zero_max_ups = controls.get("max_ups") == 0
         has_symmetric_stiffness = "symmetric_stiffness" in controls
-        if has_zero_max_ups or has_symmetric_stiffness:
-            if (
-                type(controls.get("max_ups")) is not int
-                or controls["max_ups"] != 0
-                or type(controls.get("symmetric_stiffness")) is not int
-                or controls["symmetric_stiffness"] != 0
-            ):
-                self._unsupported(
-                    "nonsymmetric full Newton requires max_ups=0 and symmetric_stiffness=0"
-                )
+        if (has_zero_max_ups or has_symmetric_stiffness) and (
+            type(controls.get("max_ups")) is not int
+            or controls["max_ups"] != 0
+            or type(controls.get("symmetric_stiffness")) is not int
+            or controls["symmetric_stiffness"] != 0
+        ):
+            self._unsupported(
+                "nonsymmetric full Newton requires max_ups=0 and symmetric_stiffness=0"
+            )
         if controls["auto_penalty"] is not True:
             self._unsupported(
                 "this dialect requires explicit auto_penalty=true and a dimensionless penalty factor"
