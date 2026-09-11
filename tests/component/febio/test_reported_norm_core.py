@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import xml.etree.ElementTree as ET
 from dataclasses import replace
 from typing import Any
 
@@ -34,9 +35,10 @@ def _resolved(path: str, role: str, content: bytes) -> ResolvedFileContent:
     )
 
 
-def _context() -> tuple[
+def _context(*, full_newton: bool = False) -> tuple[
     ResolvedFileContent, ReportedNormInputPolicy, CompatibilityProfile, ReportedNormInvocation
 ]:
+    max_ups = 0 if full_newton else 10
     controls = (
         SolverControl("dtol", Quantity(0.001, "1")),
         SolverControl("etol", Quantity(0.01, "1")),
@@ -44,7 +46,7 @@ def _context() -> tuple[
         SolverControl("min_residual", Quantity(0, "1")),
         SolverControl("max_refs", 50),
         SolverControl("reform_augment", True),
-        SolverControl("max_ups", 10),
+        SolverControl("max_ups", max_ups),
         SolverControl("minaug", 0),
         SolverControl("maxaug", 10),
         SolverControl("laugon", 1),
@@ -52,6 +54,8 @@ def _context() -> tuple[
         SolverControl("gaptol", Quantity(1e-8, "m")),
         SolverControl("two_pass", False),
     )
+    if full_newton:
+        controls += (SolverControl("symmetric_stiffness", 0),)
     # This immutable toy record declares the numerical controls; it is not a
     # production registry record or a real FEBio execution receipt.
     record = canonical_bytes({"controls": [c.to_dict() for c in controls]})
@@ -98,11 +102,14 @@ def _context() -> tuple[
             rows.append(f"<{name}>{token}</{name}>")
         return "".join(rows)
 
+    method = "Broyden" if full_newton else "BFGS"
+    symmetry = "<symmetric_stiffness>0</symmetric_stiffness>" if full_newton else ""
     content = (
         '<febio_spec version="4.0"><Module type="solid"/><Control><analysis type="static"/>'
         '<time_steps>10</time_steps><step_size>0.1</step_size><solver type="solid">'
         + xml(("dtol", "etol", "rtol", "min_residual", "max_refs", "reform_augment"))
-        + '<qn_method type="BFGS"><max_ups>10</max_ups></qn_method></solver></Control>'
+        + symmetry
+        + f'<qn_method type="{method}"><max_ups>{max_ups}</max_ups></qn_method></solver></Control>'
         + '<Contact><contact type="sliding-elastic">'
         + xml(("laugon", "tolerance", "gaptol", "minaug", "maxaug", "two_pass"))
         + "</contact></Contact></febio_spec>"
@@ -110,7 +117,7 @@ def _context() -> tuple[
     return _resolved("input/case.feb", "input", content), policy, profile, invocation
 
 
-def _log(prefix: str = "") -> ResolvedFileContent:
+def _log(prefix: str = "", *, full_newton: bool = False) -> ResolvedFileContent:
     echoes = {
         "Module type": "solid",
         "analysis": "STATIC (0)",
@@ -133,7 +140,9 @@ def _log(prefix: str = "") -> ResolvedFileContent:
     lines = [
         "version 4.12.0",
         *(f"{key} .... : {value}" for key, value in echoes.items()),
+        *(["symmetric_stiffness .... : non-symmetric (0)"] if full_newton else []),
         "contact interface 1 - Type: sliding-elastic",
+        *(["symmetric_stiffness .... : yes (1)"] if full_newton else []),
     ]
     for step in range(1, 11):
         time = str(step / 10) if step < 10 else "1"
@@ -214,6 +223,65 @@ def test_manual_observations_complete_without_case_revision() -> None:
         assert log.content[slice(*row["current_span"])] == row["current"].encode("ascii")
     digest = report.pop("report_digest")
     assert digest == hashlib.sha256(canonical_bytes(report)).hexdigest()
+
+
+def test_full_newton_observations_require_exact_pair_and_solver_symmetry_echo() -> None:
+    source, policy, profile, invocation = _context(full_newton=True)
+    root = ET.fromstring(source.content)
+    assert root.findtext("Control/solver/symmetric_stiffness") == "0"
+    qn = root.find("Control/solver/qn_method")
+    assert qn is not None and qn.get("type") == "Broyden"
+    assert root.findtext("Control/solver/qn_method/max_ups") == "0"
+
+    report = assess_reported_norm_observations(
+        source,
+        _log(full_newton=True),
+        policy=policy,
+        profile=profile,
+        invocation=invocation,
+    ).to_dict()
+
+    assert report["admission"] == "SUPPORTED" and report["final_status"] == "PASS"
+    assert report["native_qualification"] == "UNVERIFIED" and not report["reasons"]
+    assert _rows(report) and all(row["status"] == "PASS" for row in _rows(report))
+
+
+@pytest.mark.parametrize(
+    "contradiction", ["solver-echo-wrong", "solver-echo-missing", "input-method"]
+)
+def test_full_newton_observations_reject_wrong_or_missing_solver_pair_evidence(
+    contradiction: str,
+) -> None:
+    source, policy, profile, invocation = _context(full_newton=True)
+    log = _log(full_newton=True)
+    if contradiction == "solver-echo-wrong":
+        log = _resolved(
+            "output/solver.log",
+            "solver_log",
+            log.content.replace(
+                b"symmetric_stiffness .... : non-symmetric (0)",
+                b"symmetric_stiffness .... : yes (1)",
+            ),
+        )
+    elif contradiction == "solver-echo-missing":
+        log = _resolved(
+            "output/solver.log",
+            "solver_log",
+            log.content.replace(b"symmetric_stiffness .... : non-symmetric (0)\r\n", b""),
+        )
+    else:
+        source = _resolved(
+            "input/case.feb",
+            "input",
+            source.content.replace(b'type="Broyden"', b'type="BFGS"'),
+        )
+    report = assess_reported_norm_observations(
+        source, log, policy=policy, profile=profile, invocation=invocation
+    ).to_dict()
+
+    assert report["admission"] == report["final_status"] == "UNVERIFIED"
+    assert report["reasons"] and _rows(report)
+    assert all(row["status"] == "UNVERIFIED" for row in _rows(report))
 
 
 @pytest.mark.parametrize("contradiction", ["policy", "echo", "invocation"])

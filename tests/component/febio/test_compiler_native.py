@@ -555,3 +555,63 @@ def test_reported_solver_norms_optional_controls(tmp_path: Path) -> None:
     )
     with pytest.raises(PortError):
         _compile(tmp_path / "bad", bad, mesh, profile)
+
+
+def test_explicit_nonsymmetric_full_newton_emits_broyden_pair(tmp_path: Path) -> None:
+    revision, mesh, profile = _case()
+    controls = (
+        *revision.spec.solver_policy.controls,
+        SolverControl("max_ups", 0),
+        SolverControl("symmetric_stiffness", 0),
+    )
+    revision = replace(
+        revision,
+        spec=replace(
+            revision.spec, solver_policy=replace(revision.spec.solver_policy, controls=controls)
+        ),
+    )
+
+    _, root, _ = _compile(tmp_path, revision, mesh, profile)
+
+    solver = _required(root, "Control/solver")
+    qn = _required(root, "Control/solver/qn_method")
+    assert qn.attrib == {"type": "Broyden"}
+    assert qn.findtext("max_ups") == "0"
+    assert solver.findtext("symmetric_stiffness") == "0"
+    assert solver.find("max_ups") is None
+
+
+@pytest.mark.parametrize(
+    ("max_ups", "symmetric_stiffness"),
+    [
+        (0, None),
+        (None, 0),
+        (False, 0),
+        (0, False),
+        (0, 1),
+        (1, 0),
+        (1, 1),
+        (None, 1),
+    ],
+)
+def test_full_newton_controls_reject_partial_boolean_and_other_pairs(
+    tmp_path: Path, max_ups: int | bool | None, symmetric_stiffness: int | bool | None
+) -> None:
+    revision, mesh, profile = _case()
+    controls = list(revision.spec.solver_policy.controls)
+    if max_ups is not None:
+        controls.append(SolverControl("max_ups", max_ups))
+    if symmetric_stiffness is not None:
+        controls.append(SolverControl("symmetric_stiffness", symmetric_stiffness))
+    revision = replace(
+        revision,
+        spec=replace(
+            revision.spec,
+            solver_policy=replace(revision.spec.solver_policy, controls=tuple(controls)),
+        ),
+    )
+
+    with pytest.raises(PortError) as caught:
+        _compile(tmp_path, revision, mesh, profile)
+    assert caught.value.category is PortErrorCategory.UNSUPPORTED_CAPABILITY
+    assert not list((tmp_path / "bundles").rglob("*.feb"))
