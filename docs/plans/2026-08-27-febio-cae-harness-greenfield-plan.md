@@ -651,7 +651,15 @@ remain separate; status exit0 continues to mean successful status retrieval.
 
 Allow only optional contact minaug (integer>=0)/maxaug (integer>0, minaug<=maxaug),
 optional boolean solver reform_augment, and optional positive integer max_ups under
-fixed solver/qn_method type=BFGS. Preserve omission; add no defaults or profile flags.
+solver/qn_method type=BFGS. Additionally admit only the explicit integer pair
+max_ups=0 and symmetric_stiffness=0 as nonsymmetric full Newton, emitted as
+solver/qn_method type=Broyden with nested max_ups=0 and solver/symmetric_stiffness=0.
+Reject a lone zero-valued member, booleans, and other symmetry/method combinations.
+Preserve omitted and positive-max_ups BFGS behavior; add no defaults or profile flags.
+Printed-norm admission must match this exact input/frozen-policy pair and the
+observed solver nonsymmetric echo, distinguishing it from the contact symmetry echo.
+The observed synthetic FEBio4.12 solver convergence motivates this numerical path;
+it does not establish output sign compatibility, profile or mandatory residual PASS.
 No new persisted schema, process/runner behavior or log publication path. Fresh
 bounded actual producer qualification and a formal completeness decision remain
 required before mandatory residual PASS; synthetic software checks are not native
