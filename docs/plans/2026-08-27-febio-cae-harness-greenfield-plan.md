@@ -637,6 +637,13 @@ inconsistent association remains UNVERIFIED. Observed max_ups reformation is not
 retry. Each nonlinear row retains INITIAL/CURRENT/REQUIRED; augmentation retains
 CURRENT/REQUIRED. Never freeze a changing required value from an earlier row.
 
+The observed `CONTACT INTERFACE DATA` section heading is not an interface
+declaration. Permit that exact optional heading once in the preamble, before the
+sole supported interface declaration and before any increment. Duplicate, late,
+misplaced or unknown interface records remain UNVERIFIED. Add a failing regression
+for this native-observed grammar and its phase boundaries before implementation;
+retain line/byte spans, admission, final-cycle and failure precedence unchanged.
+
 Compare exact finite nonnegative printed CURRENT against positive printed REQUIRED:
 strictly below is reported-row PASS, strictly above FAIL, equality/zero/nonfinite,
 disabled/shortcut/unsupported evidence UNVERIFIED. No epsilon, inferred norm units,
