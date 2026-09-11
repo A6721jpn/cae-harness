@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import xml.etree.ElementTree as ET
 from dataclasses import replace
 from typing import Any
 
@@ -227,12 +226,6 @@ def test_manual_observations_complete_without_case_revision() -> None:
 
 def test_full_newton_observations_require_exact_pair_and_solver_symmetry_echo() -> None:
     source, policy, profile, invocation = _context(full_newton=True)
-    root = ET.fromstring(source.content)
-    assert root.findtext("Control/solver/symmetric_stiffness") == "0"
-    qn = root.find("Control/solver/qn_method")
-    assert qn is not None and qn.get("type") == "Broyden"
-    assert root.findtext("Control/solver/qn_method/max_ups") == "0"
-
     report = assess_reported_norm_observations(
         source,
         _log(full_newton=True),

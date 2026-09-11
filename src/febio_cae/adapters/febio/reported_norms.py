@@ -169,9 +169,25 @@ def _admission(
     if solver.get("type") != "solid" or contact.get("type") != "sliding-elastic":
         raise ValueError("unsupported solver/interface")
     qn = element(solver, "qn_method")
-    if qn.get("type") != "BFGS" or solver.find("max_ups") is not None:
+    if solver.find("max_ups") is not None:
         raise ValueError("unsupported quasi-Newton controls")
     values = {c.name: c.value for c in policy.solver_policy.controls}
+    symmetric_nodes = solver.findall("symmetric_stiffness")
+    symmetric_value = values.get("symmetric_stiffness")
+    method = qn.get("type")
+    if symmetric_value is None:
+        if method != "BFGS" or symmetric_nodes:
+            raise ValueError("unsupported quasi-Newton controls")
+    elif (
+        type(symmetric_value) is not int
+        or symmetric_value != 0
+        or method != "Broyden"
+        or len(symmetric_nodes) != 1
+        or _number((symmetric_nodes[0].text or "").strip()) != 0
+    ):
+        raise ValueError("unsupported nonsymmetric full Newton controls")
+    if symmetric_value is not None and values.get("max_ups") != 0:
+        raise ValueError("nonsymmetric full Newton requires max_ups=0")
     configured: dict[str, float] = {}
     for name in _CONTROLS:
         selected = values.get(name)
@@ -204,12 +220,13 @@ def _admission(
                 "etol",
                 "rtol",
                 "max_refs",
-                "max_ups",
                 "tolerance",
                 "gaptol",
                 "maxaug",
             )
         )
+        or configured["max_ups"] < 0
+        or (symmetric_value is None and configured["max_ups"] == 0)
         or configured["min_residual"] != 0
         or configured["minaug"] < 0
         or configured["minaug"] > configured["maxaug"]
@@ -228,6 +245,24 @@ def _admission(
         match = re.fullmatch(r"\s*(.*?)\s+\.{2,}\s*:\s*(.*?)\s*", line)
         if match:
             echoes.setdefault(match[1], []).append(match[2])
+    interface = re.search(r"(?m)^contact interface [^\r\n]*", preamble)
+    if interface is None:
+        raise ValueError("missing echoed contact interface")
+    solver_echoes: dict[str, list[str]] = {}
+    contact_echoes: dict[str, list[str]] = {}
+    for line in preamble[: interface.start()].splitlines():
+        match = re.fullmatch(r"\s*(.*?)\s+\.{2,}\s*:\s*(.*?)\s*", line)
+        if match:
+            solver_echoes.setdefault(match[1], []).append(match[2])
+    for line in preamble[interface.end() :].splitlines():
+        match = re.fullmatch(r"\s*(.*?)\s+\.{2,}\s*:\s*(.*?)\s*", line)
+        if match:
+            contact_echoes.setdefault(match[1], []).append(match[2])
+    if symmetric_value is not None and (
+        solver_echoes.get("symmetric_stiffness") != ["non-symmetric (0)"]
+        or contact_echoes.get("symmetric_stiffness") != ["yes (1)"]
+    ):
+        raise ValueError("missing/mismatched solver or contact symmetry echo")
     literals = {
         "Module type": "solid",
         "analysis": "STATIC (0)",

@@ -62,6 +62,7 @@ _SOLVER_CONTROLS: Final[frozenset[str]] = frozenset(
         "diverge_reform",
         "reform_each_time_step",
         "min_residual",
+        "symmetric_stiffness",
     }
 )
 _BOOLEAN_CONTROLS: Final[frozenset[str]] = frozenset(
@@ -397,12 +398,19 @@ class CompilerAdapter:
             if name in _BOOLEAN_CONTROLS:
                 if not isinstance(value, bool):
                     self._unsupported(f"{name} requires an explicit boolean")
-            elif name in {"laugon", "max_refs", "minaug", "maxaug", "max_ups"}:
+            elif name in {
+                "laugon",
+                "max_refs",
+                "minaug",
+                "maxaug",
+                "max_ups",
+                "symmetric_stiffness",
+            }:
                 if (
                     type(value) is not int
                     or value < 0
                     or (name == "laugon" and value not in {0, 1})
-                    or (name in {"maxaug", "max_ups"} and value == 0)
+                    or (name == "maxaug" and value == 0)
                 ):
                     self._unsupported(f"{name} requires a supported integer")
             else:
@@ -429,6 +437,18 @@ class CompilerAdapter:
             and controls["minaug"] > controls["maxaug"]
         ):
             self._unsupported("minaug exceeds maxaug")
+        has_zero_max_ups = controls.get("max_ups") == 0
+        has_symmetric_stiffness = "symmetric_stiffness" in controls
+        if has_zero_max_ups or has_symmetric_stiffness:
+            if (
+                type(controls.get("max_ups")) is not int
+                or controls["max_ups"] != 0
+                or type(controls.get("symmetric_stiffness")) is not int
+                or controls["symmetric_stiffness"] != 0
+            ):
+                self._unsupported(
+                    "nonsymmetric full Newton requires max_ups=0 and symmetric_stiffness=0"
+                )
         if controls["auto_penalty"] is not True:
             self._unsupported(
                 "this dialect requires explicit auto_penalty=true and a dimensionless penalty factor"
@@ -508,7 +528,8 @@ class CompilerAdapter:
 
         for setting in spec.solver_policy.controls:
             if setting.name == "max_ups":
-                qn = ET.SubElement(solver, "qn_method", {"type": "BFGS"})
+                qn_type = "Broyden" if setting.value == 0 else "BFGS"
+                qn = ET.SubElement(solver, "qn_method", {"type": qn_type})
                 ET.SubElement(qn, "max_ups").text = self._control_value(setting.value)
 
         materials = ET.SubElement(root, "Material")
