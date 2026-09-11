@@ -279,6 +279,66 @@ def test_full_newton_observations_reject_wrong_or_missing_solver_pair_evidence(
     assert all(row["status"] == "UNVERIFIED" for row in _rows(report))
 
 
+def test_native_contact_heading_is_admitted_without_hiding_final_failure() -> None:
+    source, policy, profile, invocation = _context()
+    heading = b"CONTACT INTERFACE DATA\r\n"
+    declaration = b"contact interface 1 - Type: sliding-elastic\r\n"
+
+    valid_log = _resolved(
+        "output/solver.log",
+        "solver_log",
+        _log().content.replace(declaration, heading + declaration, 1),
+    )
+    valid = assess_reported_norm_observations(
+        source, valid_log, policy=policy, profile=profile, invocation=invocation
+    ).to_dict()
+    assert valid["admission"] == "SUPPORTED" and valid["final_status"] == "PASS"
+    assert _rows(valid) and all(row["status"] == "PASS" for row in _rows(valid))
+
+    failing_log = _resolved(
+        "output/solver.log",
+        "solver_log",
+        _log("nonlinear").content.replace(declaration, heading + declaration, 1),
+    )
+    failing = assess_reported_norm_observations(
+        source, failing_log, policy=policy, profile=profile, invocation=invocation
+    ).to_dict()
+    assert failing["admission"] == "SUPPORTED" and failing["final_status"] == "FAIL"
+    assert any(row["status"] == "FAIL" for row in _rows(failing))
+
+
+@pytest.mark.parametrize(
+    "boundary", ["duplicate", "after-declaration", "inside-increment", "after-increment", "unknown"]
+)
+def test_native_contact_heading_is_unverified_outside_preamble(boundary: str) -> None:
+    source, policy, profile, invocation = _context()
+    content = _log().content
+    heading = b"CONTACT INTERFACE DATA\r\n"
+    declaration = b"contact interface 1 - Type: sliding-elastic\r\n"
+    if boundary == "duplicate":
+        content = content.replace(declaration, heading + heading + declaration, 1)
+    elif boundary == "after-declaration":
+        content = content.replace(declaration, declaration + heading, 1)
+    elif boundary == "inside-increment":
+        marker = b"===== beginning time step 1 : 0.1 =====\r\n"
+        content = content.replace(marker, marker + heading, 1)
+    elif boundary == "after-increment":
+        marker = b"------- converged at time : 0.1\r\n"
+        content = content.replace(marker, marker + heading, 1)
+    else:
+        content = content.replace(
+            declaration, b"CONTACT INTERFACE DATA EXTRA\r\n" + declaration, 1
+        )
+    log = _resolved("output/solver.log", "solver_log", content)
+
+    report = assess_reported_norm_observations(
+        source, log, policy=policy, profile=profile, invocation=invocation
+    ).to_dict()
+    assert report["admission"] == "SUPPORTED" and report["final_status"] == "UNVERIFIED"
+    assert report["reasons"] and _rows(report)
+    assert all(row["status"] == "UNVERIFIED" for row in _rows(report))
+
+
 @pytest.mark.parametrize("contradiction", ["policy", "echo", "invocation"])
 def test_manual_observations_admission_contradiction(contradiction: str) -> None:
     source, policy, profile, invocation = _context()
