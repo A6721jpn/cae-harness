@@ -326,9 +326,7 @@ def test_native_contact_heading_is_unverified_outside_preamble(boundary: str) ->
         marker = b"------- converged at time : 0.1\r\n"
         content = content.replace(marker, marker + heading, 1)
     else:
-        content = content.replace(
-            declaration, b"CONTACT INTERFACE DATA EXTRA\r\n" + declaration, 1
-        )
+        content = content.replace(declaration, b"CONTACT INTERFACE DATA EXTRA\r\n" + declaration, 1)
     log = _resolved("output/solver.log", "solver_log", content)
 
     report = assess_reported_norm_observations(
