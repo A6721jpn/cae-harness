@@ -2,7 +2,6 @@
 
 import hashlib
 import struct
-import sys
 from dataclasses import replace
 from pathlib import Path
 
@@ -31,7 +30,11 @@ from .test_runner_authority import _cleanup_process, _finish
 
 
 def test_xplt_capacity_native_surface_traversal_and_bounded_counter(tmp_path: Path) -> None:
-    from febio_cae.adapters.febio.xplt_reader import _MAX_BLOCKS, _NativeParser, _ParseError
+    from febio_cae.adapters.febio.xplt_reader import (
+        _MAX_BLOCKS,
+        _NativeParser,
+        _ParseError,
+    )
 
     from .reader_fixture import block, text, uint
 
@@ -298,7 +301,7 @@ def test_compiler_runner_registered_reader_codec_connection(tmp_path: Path) -> N
         "Path('output').mkdir(exist_ok=True);"
         f"Path('output/results.xplt').write_bytes(bytes.fromhex('{payload.hex()}'))"
     )
-    bundle = replace(compiled, argv=(sys.executable, "-c", script))
+    bundle = replace(compiled, argv=(compiled.argv[0], "-c", script))
     runner = RunnerAdapter(
         ownership=_Ownership(),
         root=tmp_path / "runs",

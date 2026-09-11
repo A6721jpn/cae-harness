@@ -211,7 +211,7 @@ def quality_case(
         bundle.bundle_digest,
         RunState.VALIDATING,
         ProcessIdentity(
-            sys.executable,
+            bundle.argv[0],
             bundle.tool.executable_digest,
             bundle.argv,
             str(tmp_path),

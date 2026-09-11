@@ -281,7 +281,7 @@ def setup_reader(
         bundle.bundle_digest,
         RunState.VALIDATING,
         ProcessIdentity(
-            sys.executable,
+            bundle.argv[0],
             bundle.tool.executable_digest,
             bundle.argv,
             str(attempt_root),
