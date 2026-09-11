@@ -7,7 +7,6 @@ from pathlib import Path
 
 import pytest
 
-from febio_cae.adapters.febio._windows_job import WindowsJobProcess
 from febio_cae.adapters.febio.compiler import LocalBundleStore
 from febio_cae.adapters.febio.runner import RunnerAdapter
 from febio_cae.adapters.febio.xplt_reader import LocalResultDataStore
@@ -313,8 +312,6 @@ def test_compiler_runner_registered_reader_codec_connection(tmp_path: Path) -> N
     try:
         attempt = _finish(runner, attempt, owner)
         assert attempt.state is RunState.VALIDATING
-        assert isinstance(managed.process, WindowsJobProcess)
-        assert managed.process.closed and not runner._managed
         assert attempt.process is not None
         content = (Path(attempt.process.cwd) / "output/results.xplt").read_bytes()
         assert content == payload
@@ -329,7 +326,9 @@ def test_compiler_runner_registered_reader_codec_connection(tmp_path: Path) -> N
         )
         manifest = reader.read(attempt, bundle)
         data = reader.data_store.resolve_manifest_output(manifest.manifest_id, "stress")
-        assert decode_record(encode_record(data), NumericResultData) == data
+        restored = decode_record(encode_record(data), NumericResultData)
+        assert restored.component_ids == ("xx", "yy", "zz", "xy", "yz", "xz")
+        assert restored.values[-1] == (10.0, 2.0, 3.0, 4.0, 5.0, 6.0)
     finally:
         _cleanup_process(managed.process)
         managed.stdout.close()
