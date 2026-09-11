@@ -245,24 +245,22 @@ def _admission(
         match = re.fullmatch(r"\s*(.*?)\s+\.{2,}\s*:\s*(.*?)\s*", line)
         if match:
             echoes.setdefault(match[1], []).append(match[2])
-    interface = re.search(r"(?m)^contact interface [^\r\n]*", preamble)
-    if interface is None:
-        raise ValueError("missing echoed contact interface")
-    solver_echoes: dict[str, list[str]] = {}
-    contact_echoes: dict[str, list[str]] = {}
-    for line in preamble[: interface.start()].splitlines():
-        match = re.fullmatch(r"\s*(.*?)\s+\.{2,}\s*:\s*(.*?)\s*", line)
-        if match:
-            solver_echoes.setdefault(match[1], []).append(match[2])
-    for line in preamble[interface.end() :].splitlines():
-        match = re.fullmatch(r"\s*(.*?)\s+\.{2,}\s*:\s*(.*?)\s*", line)
-        if match:
-            contact_echoes.setdefault(match[1], []).append(match[2])
-    if symmetric_value is not None and (
-        solver_echoes.get("symmetric_stiffness") != ["non-symmetric (0)"]
-        or contact_echoes.get("symmetric_stiffness") != ["yes (1)"]
-    ):
-        raise ValueError("missing/mismatched solver or contact symmetry echo")
+    if symmetric_value is not None:
+        interface = re.search(r"(?m)^contact interface [^\r\n]*", preamble)
+        if interface is None:
+            raise ValueError("missing echoed contact interface")
+        solver_symmetry: list[str] = []
+        contact_symmetry: list[str] = []
+        for line in preamble[: interface.start()].splitlines():
+            match = re.fullmatch(r"\s*(.*?)\s+\.{2,}\s*:\s*(.*?)\s*", line)
+            if match and match[1] == "symmetric_stiffness":
+                solver_symmetry.append(match[2])
+        for line in preamble[interface.end() :].splitlines():
+            match = re.fullmatch(r"\s*(.*?)\s+\.{2,}\s*:\s*(.*?)\s*", line)
+            if match and match[1] == "symmetric_stiffness":
+                contact_symmetry.append(match[2])
+        if solver_symmetry != ["non-symmetric (0)"] or contact_symmetry != ["yes (1)"]:
+            raise ValueError("missing/mismatched solver or contact symmetry echo")
     literals = {
         "Module type": "solid",
         "analysis": "STATIC (0)",
@@ -343,6 +341,7 @@ def _scan(
     trusted = True
     active: dict[str, Any] | None = None
     seen: set[int] = set()
+    heading_seen = False
     interface_seen = False
 
     def add(kind: str, start: int, end: int, **data: Any) -> int:
@@ -364,17 +363,20 @@ def _scan(
         line = lines[i].strip()
         begin = _BEGIN.fullmatch(line)
         try:
-            if line.lower().startswith(("contact interface", "sliding interface")):
-                if (
-                    line != "contact interface 1 - Type: sliding-elastic"
-                    or interface_seen
-                    or seen
-                    or active is not None
-                ):
+            if line == "CONTACT INTERFACE DATA":
+                if heading_seen or interface_seen or seen or active is not None:
+                    raise ValueError("unexpected contact interface heading")
+                heading_seen = True
+                i += 1
+                continue
+            if line == "contact interface 1 - Type: sliding-elastic":
+                if interface_seen or seen or active is not None:
                     raise ValueError("unexpected interface declaration outside augmentation")
                 interface_seen = True
                 i += 1
                 continue
+            if line.lower().startswith(("contact interface", "sliding interface")):
+                raise ValueError("unsupported interface record")
             if begin:
                 n, t = int(begin[1]), begin[2]
                 if (
