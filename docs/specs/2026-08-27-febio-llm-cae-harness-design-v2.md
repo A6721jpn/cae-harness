@@ -1,6 +1,6 @@
 # FEBio CAE Harness V2 — プロトタイプ設計仕様書
 
-文書版: 0.2 / 作成日: 2026-09-07 / 更新日: 2026-09-09 / 状態: 実装用設計、一般的な実機適合性は未検証。
+文書版: 0.2 / 作成日: 2026-09-07 / 更新日: 2026-09-13 / 状態: 実装用設計、一般的な実機適合性は未検証。
 ファイル名の日付は文書識別子であり、作成日ではない。
 対応する工程・受け入れ試験は[実装計画書](../plans/2026-08-27-febio-cae-harness-greenfield-plan.md)に定義する。
 
@@ -704,7 +704,9 @@ INSPECTED means observation only; native_qualification remains UNVERIFIED and
 physical decisions unresolved. Investigation figures remain separately pending.
 No qualification/profile provisioning, catalog placeholder, new process framework,
 wider placement, preview-open or general lifecycle/retry work is included.
-Actual qualification authority is missing and is not a human physics question.
+That inspection-only contract does not establish qualification authority. The
+separate scoped provisioning route below consumes reviewed evidence; it does not
+promote inspection observations into qualification.
 Python 3.12, CLI-only operation, no runtime Orca/Codex dependency and all existing
 geometry/domain/codec/store/producer/ownership boundaries remain unchanged.
 
@@ -723,6 +725,52 @@ super()._prepare_owned_session, then record module path/hash/version/BuildInfo
 from that same live owned session. Plain backend means unchanged body/face/
 geometry algorithms and admission; no planar face override, second session or
 probe, public backend API change, or frozen-file edit is permitted.
+
+
+### Scoped trusted planar profile provisioning
+
+`case --state-dir STATE provision-planar-profiles CASE_ID --bundle-path BUNDLE
+--json` is the explicit setup route for a fresh registered case. The product pins
+one reviewed external bundle's exact SHA-256 and byte count; the caller supplies
+only its location, never a trust override. The bundle is portable evidence input,
+not a dependency on a development coordination directory.
+
+Before source or profile registration, authenticate bounded bundle bytes, decode
+the typed records and evidence, verify the actual imported XPLT reader bytes, and
+preflight current stored identities. Unreadable or unqualified reader bytes fail
+with INTEGRITY. Compatibility registration also enforces identity atomically:
+an identical same-ID record is reusable, but different canonical bytes produce
+CONFLICT even between concurrent writers. No replacement entry point is added.
+Mesh-quality records retain their existing profile-ID plus record-digest identity.
+
+The result contains full schema-1 NumericalProfileRef records for solver, outputs,
+quality and mesh quality, the approved bundle identity, its scope statement and
+`native_operations: 0`. PROVISIONED means records were registered, not that a
+draft, revision, mesh, run, numerical assessment or preview was completed.
+
+The `febio.scope.planar_linear_frictionless_fixed_xyz` capability has executable
+consumers: every resolved preparation profile is checked before reservation, and
+the compiler's bound profile is checked before rendering or staging. A tagged
+SUPPORTED profile admits only isotropic linear elasticity, frictionless contact,
+one AsPlaced box tool, negative World-Z motion, untransformed World fully fixed
+XYZ supports, and World tool DOFs x/y/rx/ry/rz fixed with z prescribed. Its
+nonadaptive 0.1-second steps cover 0..1 seconds with no step retries. Out-of-scope
+intent is rejected, never converted or completed with inferred constraints.
+Untagged profiles retain their own existing contracts and are not upgraded.
+
+These records cover the declared four-variable reader layout and bounded planar
+mechanisms, not arbitrary-case accuracy. Reaction interpretation remains support-Z
+only; neither independent XY calibration nor full-field convergence is claimed.
+Mesh admission remains synthetic and the retained native aggregate remains
+UNVERIFIED. Sphere/cylinder, finite friction, neo-Hookean, Hertz, stress output in
+this planar profile, Studio, live LLM and real-model acceptance are not promoted.
+
+The installed synthetic gate requires a `qualification_bundle` file identity
+alongside its other frozen inputs. It invokes this public setup command after
+case creation, checks all returned references against the three preparation
+requests, and only then permits the declared three preparations and four solver
+attempts. Profile setup does not spend or extend those native budgets, and cannot
+substitute for each case's mandatory numerical checks or overall E2E acceptance.
 
 
 ### Owned solver-log binding (P3 bounded capture)

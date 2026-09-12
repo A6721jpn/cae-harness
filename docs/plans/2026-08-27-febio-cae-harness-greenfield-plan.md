@@ -1,6 +1,6 @@
 # FEBio CAE Harness V2 — プロトタイプ実装・検証計画
 
-文書版: 0.3 / 作成日: 2026-09-07 / 更新日: 2026-09-09 / 状態: V2開発中の工程・受け入れ基準。
+文書版: 0.3 / 作成日: 2026-09-07 / 更新日: 2026-09-13 / 状態: V2開発中の工程・受け入れ基準。
 ファイル名の日付は文書識別子であり、作成日ではない。
 製品の振る舞いは[設計仕様書](../specs/2026-08-27-febio-llm-cae-harness-design-v2.md)に従う。
 
@@ -169,6 +169,11 @@ sourceのRED/GREENと独立レビュー後にfresh installed CLIで新しい有�
 これはHertz、他の材料・摩擦・治具profile、Studio、live LLM、実モデルの免除ではない。
 installed gateの`FEBIO_CAE_E2E_SETTINGS`は、`preparation_requests`にcoarse・refined・fine順の
 3つの内容ハッシュ付き要求ファイルを指定し、`limits`をpreparation3回・solver4回に固定する。
+`qualification_bundle`には承認済み限定bundleのpath・SHA-256・sizeを固定する。
+新規case作成後、公開`case provision-planar-profiles`を呼び、返された完全なprofile参照が
+3要求のsolver・outputs・quality・mesh quality参照と一致することをnative予約前に確認する。
+実Readerのバイト不一致、callerによる自己認定、既存IDの異なる内容への上書きを拒否する。
+同一内容の再登録は許可するが、draft・revision・runの進行や数値合格には読み替えない。
 要求間で変えてよいのはglobal_sizeだけとし、3サイズ・相対収束限界・力のfloor・
 Young率変更時の正規化限界を同じ根拠で宣言する。部品と治具の変位要求は別IDで保持する。
 四番目は新規prepareではなくfine親の明示的な材料patchとする。全生成記録・旧版の不変性と、
@@ -506,7 +511,9 @@ INSPECTED means observation only; native_qualification remains UNVERIFIED and
 physical decisions unresolved. Investigation figures remain separately pending.
 No qualification/profile provisioning, catalog placeholder, new process framework,
 wider placement, preview-open or general lifecycle/retry work is included.
-Actual qualification authority is missing and is not a human physics question.
+That inspection-only contract does not establish qualification authority. The
+separate scoped provisioning route in design section “Scoped trusted planar
+profile provisioning” consumes reviewed records without promoting observations.
 Python 3.12, CLI-only operation, no runtime Orca/Codex dependency and all existing
 geometry/domain/codec/store/producer/ownership boundaries remain unchanged.
 
