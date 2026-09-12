@@ -151,9 +151,7 @@ def test_complete_two_body_compiler_port_emits_native_entities_and_references(
         item.attrib["name"]: set(_integers(item.text)) for item in root.findall("Mesh/NodeSet")
     }
     support = _required(root, "Boundary/bc")
-    assert support.attrib["type"] == "zero displacement"
     assert node_sets[support.attrib["node_set"]] == set(mesh.faces[0].node_ids)
-    assert [support.findtext(f"{axis}_dof") for axis in "xyz"] == ["1", "1", "1"]
     pair = _required(root, "Mesh/SurfacePair")
     assert pair.findtext("primary") == "tool-contact"
     assert pair.findtext("secondary") == "part-contact"
@@ -199,6 +197,74 @@ def test_complete_two_body_compiler_port_emits_native_entities_and_references(
         tuple(float(x) for x in (point.text or "").split(","))
         for point in max_curve.findall("points/point")
     ] == [(0.0, 1.0), (1.0, 1.0)]
+
+
+def _assert_zero_prescribed_component(bc: ET.Element, dof: str) -> None:
+    assert bc.attrib["type"] == "prescribed displacement"
+    assert bc.findtext("dof") == dof
+    value = _required(bc, "value")
+    assert value.attrib == {"lc": "1"}
+    assert value.text == "0"
+    assert bc.findtext("relative") == "0"
+    assert {child.tag for child in bc} == {"dof", "value", "relative"}
+
+
+def test_full_fixed_support_uses_zero_prescribed_component_bcs_with_distinct_names(
+    tmp_path: Path,
+) -> None:
+    revision, mesh, profile = _case()
+    collision_names = {
+        "part-elements": "support-main-x",
+        "tool-elements": "support-main-y",
+        "part-output": "support-main-z",
+    }
+    mesh = replace(
+        mesh,
+        sets=tuple(
+            replace(item, set_id=collision_names.get(item.set_id, item.set_id))
+            for item in mesh.sets
+        ),
+    )
+    _, root, _ = _compile(tmp_path, revision, mesh, profile)
+
+    bcs = root.findall("Boundary/bc")
+    assert len(bcs) == 3
+    assert root.find("Boundary/bc[@type='zero displacement']") is None
+    assert len({bc.attrib["name"] for bc in bcs}) == len(bcs)
+    registered_names = {item.set_id for item in mesh.sets}
+    assert {bc.attrib["name"] for bc in bcs}.isdisjoint(registered_names)
+    node_sets = {
+        item.attrib["name"]: set(_integers(item.text)) for item in root.findall("Mesh/NodeSet")
+    }
+    assert len({bc.attrib["node_set"] for bc in bcs}) == 1
+    assert node_sets[bcs[0].attrib["node_set"]] == set(mesh.faces[0].node_ids)
+    by_dof = {bc.findtext("dof"): bc for bc in bcs}
+    assert set(by_dof) == {"x", "y", "z"}
+    for dof, bc in by_dof.items():
+        _assert_zero_prescribed_component(bc, dof)
+    _required(root, "LoadData/load_controller[@id='1']")
+
+
+def test_mixed_fixed_free_support_emits_only_fixed_zero_prescribed_components(
+    tmp_path: Path,
+) -> None:
+    revision, mesh, profile = _case()
+    support = revision.spec.support.supports[0]
+    support = replace(support, y=replace(support.y, state="free"))
+    revision = replace(
+        revision,
+        spec=replace(revision.spec, support=replace(revision.spec.support, supports=(support,))),
+    )
+    _, root, _ = _compile(tmp_path, revision, mesh, profile)
+
+    bcs = root.findall("Boundary/bc")
+    assert len(bcs) == 2
+    assert len({bc.attrib["name"] for bc in bcs}) == len(bcs)
+    by_dof = {bc.findtext("dof"): bc for bc in bcs}
+    assert set(by_dof) == {"x", "z"}
+    for dof, bc in by_dof.items():
+        _assert_zero_prescribed_component(bc, dof)
+    assert root.find("Boundary/bc[@type='zero displacement']") is None
 
 
 def test_explicit_part_primary_contact_direction(tmp_path: Path) -> None:
