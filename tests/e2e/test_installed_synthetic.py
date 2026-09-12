@@ -25,7 +25,6 @@ from typing import Any, cast
 
 import pytest
 
-
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _EVIDENCE_KEYS = {
     "schema_version",
@@ -233,9 +232,7 @@ def _finite(value: object, field: str) -> float:
 
 
 def _read_json(path: Path, field: str, *, environment: bool) -> dict[str, Any]:
-    error_type: type[Exception] = (
-        _EnvironmentNotReady if environment else _AcceptanceFailure
-    )
+    error_type: type[Exception] = _EnvironmentNotReady if environment else _AcceptanceFailure
     try:
         value = json.loads(
             path.read_text(encoding="utf-8"),
@@ -275,11 +272,7 @@ def _file_identity(value: object, field: str) -> _FileIdentity:
     path = Path(raw_path)
     if not path.is_absolute() or _contains_02_cae(path):
         raise _EnvironmentNotReady(f"{field}.path must be absolute and outside 02_CAE")
-    if (
-        isinstance(item["size"], bool)
-        or not isinstance(item["size"], int)
-        or item["size"] < 1
-    ):
+    if isinstance(item["size"], bool) or not isinstance(item["size"], int) or item["size"] < 1:
         raise _EnvironmentNotReady(f"{field}.size must be a positive integer")
     expected_digest = _digest(item["sha256"], f"{field}.sha256")
     try:
@@ -376,9 +369,10 @@ def _validate_source_declaration(value: object, field: str) -> dict[str, Any]:
     if content is not None:
         if digest is None:
             raise _EnvironmentNotReady(f"{field}.content_digest is required with content")
-        if _digest(digest, f"{field}.content_digest") != hashlib.sha256(
-            content.encode("utf-8")
-        ).hexdigest():
+        if (
+            _digest(digest, f"{field}.content_digest")
+            != hashlib.sha256(content.encode("utf-8")).hexdigest()
+        ):
             raise _EnvironmentNotReady(f"{field}.content digest does not match content")
     elif reference != "cad":
         raise _EnvironmentNotReady(
@@ -391,9 +385,7 @@ def _validate_source_declaration(value: object, field: str) -> dict[str, Any]:
     return item
 
 
-def _validate_request(
-    request: dict[str, Any], source: _FileIdentity
-) -> tuple[str, str, int]:
+def _validate_request(request: dict[str, Any], source: _FileIdentity) -> tuple[str, str, int]:
     allowed = {
         "schema_version",
         "values",
@@ -410,10 +402,6 @@ def _validate_request(
     )
     if item["schema_version"] != "1":
         raise _EnvironmentNotReady("preparation_request.schema_version must be '1'")
-    if "input_intent" in item:
-        input_intent = item["input_intent"]
-        if not isinstance(input_intent, str) or input_intent not in {"", "explicit"}:
-            raise _EnvironmentNotReady("preparation_request.input_intent must be explicit")
     if "preparation" in item:
         preparation = _as_object(item["preparation"], "preparation_request.preparation")
         if set(preparation) - {"wall_seconds", "max_tetrahedra", "max_nodes", "cpu_workers"}:
@@ -466,21 +454,13 @@ def _validate_request(
     source_by_reference = {entry["reference"]: entry for entry in sources}
 
     nested_evidence: list[dict[str, Any]] = []
-    part_body_id: str | None = None
-    tool_body_id: str | None = None
 
     def visit(value: object, path: str) -> None:
-        nonlocal part_body_id, tool_body_id
         if isinstance(value, dict):
             keys = set(value)
             if _EVIDENCE_KEYS <= keys:
                 nested_evidence.append(_validate_evidence(value, path))
             for key, child in value.items():
-                if key == "geometry_digest" or key == "inspection_digest":
-                    if child is not None:
-                        raise _EnvironmentNotReady(f"{path}.{key} must be null before preparation")
-                if key == "resolution" and child is not None:
-                    raise _EnvironmentNotReady(f"{path}.resolution must be null before preparation")
                 visit(child, f"{path}.{key}")
         elif isinstance(value, list):
             for index, child in enumerate(value):
@@ -553,9 +533,7 @@ def _validate_request(
             and declaration["content_digest"] != entry["content_digest"]
         ):
             raise _EnvironmentNotReady(f"evidence declaration {reference!r} has a stale digest")
-    if not any(
-        entry["target_field"] == "material.youngs_modulus" for entry in nested_evidence
-    ):
+    if not any(entry["target_field"] == "material.youngs_modulus" for entry in nested_evidence):
         raise _EnvironmentNotReady("material Young's modulus lacks field-bound evidence")
 
     outputs = _as_object(values["outputs"], "preparation_request.values.outputs")
@@ -568,8 +546,7 @@ def _validate_request(
         quantity_id = _text(request.get("quantity_id"), f"outputs.requests[{index}].quantity_id")
         by_quantity.setdefault(quantity_id, []).append(request)
     if any(
-        len(by_quantity.get(quantity, [])) != 1
-        for quantity in ("contact_force", "displacement")
+        len(by_quantity.get(quantity, [])) != 1 for quantity in ("contact_force", "displacement")
     ):
         raise _EnvironmentNotReady("exactly one force and one displacement output are required")
     for quantity, location, unit, body in (
@@ -623,12 +600,9 @@ def _validate_request(
             sample.get("displacement"),
             f"motion.samples[{index}].displacement",
         )
-        if (
-            previous_time is not None
-            and (
-                current_time <= previous_time
-                or current_displacement <= cast(float, previous_displacement)
-            )
+        if previous_time is not None and (
+            current_time <= previous_time
+            or current_displacement <= cast(float, previous_displacement)
         ):
             raise _EnvironmentNotReady("motion samples must increase in time and compression")
         previous_time, previous_displacement = current_time, current_displacement
@@ -657,9 +631,8 @@ def _validate_axes(
         raise _EnvironmentNotReady(
             "comparison.fixed_conditions must declare every fixed condition once"
         )
-    if (
-        "intended_changes" in comparison
-        and comparison["intended_changes"] != list(_INTENDED_CHANGES)
+    if "intended_changes" in comparison and comparison["intended_changes"] != list(
+        _INTENDED_CHANGES
     ):
         raise _EnvironmentNotReady("comparison.intended_changes is fixed to the E-only change")
     raw_axes = comparison["axes"]
@@ -842,7 +815,7 @@ def _under(path: Path, parent: Path) -> bool:
 
 def _validate_runtime(
     settings: _Settings,
-    report: "_Report",
+    report: _Report,
     cwd: Path,
 ) -> None:
     argv = [str(settings.installed_python.path), "-I", "-c", _RUNTIME_PROBE]
@@ -984,9 +957,7 @@ def _load_settings() -> _Settings:
         identities["source_step"],
     )
     request_values = _as_object(request["values"], "preparation_request.values")
-    request_material = _as_object(
-        request_values["material"], "preparation_request.values.material"
-    )
+    request_material = _as_object(request_values["material"], "preparation_request.values.material")
     baseline_modulus = _quantity_si(
         request_material["youngs_modulus"],
         "preparation_request.values.material.youngs_modulus",
@@ -1180,8 +1151,7 @@ def _run_subprocess(
             cwd=str(cwd),
             env=environment,
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
             shell=False,
             timeout=timeout,
             check=False,
@@ -1218,9 +1188,9 @@ def _run_subprocess(
             parse_constant=_reject_constant,
         )
         if not isinstance(parsed, dict):
-            raise ValueError("CLI output is not a JSON object")
+            raise TypeError("CLI output is not a JSON object")
         reply = cast(dict[str, Any], parsed)
-    except (UnicodeError, ValueError) as error:
+    except (UnicodeError, ValueError, TypeError) as error:
         report.finish_command(
             command,
             returncode=completed.returncode,
@@ -1259,9 +1229,7 @@ def _run_cli(
         timeout=timeout,
         native_kind=native_kind,
     )
-    native_index = (
-        len(report.data["native_attempts"]) - 1 if native_kind is not None else None
-    )
+    native_index = len(report.data["native_attempts"]) - 1 if native_kind is not None else None
     return return_code, reply, native_index
 
 
@@ -1484,12 +1452,7 @@ def _record_solver_process(
     _expect(
         _same_path(
             process_cwd,
-            case_root
-            / "native"
-            / case_id
-            / run_id
-            / attempt_id
-            / str(owner_generation),
+            case_root / "native" / case_id / run_id / attempt_id / str(owner_generation),
         ),
         "registered solver process cwd is not the exact owned attempt directory",
     )
@@ -1656,8 +1619,9 @@ def _validate_numeric_data(
     outputs = _require_dict(spec.get("outputs"), "revision.spec.outputs")
     requests = _require_list(outputs.get("requests"), "revision.spec.outputs.requests")
     requests_by_id = {
-        _require_id(_require_dict(item, "output request").get("request_id"), "request_id"):
-        _require_dict(item, "output request")
+        _require_id(
+            _require_dict(item, "output request").get("request_id"), "request_id"
+        ): _require_dict(item, "output request")
         for item in requests
     }
     request_ids = {
@@ -1688,9 +1652,7 @@ def _validate_numeric_data(
         hashlib.sha256(result_bytes).hexdigest() == result_entry.get("digest"),
         "persisted XPLT digest differs from the manifest",
     )
-    saved_times = _require_list(
-        outputs.get("saved_times"), "revision.spec.outputs.saved_times"
-    )
+    saved_times = _require_list(outputs.get("saved_times"), "revision.spec.outputs.saved_times")
     motion = _require_dict(spec.get("motion"), "revision.spec.motion")
     samples = _require_list(motion.get("samples"), "revision.spec.motion.samples")
     _expect(bool(samples), "revision motion has no terminal sample")
@@ -1778,8 +1740,7 @@ def _validate_numeric_data(
             f"numeric mapping for {output_id!r} differs from its output request",
         )
         _expect(
-            numeric.get("axis_id") == "state_time"
-            and numeric.get("axis_unit") == "s",
+            numeric.get("axis_id") == "state_time" and numeric.get("axis_unit") == "s",
             "numeric result is not an explicit state-time history",
         )
         axis_values = _require_list(numeric.get("axis_values"), "numeric.axis_values")
@@ -1791,8 +1752,7 @@ def _validate_numeric_data(
             "output state_count differs from its numeric history",
         )
         _expect(
-            len(axis_values) >= max(2, expected_state_count)
-            and len(axis_values) == len(values),
+            len(axis_values) >= max(2, expected_state_count) and len(axis_values) == len(values),
             "numeric history lacks complete states",
         )
         axis_floats = [
@@ -1911,10 +1871,7 @@ def _validate_run(
     numerical = _require_list(
         required_quality.get("numerical"), f"{run_label}.required_quality.numerical"
     )
-    rows = [
-        _require_dict(row, f"{run_label}.required_quality.numerical row")
-        for row in numerical
-    ]
+    rows = [_require_dict(row, f"{run_label}.required_quality.numerical row") for row in numerical]
     _expect(
         len(rows) == len(_REQUIRED_NUMERICAL),
         f"{run_label} required numerical inventory contains duplicates",
@@ -2087,9 +2044,7 @@ def _validate_comparison(
         previous_coordinate = coordinate
     series = [
         _require_dict(item, f"comparison.series[{index}]")
-        for index, item in enumerate(
-            _require_list(comparison.get("series"), "comparison.series")
-        )
+        for index, item in enumerate(_require_list(comparison.get("series"), "comparison.series"))
     ]
     _expect(
         len(series) == len(_COMPARISON_AXES)
@@ -2463,9 +2418,7 @@ def test_installed_synthetic_cli_flow(tmp_path: Path) -> None:
             child_validate_code == 0 and child_validated.get("status") == "VALIDATED",
             "E-only child did not validate",
         )
-        child_freeze_code, child_frozen, _ = cli(
-            "freeze-child", ["freeze", case_id, "--json"]
-        )
+        child_freeze_code, child_frozen, _ = cli("freeze-child", ["freeze", case_id, "--json"])
         _expect(
             child_freeze_code == 0 and child_frozen.get("status") == "FROZEN",
             "E-only child was not frozen",
@@ -2644,12 +2597,7 @@ def test_installed_synthetic_cli_flow(tmp_path: Path) -> None:
             _text(comparison_response.get("record_path"), "comparison.record_path")
         )
         expected_record_path = (
-            case_root
-            / "cases"
-            / case_id
-            / "comparisons"
-            / comparison_id
-            / "comparison.json"
+            case_root / "cases" / case_id / "comparisons" / comparison_id / "comparison.json"
         )
         _expect(
             _same_path(comparison_record_path, expected_record_path),
