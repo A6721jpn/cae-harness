@@ -27,6 +27,7 @@ from febio_cae.cli import case as case_cli
 from febio_cae.cli.main import main
 from febio_cae.domain.partial_case_spec import PartialCaseSpec
 from febio_cae.domain.ports import PortError
+from febio_cae.domain.units import Quantity
 
 SETTINGS_ENV = "FEBIO_CAE_NATIVE_LLM_SETTINGS"
 MAX_EXPECTED_CALLS = 6
@@ -150,7 +151,7 @@ def _load_repository_fixture() -> ModuleType:
     return module
 
 
-def _setup_synthetic_case(tmp_path: Path) -> tuple[RegisteredCaseService, Any]:
+def _setup_synthetic_case(tmp_path: Path) -> tuple[RegisteredCaseService, Any, Any]:
     fixture = _load_repository_fixture()
     service, created, _ = fixture._created(tmp_path)
     spec = fixture.complete_spec()
@@ -163,7 +164,48 @@ def _setup_synthetic_case(tmp_path: Path) -> tuple[RegisteredCaseService, Any]:
         expected_generation=0,
         evidence=(fixture._evidence("case_revision.spec"),),
     )
-    return service, created
+    return service, created, spec
+
+
+def _revision_snapshot(service: RegisteredCaseService, case_id: str) -> dict[str, bytes]:
+    revision_root = service._storage(case_id).root / "cases" / case_id / "revisions"
+    return {
+        path.relative_to(revision_root).as_posix(): path.read_bytes()
+        for path in sorted(revision_root.glob("*/revision.json"))
+        if path.is_file()
+    }
+
+
+def _assert_answered_material(material: Any, original_material: Any) -> None:
+    assert type(material) is type(original_material)
+    assert material.youngs_modulus == Quantity(1, "MPa")
+    assert material.poisson_ratio == Quantity(0.3, "1")
+    assert material.applicability.strain_statement == "applicable"
+    assert material.applicability.rate_statement == "applicable"
+
+    # Evidence and lineage are intentionally excluded from this semantic
+    # comparison; the typed values and applicability must match the supplied
+    # synthetic material semantics.
+    observed = replace(
+        material,
+        model_evidence=original_material.model_evidence,
+        youngs_modulus_evidence=original_material.youngs_modulus_evidence,
+        poisson_ratio_evidence=original_material.poisson_ratio_evidence,
+        applicability=replace(
+            material.applicability,
+            strain_evidence=original_material.applicability.strain_evidence,
+            rate_evidence=original_material.applicability.rate_evidence,
+        ),
+    )
+    expected = replace(
+        original_material,
+        applicability=replace(
+            original_material.applicability,
+            strain_statement="applicable",
+            rate_statement="applicable",
+        ),
+    )
+    assert observed.to_bytes() == expected.to_bytes()
 
 
 def _invoke_llm(
@@ -240,13 +282,15 @@ def test_live_ai02_japanese_intent_answer_freeze_and_e_edit(
     receipt = _receipt()
     try:
         settings_path, settings = _load_approved_settings(receipt)
-        service, created = _setup_synthetic_case(tmp_path)
+        service, created, original_spec = _setup_synthetic_case(tmp_path)
         receipt["case_id"] = created.case_id
         # Keep the registered synthetic geometry/profiles while preserving the
         # public case CLI and the real, unmodified LLM adapter path.
         monkeypatch.setattr(case_cli, "RegisteredCaseService", lambda **_: service)
 
-        initial_generation = service.current_draft(created.case_id).generation
+        initial_draft = service.current_draft(created.case_id)
+        initial_generation = initial_draft.generation
+        intent_revision_snapshot = _revision_snapshot(service, created.case_id)
         intent_operation = f"ai02-intent-{uuid.uuid4().hex}"
         intent_text = "材料モデル = 等方線形弾性\nヤング率 = 1 MPa"
         intent_code, intent = _invoke_llm(
@@ -276,9 +320,18 @@ def test_live_ai02_japanese_intent_answer_freeze_and_e_edit(
         ]
         assert intent["question"]["target_fields"] == ["material"]
         assert intent["question"]["generation"] == intent["draft"]["generation"]
+        intent_draft = service.current_draft(created.case_id)
+        assert intent["draft"] == intent_draft.to_dict()
+        assert intent_draft.generation == initial_draft.generation + 1
+        assert _revision_snapshot(service, created.case_id) == intent_revision_snapshot
         receipt["question_id"] = intent["question"]["question_id"]
         _record_operation(receipt, "intent", intent_operation, intent)
 
+        replay_before = service.current_draft(created.case_id)
+        replay_revision_snapshot = _revision_snapshot(service, created.case_id)
+        replay_frozen_revision = service._storage(created.case_id).current_frozen_revision(
+            created.case_id
+        )
         replay_code, replay = _invoke_llm(
             capsys,
             created,
@@ -290,6 +343,13 @@ def test_live_ai02_japanese_intent_answer_freeze_and_e_edit(
         )
         assert replay_code == intent_code
         assert replay == intent
+        replay_after = service.current_draft(created.case_id)
+        assert replay_after.to_bytes() == replay_before.to_bytes()
+        assert replay_after.generation == replay_before.generation
+        assert _revision_snapshot(service, created.case_id) == replay_revision_snapshot
+        assert service._storage(created.case_id).current_frozen_revision(created.case_id) == (
+            replay_frozen_revision
+        )
         receipt["actions"].append(
             {
                 "action": "intent_reentry",
@@ -300,7 +360,9 @@ def test_live_ai02_japanese_intent_answer_freeze_and_e_edit(
 
         answer_operation = f"ai02-answer-{uuid.uuid4().hex}"
         answer_text = "ポアソン比 = 0.3 1\nひずみ適用性 = 適用可\n速度適用性 = 適用可"
-        answer_generation = service.current_draft(created.case_id).generation
+        answer_before = service.current_draft(created.case_id)
+        answer_revision_snapshot = _revision_snapshot(service, created.case_id)
+        answer_generation = answer_before.generation
         answer_code, answer = _invoke_llm(
             capsys,
             created,
@@ -323,26 +385,45 @@ def test_live_ai02_japanese_intent_answer_freeze_and_e_edit(
             "material.strain_applicability",
             "material.rate_applicability",
         }
+        answered_draft = service.current_draft(created.case_id)
+        assert answer["draft"] == answered_draft.to_dict()
+        assert answered_draft.generation == answer_before.generation + 1
+        assert _revision_snapshot(service, created.case_id) == answer_revision_snapshot
+        assert answered_draft.values.material is not None
+        _assert_answered_material(answered_draft.values.material, original_spec.material)
         _record_operation(receipt, "answer", answer_operation, answer)
 
         # Numerical policy is explicit test setup, not an inferred physical fact.
-        budget_generation = service.current_draft(created.case_id).generation
+        budget_before = service.current_draft(created.case_id)
+        budget_generation = budget_before.generation
         prepared_draft = service.set_spec(
             created.case_id,
             values=PartialCaseSpec(budget=parse_budget(settings["budget"])),
             expected_generation=budget_generation,
         )
+        assert prepared_draft.generation == budget_before.generation + 1
+        assert prepared_draft.to_bytes() == service.current_draft(created.case_id).to_bytes()
         validate_code, validated = _invoke_case(capsys, "validate", created.case_id)
         assert validate_code == 0
         assert validated["status"] == "VALIDATED"
         assert prepared_draft.generation == service.current_draft(created.case_id).generation
 
+        freeze_before = service.current_draft(created.case_id)
+        freeze_revision_snapshot = _revision_snapshot(service, created.case_id)
         freeze_code, frozen = _invoke_case(capsys, "freeze", created.case_id)
         assert freeze_code == 0
         assert frozen["status"] == "FROZEN"
         frozen_revision_id = frozen["revision_id"]
         assert isinstance(frozen_revision_id, str) and frozen_revision_id
         parent = service.get_revision(created.case_id, frozen_revision_id)
+        assert service.current_draft(created.case_id).to_bytes() == freeze_before.to_bytes()
+        assert service.current_draft(created.case_id).generation == freeze_before.generation
+        assert _revision_snapshot(service, created.case_id) != freeze_revision_snapshot
+        assert parent.spec.budget == prepared_draft.values.budget
+        assert parent.spec.material is not None
+        _assert_answered_material(parent.spec.material, original_spec.material)
+        for field in CASE_SPEC_FIELDS:
+            assert getattr(parent.spec, field) == getattr(original_spec, field)
         receipt["actions"].append(
             {
                 "action": "validate",
@@ -361,7 +442,12 @@ def test_live_ai02_japanese_intent_answer_freeze_and_e_edit(
         receipt["final_revision_id"] = frozen_revision_id
 
         edit_operation = f"ai02-edit-{uuid.uuid4().hex}"
-        edit_generation = service.current_draft(created.case_id).generation
+        edit_before = service.current_draft(created.case_id)
+        edit_revision_snapshot = _revision_snapshot(service, created.case_id)
+        edit_frozen_revision = service._storage(created.case_id).current_frozen_revision(
+            created.case_id
+        )
+        edit_generation = edit_before.generation
         edit_code, edited = _invoke_llm(
             capsys,
             created,
@@ -376,9 +462,18 @@ def test_live_ai02_japanese_intent_answer_freeze_and_e_edit(
         assert edit_code == 0
         assert edited["status"] == "UPDATED"
         assert edited["draft"]["parent_revision_id"] == frozen_revision_id
+        edited_draft = service.current_draft(created.case_id)
+        assert edited["draft"] == edited_draft.to_dict()
+        assert edited_draft.generation == edit_before.generation + 1
+        assert edited_draft.parent_revision_id == frozen_revision_id
+        assert edited_draft.parent_spec_digest == parent.spec_digest
+        assert _revision_snapshot(service, created.case_id) == edit_revision_snapshot
+        assert service._storage(created.case_id).current_frozen_revision(created.case_id) == (
+            edit_frozen_revision
+        )
         _record_operation(receipt, "edit", edit_operation, edited)
 
-        current = service.current_draft(created.case_id)
+        current = edited_draft
         assert current.values.material is not None
         assert current.values.material.youngs_modulus.to_si().value == 2e6
         assert current.parent_revision_id == frozen_revision_id
