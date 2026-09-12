@@ -753,8 +753,9 @@ class CompilerAdapter:
         plotfile = ET.SubElement(output, "plotfile", {"type": "febio"})
         ET.SubElement(plotfile, "compression").text = "0"
         variables: set[str] = set()
-        for request in spec.outputs.requests:
-            mapping = profile.mapping_for(request.quantity_id)
+        # The reader requires the registered dictionary, including quality evidence
+        # that is not selected for a user-facing reading.
+        for mapping in profile.output_mappings:
             if mapping.native_name not in variables:
                 ET.SubElement(plotfile, "var", {"type": mapping.native_name})
                 variables.add(mapping.native_name)

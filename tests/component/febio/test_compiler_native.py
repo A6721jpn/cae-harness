@@ -109,6 +109,21 @@ def _integers(text: str | None) -> tuple[int, ...]:
     return tuple(int(value.strip()) for value in text.split(","))
 
 
+def test_registered_dictionary_includes_unrequested_reaction_evidence(tmp_path: Path) -> None:
+    revision, mesh, profile = _case()
+    reaction = replace(
+        profile.mapping_for("contact_force"),
+        canonical_id="reaction_force",
+        native_name="reaction forces",
+        location="node",
+    )
+    profile = replace(profile, output_mappings=(*profile.output_mappings, reaction))
+
+    _, root, _ = _compile(tmp_path, revision, mesh, profile)
+
+    assert root.find("Output/plotfile/var[@type='reaction forces']") is not None
+
+
 def test_complete_two_body_compiler_port_emits_native_entities_and_references(
     tmp_path: Path,
 ) -> None:
