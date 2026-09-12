@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
 
 import pytest
+import test_comparison as comparison
 from test_comparison import _configure, _result
 from test_persistence_authority import _created, _populate_complete, _profile
 from test_planar_edit_validation import prepared
@@ -30,10 +32,85 @@ def _numerical_rows(result: dict[str, object]) -> tuple[dict[str, Any], dict[str
     return rows, coverage
 
 
-def _complete_summary(tmp_path: Path, *, factor: float = 1.0) -> dict[str, object]:
-    service, created, storage, revision = prepared(tmp_path, _configure)
+def _complete_summary(
+    tmp_path: Path,
+    *,
+    factor: float = 1.0,
+    configure: Any = _configure,
+) -> dict[str, object]:
+    service, created, storage, revision = prepared(tmp_path, configure)
     _result(service, storage, revision, "completeness", (0.0, 0.5, 1.0), factor)
     return service.run_status(created.case_id, "run-completeness")
+
+
+def _configure_unsupported_force_type(service: Any, spec: Any) -> Any:
+    configured = _configure(service, spec)
+    registered = service.compatibility.get_profile(configured.outputs.profile.profile_id)
+    profile = replace(
+        registered,
+        profile_id="comparison-unsupported-force-type",
+        output_mappings=tuple(
+            replace(mapping, value_type="UNSUPPORTED_VECTOR")
+            if mapping.canonical_id == "contact_force"
+            else mapping
+            for mapping in registered.output_mappings
+        ),
+    )
+    service.register_profile(profile)
+    digest = hashlib.sha256(profile.to_bytes()).hexdigest()
+
+    def rebind(reference: Any) -> Any:
+        return replace(reference, profile_id=profile.profile_id, record_digest=digest)
+
+    return replace(
+        configured,
+        outputs=replace(configured.outputs, profile=rebind(configured.outputs.profile)),
+        quality_policy=replace(
+            configured.quality_policy,
+            profile=rebind(configured.quality_policy.profile),
+        ),
+        solver_policy=replace(
+            configured.solver_policy,
+            profile=rebind(configured.solver_policy.profile),
+        ),
+    )
+
+
+def _patch_force_numeric(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    entity_ids: tuple[str, ...] | None = None,
+    component_ids: tuple[str, ...] | None = None,
+) -> None:
+    original = comparison.NumericResultData
+
+    def construct(
+        reference: Any,
+        mapping: Any,
+        axis_id: Any,
+        axis_unit: Any,
+        axis_values: Any,
+        current_entity_ids: Any,
+        current_component_ids: Any,
+        values: Any,
+    ) -> NumericResultData:
+        if mapping.canonical_id == "contact_force":
+            current_entity_ids = entity_ids or current_entity_ids
+            current_component_ids = component_ids or current_component_ids
+            width = len(current_entity_ids) * len(current_component_ids)
+            values = tuple(tuple(row[:width]) for row in values)
+        return original(
+            reference,
+            mapping,
+            axis_id,
+            axis_unit,
+            axis_values,
+            current_entity_ids,
+            current_component_ids,
+            values,
+        )
+
+    monkeypatch.setattr(comparison, "NumericResultData", construct)
 
 
 def test_registered_complete_result_passes_only_execution_completeness(
@@ -72,12 +149,10 @@ def test_known_trusted_quality_fail_still_wins_over_complete_result(
     assert result["task_status"] == "FAILED"
 
 
-def _registered_shape_summary(
+def _registered_publication_summary(
     tmp_path: Path,
     *,
     times: tuple[float, ...] = (0.0, 1.0),
-    entity_ids: tuple[str, ...] = ("1",),
-    component_ids: tuple[str, ...] = ("z",),
     include_output: bool = True,
 ) -> dict[str, object]:
     service, created, storage = _created(tmp_path)
@@ -92,6 +167,8 @@ def _registered_shape_summary(
 
     def read(attempt: Any, bundle: Any, files: Any, registered: Any) -> ResultManifest:
         mapping = _profile(bundle.profile_id).output_mappings[0]
+        entity_ids = ("1",)
+        component_ids = ("z",)
         width = len(entity_ids) * len(component_ids)
         numeric = NumericResultData(
             ResultDataRef(
@@ -154,27 +231,49 @@ def _registered_shape_summary(
     return service.run_status(created.case_id, str(row[0]))
 
 
-@pytest.mark.parametrize(
-    ("entity_ids", "component_ids"),
-    [
-        (("1",), ("z",)),
-        (("1",), ("x",)),
-    ],
-    ids=["missing-required-entities", "wrong-requested-component"],
-)
-def test_registered_incomplete_entity_or_component_cannot_pass_completeness(
-    tmp_path: Path,
-    entity_ids: tuple[str, ...],
-    component_ids: tuple[str, ...],
+def test_missing_required_entity_is_unverified_after_observable_valid_baseline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    result = _registered_shape_summary(
-        tmp_path,
-        entity_ids=entity_ids,
-        component_ids=component_ids,
-    )
+    baseline = _complete_summary(tmp_path)
+    baseline_rows, _ = _numerical_rows(baseline)
+    assert baseline_rows["execution_result_completeness"]["status"] == "PASS"
+
+    defect_root = tmp_path / "missing-required-entity"
+    defect_root.mkdir()
+    _patch_force_numeric(monkeypatch, entity_ids=("part",))
+    result = _complete_summary(defect_root)
     rows, _ = _numerical_rows(result)
 
-    assert rows["execution_result_completeness"]["status"] != "PASS"
+    assert rows["execution_result_completeness"]["status"] == "UNVERIFIED"
+
+
+def test_missing_requested_component_is_unverified_after_observable_valid_baseline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    baseline = _complete_summary(tmp_path)
+    baseline_rows, _ = _numerical_rows(baseline)
+    assert baseline_rows["execution_result_completeness"]["status"] == "PASS"
+
+    defect_root = tmp_path / "missing-requested-component"
+    defect_root.mkdir()
+    _patch_force_numeric(monkeypatch, component_ids=("x", "y"))
+    result = _complete_summary(defect_root)
+    rows, _ = _numerical_rows(result)
+
+    assert rows["execution_result_completeness"]["status"] == "UNVERIFIED"
+
+
+def test_unsupported_mapping_value_type_cannot_pass_complete_result(tmp_path: Path) -> None:
+    baseline = _complete_summary(tmp_path)
+    baseline_rows, _ = _numerical_rows(baseline)
+    assert baseline_rows["execution_result_completeness"]["status"] == "PASS"
+
+    defect_root = tmp_path / "unsupported-value-type"
+    defect_root.mkdir()
+    result = _complete_summary(defect_root, configure=_configure_unsupported_force_type)
+    rows, _ = _numerical_rows(result)
+
+    assert rows["execution_result_completeness"]["status"] == "UNVERIFIED"
 
 
 @pytest.mark.parametrize("defect", ["missing-output", "missing-endpoint"])
@@ -183,7 +282,7 @@ def test_registered_missing_output_or_endpoint_is_rejected_before_summary(
     defect: str,
 ) -> None:
     with pytest.raises((PortError, ValueError)):
-        _registered_shape_summary(
+        _registered_publication_summary(
             tmp_path,
             times=(0.0,) if defect == "missing-endpoint" else (0.0, 1.0),
             include_output=defect != "missing-output",
