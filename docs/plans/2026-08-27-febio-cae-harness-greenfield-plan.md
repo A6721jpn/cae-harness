@@ -560,11 +560,18 @@ Public post-run summaries independently enumerate execution/result completeness,
 contact quality, motion/support/contact-set fidelity, quasi-static equilibrium,
 solver residuals and mesh dependence, regardless of the declared criterion list.
 Missing implementation or qualified evidence is UNVERIFIED with category-specific
-reasons and prevents COMPLETE. The initial gate has no qualified PASS or
-NOT_APPLICABLE producer; arithmetic methods, criterion names, arbitrary evidence
-references and registered profile labels cannot discharge an obligation. Current
-public paths therefore cannot attain mandatory numerical COMPLETE until qualified
-verifiers exist. No physics, signs, thresholds or applicability exclusions are guessed.
+reasons and prevents COMPLETE. Execution/result completeness has a bounded producer:
+it verifies the successful registered attempt and exact revision, bundle, mesh,
+profile, reader and result bindings; every declared output must cover its requested
+entities, components, layout, frame and units with finite registered state data
+through the declared endpoint. Complete coverage may produce PASS; unavailable
+data-level coverage remains UNVERIFIED and corrupt registration remains INTEGRITY.
+This does not qualify native physics, signs or the reader itself. The other five
+numerical obligations still have no qualified PASS or NOT_APPLICABLE producer.
+Arithmetic methods, criterion names, arbitrary evidence references and registered
+profile labels cannot discharge them. Public paths therefore still cannot attain
+mandatory numerical COMPLETE. No physics, signs, thresholds or applicability
+exclusions are guessed.
 
 Expose derived required_quality with the exact resolved revision/spec, mesh,
 profile, attempt/bundle/manifest and arithmetic-assessment identities/digests.
@@ -590,10 +597,13 @@ Use focused bound synthetic public-summary RED/GREEN: registered peak/signed-sum
 PASS and confirmed preview still need required numerical quality; omitted/renamed
 criteria or reason-only exemptions cannot shrink the inventory; known FAIL persists;
 run-status without a preview reports the same unresolved quality gap. Preserve
-arithmetic registration/digests and independent physical applicability. Do not test
-or claim a fictitious qualified PASS path. Native force-system/sign, residual and
-mesh-dependence qualification and all required real E2Es remain pending. This gate
-closes silent omission, not the missing verification capabilities or P3/REQ-11/FB-03.
+arithmetic registration/digests and independent physical applicability. The bounded
+execution-completeness slice additionally verifies complete registered coverage can
+pass that row alone, incomplete entities/components cannot pass, and missing
+outputs/endpoints are rejected before summary publication. A known trusted quality
+FAIL still wins over complete execution. Do not claim an overall qualified PASS.
+Native force-system/sign, residual and mesh-dependence qualification and all required
+real E2Es remain pending. This gate does not establish P3/REQ-11/FB-03 completion.
 
 
 ### Owned solver-log binding (P3 bounded capture)

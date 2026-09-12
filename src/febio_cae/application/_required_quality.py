@@ -1,4 +1,4 @@
-"""Derived mandatory coverage for public paths without qualified obligation verifiers."""
+"""Derived execution completeness and unresolved mandatory numerical coverage."""
 
 from __future__ import annotations
 
@@ -16,23 +16,18 @@ from febio_cae.domain import (
     MeshArtifact,
     NumericResultData,
     QualityAssessment,
+    Quantity,
     ReadStatus,
     ResolvedFileContent,
     ResultManifest,
     RunState,
-    Quantity,
 )
 from febio_cae.domain.ports import PortError, PortErrorCategory
 from febio_cae.domain.results import numeric_state_indices
 from febio_cae.storage import CaseStorage
 
-# This is the formal inventory, not a mapping from caller-selected criterion names.
-_NUMERICAL = (
-    (
-        "execution_result_completeness",
-        "execution",
-        "solver/read success does not verify the complete requested endpoint and output obligation",
-    ),
+# Remaining obligations cannot be discharged by caller-selected criterion names.
+_UNVERIFIED_NUMERICAL = (
     (
         "contact_quality",
         "numeric",
@@ -114,10 +109,7 @@ def _execution_result_completeness(
 
         expected_times = tuple(
             sorted(
-                {
-                    float(item.to_si().value)
-                    for item in revision.spec.outputs.saved_times
-                }
+                {float(item.to_si().value) for item in revision.spec.outputs.saved_times}
                 | {float(revision.spec.motion.samples[-1].time.to_si().value)}
             )
         )
@@ -229,7 +221,7 @@ def required_quality_summary(
     )
     numerical = (execution_row,) + tuple(
         CriterionAssessment(identifier, dimension, AssessmentStatus.UNVERIFIED, (), reason)
-        for identifier, dimension, reason in _NUMERICAL[1:]
+        for identifier, dimension, reason in _UNVERIFIED_NUMERICAL
     )
     physical = CriterionAssessment(
         "physical_applicability_validation",
