@@ -17,6 +17,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
+from febio_cae.adapters.febio import xplt_reader
 from febio_cae.domain.artifacts import SourceAssetRef
 from febio_cae.domain.canonical import canonical_bytes
 from febio_cae.domain.codec import CodecError, decode_record
@@ -144,7 +145,15 @@ def _read_bundle(path: Path) -> bytes:
     return content
 
 
-def _parse_bundle(content: bytes) -> tuple[dict[str, Any], dict[str, bytes]]:
+def _parse_bundle(
+    content: bytes,
+) -> tuple[
+    dict[str, Any],
+    dict[str, bytes],
+    dict[str, dict[str, str]],
+    dict[str, CompatibilityProfile],
+    MeshQualityRegistration,
+]:
     try:
         raw = json.loads(
             content,
@@ -258,7 +267,7 @@ def _parse_bundle(content: bytes) -> tuple[dict[str, Any], dict[str, bytes]]:
             check_evidence(evidence, "bundle.mesh_quality.qualification_evidence")
     except _BundleError as error:
         raise PortError(PortErrorCategory.INTEGRITY, str(error)) from error
-    return bundle, sources
+    return bundle, sources, source_metadata, profiles, mesh
 
 
 def _prevalidate_existing(
@@ -319,26 +328,20 @@ def provision_planar_profiles(
     bundle_path: Path,
 ) -> dict[str, object]:
     """Validate and publish the exact approved planar records without native work."""
-    content = _read_bundle(Path(bundle_path))
-    bundle, source_bytes = _parse_bundle(content)
-    source_items = cast(list[dict[str, Any]], bundle["source_documents"])
-    source_metadata = {
-        str(item["asset_id"]): {
-            "source_kind": str(item["source_kind"]),
-            "media_type": str(item["media_type"]),
-            "content_digest": str(item["content_digest"]),
-        }
-        for item in source_items
-    }
-    profiles_raw = cast(dict[str, Any], bundle["profiles"])
-    profiles: dict[str, CompatibilityProfile] = {}
-    for purpose, value in profiles_raw.items():
-        profiles[purpose] = decode_record(canonical_bytes(value), CompatibilityProfile)
-    mesh = decode_mesh_quality(canonical_bytes(bundle["mesh_quality"]))
-    assert isinstance(mesh, MeshQualityRegistration)
+    content = _read_bundle(bundle_path)
+    bundle, source_bytes, source_metadata, profiles, mesh = _parse_bundle(content)
+    try:
+        reader_payload = Path(xplt_reader.__file__).read_bytes()
+    except OSError as error:
+        raise PortError(
+            PortErrorCategory.INTEGRITY, "installed reader bytes cannot be verified"
+        ) from error
+    if hashlib.sha256(reader_payload).hexdigest() != _APPROVED_READER_SHA256:
+        raise PortError(
+            PortErrorCategory.INTEGRITY, "installed reader differs from the qualified reader"
+        )
 
-    # This is deliberately the last read-only step.  Every possible identity
-    # conflict is surfaced before the first source/profile write below.
+    # Preflight current identities; stores also enforce conflicts during publication.
     _prevalidate_existing(service, case_id, profiles, mesh, source_metadata, source_bytes)
     storage = service._storage(case_id)
     for asset_id, metadata in source_metadata.items():
