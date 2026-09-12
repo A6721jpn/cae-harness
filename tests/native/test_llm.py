@@ -178,7 +178,7 @@ def _revision_snapshot(service: RegisteredCaseService, case_id: str) -> dict[str
 
 def _assert_answered_material(material: Any, original_material: Any) -> None:
     assert type(material) is type(original_material)
-    assert material.youngs_modulus == Quantity(1, "MPa")
+    assert material.youngs_modulus.to_si() == Quantity(1_000_000, "Pa")
     assert material.poisson_ratio == Quantity(0.3, "1")
     assert material.applicability.strain_statement == "applicable"
     assert material.applicability.rate_statement == "applicable"
@@ -309,10 +309,10 @@ def test_live_ai02_japanese_intent_answer_freeze_and_e_edit(
             "material.model",
             "material.youngs_modulus",
         }
-        assert intent["known_facts"]["material.youngs_modulus"] == {
-            "value": "1",
-            "unit": "MPa",
-        }
+        known_modulus = intent["known_facts"]["material.youngs_modulus"]
+        assert Quantity(float(known_modulus["value"]), known_modulus["unit"]).to_si() == Quantity(
+            1_000_000, "Pa"
+        )
         assert intent["missing_fields"] == [
             "material.poisson_ratio",
             "material.strain_applicability",
@@ -391,6 +391,11 @@ def test_live_ai02_japanese_intent_answer_freeze_and_e_edit(
         assert _revision_snapshot(service, created.case_id) == answer_revision_snapshot
         assert answered_draft.values.material is not None
         _assert_answered_material(answered_draft.values.material, original_spec.material)
+        for field in CASE_SPEC_FIELDS:
+            assert (
+                getattr(answered_draft.values, field).to_bytes()
+                == getattr(original_spec, field).to_bytes()
+            )
         _record_operation(receipt, "answer", answer_operation, answer)
 
         # Numerical policy is explicit test setup, not an inferred physical fact.
@@ -422,8 +427,9 @@ def test_live_ai02_japanese_intent_answer_freeze_and_e_edit(
         assert parent.spec.budget == prepared_draft.values.budget
         assert parent.spec.material is not None
         _assert_answered_material(parent.spec.material, original_spec.material)
+        frozen_values = parent.spec.to_dict()
         for field in CASE_SPEC_FIELDS:
-            assert getattr(parent.spec, field) == getattr(original_spec, field)
+            assert frozen_values[field] == validated["draft"]["values"][field]
         receipt["actions"].append(
             {
                 "action": "validate",
