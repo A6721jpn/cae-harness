@@ -157,7 +157,7 @@ class GmshOCCBackend:
         return self.config.expected_version
 
     def inspect_rigid_primitive(
-        self, primitive: RigidPrimitive, geometry_digest: str
+        self, primitive: RigidPrimitive, *, geometry_digest: str
     ) -> BackendInspection:
         """Inspect a native OCC sphere or cylinder in its local frame."""
 
@@ -195,6 +195,7 @@ class GmshOCCBackend:
     def mesh_rigid_primitive(
         self,
         primitive: RigidPrimitive,
+        *,
         geometry_digest: str,
         global_size_si: float,
     ) -> BackendMesh:
@@ -862,9 +863,7 @@ def _source_digest(content: bytes) -> str:
 
 def _require_curved_primitive(value: object) -> RigidPrimitive:
     if not isinstance(value, RigidPrimitive):
-        raise BackendError(
-            BackendErrorCategory.INVALID_INPUT, "primitive must be a RigidPrimitive"
-        )
+        raise BackendError(BackendErrorCategory.INVALID_INPUT, "primitive must be a RigidPrimitive")
     if value.kind not in {"sphere", "cylinder"}:
         raise BackendError(
             BackendErrorCategory.UNSUPPORTED_CAPABILITY,

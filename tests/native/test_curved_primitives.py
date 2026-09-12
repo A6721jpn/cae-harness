@@ -28,7 +28,7 @@ import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -39,6 +39,7 @@ from febio_cae.adapters.geometry.backend import (
     BackendMesh,
 )
 from febio_cae.domain import (
+    TET10_FACE_NODE_POSITIONS,
     BodyId,
     EvidenceRef,
     FrameId,
@@ -46,7 +47,6 @@ from febio_cae.domain import (
     Quantity,
     RigidPrimitive,
     RigidTransform,
-    TET10_FACE_NODE_POSITIONS,
     Translation3,
 )
 
@@ -172,8 +172,7 @@ def _native_config(config_type: Any) -> Any:
         pytest.fail(f"NATIVE_PREREQUISITE_INVALID: cannot read Gmsh config: {error}", pytrace=False)
     if not isinstance(raw, dict) or set(raw) != _CONFIG_FIELDS:
         pytest.fail(
-            "NATIVE_PREREQUISITE_INVALID: config must contain exactly "
-            f"{sorted(_CONFIG_FIELDS)!r}",
+            f"NATIVE_PREREQUISITE_INVALID: config must contain exactly {sorted(_CONFIG_FIELDS)!r}",
             pytrace=False,
         )
     if raw.get("geometry_kernel") != "OpenCASCADE":
@@ -199,7 +198,9 @@ def _native_config(config_type: Any) -> Any:
     try:
         return config_type(**raw)
     except (TypeError, ValueError) as error:
-        pytest.fail(f"NATIVE_PREREQUISITE_INVALID: Gmsh config is not accepted: {error}", pytrace=False)
+        pytest.fail(
+            f"NATIVE_PREREQUISITE_INVALID: Gmsh config is not accepted: {error}", pytrace=False
+        )
 
 
 def _backend() -> Any:
@@ -259,15 +260,25 @@ def _height_si(case: _PrimitiveCase) -> float:
 
 def _analytic_volume(case: _PrimitiveCase) -> float:
     radius = _radius_si(case)
-    return 4.0 * math.pi * radius**3 / 3.0 if case.kind == "sphere" else math.pi * radius**2 * _height_si(case)
+    return (
+        4.0 * math.pi * radius**3 / 3.0
+        if case.kind == "sphere"
+        else math.pi * radius**2 * _height_si(case)
+    )
 
 
 def _analytic_surface_area(case: _PrimitiveCase) -> float:
     radius = _radius_si(case)
-    return 4.0 * math.pi * radius**2 if case.kind == "sphere" else 2.0 * math.pi * radius * (radius + _height_si(case))
+    return (
+        4.0 * math.pi * radius**2
+        if case.kind == "sphere"
+        else 2.0 * math.pi * radius * (radius + _height_si(case))
+    )
 
 
-def _assert_local_coordinates(case: _PrimitiveCase, primitive: RigidPrimitive, mesh: BackendMesh) -> None:
+def _assert_local_coordinates(
+    case: _PrimitiveCase, primitive: RigidPrimitive, mesh: BackendMesh
+) -> None:
     assert mesh.frame == primitive.local_frame
     radius = _radius_si(case)
     tolerance = max(_SURFACE_TOLERANCE, radius * 1.0e-5)
@@ -281,7 +292,9 @@ def _assert_local_coordinates(case: _PrimitiveCase, primitive: RigidPrimitive, m
     half_height = _height_si(case) / 2.0
     radial = [math.hypot(point[0], point[1]) for point in coordinates]
     assert all(value <= radius + tolerance for value in radial)
-    assert all(-half_height - tolerance <= point[2] <= half_height + tolerance for point in coordinates)
+    assert all(
+        -half_height - tolerance <= point[2] <= half_height + tolerance for point in coordinates
+    )
     assert max(radial) >= radius - tolerance
     assert min(point[2] for point in coordinates) <= -half_height + tolerance
     assert max(point[2] for point in coordinates) >= half_height - tolerance
@@ -297,10 +310,14 @@ def _face_coordinates(face: Any, mesh: BackendMesh) -> tuple[tuple[float, float,
         element.node_ids[position] for position in BACKEND_TET10_TO_CANONICAL_POSITIONS
     )
     positions = TET10_FACE_NODE_POSITIONS[face.local_face_ids[0]]
-    return tuple(nodes[canonical_ids[position]] for position in positions)
+    return tuple(
+        cast(tuple[float, float, float], nodes[canonical_ids[position]]) for position in positions
+    )
 
 
-def _assert_surface_membership(case: _PrimitiveCase, points: tuple[tuple[float, float, float], ...]) -> None:
+def _assert_surface_membership(
+    case: _PrimitiveCase, points: tuple[tuple[float, float, float], ...]
+) -> None:
     assert len(points) == 6, "boundary checks must include all Tet10 face nodes"
     radius = _radius_si(case)
     tolerance = max(_SURFACE_TOLERANCE, radius * 1.0e-5)
@@ -318,7 +335,9 @@ def _assert_surface_membership(case: _PrimitiveCase, points: tuple[tuple[float, 
         assert all(math.hypot(point[0], point[1]) <= radius + tolerance for point in points)
     else:
         assert all(abs(math.hypot(point[0], point[1]) - radius) <= tolerance for point in points)
-        assert all(-half_height - tolerance <= point[2] <= half_height + tolerance for point in points)
+        assert all(
+            -half_height - tolerance <= point[2] <= half_height + tolerance for point in points
+        )
 
 
 def _max_chord_deviation(
@@ -363,7 +382,10 @@ def test_native_curved_primitive_inspection_and_tet10_mesh(case: _PrimitiveCase)
     assert all(element.body_id == primitive.body_id.value for element in mesh.elements)
     assert all(element.element_type == "tet10" for element in mesh.elements)
     assert all(element.ordering_id == BACKEND_TET10_ORDER_ID for element in mesh.elements)
-    assert all(len(element.node_ids) == 10 and len(set(element.node_ids)) == 10 for element in mesh.elements)
+    assert all(
+        len(element.node_ids) == 10 and len(set(element.node_ids)) == 10
+        for element in mesh.elements
+    )
     assert len({face.face_id for face in mesh.faces}) == len(mesh.faces)
 
     inspection_face_ids = {face.face_id for body in inspection.bodies for face in body.faces}
