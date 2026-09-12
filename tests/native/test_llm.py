@@ -21,6 +21,7 @@ from typing import Any, NoReturn
 import pytest
 
 from febio_cae import __version__
+from febio_cae.adapters.llm.openai_responses import _resolve_key
 from febio_cae.application.intent_contracts import parse_budget, settings_from_dict, strict_json
 from febio_cae.application.service import RegisteredCaseService
 from febio_cae.cli import case as case_cli
@@ -114,11 +115,10 @@ def _load_approved_settings(receipt: dict[str, Any]) -> tuple[Path, dict[str, An
             "key_env": key_env,
         }
     )
-    if not isinstance(key_env, str) or not os.environ.get(key_env):
-        _environment_not_ready(
-            receipt,
-            f"the configured key environment name {key_env!r} is unset or empty",
-        )
+    try:
+        _resolve_key(key_env)
+    except PortError:
+        _environment_not_ready(receipt, "the configured provider key is unavailable or unusable")
 
     receipt.update(
         {
@@ -249,8 +249,6 @@ def _record_operation(
     operation = result.get("operation")
     assert isinstance(operation, dict)
     assert operation.get("operation_id") == operation_id
-    assert operation.get("reserved_calls") == 2
-    assert operation.get("attempted_requests") == 2
     receipt["operation_ids"].append(operation_id)
     receipt["actions"].append(
         {
@@ -268,6 +266,8 @@ def _record_operation(
         for item in receipt["actions"]
         if item.get("action") in {"intent", "answer", "edit"}
     )
+    assert operation.get("reserved_calls") == 2
+    assert operation.get("attempted_requests") == 2
 
 
 @pytest.mark.llm
@@ -302,6 +302,7 @@ def test_live_ai02_japanese_intent_answer_freeze_and_e_edit(
             intent_operation,
             intent_text,
         )
+        _record_operation(receipt, "intent", intent_operation, intent)
         assert intent_code == 3
         assert intent["status"] == "NEEDS_INPUT"
         assert intent["draft"]["values"]["material"] is None
@@ -325,7 +326,6 @@ def test_live_ai02_japanese_intent_answer_freeze_and_e_edit(
         assert intent_draft.generation == initial_draft.generation + 1
         assert _revision_snapshot(service, created.case_id) == intent_revision_snapshot
         receipt["question_id"] = intent["question"]["question_id"]
-        _record_operation(receipt, "intent", intent_operation, intent)
 
         replay_before = service.current_draft(created.case_id)
         replay_revision_snapshot = _revision_snapshot(service, created.case_id)
@@ -374,6 +374,7 @@ def test_live_ai02_japanese_intent_answer_freeze_and_e_edit(
             "--question",
             intent["question"]["question_id"],
         )
+        _record_operation(receipt, "answer", answer_operation, answer)
         assert answer_code == 0
         assert answer["status"] == "UPDATED"
         assert answer["draft"]["values"]["material"] is not None
@@ -396,7 +397,6 @@ def test_live_ai02_japanese_intent_answer_freeze_and_e_edit(
                 getattr(answered_draft.values, field).to_bytes()
                 == getattr(original_spec, field).to_bytes()
             )
-        _record_operation(receipt, "answer", answer_operation, answer)
 
         # Numerical policy is explicit test setup, not an inferred physical fact.
         budget_before = service.current_draft(created.case_id)
@@ -465,6 +465,7 @@ def test_live_ai02_japanese_intent_answer_freeze_and_e_edit(
             "--base",
             frozen_revision_id,
         )
+        _record_operation(receipt, "edit", edit_operation, edited)
         assert edit_code == 0
         assert edited["status"] == "UPDATED"
         assert edited["draft"]["parent_revision_id"] == frozen_revision_id
@@ -477,7 +478,6 @@ def test_live_ai02_japanese_intent_answer_freeze_and_e_edit(
         assert service._storage(created.case_id).current_frozen_revision(created.case_id) == (
             edit_frozen_revision
         )
-        _record_operation(receipt, "edit", edit_operation, edited)
 
         current = edited_draft
         assert current.values.material is not None
