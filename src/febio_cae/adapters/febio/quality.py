@@ -354,7 +354,7 @@ class QualityAdapter:
                     if face.face_id in faces[0].member_ids
                     for node in face.node_ids
                 }
-        if location not in {"node", "element"} or len(matching) != 1:
+        if location not in {"node", "element", "face"} or len(matching) != 1:
             raise ValueError(f"ROI does not resolve to one supported {location} set")
         return {str(member) for member in matching[0].member_ids}
 
