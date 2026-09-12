@@ -446,7 +446,7 @@ LLMは構造化された提案を返し、applicationがスキーマ、参照先
 
 質問は必要な項目をまとめ、取得済みの根拠で解消できる項目を再質問しない。古い質問への回答は現行草案を変更できない。数値設定の選択やツール欠落は物理条件の質問と分け、構造化診断にする。
 
-以下は実装予定のCLI契約であり、現時点で存在するコマンドではない。
+以下はCLIの操作契約を示す。previewの2行は8.4に記載した現行経路であり、その他の予定名は実装済みコマンドの一覧を意味しない。
 
 | コマンド | 動作 |
 |---|---|
@@ -459,8 +459,8 @@ LLMは構造化された提案を返し、applicationがスキーマ、参照先
 | `case validate <case-id>` / `case freeze <case-id>` | 検証と不変版の作成。凍結も再検証を必要とする |
 | `run <case-id> --revision <id>` | 検証済み版を予算内で実行。完了または明示的な未完了理由を返す |
 | `status <run-id>` / `cancel <run-id>` / `resume <run-id>` | 永続状態、所有プロセスの取消し、状態照合と再開判断 |
-| `preview <run-id> --open` | 結果の検証とStudio起動 |
-| `preview <run-id> --confirm --evidence <path>` | 読込確認の記録。内容ハッシュを再検証 |
+| `case preview <case-id> --manifest-id <id> --window-id <id> --studio <path> --timeout <seconds>` | 既存Studioセッションに対する一回限りの観測要求を発行し、標準入力から独立した観測を受けて読込確認を記録。Studioを起動しない |
+| `case preview-status <case-id> --preview-id <id>` | 登録済み観測の内容ハッシュと結果・品質の結び付きを再検証 |
 | `case edit <case-id> --base <revision> --text <text>` | 親版を指定した部分変更の草案 |
 | `compare <baseline-run> <candidate-run> --spec <path>` | 型付き比較条件で差分・曲線・レポートを作成 |
 
@@ -468,7 +468,7 @@ LLMは構造化された提案を返し、applicationがスキーマ、参照先
 
 各操作は`--json`を持ち、`schema_version, status, case_id, revision_id, run_id, diagnostics, next_actions`を返す。適用外IDはnullで表す。終了コードは0=操作成功、2=入力または比較条件不正、3=物理条件待ち、4=環境・未対応能力、5=実行失敗、6=結果完全性・必須品質不合格、7=キャンセル・中断、8=競合・古い世代とする。`status`の読取成功はrun成功を意味せず、返却JSON内の状態を解釈する。
 
-runに関する応答には`run_status, quality_status, preview_status, task_status`も含める。`task_status`は既存の記録からapplicationが導出する`READY / NEEDS_INPUT / RUNNING / NEEDS_QUALITY / NEEDS_PREVIEW / COMPLETE / FAILED / INTERRUPTED`であり、呼出し側が書き込む成功フラグにはしない。計算と必須品質が成立していても、要求した表示が未確認ならNEEDS_PREVIEWと返す。`preview --open`の起動成功も読込確認を意味しない。終了コード0とタスク全体のCOMPLETEを区別する。
+runに関する応答には`run_status, quality_status, preview_status, task_status`も含める。`task_status`は既存の記録からapplicationが導出する`READY / NEEDS_INPUT / RUNNING / NEEDS_QUALITY / NEEDS_PREVIEW / COMPLETE / FAILED / INTERRUPTED`であり、呼出し側が書き込む成功フラグにはしない。計算と必須品質が成立していても、要求した表示が未確認ならNEEDS_PREVIEWと返す。`case preview`の観測要求発行だけでは読込確認を意味しない。終了コード0とタスク全体のCOMPLETEを区別する。
 
 ## 11. 保存、再現性、データ境界
 

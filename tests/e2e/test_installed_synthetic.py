@@ -91,7 +91,7 @@ _REQUIRED_NUMERICAL = {
     "solver_residual",
     "mesh_dependence",
 }
-_ALLOWED_NUMERICAL = {"PASS", "NOT_APPLICABLE"}
+_ALLOWED_NUMERICAL = {"PASS"}
 _FORBIDDEN_INPUT_KEYS = {
     "argv",
     "command",
