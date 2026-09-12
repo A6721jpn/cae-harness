@@ -48,14 +48,14 @@ def _refinement_error(curves: Sequence[Sequence[float]], floor: float) -> float:
 
 
 def _geometry(mesh: MeshArtifact, body: str | None = None) -> tuple[str, int, float]:
-    coordinates = {node.node_id: tuple(node.coordinates_si) for node in mesh.nodes}
+    coordinates = {node.node_id: list(node.coordinates_si) for node in mesh.nodes}
     elements = tuple(
         element for element in mesh.elements if body is None or element.body_id == body
     )
     if not elements:
         raise ValueError("refinement mesh has no requested body elements")
     geometry = sorted(
-        (element.body_id, sorted(coordinates[node] for node in element.node_ids))
+        [element.body_id, sorted(coordinates[node] for node in element.node_ids)]
         for element in elements
     )
     longest_edge = max(
