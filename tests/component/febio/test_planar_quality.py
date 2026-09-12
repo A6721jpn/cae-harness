@@ -618,3 +618,102 @@ def test_contact_uses_registered_projection_of_explicit_coordinate_selection() -
         next(row for row in rows if row.criterion_id == "contact_quality").status
         is AssessmentStatus.PASS
     )
+
+
+def test_quadratic_contact_gap_cannot_hide_an_interior_extremum() -> None:
+    case = _fixture()
+    numeric = case[-1].records["part_displacement"]
+    values = [list(row) for row in numeric.values]
+    face = next(face for face in case[1].faces if face.body_id == PART_BODY.value)
+    for node in face.node_ids[3:]:
+        values[-1][numeric.entity_ids.index(str(node)) * 3 + 2] -= 0.9e-6
+    updated = _replace_displacement(
+        case, replace(numeric, values=tuple(tuple(row) for row in values))
+    )
+    contact = next(row for row in _assess(updated) if row.criterion_id == "contact_quality")
+    assert contact.status is not AssessmentStatus.PASS
+
+
+def test_normal_gap_alone_cannot_prove_contact_after_tangential_departure() -> None:
+    case = _fixture()
+    numeric = case[-1].records["part_displacement"]
+    values = [list(row) for row in numeric.values]
+    face = next(face for face in case[1].faces if face.body_id == PART_BODY.value)
+    for node in face.node_ids:
+        values[-1][numeric.entity_ids.index(str(node)) * 3] += 0.02
+    updated = _replace_displacement(
+        case, replace(numeric, values=tuple(tuple(row) for row in values))
+    )
+    contact = next(row for row in _assess(updated) if row.criterion_id == "contact_quality")
+    assert contact.status is not AssessmentStatus.PASS
+
+
+def test_missing_equilibrium_scope_cannot_hide_independent_motion_failure() -> None:
+    case = _fixture()
+    numeric = case[-1].records["part_displacement"]
+    values = [list(row) for row in numeric.values]
+    values[-1][len(_PART_NODES) * 3] = 0.0002
+    revision, mesh, profile, manifest, data = _replace_displacement(
+        case, replace(numeric, values=tuple(tuple(row) for row in values))
+    )
+    evaluations = tuple(
+        replace(item, state_times=item.state_times[:-1])
+        if item.evaluation_id == "ev_support_reaction"
+        else item
+        for item in revision.spec.outputs.evaluations
+    )
+    revision = replace(
+        revision,
+        spec=replace(
+            revision.spec, outputs=replace(revision.spec.outputs, evaluations=evaluations)
+        ),
+    )
+    rows = {
+        row.criterion_id: row.status for row in _assess((revision, mesh, profile, manifest, data))
+    }
+    assert rows["motion_support_contact_fidelity"] is AssessmentStatus.FAIL
+    assert rows["quasistatic_equilibrium"] is AssessmentStatus.UNVERIFIED
+
+
+def test_evaluation_policy_must_cover_declared_motion_endpoint() -> None:
+    revision, mesh, profile, manifest, data = _fixture()
+    outputs = revision.spec.outputs
+    revision = replace(
+        revision,
+        spec=replace(
+            revision.spec,
+            outputs=replace(
+                outputs,
+                saved_times=outputs.saved_times[:-1],
+                evaluations=tuple(
+                    replace(item, state_times=item.state_times[:-1]) for item in outputs.evaluations
+                ),
+            ),
+        ),
+    )
+    rows = {
+        row.criterion_id: row.status for row in _assess((revision, mesh, profile, manifest, data))
+    }
+    assert rows["motion_support_contact_fidelity"] is AssessmentStatus.UNVERIFIED
+    assert rows["quasistatic_equilibrium"] is AssessmentStatus.UNVERIFIED
+
+
+def test_canonical_contact_force_is_converted_back_for_applied_force_balance() -> None:
+    revision, mesh, profile, _, data = _fixture()
+    previous = data.records["tool_force"]
+    mapping = replace(previous.mapping, raw_sign=-1)
+    force = _numeric(
+        mapping,
+        tuple(previous.entity_ids),
+        tuple(tuple(-value for value in row) for row in previous.values),
+    )
+    profile = replace(
+        profile,
+        output_mappings=tuple(
+            mapping if item.canonical_id == mapping.canonical_id else item
+            for item in profile.output_mappings
+        ),
+    )
+    records = dict(data.records, tool_force=force)
+    rows = _assess((revision, mesh, profile, _manifest(records, profile), _Data(records)))
+    assert all(row.status is AssessmentStatus.PASS for row in rows)

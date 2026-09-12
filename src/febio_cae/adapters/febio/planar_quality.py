@@ -289,6 +289,7 @@ def _resolve_context(
     profile: CompatibilityProfile,
     data: ResultDataPort,
     criteria: Sequence[QualityCriterion],
+    evaluation_cache: dict[str, tuple[tuple[str, str], _Resolved]],
 ) -> _Context:
     if not isinstance(manifest, ResultManifest) or not isinstance(revision, CaseRevision):
         _fail("manifest or revision is invalid")
@@ -352,24 +353,22 @@ def _resolve_context(
     )
     if saved_times[0] < motion_times[0] or saved_times[-1] > motion_times[-1]:
         _fail("saved states fall outside the declared motion history")
+    if saved_times[-1] != motion_times[-1]:
+        _fail("numerical evaluation policy does not cover the declared motion endpoint")
 
     part_body = spec.geometry.body_id.value
     tool_body = spec.rigid_tool.primitive.body_id.value
     part_nodes = frozenset(
-        str(node.node_id)
-        for node in mesh.nodes
-        if any(
-            element.body_id == part_body and node.node_id in element.node_ids
-            for element in mesh.elements
-        )
+        str(node)
+        for element in mesh.elements
+        if element.body_id == part_body
+        for node in element.node_ids
     )
     tool_nodes = frozenset(
-        str(node.node_id)
-        for node in mesh.nodes
-        if any(
-            element.body_id == tool_body and node.node_id in element.node_ids
-            for element in mesh.elements
-        )
+        str(node)
+        for element in mesh.elements
+        if element.body_id == tool_body
+        for node in element.node_ids
     )
     if not part_nodes or not tool_nodes or set(part_nodes) & set(tool_nodes):
         _fail("mesh node/body membership is incomplete or overlapping")
@@ -384,6 +383,13 @@ def _resolve_context(
     }
     resolved: dict[tuple[str, str], _Resolved] = {}
     for evaluation_id in sorted(evaluation_ids):
+        cached = evaluation_cache.get(evaluation_id)
+        if cached is not None:
+            key, value = cached
+            if key in resolved:
+                _fail(f"duplicate {key[0]} evaluation scope for body {key[1]}")
+            resolved[key] = value
+            continue
         evaluation = evaluations_by_id.get(evaluation_id)
         if evaluation is None:
             _fail(f"declared evaluation is missing: {evaluation_id}")
@@ -428,7 +434,7 @@ def _resolve_context(
             kind = "force"
             if set(numeric.entity_ids) != {tool_body} or request.location != "rigid_body":
                 _fail("rigid applied force scope is incomplete")
-            if mapping.raw_sign != 1 or mapping.canonical_sign != 1:
+            if mapping.raw_sign not in {-1, 1} or mapping.canonical_sign != 1:
                 _fail("rigid applied force mapping sign is unexpected")
         elif native_name == "rigid position":
             kind = "position"
@@ -456,13 +462,18 @@ def _resolve_context(
             _fail(f"duplicate {kind} evaluation scope for body {key[1]}")
         if kind == "displacement" and entities not in {part_nodes, tool_nodes}:
             _fail("displacement evaluation does not identify one complete body")
+        scale = float(Quantity(1, mapping.unit).to_si().value)
+        if kind == "force":
+            # Numeric data is canonical; equilibrium requires FEBio's applied force.
+            scale *= mapping.raw_sign * mapping.canonical_sign
         resolved[key] = _Resolved(
             numeric,
             entities,
             state_indices,
             {entity: index * 3 for index, entity in enumerate(numeric.entity_ids)},
-            float(Quantity(1, mapping.unit).to_si().value),
+            scale,
         )
+        evaluation_cache[evaluation_id] = (key, resolved[key])
 
     return _Context(
         revision,
@@ -646,6 +657,72 @@ def _contact_faces(
     return part, tool, initial_gap
 
 
+def _quadratic_coefficients(values: Sequence[float]) -> tuple[float, ...]:
+    origin = values[0]
+    first, second = values[1] - origin, values[2] - origin
+    a = 2.0 * (first - 2.0 * (values[3] - origin))
+    c = 2.0 * (second - 2.0 * (values[5] - origin))
+    d, e = first - a, second - c
+    b = 4.0 * (values[4] - origin) - a - c - 2.0 * (d + e)
+    return a, b, c, d, e, origin
+
+
+def _quadratic_value(coefficients: Sequence[float], u: float, v: float) -> float:
+    a, b, c, d, e, origin = coefficients
+    return _finite(
+        math.fsum((a * u * u, b * u * v, c * v * v, d * u, e * v, origin)), "quadratic value"
+    )
+
+
+def _quadratic_range(values: Sequence[float]) -> tuple[float, float]:
+    """Extrema of a six-node scalar field on the closed reference triangle."""
+    coefficients = _quadratic_coefficients(values)
+    candidates = list(values[:3])
+    for first, second, middle in ((0, 1, 3), (1, 2, 4), (2, 0, 5)):
+        a = 2.0 * (values[first] + values[second] - 2.0 * values[middle])
+        b = values[second] - values[first] - a
+        if a != 0.0:
+            position = -b / (2.0 * a)
+            if 0.0 < position < 1.0:
+                candidates.append((a * position + b) * position + values[first])
+    a, b, c, d, e, _ = coefficients
+    determinant = 4.0 * a * c - b * b
+    if determinant != 0.0:
+        u = (b * e - 2.0 * c * d) / determinant
+        v = (b * d - 2.0 * a * e) / determinant
+        if u > 0.0 and v > 0.0 and u + v < 1.0:
+            candidates.append(_quadratic_value(coefficients, u, v))
+    return min(candidates), max(candidates)
+
+
+def _deformed_projected_overlap(
+    part: Sequence[Sequence[float]],
+    tools: Sequence[Sequence[Sequence[float]]],
+    dropped_axis: int,
+) -> bool:
+    """Prove positive overlap by a regular curved-face point inside an affine tool face."""
+    axes = tuple(axis for axis in range(3) if axis != dropped_axis)
+    x = _quadratic_coefficients(tuple(point[axes[0]] for point in part))
+    y = _quadratic_coefficients(tuple(point[axes[1]] for point in part))
+    for u, v in ((1.0 / 3, 1.0 / 3), (0.25, 0.25), (0.5, 0.25), (0.25, 0.5)):
+        xu, xv = 2 * x[0] * u + x[1] * v + x[3], x[1] * u + 2 * x[2] * v + x[4]
+        yu, yv = 2 * y[0] * u + y[1] * v + y[3], y[1] * u + 2 * y[2] * v + y[4]
+        if xu * yv - xv * yu == 0.0:
+            continue
+        point = (_quadratic_value(x, u, v), _quadratic_value(y, u, v))
+        for tool in tools:
+            signs = tuple(
+                (tool[(index + 1) % 3][axes[0]] - tool[index][axes[0]])
+                * (point[1] - tool[index][axes[1]])
+                - (tool[(index + 1) % 3][axes[1]] - tool[index][axes[1]])
+                * (point[0] - tool[index][axes[0]])
+                for index in range(3)
+            )
+            if all(value > 0.0 for value in signs) or all(value < 0.0 for value in signs):
+                return True
+    return False
+
+
 def _deformed_gap(
     context: _Context,
     part_faces: Sequence[_FaceGeometry],
@@ -654,21 +731,49 @@ def _deformed_gap(
     tool_displacement: _Resolved,
     saved_index: int,
 ) -> tuple[float, float]:
-    def scalars(faces: Sequence[_FaceGeometry], displacement: _Resolved) -> list[float]:
+    def deformed(
+        faces: Sequence[_FaceGeometry], displacement: _Resolved
+    ) -> tuple[tuple[tuple[float, float, float], ...], ...]:
         state_index = displacement.state_indices[saved_index]
-        return [
-            _dot(_add(point, displacement.row_vector(state_index, str(node_id))), context.direction)
+        return tuple(
+            tuple(
+                _add(point, displacement.row_vector(state_index, str(node_id)))
+                for node_id, point in zip(face.face.node_ids, face.points, strict=True)
+            )
             for face in faces
-            for node_id, point in zip(face.face.node_ids, face.points, strict=True)
-        ]
+        )
 
-    part = scalars(part_faces, part_displacement)
-    tool = scalars(tool_faces, tool_displacement)
+    part = deformed(part_faces, part_displacement)
+    tool = deformed(tool_faces, tool_displacement)
     if not part or not tool:
         _fail("contact face geometry is empty")
+    axes = tuple(axis for axis in range(3) if axis != context.direction_axis)
+    for face in tool:
+        for first, second, middle in ((0, 1, 3), (1, 2, 4), (2, 0, 5)):
+            for axis in axes:
+                expected = 0.5 * (face[first][axis] + face[second][axis])
+                tolerance = 32 * max(
+                    math.ulp(face[index][axis]) for index in (first, second, middle)
+                )
+                if abs(face[middle][axis] - expected) > tolerance:
+                    _fail("deformed tool contact projection is not affine")
+    if not all(_deformed_projected_overlap(face, tool, context.direction_axis) for face in part):
+        _fail("positive projected contact overlap is not established for every deformed part face")
+    part_ranges = tuple(
+        _quadratic_range(tuple(_dot(point, context.direction) for point in face)) for face in part
+    )
+    tool_ranges = tuple(
+        _quadratic_range(tuple(_dot(point, context.direction) for point in face)) for face in tool
+    )
     return (
-        _finite(min(part) - max(tool), "minimum deformed contact gap"),
-        _finite(max(part) - min(tool), "maximum deformed contact gap"),
+        _finite(
+            min(pair[0] for pair in part_ranges) - max(pair[1] for pair in tool_ranges),
+            "minimum deformed contact gap",
+        ),
+        _finite(
+            max(pair[1] for pair in part_ranges) - min(pair[0] for pair in tool_ranges),
+            "maximum deformed contact gap",
+        ),
     )
 
 
@@ -889,11 +994,7 @@ def assess_planar_requirements(
 
     criteria = tuple(revision.spec.quality_policy.criteria)
 
-    try:
-        context = _resolve_context(manifest, revision, mesh, profile, data, criteria)
-    except (ValueError, KeyError, OverflowError) as error:
-        reason = f"planar quality scope/evidence is unavailable: {error}"
-        return tuple(_unverified(identifier, reason) for identifier in _REQUIRED_IDS)
+    evaluation_cache: dict[str, tuple[tuple[str, str], _Resolved]] = {}
 
     assessments: list[CriterionAssessment] = []
     for output_id, metric_id, evaluator in (
@@ -903,6 +1004,9 @@ def assess_planar_requirements(
     ):
         try:
             criterion = _criterion_for_metric(criteria, metric_id)
+            context = _resolve_context(
+                manifest, revision, mesh, profile, data, (criterion,), evaluation_cache
+            )
             assessments.append(evaluator(context, criterion))
         except (ValueError, KeyError, OverflowError) as error:
             assessments.append(
