@@ -401,9 +401,9 @@ Physical corroboration alone is not a universal prerequisite for numerical compl
 
 ### 8.4 プレビューとタスク完了
 
-`preview --open`は登録済みXPLTのハッシュを確認して外部FEBio Studioを起動する。プレビュー状態は`REQUESTED / LAUNCHED / CONFIRMED / FAILED`とする。プロセス起動だけではCONFIRMEDにしない。
+公開`case preview`は既に開かれた外部FEBio Studioのプロセス・ウィンドウを受動的に特定し、登録済みXPLTのハッシュと要求表示に結び付く一回限りの観察要求を発行する。このCLI自体はStudioを起動・操作しない。プレビュー状態は`REQUESTED / LAUNCHED / CONFIRMED / FAILED`であり、プロセスの存在・起動・正常終了だけではCONFIRMEDにしない。
 
-CONFIRMEDには、対象ファイル、Studio版、最終状態、必要な変数の表示を確認した根拠が必要である。対応版に公式の確認インターフェースがある場合は検証して利用し、それ以外は人による確認とケース領域の証拠を記録する。確認時のXPLTハッシュと現在値を照合する。検証手順に用いる外部操作ツールは製品の実行時依存にしない。
+CONFIRMEDには、対象ファイル、Studio版、最終状態、必要な変数・成分・座標系・単位の実表示を独立した操作者が確認した根拠が必要である。既存セッションとnonceに一致する観察記録を、要求発行後に新規作成したPNGとともに有限期限内に受理し、ケースへ登録する。確認時のXPLTハッシュと現在値を照合する。要求値の単純な反射や過去の画像を確認根拠にせず、検証手順に用いる外部操作ツールは製品の実行時依存にしない。
 
 解析タスクの完了は、要求終端への到達、結果の完全性、必須数値品質、要求されたプレビュー確認を満たした時点とする。物理的な実物検証が別途必要なら、その未検証状態を結果と併記する。プレビュー未確認を物理条件不足のASK_AND_BLOCKへ変換しない。
 
@@ -417,8 +417,9 @@ registers missing quality. The embedded quality is the recomputed declared-crite
 assessment; quality_registration_status describes its registered usability, while
 quality_status also enforces the mandatory coverage gate above.
 Registered declared-criterion PASS alone is not evidence of complete mandatory
-physical/numerical coverage; force-system completeness, applicability, native sign
-and solver-residual obligations remain pending. This registration check changes no policy or persisted arithmetic schema.
+physical/numerical coverage. Each mandatory numerical obligation requires its own
+qualified producer and exact applicable evidence. This registration check changes
+no policy or persisted arithmetic schema.
 
 ## 9. 部分変更と比較
 
@@ -835,10 +836,11 @@ internal formula or full-precision convergence claim. Maximum gap remains the
 literal native quantity, not averaged L2 or physical penetration. A trusted final
 contrary row makes effective quality FAIL/task FAILED despite unrelated unknowns;
 nonfinal/rejected or untrusted admission cannot manufacture finalFAIL. Report-level
-PASS means only printed comparisons; mandatory solver_residual and
-native_qualification remain UNVERIFIED. No automatic COMPLETE or capability-driven
-ASK_AND_BLOCK. Existing arithmetic registration, integrity and physical display
-remain separate; status exit0 continues to mean successful status retrieval.
+PASS means only printed comparisons; the report's native_qualification remains
+UNVERIFIED. Mandatory solver_residual requires the separately qualified producer
+and bound evidence, not this report alone. There is no automatic COMPLETE or
+capability-driven ASK_AND_BLOCK. Arithmetic registration, integrity and physical
+display remain separate; status exit0 means successful status retrieval.
 
 Allow only optional contact minaug (integer>=0)/maxaug (integer>0, minaug<=maxaug),
 optional boolean solver reform_augment, and optional positive integer max_ups under
@@ -849,12 +851,13 @@ Reject a lone zero-valued member, booleans, and other symmetry/method combinatio
 Preserve omitted and positive-max_ups BFGS behavior; add no defaults or profile flags.
 Printed-norm admission must match this exact input/frozen-policy pair and the
 observed solver nonsymmetric echo, distinguishing it from the contact symmetry echo.
-The observed synthetic FEBio4.12 solver convergence motivates this numerical path;
-it does not establish output sign compatibility, profile or mandatory residual PASS.
-No new persisted schema, process/runner behavior or log publication path. Fresh
-bounded actual producer qualification and a formal completeness decision remain
-required before mandatory residual PASS; synthetic software checks are not native
-qualification. All other quality obligations and required real E2Es remain pending.
+Observed synthetic FEBio4.12 convergence motivates this numerical path but does
+not by itself establish output sign compatibility, a profile or mandatory residual
+PASS. The qualified producer must independently bind actual runtime, input,
+controls and accepted final cycles as required by the numerical completion
+contract. No new persisted schema, process/runner behavior or log publication path
+is introduced here. Other numerical obligations require their own applicable
+producers; scientific validation and required real E2Es remain separate.
 
 ### Bounded printed-norm core and standalone manual benchmarks
 

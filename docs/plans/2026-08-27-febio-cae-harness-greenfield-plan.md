@@ -576,8 +576,9 @@ registers missing quality. The embedded quality is the recomputed declared-crite
 assessment; quality_registration_status preserves that registered usability;
 quality_status is extended by the mandatory coverage increment below.
 Registered declared-criterion PASS alone is not evidence of complete mandatory
-physical/numerical coverage; force-system completeness, applicability, native sign
-and solver-residual obligations remain pending. This registration check changes no policy or persisted arithmetic schema.
+physical/numerical coverage. Each mandatory numerical obligation requires its own
+qualified producer and exact applicable evidence. This registration check changes
+no policy or persisted arithmetic schema.
 
 Use focused synthetic registration tests before implementation: missing quality
 registration cannot complete even with confirmed preview and successful solver;
@@ -598,12 +599,13 @@ profile, reader and result bindings; every declared output must cover its reques
 entities, components, layout, frame and units with finite registered state data
 through the declared endpoint. Complete coverage may produce PASS; unavailable
 data-level coverage remains UNVERIFIED and corrupt registration remains INTEGRITY.
-This does not qualify native physics, signs or the reader itself. The other five
-numerical obligations still have no qualified PASS or NOT_APPLICABLE producer.
-Arithmetic methods, criterion names, arbitrary evidence references and registered
-profile labels cannot discharge them. Public paths therefore still cannot attain
-mandatory numerical COMPLETE. No physics, signs, thresholds or applicability
-exclusions are guessed.
+This completeness row does not qualify native physics, signs or the reader itself.
+For the registered planar-linear-frictionless box scope in section 5.4, separate
+qualified producers can discharge the other five numerical obligations only with
+their exact runtime, result, policy and refinement evidence. Arithmetic methods,
+criterion names, arbitrary evidence references and profile labels alone cannot
+discharge them. Missing or out-of-scope evidence remains UNVERIFIED; no physics,
+signs, thresholds or applicability exclusions are guessed.
 
 Expose derived required_quality with the exact resolved revision/spec, mesh,
 profile, attempt/bundle/manifest and arithmetic-assessment identities/digests.
@@ -693,10 +695,11 @@ internal formula or full-precision convergence claim. Maximum gap remains the
 literal native quantity, not averaged L2 or physical penetration. A trusted final
 contrary row makes effective quality FAIL/task FAILED despite unrelated unknowns;
 nonfinal/rejected or untrusted admission cannot manufacture finalFAIL. Report-level
-PASS means only printed comparisons; mandatory solver_residual and
-native_qualification remain UNVERIFIED. No automatic COMPLETE or capability-driven
-ASK_AND_BLOCK. Existing arithmetic registration, integrity and physical display
-remain separate; status exit0 continues to mean successful status retrieval.
+PASS means only printed comparisons; the report's native_qualification remains
+UNVERIFIED. Mandatory solver_residual requires the separately qualified producer
+and bound evidence, not this report alone. There is no automatic COMPLETE or
+capability-driven ASK_AND_BLOCK. Arithmetic registration, integrity and physical
+display remain separate; status exit0 means successful status retrieval.
 
 Allow only optional contact minaug (integer>=0)/maxaug (integer>0, minaug<=maxaug),
 optional boolean solver reform_augment, and optional positive integer max_ups under
@@ -707,12 +710,13 @@ Reject a lone zero-valued member, booleans, and other symmetry/method combinatio
 Preserve omitted and positive-max_ups BFGS behavior; add no defaults or profile flags.
 Printed-norm admission must match this exact input/frozen-policy pair and the
 observed solver nonsymmetric echo, distinguishing it from the contact symmetry echo.
-The observed synthetic FEBio4.12 solver convergence motivates this numerical path;
-it does not establish output sign compatibility, profile or mandatory residual PASS.
-No new persisted schema, process/runner behavior or log publication path. Fresh
-bounded actual producer qualification and a formal completeness decision remain
-required before mandatory residual PASS; synthetic software checks are not native
-qualification. All other quality obligations and required real E2Es remain pending.
+Observed synthetic FEBio4.12 convergence motivates this numerical path but does
+not by itself establish output sign compatibility, a profile or mandatory residual
+PASS. The qualified producer must independently bind actual runtime, input,
+controls and accepted final cycles as required by the numerical completion
+contract. No new persisted schema, process/runner behavior or log publication path
+is introduced here. Other numerical obligations require their own applicable
+producers; scientific validation and required real E2Es remain separate.
 
 ### Bounded norm-core extraction and manual-reader contract
 
