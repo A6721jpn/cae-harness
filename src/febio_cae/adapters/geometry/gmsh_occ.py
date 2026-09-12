@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Self
 
-from febio_cae.domain import FrameId, unit_definition
+from febio_cae.domain import FrameId, RigidPrimitive, unit_definition
 from febio_cae.domain.canonical import canonical_bytes
 
 from .backend import (
@@ -52,6 +52,7 @@ _CONVERSION_LENGTH_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 _BODY_ID_RE = re.compile(r"^body-(?P<tag>[1-9][0-9]*)$")
+_SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _TET10_TYPE = 11
 # Native Gmsh state is process-global even across different backend/module
 # wrappers. Non-reentrant admission avoids both query/initialize races and
@@ -154,6 +155,78 @@ class GmshOCCBackend:
     @property
     def backend_version(self) -> str:
         return self.config.expected_version
+
+    def inspect_rigid_primitive(
+        self, primitive: RigidPrimitive, geometry_digest: str
+    ) -> BackendInspection:
+        """Inspect a native OCC sphere or cylinder in its local frame."""
+
+        primitive = _require_curved_primitive(primitive)
+        geometry_digest = _require_geometry_digest(geometry_digest)
+        source_digest = _primitive_source_digest(
+            primitive,
+            geometry_digest=geometry_digest,
+            global_size_si=None,
+        )
+        gmsh = self._load_module()
+        with _GmshSession(gmsh, self.config.geometry_kernel):
+            self._prepare_owned_session(gmsh)
+            volume_tag = self._create_rigid_primitive(gmsh, primitive)
+            context = self._primitive_context(gmsh, volume_tag, primitive)
+        if not context.closed_solid:
+            raise BackendError(
+                BackendErrorCategory.UNSUPPORTED_CAPABILITY,
+                f"native {primitive.kind} did not produce a closed solid",
+            )
+        body = BackendBody(
+            context.body_id,
+            context.closed_solid,
+            context.volume_si,
+            context.faces,
+        )
+        return BackendInspection(
+            source_digest=source_digest,
+            geometry_digest=geometry_digest,
+            declared_units=("m",),
+            frame=primitive.local_frame,
+            bodies=(body,),
+        )
+
+    def mesh_rigid_primitive(
+        self,
+        primitive: RigidPrimitive,
+        geometry_digest: str,
+        global_size_si: float,
+    ) -> BackendMesh:
+        """Generate a native curved Tet10 mesh for a local sphere or cylinder."""
+
+        primitive = _require_curved_primitive(primitive)
+        geometry_digest = _require_geometry_digest(geometry_digest)
+        global_size_si = _require_global_size_si(global_size_si)
+        source_digest = _primitive_source_digest(
+            primitive,
+            geometry_digest=geometry_digest,
+            global_size_si=global_size_si,
+        )
+        gmsh = self._load_module()
+        with _GmshSession(gmsh, self.config.geometry_kernel):
+            self._prepare_owned_session(gmsh)
+            volume_tag = self._create_rigid_primitive(gmsh, primitive)
+            context = self._primitive_context(gmsh, volume_tag, primitive)
+            if not context.closed_solid:
+                raise BackendError(
+                    BackendErrorCategory.UNSUPPORTED_CAPABILITY,
+                    f"native {primitive.kind} did not produce a closed solid",
+                )
+            return self._mesh_context(
+                gmsh,
+                context,
+                source_digest,
+                geometry_digest,
+                _OCC_TARGET_SCALE_TO_SI,
+                global_size_si,
+                frame=primitive.local_frame,
+            )
 
     def inspect(self, content: bytes, requested_body_ids: Sequence[str]) -> BackendInspection:
         source_digest = _source_digest(content)
@@ -299,6 +372,108 @@ class GmshOCCBackend:
             )
         return module
 
+    def _create_rigid_primitive(self, gmsh: Any, primitive: RigidPrimitive) -> int:
+        radius = _primitive_length_si(primitive, "radius")
+        try:
+            option = getattr(gmsh, "option", None)
+            set_string = getattr(option, "setString", None)
+            if not callable(set_string):
+                raise BackendError(
+                    BackendErrorCategory.UNSUPPORTED_CAPABILITY,
+                    "configured Gmsh module has no OCC target-unit option API",
+                )
+            # Direct OCC dimensions are passed in SI metres. Keep the same
+            # explicit target-unit declaration used by the STEP path.
+            set_string("Geometry.OCCTargetUnit", _OCC_TARGET_UNIT)
+            model = gmsh.model
+            model.add("febio_cae_rigid_primitive")
+            occ = model.occ
+            if primitive.kind == "sphere":
+                add_sphere = getattr(occ, "addSphere", None)
+                if not callable(add_sphere):
+                    raise BackendError(
+                        BackendErrorCategory.UNSUPPORTED_CAPABILITY,
+                        "configured Gmsh OCC module has no addSphere API",
+                    )
+                native_tag = add_sphere(0.0, 0.0, 0.0, radius)
+            else:
+                height = _primitive_length_si(primitive, "height")
+                add_cylinder = getattr(occ, "addCylinder", None)
+                if not callable(add_cylinder):
+                    raise BackendError(
+                        BackendErrorCategory.UNSUPPORTED_CAPABILITY,
+                        "configured Gmsh OCC module has no addCylinder API",
+                    )
+                native_tag = add_cylinder(
+                    0.0,
+                    0.0,
+                    -height / 2.0,
+                    0.0,
+                    0.0,
+                    height,
+                    radius,
+                )
+            synchronize = getattr(occ, "synchronize", None)
+            if not callable(synchronize):
+                raise BackendError(
+                    BackendErrorCategory.UNSUPPORTED_CAPABILITY,
+                    "configured Gmsh OCC module has no synchronize API",
+                )
+            synchronize()
+        except BackendError:
+            raise
+        except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as error:
+            raise BackendError(
+                BackendErrorCategory.ENVIRONMENT,
+                f"Gmsh OCC primitive creation failed: {error}",
+            ) from error
+        try:
+            volume_tag = int(native_tag)
+        except (NameError, TypeError, ValueError, OverflowError) as error:
+            raise BackendError(
+                BackendErrorCategory.INTEGRITY,
+                "Gmsh OCC primitive creation returned an invalid volume tag",
+            ) from error
+        if volume_tag <= 0:
+            raise BackendError(
+                BackendErrorCategory.INTEGRITY,
+                "Gmsh OCC primitive creation returned a non-positive volume tag",
+            )
+        return volume_tag
+
+    def _primitive_context(
+        self, gmsh: Any, volume_tag: int, primitive: RigidPrimitive
+    ) -> _BodyContext:
+        contexts = self._inspect_contexts(gmsh, _OCC_TARGET_SCALE_TO_SI)
+        matches = tuple(context for context in contexts if context.volume_tag == volume_tag)
+        if len(contexts) != 1 or len(matches) != 1:
+            raise BackendError(
+                BackendErrorCategory.UNSUPPORTED_CAPABILITY,
+                "native rigid primitive did not produce exactly one volume",
+            )
+        native = matches[0]
+        body_id = primitive.body_id.value
+        faces = tuple(
+            BackendFace(
+                face_id=f"{body_id}:face-{_surface_tag(face.face_id)}",
+                body_id=body_id,
+                frame=primitive.local_frame,
+                area_si=face.area_si,
+                centroid_si=face.centroid_si,
+                boundary_points_si=face.boundary_points_si,
+                attributes=face.attributes,
+                defects=face.defects,
+            )
+            for face in native.faces
+        )
+        return _BodyContext(
+            body_id=body_id,
+            volume_tag=native.volume_tag,
+            faces=faces,
+            volume_si=native.volume_si,
+            closed_solid=native.closed_solid,
+        )
+
     def _import_step(self, gmsh: Any, path: Path) -> None:
         if self.config.geometry_kernel != "OpenCASCADE":
             raise BackendError(
@@ -421,6 +596,8 @@ class GmshOCCBackend:
         geometry_digest: str,
         native_scale_to_si: float,
         global_size_si: float,
+        *,
+        frame: FrameId | None = None,
     ) -> BackendMesh:
         try:
             mesh_api = gmsh.model.mesh
@@ -469,7 +646,7 @@ class GmshOCCBackend:
         return BackendMesh(
             source_digest=source_digest,
             geometry_digest=geometry_digest,
-            frame=FrameId(self.config.frame_id),
+            frame=frame if frame is not None else FrameId(self.config.frame_id),
             body_id=context.body_id,
             nodes=nodes,
             elements=tuple(
@@ -681,6 +858,81 @@ def _source_digest(content: bytes) -> str:
             BackendErrorCategory.INVALID_INPUT, "STEP content must be non-empty bytes"
         )
     return hashlib.sha256(content).hexdigest()
+
+
+def _require_curved_primitive(value: object) -> RigidPrimitive:
+    if not isinstance(value, RigidPrimitive):
+        raise BackendError(
+            BackendErrorCategory.INVALID_INPUT, "primitive must be a RigidPrimitive"
+        )
+    if value.kind not in {"sphere", "cylinder"}:
+        raise BackendError(
+            BackendErrorCategory.UNSUPPORTED_CAPABILITY,
+            f"native OCC primitive kind is unsupported: {value.kind!r}",
+        )
+    return value
+
+
+def _require_geometry_digest(value: object) -> str:
+    if not isinstance(value, str) or _SHA256_RE.fullmatch(value) is None:
+        raise BackendError(
+            BackendErrorCategory.INVALID_INPUT,
+            "geometry_digest must be a lowercase SHA-256 digest",
+        )
+    return value
+
+
+def _require_global_size_si(value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise BackendError(BackendErrorCategory.INVALID_INPUT, "global_size_si must be numeric")
+    try:
+        result = float(value)
+    except OverflowError as error:
+        raise BackendError(
+            BackendErrorCategory.INVALID_INPUT, "global_size_si must be finite"
+        ) from error
+    if not math.isfinite(result) or result <= 0.0:
+        raise BackendError(
+            BackendErrorCategory.INVALID_INPUT, "global_size_si must be positive and finite"
+        )
+    return result
+
+
+def _primitive_length_si(primitive: RigidPrimitive, name: str) -> float:
+    try:
+        value = float(primitive.dimensions[name].to_si().value)
+    except (AttributeError, KeyError, TypeError, ValueError, OverflowError) as error:
+        raise BackendError(
+            BackendErrorCategory.INVALID_INPUT,
+            f"primitive dimension {name!r} is not a finite length",
+        ) from error
+    if not math.isfinite(value) or value <= 0.0:
+        raise BackendError(
+            BackendErrorCategory.INVALID_INPUT,
+            f"primitive dimension {name!r} must be positive and finite",
+        )
+    return value
+
+
+def _primitive_source_digest(
+    primitive: RigidPrimitive,
+    *,
+    geometry_digest: str,
+    global_size_si: float | None,
+) -> str:
+    return hashlib.sha256(
+        canonical_bytes(
+            {
+                "schema_version": "1",
+                "backend_id": "gmsh-occ",
+                "primitive": primitive.to_dict(),
+                "geometry_digest": geometry_digest,
+                "native_length_unit": "m",
+                "global_size_si": global_size_si,
+                "ordering_id": BACKEND_TET10_ORDER_ID if global_size_si is not None else None,
+            }
+        )
+    ).hexdigest()
 
 
 def _require_ap214_header(content: bytes) -> None:
