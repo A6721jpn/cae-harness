@@ -13,7 +13,7 @@ import sys
 import xml.etree.ElementTree as ET
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -37,10 +37,10 @@ from febio_cae.domain import (
     RunState,
 )
 from febio_cae.domain.canonical import canonical_bytes
+from febio_cae.domain.output_policy import OutputLocation
 
 from .fixtures import evidence
 from .test_compiler_native import _case
-
 
 _CONTACT_SPECS = (
     # canonical ID, native name, location, value type, unit, side, component,
@@ -276,9 +276,7 @@ def _contact_entities(revision: Any, mesh: Any) -> dict[str, tuple[str, ...]]:
     faces = {face.face_id: face for face in mesh.faces}
     face_sets = {
         side: next(
-            item
-            for item in mesh.sets
-            if item.set_id == selection.name and item.kind == "face"
+            item for item in mesh.sets if item.set_id == selection.name and item.kind == "face"
         )
         for side, selection in selections.items()
     }
@@ -328,9 +326,7 @@ def native_bytes(mesh: Any, *, defect: str = "") -> bytes:
 
     nodes = tuple(mesh.nodes)
     node_index = {node.node_id: index for index, node in enumerate(nodes)}
-    node_data = b"".join(
-        struct.pack("<Ifff", node.node_id, *node.coordinates_si) for node in nodes
-    )
+    node_data = b"".join(struct.pack("<Ifff", node.node_id, *node.coordinates_si) for node in nodes)
     mesh_nodes = block(
         0x01041000,
         block(0x01041100, uint(0x01041101, len(nodes)) + uint(0x01041102, 3))
@@ -377,15 +373,14 @@ def native_bytes(mesh: Any, *, defect: str = "") -> bytes:
             indices = (len(nodes), *indices[1:])
         facet = struct.pack("<II6I", 1, 6, *indices)
         surface_header = (
-            uint(0x01043102, surface_ids[name] if name in surface_ids else 1)
+            uint(0x01043102, surface_ids.get(name, 1))
             + uint(0x01043103, 1)
             + text(0x01043104, name)
             + uint(0x01043105, 6)
         )
         surfaces += block(
             0x01043100,
-            block(0x01043101, surface_header)
-            + block(0x01043200, block(0x01043201, facet)),
+            block(0x01043101, surface_header) + block(0x01043200, block(0x01043201, facet)),
         )
     mesh_bytes = block(
         0x01040000,
@@ -416,9 +411,7 @@ def native_bytes(mesh: Any, *, defect: str = "") -> bytes:
                 raw_values = (float("nan"), *raw_values[1:])
             if defect == "wrong-contact-width" and index == 1:
                 raw_values = raw_values[:-1]
-            per_surface_width = (6 if spec[10] == 2 else 1) * (
-                3 if spec[3] == "VEC3F" else 1
-            )
+            per_surface_width = (6 if spec[10] == 2 else 1) * (3 if spec[3] == "VEC3F" else 1)
             # Rows are registered canonically as part then tool.  Native
             # contact regions intentionally arrive as ID 2 then ID 1.
             regions: tuple[tuple[int, tuple[float, ...]], ...] = (
@@ -477,7 +470,7 @@ def _surface_case(
             quantity_id=spec[0],
             measure_id="value",
             component_id=spec[6],
-            location=spec[2],
+            location=cast(OutputLocation, spec[2]),
             selection=part_selection if spec[5] == "part" else tool_selection,
             frame=mesh.frame,
             display_unit=spec[4],
@@ -646,9 +639,7 @@ def test_native_contact_outputs_compile_and_project_exact_entities(tmp_path: Pat
         output_id: (item.location, item.value_type, item.unit)
         for output_id, item in observations.items()
         if output_id in {spec[0] for spec in _CONTACT_SPECS}
-    } == {
-        spec[0]: (spec[2], spec[3], spec[4]) for spec in _CONTACT_SPECS
-    }
+    } == {spec[0]: (spec[2], spec[3], spec[4]) for spec in _CONTACT_SPECS}
 
     expected_entities = _contact_entities(revision, mesh)
     for spec in _CONTACT_SPECS:
@@ -660,13 +651,10 @@ def test_native_contact_outputs_compile_and_project_exact_entities(tmp_path: Pat
         assert numeric.mapping.value_type == value_type
         assert numeric.mapping.unit == unit
         assert numeric.entity_ids == expected_entities[canonical_id]
-        assert numeric.component_ids == (
-            ("value",) if value_type == "FLOAT" else ("x", "y", "z")
-        )
+        assert numeric.component_ids == (("value",) if value_type == "FLOAT" else ("x", "y", "z"))
         sign = raw_sign * canonical_sign
         assert numeric.values == tuple(
-            tuple(_f32(sign * value) for value in row)
-            for row in _CONTACT_RAW_VALUES[canonical_id]
+            tuple(_f32(sign * value) for value in row) for row in _CONTACT_RAW_VALUES[canonical_id]
         )
 
     assert expected_entities["contact_area"] == ("part-contact", "tool-contact")
@@ -706,11 +694,10 @@ def test_quality_evaluates_contact_surface_node_surface_and_face_scopes(tmp_path
     assert assessment.overall_status is AssessmentStatus.PASS
     criteria = {item.criterion_id: item for item in assessment.criteria}
     assert {item.status for item in criteria.values()} == {AssessmentStatus.PASS}
-    measured = {
-        item.criterion_id: item.measured[0].value for item in criteria.values()
-    }
+    measured = {item.criterion_id: item.measured[0].value for item in criteria.values()}
     assert measured["criterion_contact_gap"] == pytest.approx(0.8)
-    assert measured["criterion_contact_area"] == pytest.approx(0.5)
+    # Tool-side peak precedes the endpoint (0.5); the part-side peak is 0.9.
+    assert measured["criterion_contact_area"] == pytest.approx(0.8)
     assert measured["criterion_contact_pressure"] == pytest.approx(25.0)
 
 
