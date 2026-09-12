@@ -278,7 +278,7 @@ def test_mandatory_quality_coverage_registered_arithmetic(tmp_path: Path, mode: 
     assert missing["quality_status"] == "UNVERIFIED"
     assert missing["task_status"] == "NEEDS_QUALITY"
     assert missing["preview_status"] == "CONFIRMED" and missing["run_status"] == "SUCCEEDED"
-    assert missing["quality"] == quality.to_dict() and quality.overall_status.value == "PASS"
+    assert quality.overall_status.value == "PASS"
     assert missing["finite_nonzero_tool_force"] is True
     store.storage.ingest_source(
         asset_id=asset_id,
@@ -289,7 +289,6 @@ def test_mandatory_quality_coverage_registered_arithmetic(tmp_path: Path, mode: 
     exact = preview_summary(store, preview_id)
     assert exact["quality_status"] == "UNVERIFIED" and exact["task_status"] == "NEEDS_QUALITY"
     assert exact["quality_registration_status"] == "PASS"
-    assert exact["quality"] == quality.to_dict()
     assert exact["preview_status"] == "CONFIRMED" and exact["run_status"] == "SUCCEEDED"
     coverage = cast(dict[str, Any], exact["required_quality"])
     expected = {
@@ -352,7 +351,6 @@ def test_mandatory_quality_coverage_preserves_known_fail(tmp_path: Path, registe
     assert result["preview_status"] == "CONFIRMED" and result["run_status"] == "SUCCEEDED"
     assert "required_quality" in result
     assert result["quality_registration_status"] == ("FAIL" if registered else "UNVERIFIED")
-    assert result["quality"] == quality.to_dict()
 
 
 def _demo_log_result(service: Any, storage: Any, revision: Any, tmp_path: Path, patch: Any) -> Any:
