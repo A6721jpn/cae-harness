@@ -11,7 +11,7 @@ from typing import Any
 import pytest
 
 from febio_cae.adapters.febio.runner import RunnerAdapter
-from febio_cae.domain import ExecutionSetting, PortError, Quantity, RunState
+from febio_cae.domain import ExecutionSetting, PortError, PortErrorCategory, Quantity, RunState
 
 from .runner_fixture import _compiled, _owner, _Ownership
 from .test_runner_job import _job_type, _no_pid_operations, _until
@@ -240,3 +240,74 @@ def test_compiled_input_is_staged_and_success_requires_observed_exit(tmp_path: P
         _cleanup_process(managed.process)
         managed.stdout.close()
         managed.stderr.close()
+
+
+@pytest.mark.parametrize("failure", ["missing", "tampered"])
+def test_qualified_runtime_failure_is_rejected_before_spawn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    import hashlib
+
+    from febio_cae.adapters.febio import _native_qualification
+    from febio_cae.domain import FileEntry, ToolIdentity
+    from febio_cae.domain.canonical import canonical_bytes
+
+    runtime_root = tmp_path / "runtime"
+    runtime_root.mkdir()
+    executable = runtime_root / "febio4.exe"
+    executable_bytes = b"synthetic qualified executable"
+    executable.write_bytes(executable_bytes)
+    dll_bytes = {
+        "dependency-a.dll": b"dependency-a",
+        "dependency-b.dll": b"dependency-b",
+    }
+    if failure == "missing":
+        (runtime_root / "dependency-a.dll").write_bytes(dll_bytes["dependency-a.dll"])
+    else:
+        (runtime_root / "dependency-a.dll").write_bytes(b"tampered")
+        (runtime_root / "dependency-b.dll").write_bytes(dll_bytes["dependency-b.dll"])
+
+    known_tool = ToolIdentity(
+        "synthetic-qualified",
+        "1",
+        hashlib.sha256(executable_bytes).hexdigest(),
+    )
+    expected_runtime_files = tuple(
+        _native_qualification._RuntimeFile(name, hashlib.sha256(content).hexdigest(), len(content))
+        for name, content in (("febio4.exe", executable_bytes), *dll_bytes.items())
+    )
+    expected_files = [
+        {"name": item.name, "digest": item.digest, "size_bytes": item.size_bytes}
+        for item in expected_runtime_files
+    ]
+    descriptor = canonical_bytes(
+        {
+            "schema_version": "1",
+            "kind": "febio-runtime-qualification",
+            "tool": known_tool.to_dict(),
+            "executable": expected_files[0],
+            "dlls": expected_files[1:],
+        }
+    )
+    monkeypatch.setattr(_native_qualification, "_QUALIFIED_TOOL", known_tool)
+    monkeypatch.setattr(_native_qualification, "_QUALIFIED_DESCRIPTOR", descriptor)
+    monkeypatch.setattr(_native_qualification, "_QUALIFIED_FILES", expected_runtime_files)
+
+    runner, _, bundle, budget = _fixture(tmp_path)
+    runtime_entry = FileEntry(
+        "input/native-runtime.json",
+        hashlib.sha256(descriptor).hexdigest(),
+        len(descriptor),
+        "native-runtime",
+    )
+    bundle = replace(
+        bundle,
+        tool=known_tool,
+        files=(*bundle.files, runtime_entry),
+        argv=(str(executable), *bundle.argv[1:]),
+    )
+    runner.bundle_store.stage(bundle.bundle_id, runtime_entry.logical_path, descriptor)
+
+    with pytest.raises(PortError) as failure_record:
+        runner.start(bundle, _owner(), budget)
+    assert failure_record.value.category is PortErrorCategory.INTEGRITY

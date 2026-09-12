@@ -31,6 +31,8 @@ from febio_cae.domain import (
 from febio_cae.domain.artifacts import TET10_NODE_ORDER_ID, validate_logical_path
 from febio_cae.domain.rigid_kinematics import check_translational_indentation_compatibility
 
+from ._native_qualification import qualification_document
+
 # This adapter dialect is deliberately separate from the solver's version.
 _FEB_SCHEMA = "4.0"
 _SOLVER_VERSION = "4.12.0"
@@ -169,21 +171,30 @@ class CompilerAdapter:
     ) -> ExecutionBundle:
         self._validate(revision, mesh, profile)
         content = self._render(revision, mesh, profile)
-        identity = hashlib.sha256(
-            b"|".join(
-                (
-                    revision.spec_digest.encode(),
-                    mesh.artifact_digest.encode(),
-                    profile.to_bytes(),
-                    content,
-                    self.executable.encode(),
+        runtime_descriptor = qualification_document(profile.solver)
+        identity_parts = [
+            revision.spec_digest.encode(),
+            mesh.artifact_digest.encode(),
+            profile.to_bytes(),
+            content,
+            self.executable.encode(),
+        ]
+        if runtime_descriptor is not None:
+            identity_parts.append(runtime_descriptor)
+        identity = hashlib.sha256(b"|".join(identity_parts)).hexdigest()
+        bundle_id = f"bundle-{identity[:24]}"
+        files = [
+            FileEntry("input/case.feb", hashlib.sha256(content).hexdigest(), len(content), "input")
+        ]
+        if runtime_descriptor is not None:
+            files.append(
+                FileEntry(
+                    "input/native-runtime.json",
+                    hashlib.sha256(runtime_descriptor).hexdigest(),
+                    len(runtime_descriptor),
+                    "native-runtime",
                 )
             )
-        ).hexdigest()
-        bundle_id = f"bundle-{identity[:24]}"
-        file_entry = FileEntry(
-            "input/case.feb", hashlib.sha256(content).hexdigest(), len(content), "input"
-        )
         bundle = ExecutionBundle(
             bundle_id=bundle_id,
             case_id=revision.case_id,
@@ -192,7 +203,7 @@ class CompilerAdapter:
             mesh_digest=mesh.artifact_digest,
             profile_id=profile.profile_id,
             tool=profile.solver,
-            files=(file_entry,),
+            files=tuple(files),
             argv=(
                 self.executable,
                 "-i",
@@ -218,7 +229,9 @@ class CompilerAdapter:
                 ExecutionSetting("output_log_path", "output/solver.log"),
             ),
         )
-        self.store.stage(bundle.bundle_id, file_entry.logical_path, content)
+        self.store.stage(bundle.bundle_id, files[0].logical_path, content)
+        if runtime_descriptor is not None:
+            self.store.stage(bundle.bundle_id, "input/native-runtime.json", runtime_descriptor)
         return bundle
 
     def _validate(

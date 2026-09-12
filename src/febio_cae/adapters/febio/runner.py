@@ -8,6 +8,7 @@ import signal
 import subprocess
 import time
 import uuid
+from contextlib import ExitStack
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, BinaryIO
@@ -28,6 +29,11 @@ from febio_cae.domain import (
     TrustedOwnerContext,
 )
 
+from ._native_qualification import (
+    has_qualified_runtime,
+    pin_qualified_runtime,
+    qualification_document,
+)
 from ._windows_job import LaunchCleanupPending, WindowsJobProcess
 
 _Scope = tuple[str, str, str, int]
@@ -49,6 +55,7 @@ class _Managed:
     descendants: set[int] = field(default_factory=set)
     enumeration_unknown: bool = False
     returncode: int | None = None
+    runtime_pin: ExitStack | None = None
 
 
 class RunnerAdapter:
@@ -85,7 +92,8 @@ class RunnerAdapter:
             raise PortError(PortErrorCategory.CONFLICT, "execution scope is already live")
         self.retry_failed_launch_cleanup()
         deadline = time.monotonic() + budget.max_elapsed.to_si().value
-        executable = Path(bundle.argv[0]).resolve()
+        executable_argument = Path(bundle.argv[0]).absolute()
+        executable = executable_argument.resolve()
         try:
             executable_digest = hashlib.sha256(executable.read_bytes()).hexdigest()
         except (OSError, ValueError) as error:
@@ -96,6 +104,12 @@ class RunnerAdapter:
             raise PortError(
                 PortErrorCategory.INTEGRITY,
                 "solver executable digest does not match the registered profile",
+            )
+        qualified_descriptor = qualification_document(bundle.tool)
+        if qualified_descriptor is not None and not has_qualified_runtime(bundle):
+            raise PortError(
+                PortErrorCategory.INTEGRITY,
+                "qualified runtime descriptor is missing or invalid",
             )
         self.ownership.claim(owner)
         attempt_root = (
@@ -119,7 +133,14 @@ class RunnerAdapter:
             ) from error
         (attempt_root / "output").mkdir()
         (attempt_root / "logs").mkdir()
-        self._stage_bundle(bundle, attempt_root)
+        staged = self._stage_bundle(bundle, attempt_root)
+        if qualified_descriptor is not None and staged.get("input/native-runtime.json") != (
+            qualified_descriptor
+        ):
+            raise PortError(
+                PortErrorCategory.INTEGRITY,
+                "staged qualified runtime descriptor does not match its qualification",
+            )
         preparing = AttemptRecord(
             attempt_id=owner.attempt_id,
             run_id=owner.run_id,
@@ -134,15 +155,29 @@ class RunnerAdapter:
             )
             + (ExecutionSetting("attempt_root", str(attempt_root)),),
         ).transition_to(RunState.PREPARING)
+        runtime_pin = ExitStack() if qualified_descriptor is not None else None
+        if runtime_pin is not None:
+            try:
+                runtime_pin.enter_context(pin_qualified_runtime(bundle, executable_argument))
+            except (OSError, TypeError, ValueError) as error:
+                runtime_pin.close()
+                raise PortError(
+                    PortErrorCategory.INTEGRITY,
+                    f"qualified runtime validation failed: {error}",
+                ) from error
         try:
             process, stdout, stderr = self._spawn(bundle, attempt_root)
         except LaunchCleanupPending as error:
+            if runtime_pin is not None:
+                runtime_pin.close()
             self._failed_launches.append(error.process)
             raise PortError(
                 PortErrorCategory.ENVIRONMENT,
                 "launch failed; retained suspended-root cleanup remains pending",
             ) from error
         except OSError as error:
+            if runtime_pin is not None:
+                runtime_pin.close()
             raise PortError(
                 PortErrorCategory.ENVIRONMENT, f"solver process could not start: {error}"
             ) from error
@@ -171,7 +206,15 @@ class RunnerAdapter:
             + (ExecutionSetting("max_elapsed_seconds", budget.max_elapsed.to_si().value),),
         )
         self._managed[key] = _Managed(
-            process, attempt_root, time.monotonic(), stdout, stderr, owner, attempt, deadline
+            process,
+            attempt_root,
+            time.monotonic(),
+            stdout,
+            stderr,
+            owner,
+            attempt,
+            deadline,
+            runtime_pin=runtime_pin,
         )
         return attempt
 
@@ -346,23 +389,34 @@ class RunnerAdapter:
             stderr.close()
             raise
 
-    def _stage_bundle(self, bundle: ExecutionBundle, attempt_root: Path) -> None:
+    def _stage_bundle(self, bundle: ExecutionBundle, attempt_root: Path) -> dict[str, bytes]:
         if self.bundle_store is None:
-            return
+            return {}
         resolver = getattr(self.bundle_store, "resolve", None)
         if not callable(resolver):
             raise PortError(
                 PortErrorCategory.ENVIRONMENT, "bundle store cannot resolve compiler bytes"
             )
+        staged: dict[str, bytes] = {}
         for entry in bundle.files:
             content = resolver(bundle, entry.logical_path)
             if not isinstance(content, bytes):
                 raise PortError(
                     PortErrorCategory.INTEGRITY, "bundle store returned non-byte content"
                 )
+            if (
+                len(content) != entry.size_bytes
+                or hashlib.sha256(content).hexdigest() != entry.digest
+            ):
+                raise PortError(
+                    PortErrorCategory.INTEGRITY,
+                    f"bundle store returned bytes that do not match {entry.logical_path}",
+                )
             target = attempt_root / Path(*entry.logical_path.split("/"))
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(content)
+            staged[entry.logical_path] = content
+        return staged
 
     def _observe_exit(self, attempt: AttemptRecord, managed: _Managed) -> PollResult:
         if attempt.state is RunState.RUNNING:
@@ -412,6 +466,9 @@ class RunnerAdapter:
             managed.process.close()
         managed.stdout.close()
         managed.stderr.close()
+        if managed.runtime_pin is not None:
+            managed.runtime_pin.close()
+            managed.runtime_pin = None
 
     def _wait_for_drain(self, managed: _Managed, *, force: bool) -> bool:
         if isinstance(managed.process, WindowsJobProcess):
