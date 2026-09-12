@@ -303,12 +303,12 @@ def _prevalidate_existing(
 
     for profile in profiles.values():
         try:
-            current = service.compatibility.get_profile(profile.profile_id)
+            registered_profile = service.compatibility.get_profile(profile.profile_id)
         except PortError as error:
             if error.category is PortErrorCategory.UNSUPPORTED_CAPABILITY:
                 continue
             raise
-        if current.to_bytes() != profile.to_bytes():
+        if registered_profile.to_bytes() != profile.to_bytes():
             raise PortError(
                 PortErrorCategory.CONFLICT,
                 f"compatibility profile {profile.profile_id!r} is already registered differently",
