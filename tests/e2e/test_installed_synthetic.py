@@ -27,6 +27,8 @@ from typing import Any, cast
 import pytest
 
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
+_APPROVED_BUNDLE_SHA256 = "f5f5ce51367f6f9af6f19fc42da6641fd3b4202711e95681a89333d74a3d22c5"
+_APPROVED_BUNDLE_SIZE = 604962
 _EVIDENCE_KEYS = {
     "schema_version",
     "source_kind",
@@ -134,6 +136,7 @@ class _Settings:
     wheel: _FileIdentity
     solver: _FileIdentity
     source_step: _FileIdentity
+    qualification_bundle: _FileIdentity
     preparation_requests: tuple[_FileIdentity, ...]
     youngs_modulus_pa: float
     instruction: str
@@ -705,6 +708,30 @@ def _validate_refinement_requests(
         raise _EnvironmentNotReady("refinement output bodies or saved states changed")
     return identities[0]
 
+def _request_profile_refs(request: dict[str, Any], field: str) -> dict[str, dict[str, Any]]:
+    values = _as_object(request.get("values"), f"{field}.values")
+    locations = (
+        ("solver", values.get("solver_policy"), "profile", "solver"),
+        ("outputs", values.get("outputs"), "profile", "outputs"),
+        ("quality", values.get("quality_policy"), "profile", "quality"),
+        ("mesh_quality", values.get("mesh_policy"), "quality_profile", "mesh_quality"),
+    )
+    result: dict[str, dict[str, Any]] = {}
+    for name, parent_value, key, purpose in locations:
+        parent = _as_object(parent_value, f"{field}.{name}")
+        ref = _strict_object(
+            parent.get(key),
+            required={"schema_version", "profile_id", "purpose", "record_digest"},
+            allowed={"schema_version", "profile_id", "purpose", "record_digest"},
+            field=f"{field}.{name}.{key}",
+        )
+        if ref["schema_version"] != "1" or ref["purpose"] != purpose:
+            raise _EnvironmentNotReady(f"{field}.{name}.{key} has an invalid profile reference")
+        _text(ref["profile_id"], f"{field}.{name}.{key}.profile_id")
+        _digest(ref["record_digest"], f"{field}.{name}.{key}.record_digest")
+        result[name] = ref
+    return result
+
 
 def _validate_axes(
     value: object,
@@ -1008,6 +1035,7 @@ def _load_settings() -> _Settings:
         "wheel",
         "solver",
         "source_step",
+        "qualification_bundle",
         "preparation_requests",
         "edit",
         "comparison",
@@ -1020,8 +1048,15 @@ def _load_settings() -> _Settings:
         )
     identities = {
         name: _file_identity(settings[name], f"settings.{name}")
-        for name in ("installed_python", "wheel", "solver", "source_step")
+        for name in ("installed_python", "wheel", "solver", "source_step", "qualification_bundle")
     }
+    if (
+        identities["qualification_bundle"].digest != _APPROVED_BUNDLE_SHA256
+        or identities["qualification_bundle"].size != _APPROVED_BUNDLE_SIZE
+    ):
+        raise _EnvironmentNotReady(
+            "settings.qualification_bundle is not the approved portable bundle identity"
+        )
     raw_requests = settings["preparation_requests"]
     if not isinstance(raw_requests, list) or len(raw_requests) != 3:
         raise _EnvironmentNotReady(
@@ -1102,6 +1137,7 @@ def _load_settings() -> _Settings:
         wheel=identities["wheel"],
         solver=identities["solver"],
         source_step=identities["source_step"],
+        qualification_bundle=identities["qualification_bundle"],
         preparation_requests=preparation_requests,
         youngs_modulus_pa=youngs_modulus_pa,
         instruction=instruction,
@@ -2326,6 +2362,64 @@ def test_installed_synthetic_cli_flow(tmp_path: Path) -> None:
             "create returned fabricated lifecycle IDs",
         )
         report.data["artifacts"]["case_id"] = case_id
+        report.write()
+
+        provision_code, provisioned, _ = cli(
+            "provision-planar-profiles",
+            [
+                "provision-planar-profiles",
+                case_id,
+                "--bundle-path",
+                str(settings.qualification_bundle.path),
+                "--json",
+            ],
+        )
+        _expect(
+            provision_code == 0
+            and provisioned.get("status") == "PROVISIONED"
+            and provisioned.get("case_id") == case_id
+            and provisioned.get("native_operations") == 0,
+            "planar profile provisioning failed or performed native work",
+        )
+        approved_bundle = _require_dict(
+            provisioned.get("approved_bundle"), "provisioned.approved_bundle"
+        )
+        _expect(
+            approved_bundle.get("sha256") == settings.qualification_bundle.digest
+            and approved_bundle.get("size") == settings.qualification_bundle.size,
+            "provisioned bundle identity differs from configured evidence",
+        )
+        provision_scope = _require_dict(provisioned.get("scope"), "provisioned.scope")
+        _expect(
+            provision_scope.get("enforced_scope_capability")
+            == "febio.scope.planar_linear_frictionless_fixed_xyz",
+            "provisioned scope is not the bounded planar capability",
+        )
+        request_payloads = [
+            _read_json(identity.path, f"preparation_requests[{index}]", environment=False)
+            for index, identity in enumerate(settings.preparation_requests)
+        ]
+        request_refs = tuple(
+            _request_profile_refs(request, f"preparation_requests[{index}]")
+            for index, request in enumerate(request_payloads)
+        )
+        expected_refs = request_refs[0]
+        _expect(
+            all(refs == expected_refs for refs in request_refs[1:]),
+            "preparation requests do not share immutable profile references",
+        )
+        returned_profiles = _require_dict(provisioned.get("profiles"), "provisioned.profiles")
+        _expect(set(returned_profiles) == {"solver", "outputs", "quality"}, "profile purposes differ")
+        for purpose in ("solver", "outputs", "quality"):
+            _expect(
+                returned_profiles.get(purpose) == expected_refs[purpose],
+                f"provisioned {purpose} reference differs from every preparation request",
+            )
+        _expect(
+            provisioned.get("mesh_quality") == expected_refs["mesh_quality"],
+            "provisioned mesh-quality reference differs from every preparation request",
+        )
+        report.data["profile_provisioning"] = provisioned
         report.write()
 
         revisions: list[dict[str, Any]] = []

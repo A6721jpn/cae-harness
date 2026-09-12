@@ -1026,6 +1026,14 @@ class RegisteredCaseService:
             raise ServiceConflictError("configured compatibility registry is read-only")
         return register(profile)
 
+    def provision_planar_profiles(
+        self, case_id: str, *, bundle_path: Path
+    ) -> dict[str, object]:
+        """Publish the exact approved planar profile bundle without native work."""
+        from ._profile_provisioning import provision_planar_profiles
+
+        return provision_planar_profiles(self, case_id, bundle_path=bundle_path)
+
     def register_mesh_quality(self, case_id: str, record: MeshQualityRecord) -> NumericalProfileRef:
         return self._storage(case_id).register_mesh_quality(record)
 

@@ -26,11 +26,25 @@ class SQLiteCompatibilityRegistry:
         payload = encode_record(profile)
         with _connect(self.path) as connection:
             connection.execute("BEGIN IMMEDIATE")
-            connection.execute(
-                "INSERT OR REPLACE INTO profiles(profile_id,payload) VALUES(?,?)",
-                (profile.profile_id, payload),
-            )
-            connection.commit()
+            try:
+                row = connection.execute(
+                    "SELECT payload FROM profiles WHERE profile_id=?", (profile.profile_id,)
+                ).fetchone()
+                if row is not None:
+                    if bytes(row["payload"]) != payload:
+                        raise PortError(
+                            PortErrorCategory.CONFLICT,
+                            f"compatibility profile {profile.profile_id!r} is already registered differently",
+                        )
+                else:
+                    connection.execute(
+                        "INSERT INTO profiles(profile_id,payload) VALUES(?,?)",
+                        (profile.profile_id, payload),
+                    )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
         return profile
 
     def get_profile(self, profile_id: str) -> CompatibilityProfile:
