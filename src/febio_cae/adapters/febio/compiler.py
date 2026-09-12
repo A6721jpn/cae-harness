@@ -32,6 +32,7 @@ from febio_cae.domain.artifacts import TET10_NODE_ORDER_ID, validate_logical_pat
 from febio_cae.domain.rigid_kinematics import check_translational_indentation_compatibility
 
 from ._native_qualification import qualification_document
+from .profile_scope import require_profile_scope
 
 # This adapter dialect is deliberately separate from the solver's version.
 _FEB_SCHEMA = "4.0"
@@ -245,6 +246,7 @@ class CompilerAdapter:
             raise PortError(
                 PortErrorCategory.INVALID_INPUT, "profile must be a CompatibilityProfile"
             )
+        require_profile_scope(revision.spec, profile)
         if profile.solver.version != _SOLVER_VERSION:
             self._unsupported("solver version is not supported by the FEB 4.0 dialect")
         if not profile.evidence:

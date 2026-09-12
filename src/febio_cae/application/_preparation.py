@@ -7,6 +7,7 @@ import time
 from dataclasses import asdict, replace
 from typing import TYPE_CHECKING, Any
 
+from febio_cae.adapters.febio.profile_scope import require_profile_scope
 from febio_cae.adapters.geometry import StepGeometryMeshAdapter
 from febio_cae.adapters.geometry.preparation import (
     CurrentInspection,
@@ -160,6 +161,7 @@ def prepare_planar(
             preliminary.quality_policy.profile,
         ):
             profile = service.compatibility.get_profile(ref.profile_id)
+            require_profile_scope(preliminary, profile)
             if hashlib.sha256(profile.to_bytes()).hexdigest() != ref.record_digest or any(
                 c.status is not CapabilityStatus.SUPPORTED for c in profile.capabilities
             ):
