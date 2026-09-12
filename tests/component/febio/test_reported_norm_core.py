@@ -382,3 +382,64 @@ def test_manual_observations_prior_fail_and_incomplete_prefix(prefix: str) -> No
             block for block in report["blocks"] if block["kind"] == f"incomplete_{prefix}"
         )
         assert all(row["status"] == "UNVERIFIED" for row in incomplete.get("rows", []))
+
+
+def test_residual_ratio_does_not_trust_a_loosened_printed_requirement() -> None:
+    from febio_cae.adapters.febio import reported_norms
+
+    source, policy, profile, invocation = _context()
+    log = _log()
+    content = log.content.replace(
+        b"residual 1.000000e+00 1.000000e-04 1.000000e-03",
+        b"residual 1.000000e+00 2.000000e-03 1.000000e-02",
+    )
+    report = assess_reported_norm_observations(
+        source,
+        _resolved("output/solver.log", "solver_log", content),
+        policy=policy,
+        profile=profile,
+        invocation=invocation,
+    ).to_dict()
+    assert report["final_status"] == "PASS"
+    result = reported_norms.assess_reported_residual(report, policy.solver_policy)
+    assert result.status.value == "FAIL"
+
+
+def test_residual_ratio_keeps_printed_rounding_ambiguity_unverified() -> None:
+    from febio_cae.adapters.febio import reported_norms
+
+    source, policy, profile, invocation = _context()
+    content = _log().content.replace(
+        b"residual 1.000000e+00 1.000000e-04 1.000000e-03",
+        b"residual 1.000000e+00 9.999999e-04 1.000000e-03",
+    )
+    report = assess_reported_norm_observations(
+        source,
+        _resolved("output/solver.log", "solver_log", content),
+        policy=policy,
+        profile=profile,
+        invocation=invocation,
+    ).to_dict()
+    assert report["final_status"] == "PASS"
+    result = reported_norms.assess_reported_residual(report, policy.solver_policy)
+    assert result.status.value == "UNVERIFIED"
+
+
+def test_residual_ratio_requires_every_accepted_final_cycle() -> None:
+    from febio_cae.adapters.febio import reported_norms
+
+    source, policy, profile, invocation = _context()
+    complete = assess_reported_norm_observations(
+        source, _log(), policy=policy, profile=profile, invocation=invocation
+    ).to_dict()
+    assert (
+        reported_norms.assess_reported_residual(complete, policy.solver_policy).status.value
+        == "PASS"
+    )
+    incomplete = assess_reported_norm_observations(
+        source, _log("augmentation"), policy=policy, profile=profile, invocation=invocation
+    ).to_dict()
+    assert (
+        reported_norms.assess_reported_residual(incomplete, policy.solver_policy).status.value
+        == "UNVERIFIED"
+    )

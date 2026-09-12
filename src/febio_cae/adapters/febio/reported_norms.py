@@ -1,4 +1,4 @@
-"""Bounded FEBio 4.12 printed observations, not native convergence qualification."""
+"""FEBio 4.12 reported norms and residual ratios; runtime qualification is separate."""
 
 from __future__ import annotations
 
@@ -7,15 +7,20 @@ import json
 import math
 import re
 import xml.etree.ElementTree as ET
+from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
+from fractions import Fraction
 from typing import Any, cast
 
 from febio_cae.domain import (
+    AssessmentStatus,
     AttemptRecord,
     CaseRevision,
     CompatibilityProfile,
+    CriterionAssessment,
     ExecutionBundle,
+    MeasuredValue,
     MeshArtifact,
     ProcessIdentity,
     Quantity,
@@ -754,3 +759,127 @@ def assess_reported_norms(
     del report["report_digest"]
     report["report_digest"] = hashlib.sha256(canonical_bytes(report)).hexdigest()
     return ReportedNorms(canonical_bytes(report))
+
+
+def _printed_interval(token: str) -> tuple[Fraction, Fraction]:
+    """Bound seven-significant-digit native scientific output without float rounding."""
+    if _NORM.fullmatch(token) is None:
+        raise ValueError("unsupported native norm token")
+    decimal = Decimal(token)
+    value = Fraction(decimal)
+    if value == 0:
+        return value, value
+    if token[0] == "0":
+        raise ValueError("non-normalized native scientific token")
+    exponent = decimal.as_tuple().exponent
+    assert isinstance(exponent, int)
+    half_quantum = Fraction(10) ** exponent / 2
+    return value - half_quantum, value + half_quantum
+
+
+def assess_reported_residual(
+    report: Mapping[str, Any], policy: SolverPolicy
+) -> CriterionAssessment:
+    """Check the frozen reported-residual ratio, not an inferred force norm.
+
+    Input is the existing context-bound parser report. The caller must separately
+    qualify the native runtime; this calculation never promotes that authority.
+    """
+    identifier = "solver_residual"
+    try:
+        if (
+            report.get("claim_id") != _POLICY["id"]
+            or report.get("parser_revision") != "1"
+            or report.get("admission") != "SUPPORTED"
+            or report.get("reasons")
+            or report.get("expected_steps") != list(range(1, 11))
+            or [step["step"] for step in report["accepted_steps"]] != list(range(1, 11))
+            or report["bindings"]["solver_policy_digest"]
+            != hashlib.sha256(policy.to_bytes()).hexdigest()
+        ):
+            raise ValueError("complete admitted final cycles and the frozen policy are required")
+        configured = {control.name: control.value for control in policy.controls}
+        control = configured["rtol"]
+        if isinstance(control, Quantity):
+            if control.dimension != Quantity(0, "1").dimension:
+                raise ValueError("rtol must be dimensionless")
+            value = float(control.to_si().value)
+        elif type(control) is int:
+            value = float(control)
+        else:
+            raise ValueError("rtol must be an explicit numeric control")
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError("the residual criterion must be enabled")
+        tolerance = Fraction.from_float(value)
+        blocks = report["blocks"]
+        residual_bounds: dict[int, tuple[Fraction, Fraction]] = {}
+        for index, block in enumerate(blocks):
+            if block["kind"] != "nonlinear":
+                continue
+            rows = [row for row in block["rows"] if row["name"] == "residual"]
+            if len(rows) != 1:
+                raise ValueError("nonlinear block lacks one unambiguous residual row")
+            row = rows[0]
+            initial = _printed_interval(row["initial"])
+            current = _printed_interval(row["current"])
+            required = _printed_interval(row["required"])
+            if initial[0] <= 0 or required[0] <= 0:
+                raise ValueError("positive initial residual and requirement are required")
+            expected = (tolerance * initial[0], tolerance * initial[1])
+            if required[1] < expected[0] or expected[1] < required[0]:
+                return CriterionAssessment(
+                    identifier,
+                    "numeric",
+                    AssessmentStatus.FAIL,
+                    (),
+                    "reported residual requirement contradicts frozen rtol times initial residual",
+                )
+            residual_bounds[index] = (current[0] / initial[1], current[1] / initial[0])
+        failed = False
+        uncertain = False
+        maximum = Fraction(0)
+        for step in report["accepted_steps"]:
+            index = step["nonlinear_block"]
+            nonlinear = blocks[index]
+            augmentation = blocks[step["augmentation_block"]]
+            if (
+                nonlinear["kind"] != "nonlinear"
+                or augmentation["kind"] != "augmentation"
+                or nonlinear["step"] != step["step"]
+                or augmentation["step"] != step["step"]
+            ):
+                raise ValueError("final cycles do not belong to their accepted increments")
+            lower, upper = residual_bounds[index]
+            maximum = max(maximum, upper)
+            failed |= lower >= tolerance
+            uncertain |= upper >= tolerance
+            for row in (*nonlinear["rows"], *augmentation["rows"]):
+                current = _printed_interval(row["current"])
+                required = _printed_interval(row["required"])
+                if required[0] <= 0:
+                    raise ValueError("a final reported requirement is not positive")
+                failed |= current[0] >= required[1]
+                uncertain |= current[1] >= required[0]
+        status = (
+            AssessmentStatus.FAIL
+            if failed
+            else AssessmentStatus.UNVERIFIED
+            if uncertain
+            else AssessmentStatus.PASS
+        )
+        return CriterionAssessment(
+            identifier,
+            "numeric",
+            status,
+            (MeasuredValue("maximum_reported_residual_ratio_upper_bound", float(maximum), "1"),),
+            "all accepted final cycles use frozen rtol and conservative printed-precision bounds; "
+            "native runtime qualification is separate",
+        )
+    except (KeyError, IndexError, TypeError, ValueError, InvalidOperation, OverflowError) as error:
+        return CriterionAssessment(
+            identifier,
+            "numeric",
+            AssessmentStatus.UNVERIFIED,
+            (),
+            f"reported residual ratio is unavailable: {error}",
+        )
