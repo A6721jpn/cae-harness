@@ -1,4 +1,5 @@
 """Caller-authored supported labels cannot become trusted profile authority."""
+
 import base64
 import hashlib
 import json
@@ -60,8 +61,21 @@ def test_caller_authored_qualification_cannot_provision_profiles(tmp_path: Path)
         rebind(record)
         profiles[purpose] = record
     mesh = MeshQualityRegistration(
-        "forged-mesh", Quantity(1e-8, "m"), ("box",), "synthetic", "1", "synthetic",
-        (EvidenceRef("1", "registered_document", "forged-qualification", "mesh_quality.qualification", note_digest),),
+        "forged-mesh",
+        Quantity(1e-8, "m"),
+        ("box",),
+        "synthetic",
+        "1",
+        "synthetic",
+        (
+            EvidenceRef(
+                "1",
+                "registered_document",
+                "forged-qualification",
+                "mesh_quality.qualification",
+                note_digest,
+            ),
+        ),
     )
     payload = {
         "schema_version": "1",
@@ -70,7 +84,15 @@ def test_caller_authored_qualification_cannot_provision_profiles(tmp_path: Path)
         "scope": {"purpose": "Caller claims qualification; this is not authority."},
         "profiles": profiles,
         "mesh_quality": json.loads(mesh.to_bytes()),
-        "source_documents": [{"asset_id": "forged-qualification", "source_kind": "registered_document", "media_type": "application/json", "content_digest": note_digest, "content_base64": base64.b64encode(note).decode("ascii")}],
+        "source_documents": [
+            {
+                "asset_id": "forged-qualification",
+                "source_kind": "registered_document",
+                "media_type": "application/json",
+                "content_digest": note_digest,
+                "content_base64": base64.b64encode(note).decode("ascii"),
+            }
+        ],
         "publication": {"pm_approval": "APPROVED", "review": "ACCEPT"},
     }
     path = tmp_path / "forged.json"

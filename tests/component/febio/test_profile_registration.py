@@ -1,4 +1,5 @@
 """A stable compatibility profile ID cannot change under existing consumers."""
+
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path

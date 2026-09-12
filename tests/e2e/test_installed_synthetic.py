@@ -708,6 +708,7 @@ def _validate_refinement_requests(
         raise _EnvironmentNotReady("refinement output bodies or saved states changed")
     return identities[0]
 
+
 def _request_profile_refs(request: dict[str, Any], field: str) -> dict[str, dict[str, Any]]:
     values = _as_object(request.get("values"), f"{field}.values")
     locations = (
@@ -2409,7 +2410,9 @@ def test_installed_synthetic_cli_flow(tmp_path: Path) -> None:
             "preparation requests do not share immutable profile references",
         )
         returned_profiles = _require_dict(provisioned.get("profiles"), "provisioned.profiles")
-        _expect(set(returned_profiles) == {"solver", "outputs", "quality"}, "profile purposes differ")
+        _expect(
+            set(returned_profiles) == {"solver", "outputs", "quality"}, "profile purposes differ"
+        )
         for purpose in ("solver", "outputs", "quality"):
             _expect(
                 returned_profiles.get(purpose) == expected_refs[purpose],

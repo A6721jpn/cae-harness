@@ -118,7 +118,9 @@ def _read_bundle(path: Path) -> bytes:
             raise _BundleError("bundle path must not be a reparse point")
         info = selected.stat()
     except (OSError, ValueError) as error:
-        raise PortError(PortErrorCategory.ENVIRONMENT, f"bundle path is unavailable: {error}") from error
+        raise PortError(
+            PortErrorCategory.ENVIRONMENT, f"bundle path is unavailable: {error}"
+        ) from error
     if not selected.is_file() or info.st_size != _APPROVED_BUNDLE_SIZE:
         raise PortError(
             PortErrorCategory.INTEGRITY,
@@ -128,11 +130,17 @@ def _read_bundle(path: Path) -> bytes:
         with selected.open("rb") as stream:
             content = stream.read(_APPROVED_BUNDLE_SIZE + 1)
     except OSError as error:
-        raise PortError(PortErrorCategory.ENVIRONMENT, f"cannot read approved bundle: {error}") from error
+        raise PortError(
+            PortErrorCategory.ENVIRONMENT, f"cannot read approved bundle: {error}"
+        ) from error
     if len(content) != _APPROVED_BUNDLE_SIZE:
-        raise PortError(PortErrorCategory.INTEGRITY, "approved bundle read was truncated or extended")
+        raise PortError(
+            PortErrorCategory.INTEGRITY, "approved bundle read was truncated or extended"
+        )
     if hashlib.sha256(content).hexdigest() != _APPROVED_BUNDLE_SHA256:
-        raise PortError(PortErrorCategory.INTEGRITY, "approved bundle digest does not match the product pin")
+        raise PortError(
+            PortErrorCategory.INTEGRITY, "approved bundle digest does not match the product pin"
+        )
     return content
 
 
@@ -144,7 +152,9 @@ def _parse_bundle(content: bytes) -> tuple[dict[str, Any], dict[str, bytes]]:
             parse_constant=_reject_constant,
         )
     except (UnicodeError, TypeError, ValueError, json.JSONDecodeError) as error:
-        raise PortError(PortErrorCategory.INTEGRITY, f"approved bundle is not valid JSON: {error}") from error
+        raise PortError(
+            PortErrorCategory.INTEGRITY, f"approved bundle is not valid JSON: {error}"
+        ) from error
     try:
         bundle = _strict_object(raw, required=_BUNDLE_KEYS, field="bundle")
         if bundle["schema_version"] != "1":
@@ -168,7 +178,9 @@ def _parse_bundle(content: bytes) -> tuple[dict[str, Any], dict[str, bytes]]:
         sources: dict[str, bytes] = {}
         source_metadata: dict[str, dict[str, str]] = {}
         for index, value in enumerate(source_items):
-            source = _strict_object(value, required=_SOURCE_KEYS, field=f"source_documents[{index}]")
+            source = _strict_object(
+                value, required=_SOURCE_KEYS, field=f"source_documents[{index}]"
+            )
             asset_id = _text(source["asset_id"], f"source_documents[{index}].asset_id")
             if asset_id in sources:
                 raise _BundleError(f"duplicate source asset {asset_id!r}")
@@ -211,8 +223,7 @@ def _parse_bundle(content: bytes) -> tuple[dict[str, Any], dict[str, bytes]]:
             if profile.solver.tool_id != "febio" or profile.solver.version != "4.12.0":
                 raise _BundleError(f"bundle.profiles.{purpose} has an unexpected solver identity")
             if not any(
-                item.capability_id == _SCOPE_CAPABILITY
-                and item.status.value == "SUPPORTED"
+                item.capability_id == _SCOPE_CAPABILITY and item.status.value == "SUPPORTED"
                 for item in profile.capabilities
             ):
                 raise _BundleError(f"bundle.profiles.{purpose} does not support the planar scope")
@@ -233,7 +244,9 @@ def _parse_bundle(content: bytes) -> tuple[dict[str, Any], dict[str, bytes]]:
                 check_evidence(evidence, f"bundle.profiles.{purpose}.evidence")
             for index, capability in enumerate(profile.capabilities):
                 for evidence in capability.evidence:
-                    check_evidence(evidence, f"bundle.profiles.{purpose}.capabilities[{index}].evidence")
+                    check_evidence(
+                        evidence, f"bundle.profiles.{purpose}.capabilities[{index}].evidence"
+                    )
 
         try:
             mesh = decode_mesh_quality(canonical_bytes(bundle["mesh_quality"]))
@@ -269,7 +282,9 @@ def _prevalidate_existing(
         except StorageConflictError:
             continue
         if current != expected or storage.source_kind(asset_id) != metadata["source_kind"]:
-            raise PortError(PortErrorCategory.CONFLICT, f"source identity {asset_id!r} is already different")
+            raise PortError(
+                PortErrorCategory.CONFLICT, f"source identity {asset_id!r} is already different"
+            )
         try:
             resolved = storage.resolve_source(current)
         except PortError as error:
@@ -277,7 +292,7 @@ def _prevalidate_existing(
         if resolved.content != source_bytes[asset_id]:
             raise PortError(PortErrorCategory.INTEGRITY, f"source bytes for {asset_id!r} differ")
 
-    for purpose, profile in profiles.items():
+    for profile in profiles.values():
         try:
             current = service.compatibility.get_profile(profile.profile_id)
         except PortError as error:
