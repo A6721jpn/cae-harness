@@ -146,6 +146,8 @@ def _curve(
 def _eligible(
     service: RegisteredCaseService, storage: CaseStorage, item: ComparisonTarget
 ) -> dict[str, object]:
+    from ._required_quality import required_quality_summary
+
     profile = service.compatibility.get_profile(item.profile.profile_id)
     if profile.to_bytes() != item.profile.to_bytes():
         raise PortError(
@@ -162,8 +164,13 @@ def _eligible(
         )
     service._verify_execution_mesh(storage, registration, item.revision, item.mesh)
     quality = QualityAdapter().assess(item.manifest, item.revision, item.mesh, profile, storage)
-    if quality.overall_status.value != "PASS":
-        raise PortError(PortErrorCategory.QUALITY, "comparison requires passing registered quality")
+    numerical_status, coverage = required_quality_summary(
+        item.manifest, item.revision, item.mesh, profile, quality, storage
+    )
+    if numerical_status == "FAIL" or (
+        quality.overall_status.value != "PASS" and numerical_status != "PASS"
+    ):
+        raise PortError(PortErrorCategory.QUALITY, "comparison requires passing declared quality")
     try:
         asset = storage.source_asset("quality-" + quality.assessment_id[:24])
     except StorageConflictError as error:
@@ -186,6 +193,8 @@ def _eligible(
         "bundle_digest": item.bundle.bundle_digest,
         "mesh_digest": item.mesh.artifact_digest,
         "quality": quality.to_dict(),
+        "quality_status": numerical_status,
+        "required_quality": coverage,
         "profile_digest": hashlib.sha256(profile.to_bytes()).hexdigest(),
         "root_mesh_digest": registration.original_mesh_digest,
         "source_step_digest": registration.source_step_digest,
@@ -353,7 +362,7 @@ def compare(
             "aggregation_order": "aggregate_each_saved_state_then_interpolate",
             "surface_approximation": "UNVERIFIED",
             "limitations": [
-                "registered synthetic planar demonstration; not scientific accuracy qualification",
+                "registered planar result comparison; numerical qualification is reported per source",
                 "descriptive comparison only; no ranking or force-doubling acceptance tolerance",
                 "whole-part node ROI aggregate; no node-wise field subtraction or mapped field image",
             ],

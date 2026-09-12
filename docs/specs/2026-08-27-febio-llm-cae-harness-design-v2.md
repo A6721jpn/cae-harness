@@ -310,12 +310,43 @@ profile, reader and result bindings; every declared output must cover its reques
 entities, components, layout, frame and units with finite registered state data
 through the declared endpoint. Complete coverage may produce PASS; unavailable
 data-level coverage remains UNVERIFIED and corrupt registration remains INTEGRITY.
-This does not qualify native physics, signs or the reader itself. The other five
-numerical obligations still have no qualified PASS or NOT_APPLICABLE producer.
-Arithmetic methods, criterion names, arbitrary evidence references and registered
-profile labels cannot discharge them. Public paths therefore still cannot attain
-mandatory numerical COMPLETE. No physics, signs, thresholds or applicability
-exclusions are guessed.
+This does not qualify native physics, signs or the reader itself. The five numerical
+obligations require bounded producers, not arithmetic methods, criterion names,
+arbitrary evidence references or registered profile labels. No physics, signs,
+thresholds or applicability exclusions are guessed. Unsupported scope or missing
+qualified evidence remains UNVERIFIED; there is no automatic NOT_APPLICABLE path.
+
+The initial numerical producer scope is an explicitly selected, axis-aligned,
+linear-elastic planar part against a frictionless rigid box with prescribed motion,
+registered quadratic contact-face projections and observed fixed support components.
+The execution bundle must bind the qualified FEBio executable and complete DLL set;
+the runner pins and verifies those actual bytes before spawning. The descriptor is
+not a caller-provided qualification flag. This scope does not qualify sphere/cylinder,
+finite-friction, neo-Hookean or Hertz behavior, which retain their separate required
+qualification studies.
+
+Within that scope, all declared saved states and units must be registered and finite:
+
+- `planar_contact` requires explicit initial-interference, contact-gap, penetration,
+  force-floor and contact-interval bounds. It evaluates both surfaces' displacement
+  and their registered selected quadratic faces; positive tool force alone is not
+  evidence of acceptable contact.
+- `motion_support_contact_fidelity` requires explicit motion-error and supported-DOF
+  displacement bounds. It checks the full tool trajectory, rigid position and
+  registered support components without inventing additional constraints.
+- `quasistatic_equilibrium` compares canonical support reactions against the raw
+  rigid applied force in every saved state. Each state uses its own explicit
+  absolute/relative tolerance; a later larger load cannot hide an earlier imbalance.
+- `solver_residual` requires the admitted version-bound log parser, all expected
+  accepted increments, accepted nonlinear/augmentation norms and the declared solver
+  policy. Printed decimal precision is bounded conservatively; ambiguous threshold
+  comparisons remain UNVERIFIED. A reported convergence banner alone is insufficient.
+- `mesh_dependence` requires three explicitly declared decreasing global tet10 sizes,
+  a relative force-change bound and an absolute force floor. Both registered
+  refinements must increase part element count and decrease observed maximum part
+  edge; both successive force-history changes are evaluated. Material-only reuse is
+  limited to an otherwise identical linear-elastic ancestor study, identical finest
+  mesh and an explicitly bounded modulus-normalized force comparison.
 
 Expose derived required_quality with the exact resolved revision/spec, mesh,
 profile, attempt/bundle/manifest and arithmetic-assessment identities/digests.

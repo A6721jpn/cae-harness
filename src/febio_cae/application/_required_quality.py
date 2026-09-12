@@ -1,11 +1,14 @@
-"""Derived execution completeness and unresolved mandatory numerical coverage."""
+"""Registered execution completeness and qualified mandatory numerical coverage."""
 
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Sequence
 
+from febio_cae.adapters.febio._native_qualification import has_qualified_runtime
+from febio_cae.adapters.febio.planar_quality import assess_planar_requirements
 from febio_cae.adapters.febio.quality import QualityAdapter
-from febio_cae.adapters.febio.reported_norms import assess_reported_norms
+from febio_cae.adapters.febio.reported_norms import assess_reported_norms, assess_reported_residual
 from febio_cae.domain import (
     AssessmentStatus,
     AttemptRecord,
@@ -16,6 +19,7 @@ from febio_cae.domain import (
     MeshArtifact,
     NumericResultData,
     QualityAssessment,
+    QualityCriterion,
     Quantity,
     ReadStatus,
     ResolvedFileContent,
@@ -25,6 +29,17 @@ from febio_cae.domain import (
 from febio_cae.domain.ports import PortError, PortErrorCategory
 from febio_cae.domain.results import numeric_state_indices
 from febio_cae.storage import CaseStorage
+
+from ._mesh_refinement import assess_mesh_refinement
+
+_PRODUCED_METRICS = frozenset(
+    {
+        "planar_contact",
+        "motion_support_contact_fidelity",
+        "quasistatic_equilibrium",
+        "mesh_dependence",
+    }
+)
 
 # Remaining obligations cannot be discharged by caller-selected criterion names.
 _UNVERIFIED_NUMERICAL = (
@@ -54,6 +69,31 @@ _UNVERIFIED_NUMERICAL = (
         "qualified refinement-study, evaluation scope and convergence verification is unavailable",
     ),
 )
+
+
+def _quality_status(
+    criteria: Sequence[QualityCriterion],
+    arithmetic: Sequence[CriterionAssessment],
+    required: Sequence[CriterionAssessment],
+    reported_status: str,
+) -> str:
+    if reported_status == "FAIL" or any(
+        row.status is AssessmentStatus.FAIL for row in (*arithmetic, *required)
+    ):
+        return "FAIL"
+    produced = {item.criterion_id for item in criteria if item.metric_id in _PRODUCED_METRICS}
+    remaining = tuple(row for row in arithmetic if row.criterion_id not in produced)
+    if (
+        reported_status == "PASS"
+        and required
+        and all(row.status is AssessmentStatus.PASS for row in required)
+        and all(
+            row.status in {AssessmentStatus.PASS, AssessmentStatus.NOT_APPLICABLE}
+            for row in remaining
+        )
+    ):
+        return "PASS"
+    return "UNVERIFIED"
 
 
 def _execution_result_completeness(
@@ -205,11 +245,10 @@ def required_quality_summary(
     quality: QualityAssessment,
     storage: CaseStorage,
 ) -> tuple[str, dict[str, object]]:
-    """Preserve arithmetic evidence while deriving registered execution completeness.
+    """Combine declared arithmetic with independent mandatory numerical producers.
 
-    Inputs come from the existing resolved public result context. No caller flags,
-    criterion labels or arbitrary evidence references can qualify these obligations.
-    Only execution/result completeness has a producer in this bounded gate.
+    Only a sealed successful execution bound to the exact supported runtime can
+    qualify the native numerical producers. Caller labels never discharge them.
     """
     context = storage.resolve_reported_norms_context(manifest)
     execution_row = _execution_result_completeness(
@@ -219,6 +258,14 @@ def required_quality_summary(
         CriterionAssessment(identifier, dimension, AssessmentStatus.UNVERIFIED, (), reason)
         for identifier, dimension, reason in _UNVERIFIED_NUMERICAL
     )
+    report = assess_reported_norms(manifest, revision, mesh, profile, context).to_dict()
+    qualified = has_qualified_runtime(context[1])
+    refinement_evidence: dict[str, object] = {}
+    if qualified and execution_row.status is AssessmentStatus.PASS:
+        planar = assess_planar_requirements(manifest, revision, mesh, profile, storage)
+        residual = assess_reported_residual(report, revision.spec.solver_policy)
+        refinement, refinement_evidence = assess_mesh_refinement(manifest, revision, storage)
+        numerical = (execution_row, *planar, residual, refinement)
     physical = CriterionAssessment(
         "physical_applicability_validation",
         "applicability",
@@ -242,23 +289,19 @@ def required_quality_summary(
             "policy_digest": quality.policy_digest,
         },
         "numerical": [row.to_dict() for row in numerical],
+        "native_runtime_binding": {
+            "status": "PASS" if qualified else "UNVERIFIED",
+            "tool": profile.solver.to_dict(),
+        },
+        "mesh_refinement": refinement_evidence,
         # Physical corroboration is deliberately outside numerical aggregation.
         "physical_applicability": physical.to_dict(),
     }
-    report = assess_reported_norms(manifest, revision, mesh, profile, context).to_dict()
     coverage["reported_solver_norms"] = report
-    status = (
-        "FAIL"
-        if quality.overall_status is AssessmentStatus.FAIL or report["final_status"] == "FAIL"
-        else "PASS"
-        if (
-            quality.overall_status is AssessmentStatus.PASS
-            and report["final_status"] == "PASS"
-            and all(
-                row.status in {AssessmentStatus.PASS, AssessmentStatus.NOT_APPLICABLE}
-                for row in numerical
-            )
-        )
-        else "UNVERIFIED"
+    status = _quality_status(
+        revision.spec.quality_policy.criteria,
+        quality.criteria,
+        numerical,
+        str(report["final_status"]),
     )
     return status, coverage

@@ -42,12 +42,12 @@ def preview_summary(store: RegisteredPreviewStore, preview_id: str) -> dict[str,
     else:
         if store.storage.resolve_source(asset).content != encode_record(quality):
             raise PortError(PortErrorCategory.INTEGRITY, "registered preview quality changed")
-        quality_registration_status = quality.overall_status.value
+        quality_registration_status = "PASS"
         quality_reason = "registered quality assessment matches the recomputed assessment"
     quality_status, coverage = required_quality_summary(
         target.manifest, target.revision, target.mesh, target.profile, quality, store.storage
     )
-    quality_reason += "; mandatory numerical coverage is unverified; see required_quality"
+    quality_reason += f"; mandatory numerical coverage is {quality_status}; see required_quality"
     force_request = next(
         (r for r in target.revision.spec.outputs.requests if r.quantity_id == "contact_force"), None
     )

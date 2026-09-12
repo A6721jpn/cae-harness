@@ -73,6 +73,22 @@ def target(storage: CaseStorage, manifest_id: str, run_id: str) -> ComparisonTar
     )
 
 
+def successful_targets(storage: CaseStorage) -> tuple[ComparisonTarget, ...]:
+    """Resolve successful case-local history through the same sealed target contract."""
+    with connect(storage.registry_path) as connection:
+        rows = connection.execute(
+            "SELECT m.manifest_id, o.payload FROM manifests m "
+            "JOIN owners o ON o.attempt_id=m.attempt_id "
+            "ORDER BY o.owner_generation, m.manifest_id"
+        ).fetchall()
+    result = []
+    for row in rows:
+        attempt = decode_record(bytes(row["payload"]), AttemptRecord)
+        if attempt.state is RunState.SUCCEEDED:
+            result.append(target(storage, row["manifest_id"], attempt.run_id))
+    return tuple(result)
+
+
 def publish(storage: CaseStorage, comparison_id: str, payload: bytes) -> Path:
     """Caller holds the case transaction; identical replay is idempotent."""
     _safe_identifier(comparison_id, "comparison_id")

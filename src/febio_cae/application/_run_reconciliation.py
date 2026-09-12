@@ -47,7 +47,7 @@ def _completion(
     else:
         if storage.resolve_source(asset).content != encode_record(quality):
             raise PortError(PortErrorCategory.INTEGRITY, "registered run quality changed")
-        quality_registration_status = quality.overall_status.value
+        quality_registration_status = "PASS"
     quality_status, coverage = required_quality_summary(
         manifest, revision, mesh, profile, quality, storage
     )
@@ -55,7 +55,7 @@ def _completion(
         "quality": quality.to_dict(),
         "quality_registration_status": quality_registration_status,
         "required_quality": coverage,
-        "quality_reason": "mandatory numerical coverage is unverified; registered arithmetic alone cannot complete the task",
+        "quality_reason": f"mandatory numerical coverage is {quality_status}; see required_quality",
     }
     preview = None
     task = (
