@@ -240,8 +240,8 @@ def test_full_fixed_support_uses_zero_prescribed_component_bcs_with_distinct_nam
     assert node_sets[bcs[0].attrib["node_set"]] == set(mesh.faces[0].node_ids)
     by_dof = {bc.findtext("dof"): bc for bc in bcs}
     assert set(by_dof) == {"x", "y", "z"}
-    for dof, bc in by_dof.items():
-        _assert_zero_prescribed_component(bc, dof)
+    for dof in ("x", "y", "z"):
+        _assert_zero_prescribed_component(by_dof[dof], dof)
     _required(root, "LoadData/load_controller[@id='1']")
 
 
@@ -262,8 +262,8 @@ def test_mixed_fixed_free_support_emits_only_fixed_zero_prescribed_components(
     assert len({bc.attrib["name"] for bc in bcs}) == len(bcs)
     by_dof = {bc.findtext("dof"): bc for bc in bcs}
     assert set(by_dof) == {"x", "z"}
-    for dof, bc in by_dof.items():
-        _assert_zero_prescribed_component(bc, dof)
+    for dof in ("x", "z"):
+        _assert_zero_prescribed_component(by_dof[dof], dof)
     assert root.find("Boundary/bc[@type='zero displacement']") is None
 
 

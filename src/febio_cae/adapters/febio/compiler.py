@@ -653,9 +653,14 @@ class CompilerAdapter:
 
         boundary = ET.SubElement(root, "Boundary")
         for support in spec.support.supports:
+            support_node_set_id: str | None = None
             for axis in ("x", "y", "z"):
                 if getattr(support, axis).state != "fixed":
                     continue
+                if support_node_set_id is None:
+                    support_node_set_id = resolved[
+                        (self._selection_digest(support.selection), "node")
+                    ]
                 fixed = ET.SubElement(
                     boundary,
                     "bc",
@@ -664,7 +669,7 @@ class CompilerAdapter:
                         "name": self._allocate_name(
                             f"{support.support_id.value}-{axis}", allocated
                         ),
-                        "node_set": resolved[(self._selection_digest(support.selection), "node")],
+                        "node_set": support_node_set_id,
                     },
                 )
                 ET.SubElement(fixed, "dof").text = axis
