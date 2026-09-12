@@ -21,15 +21,12 @@ from typing import Any, NoReturn
 import pytest
 
 from febio_cae import __version__
-from febio_cae.application.intent_contracts import settings_from_dict, strict_json
+from febio_cae.application.intent_contracts import parse_budget, settings_from_dict, strict_json
 from febio_cae.application.service import RegisteredCaseService
 from febio_cae.cli import case as case_cli
 from febio_cae.cli.main import main
-from febio_cae.domain.budget import Budget
 from febio_cae.domain.partial_case_spec import PartialCaseSpec
 from febio_cae.domain.ports import PortError
-from febio_cae.domain.units import Quantity
-
 
 SETTINGS_ENV = "FEBIO_CAE_NATIVE_LLM_SETTINGS"
 MAX_EXPECTED_CALLS = 6
@@ -199,9 +196,7 @@ def _invoke_llm(
     return code, json.loads(capsys.readouterr().out)
 
 
-def _invoke_case(
-    capsys: pytest.CaptureFixture[str], *arguments: str
-) -> tuple[int, dict[str, Any]]:
+def _invoke_case(capsys: pytest.CaptureFixture[str], *arguments: str) -> tuple[int, dict[str, Any]]:
     code = main(["case", *arguments, "--json"])
     return code, json.loads(capsys.readouterr().out)
 
@@ -304,13 +299,7 @@ def test_live_ai02_japanese_intent_answer_freeze_and_e_edit(
         )
 
         answer_operation = f"ai02-answer-{uuid.uuid4().hex}"
-        answer_text = "\n".join(
-            (
-                "ポアソン比 = 0.3 1",
-                "ひずみ適用性 = 適用可",
-                "速度適用性 = 適用可",
-            )
-        )
+        answer_text = "ポアソン比 = 0.3 1\nひずみ適用性 = 適用可\n速度適用性 = 適用可"
         answer_generation = service.current_draft(created.case_id).generation
         answer_code, answer = _invoke_llm(
             capsys,
@@ -326,33 +315,21 @@ def test_live_ai02_japanese_intent_answer_freeze_and_e_edit(
         assert answer_code == 0
         assert answer["status"] == "UPDATED"
         assert answer["draft"]["values"]["material"] is not None
-        assert (
-            answer["draft"]["values"]["material"]["kind"] == "isotropic_linear_elastic"
-        )
-        assert set(answer["known_facts"]) == set(
-            (
-                "material.model",
-                "material.youngs_modulus",
-                "material.poisson_ratio",
-                "material.strain_applicability",
-                "material.rate_applicability",
-            )
-        )
+        assert answer["draft"]["values"]["material"]["kind"] == "isotropic_linear_elastic"
+        assert set(answer["known_facts"]) == {
+            "material.model",
+            "material.youngs_modulus",
+            "material.poisson_ratio",
+            "material.strain_applicability",
+            "material.rate_applicability",
+        }
         _record_operation(receipt, "answer", answer_operation, answer)
 
         # Numerical policy is explicit test setup, not an inferred physical fact.
         budget_generation = service.current_draft(created.case_id).generation
         prepared_draft = service.set_spec(
             created.case_id,
-            values=PartialCaseSpec(
-                budget=Budget(
-                    Quantity(15, "s"),
-                    1,
-                    1,
-                    2,
-                    2 * settings["input_tokens"] + settings["output_tokens"],
-                ),
-            ),
+            values=PartialCaseSpec(budget=parse_budget(settings["budget"])),
             expected_generation=budget_generation,
         )
         validate_code, validated = _invoke_case(capsys, "validate", created.case_id)
