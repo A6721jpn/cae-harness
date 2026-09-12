@@ -1765,9 +1765,7 @@ def _validate_manifest_files(
             f"manifest file digest differs: {logical_path}",
         )
         entries[logical_path] = entry
-    _expect("input/case.feb" in entries, "manifest lacks the compiled input")
     _expect("output/results.xplt" in entries, "manifest lacks the XPLT result")
-    _expect(entries["input/case.feb"].get("role") == "input", "compiled input role differs")
     _expect(entries["output/results.xplt"].get("role") == "result", "XPLT result role differs")
     for logical_path, entry in entries.items():
         if entry.get("role") == "solver_log":
@@ -1775,6 +1773,40 @@ def _validate_manifest_files(
         if logical_path == "output/solver.log":
             _expect(entry.get("role") == "solver_log", "solver log role is not declared")
     return entries
+
+
+def _validate_bundle_input(
+    case_root: Path, manifest: dict[str, Any], attempt_id: str, attempt_root: Path
+) -> None:
+    bundle = _read_db_payload(
+        case_root,
+        "SELECT bundle FROM execution_lineage WHERE attempt_id=?",
+        attempt_id,
+        "execution bundle",
+    )
+    _expect(
+        bundle.get("bundle_digest") == manifest.get("bundle_digest"),
+        "manifest differs from its registered execution bundle",
+    )
+    inputs = [
+        _require_dict(item, "bundle.files entry")
+        for item in _require_list(bundle.get("files"), "bundle.files")
+        if isinstance(item, dict) and item.get("logical_path") == "input/case.feb"
+    ]
+    _expect(len(inputs) == 1, "execution bundle lacks one compiled input")
+    entry = inputs[0]
+    _expect(entry.get("role") == "input", "compiled input role differs")
+    digest = _require_digest(entry.get("digest"), "compiled input digest")
+    persisted = attempt_root / "input" / "case.feb"
+    _expect(persisted.is_file(), "compiled input copy is missing")
+    resolved = persisted.resolve()
+    _expect(
+        _same_path(persisted, resolved) and _under(resolved, attempt_root.resolve()),
+        "compiled input escaped its attempt",
+    )
+    content = persisted.read_bytes()
+    _expect(len(content) == entry.get("size_bytes"), "compiled input size differs")
+    _expect(hashlib.sha256(content).hexdigest() == digest, "compiled input digest differs")
 
 
 def _validate_numeric_data(
@@ -2027,6 +2059,7 @@ def _validate_run(
         attempt_id=attempt_id,
         manifest_id=manifest_id,
     )
+    _validate_bundle_input(case_root, manifest, attempt_id, attempt_root)
     _validate_numeric_data(
         case_root,
         manifest=manifest,
