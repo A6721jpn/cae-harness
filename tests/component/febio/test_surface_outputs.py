@@ -25,6 +25,7 @@ from febio_cae.domain import (
     AttemptRecord,
     EvaluationRequest,
     FileEntry,
+    MeshSet,
     NumericResultData,
     OutputMapping,
     OutputRequest,
@@ -149,6 +150,15 @@ _CONTACT_SPECS = (
         1,
         1,
     ),
+)
+
+_NATIVE_SURFACES = (
+    (1, "part-contact", "part-face"),
+    (2, "support-region", "part-face"),
+    (3, "part-output-surface", "part-face"),
+    (4, "tool-output-surface", "tool-face"),
+    (5, "tool-auxiliary-surface", "tool-face"),
+    (6, "tool-contact", "tool-face"),
 )
 
 _CONTACT_RAW_VALUES: dict[str, tuple[tuple[float, ...], tuple[float, ...]]] = {
@@ -356,24 +366,23 @@ def native_bytes(mesh: Any, *, defect: str = "") -> bytes:
             uint(0x01045101, ordinal) + fixed(0x01045102, element.body_id),
         )
 
-    surface_ids = {"part-contact": 1, "tool-contact": 2}
-    surface_names = {"part": "part-contact", "tool": "tool-contact"}
+    surface_records = list(_NATIVE_SURFACES)
     if defect == "foreign-surface":
-        surface_names["part"] = "unregistered-contact"
+        surface_records[0] = (1, "unregistered-contact", "part-face")
     elif defect == "duplicate-surface":
-        surface_names["part"] = "tool-contact"
+        surface_records[0] = (1, "tool-contact", "part-face")
     surfaces = b""
-    # Native order is intentionally tool (ID 2) then part (ID 1); canonical
-    # projection must use names and actual IDs rather than ordinal position.
-    for side in ("tool", "part"):
-        name = surface_names[side]
-        face = next(item for item in mesh.faces if item.face_id == f"{side}-face")
+    # Six compiled surfaces are present, but contact data uses only the
+    # non-contiguous native IDs 1 and 6.  Canonical projection must bind the
+    # active records by surface identity, not assume every header is active.
+    for native_id, name, face_id in surface_records:
+        face = next(item for item in mesh.faces if item.face_id == face_id)
         indices = tuple(node_index[node_id] for node_id in face.node_ids)
-        if defect == "surface-connectivity" and side == "part":
+        if defect == "surface-connectivity" and native_id == 1:
             indices = (len(nodes), *indices[1:])
         facet = struct.pack("<II6I", 1, 6, *indices)
         surface_header = (
-            uint(0x01043102, surface_ids.get(name, 1))
+            uint(0x01043102, native_id)
             + uint(0x01043103, 1)
             + text(0x01043104, name)
             + uint(0x01043105, 6)
@@ -413,17 +422,18 @@ def native_bytes(mesh: Any, *, defect: str = "") -> bytes:
                 raw_values = raw_values[:-1]
             per_surface_width = (6 if spec[10] == 2 else 1) * (3 if spec[3] == "VEC3F" else 1)
             # Rows are registered canonically as part then tool.  Native
-            # contact regions intentionally arrive as ID 2 then ID 1.
+            # contact regions intentionally arrive as active ID 6 then ID 1;
+            # compiled inactive surfaces 2 through 5 have no contact values.
             regions: tuple[tuple[int, tuple[float, ...]], ...] = (
-                (2, raw_values[per_surface_width:]),
+                (6, raw_values[per_surface_width:]),
                 (1, raw_values[:per_surface_width]),
             )
             if defect == "missing-contact-region" and index == 1:
-                regions = ()
+                regions = ((6, raw_values[per_surface_width:]),)
             elif defect == "duplicate-contact-region" and index == 1:
                 regions = (
-                    (2, raw_values[per_surface_width:]),
-                    (2, raw_values[per_surface_width:]),
+                    (6, raw_values[per_surface_width:]),
+                    (6, raw_values[per_surface_width:]),
                     (1, raw_values[:per_surface_width]),
                 )
             contact_fields += block(
@@ -462,6 +472,35 @@ def _surface_case(
     LocalBundleStore,
 ]:
     revision, mesh, profile = _case()
+    part_output = next(item for item in mesh.sets if item.set_id == "part-output")
+    tool_output = next(item for item in mesh.sets if item.set_id == "tool-output")
+    mesh = replace(
+        mesh,
+        sets=(
+            *mesh.sets,
+            MeshSet(
+                "part-output-surface",
+                "face",
+                part_output.body_id,
+                ("part-face",),
+                part_output.source_selection_digest,
+            ),
+            MeshSet(
+                "tool-output-surface",
+                "face",
+                tool_output.body_id,
+                ("tool-face",),
+                tool_output.source_selection_digest,
+            ),
+            MeshSet(
+                "tool-auxiliary-surface",
+                "face",
+                tool_output.body_id,
+                ("tool-face",),
+                tool_output.source_selection_digest,
+            ),
+        ),
+    )
     part_selection = revision.spec.contact.part_surface
     tool_selection = revision.spec.contact.tool_surface
     contact_requests = tuple(
@@ -618,6 +657,14 @@ def test_native_contact_outputs_compile_and_project_exact_entities(tmp_path: Pat
 
     revision, reader, attempt, bundle, mesh, profile, data_store, store = _surface_case(tmp_path)
     input_root = ET.fromstring(store.resolve(bundle, "input/case.feb"))
+    compiled_surfaces = input_root.findall("Mesh/Surface")
+    assert {item.attrib["name"] for item in compiled_surfaces} == {
+        name for _, name, _ in _NATIVE_SURFACES
+    }
+    assert len(compiled_surfaces) == 6
+    assert all(
+        len(surface) == 1 and surface[0].tag == "tri6" for surface in compiled_surfaces
+    )
     expected_native_names = {
         "displacement",
         "rigid force",
