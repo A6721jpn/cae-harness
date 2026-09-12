@@ -36,11 +36,7 @@ def require_profile_scope(spec: CaseSpec, profile: CompatibilityProfile) -> None
         )
 
     capability = next(
-        (
-            item
-            for item in profile.capabilities
-            if item.capability_id == PLANAR_SCOPE_CAPABILITY
-        ),
+        (item for item in profile.capabilities if item.capability_id == PLANAR_SCOPE_CAPABILITY),
         None,
     )
     if capability is None:
@@ -81,9 +77,7 @@ def require_profile_scope(spec: CaseSpec, profile: CompatibilityProfile) -> None
         or any(getattr(dofs, axis).state != "fixed" for axis in ("x", "y", "rx", "ry", "rz"))
         or dofs.z.state != "prescribed"
     ):
-        _unsupported(
-            "planar profile requires World rigid-tool x/y/rx/ry/rz fixed and z prescribed"
-        )
+        _unsupported("planar profile requires World rigid-tool x/y/rx/ry/rz fixed and z prescribed")
 
     increments = spec.solver_policy.increments
     start = float(spec.motion.samples[0].time.to_si().value)

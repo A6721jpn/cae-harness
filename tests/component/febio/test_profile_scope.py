@@ -1,4 +1,5 @@
 """Scoped compatibility declarations must not authorize unqualified mechanisms."""
+
 from dataclasses import replace
 from pathlib import Path
 
@@ -18,9 +19,7 @@ from .test_compiler_native import _case, _compile
 
 
 @pytest.mark.parametrize("outside_scope", ["finite_friction", "free_support"])
-def test_scoped_profile_refuses_unqualified_conditions(
-    tmp_path: Path, outside_scope: str
-) -> None:
+def test_scoped_profile_refuses_unqualified_conditions(tmp_path: Path, outside_scope: str) -> None:
     revision, mesh, profile = _case()
     spec = revision.spec
     spec = replace(
