@@ -275,7 +275,11 @@ def _file_identity(value: object, field: str) -> _FileIdentity:
     path = Path(raw_path)
     if not path.is_absolute() or _contains_02_cae(path):
         raise _EnvironmentNotReady(f"{field}.path must be absolute and outside 02_CAE")
-    if isinstance(item["size"], bool) or type(item["size"]) is not int or item["size"] < 1:
+    if (
+        isinstance(item["size"], bool)
+        or not isinstance(item["size"], int)
+        or item["size"] < 1
+    ):
         raise _EnvironmentNotReady(f"{field}.size must be a positive integer")
     expected_digest = _digest(item["sha256"], f"{field}.sha256")
     try:
@@ -416,7 +420,7 @@ def _validate_request(
             raise _EnvironmentNotReady("preparation_request.preparation has unsupported limits")
         for key, value in preparation.items():
             if value is not None and (
-                isinstance(value, bool) or type(value) is not int and key != "wall_seconds"
+                isinstance(value, bool) or (not isinstance(value, int) and key != "wall_seconds")
             ):
                 raise _EnvironmentNotReady(f"preparation_request.preparation.{key} is invalid")
             if key == "wall_seconds":
@@ -542,11 +546,8 @@ def _validate_request(
         declaration = source_by_reference.get(reference)
         if declaration is None:
             raise _EnvironmentNotReady(f"evidence source {reference!r} has no declaration")
-        if (
-            declaration.get("source_kind") != entry["source_kind"]
-            or declaration.get("target_field") != entry["target_field"]
-        ):
-            raise _EnvironmentNotReady(f"evidence declaration {reference!r} is not field-bound")
+        if declaration.get("source_kind") != entry["source_kind"]:
+            raise _EnvironmentNotReady(f"evidence declaration {reference!r} has a different kind")
         if (
             declaration.get("content_digest") is not None
             and declaration["content_digest"] != entry["content_digest"]
@@ -631,7 +632,7 @@ def _validate_request(
         ):
             raise _EnvironmentNotReady("motion samples must increase in time and compression")
         previous_time, previous_displacement = current_time, current_displacement
-    return cast(str, part_body_id), cast(str, tool_body_id), len(saved_times)
+    return part_body_id, tool_body_id, len(saved_times)
 
 
 def _validate_axes(
@@ -758,8 +759,41 @@ def _wheel_version(wheel: _FileIdentity) -> str:
     return versions[0]
 
 
+def _wheel_package_files(wheel: _FileIdentity) -> dict[str, tuple[int, str]]:
+    package_prefix = "febio_cae/"
+    result: dict[str, tuple[int, str]] = {}
+    try:
+        with zipfile.ZipFile(wheel.path) as archive:
+            for member in archive.infolist():
+                name = member.filename
+                if member.is_dir() or not name.startswith(package_prefix):
+                    continue
+                relative = name.removeprefix(package_prefix)
+                parts = relative.split("/")
+                if (
+                    not relative
+                    or "\\" in name
+                    or name.startswith("/")
+                    or ":" in name
+                    or any(part in {"", ".", ".."} for part in parts)
+                ):
+                    raise _EnvironmentNotReady("wheel contains an unsafe package member")
+                if "__pycache__" in parts or relative.endswith(".pyc"):
+                    continue
+                if relative in result:
+                    raise _EnvironmentNotReady("wheel contains duplicate package members")
+                content = archive.read(member)
+                result[relative] = (len(content), hashlib.sha256(content).hexdigest())
+    except (OSError, RuntimeError, UnicodeError, ValueError, zipfile.BadZipFile) as error:
+        raise _EnvironmentNotReady(f"cannot inspect wheel package members: {error}") from error
+    if "__init__.py" not in result:
+        raise _EnvironmentNotReady("wheel package members lack febio_cae/__init__.py")
+    return result
+
+
 _RUNTIME_PROBE = """\
 import json
+import hashlib
 import pathlib
 import site
 import sys
@@ -768,10 +802,23 @@ import sysconfig
 import febio_cae
 
 paths = sysconfig.get_paths()
+package_root = pathlib.Path(febio_cae.__file__).resolve().parent
+package_files = []
+for path in sorted(package_root.rglob("*")):
+    if not path.is_file() or "__pycache__" in path.parts or path.suffix == ".pyc":
+        continue
+    content = path.read_bytes()
+    package_files.append({
+        "relative_path": path.relative_to(package_root).as_posix(),
+        "size": len(content),
+        "sha256": hashlib.sha256(content).hexdigest(),
+    })
 print(json.dumps({
     "sys_executable": str(pathlib.Path(sys.executable).resolve()),
     "version": febio_cae.__version__,
     "module": str(pathlib.Path(febio_cae.__file__).resolve()),
+    "package_root": str(package_root),
+    "package_files": package_files,
     "purelib": str(pathlib.Path(paths["purelib"]).resolve()),
     "platlib": str(pathlib.Path(paths["platlib"]).resolve()),
     "site_packages": [str(pathlib.Path(item).resolve()) for item in site.getsitepackages()],
@@ -811,6 +858,7 @@ def _validate_runtime(
         raise _EnvironmentNotReady(f"installed runtime probe exited {code}")
     executable = Path(_text(payload.get("sys_executable"), "runtime.sys_executable"))
     module = Path(_text(payload.get("module"), "runtime.module"))
+    package_root = Path(_text(payload.get("package_root"), "runtime.package_root"))
     version = _text(payload.get("version"), "runtime.version")
     purelib = Path(_text(payload.get("purelib"), "runtime.purelib"))
     platlib = Path(_text(payload.get("platlib"), "runtime.platlib"))
@@ -819,21 +867,57 @@ def _validate_runtime(
         not isinstance(item, str) for item in site_packages
     ):
         raise _EnvironmentNotReady("runtime.site_packages is not a string array")
+    raw_package_files = payload.get("package_files")
+    if not isinstance(raw_package_files, list):
+        raise _EnvironmentNotReady("runtime.package_files is not an array")
+    installed_package_files: dict[str, tuple[int, str]] = {}
+    for index, raw_file in enumerate(raw_package_files):
+        if not isinstance(raw_file, dict):
+            raise _EnvironmentNotReady(f"runtime.package_files[{index}] is not an object")
+        relative = _text(
+            raw_file.get("relative_path"), f"runtime.package_files[{index}].relative_path"
+        )
+        if (
+            "\\" in relative
+            or relative.startswith("/")
+            or ":" in relative
+            or any(part in {"", ".", ".."} for part in relative.split("/"))
+        ):
+            raise _EnvironmentNotReady("runtime.package_files contains an unsafe path")
+        size = raw_file.get("size")
+        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+            raise _EnvironmentNotReady("runtime.package_files contains an invalid size")
+        digest = _digest(raw_file.get("sha256"), f"runtime.package_files[{index}].sha256")
+        if relative in installed_package_files:
+            raise _EnvironmentNotReady("runtime.package_files contains duplicate paths")
+        installed_package_files[relative] = (size, digest)
     sites = [Path(item) for item in site_packages]
     allowed_sites = [purelib, platlib, *sites]
     if not _same_path(executable, settings.installed_python.path):
         raise _EnvironmentNotReady("installed runtime used a different Python executable")
     if version != settings.wheel_version:
         raise _EnvironmentNotReady("installed package version differs from the configured wheel")
-    if _under(module, Path(__file__).resolve().parents[2]):
+    repository_root = Path(__file__).resolve().parents[2]
+    source_package_roots = (repository_root / "src" / "febio_cae", repository_root / "febio_cae")
+    if any(_under(module, source_root) for source_root in source_package_roots):
         raise _EnvironmentNotReady("installed package resolved to the source checkout")
-    if not any(_under(module, site_path) for site_path in allowed_sites):
+    if not _same_path(module, package_root / "__init__.py"):
+        raise _EnvironmentNotReady("runtime module is not the installed package initializer")
+    if not any(_under(package_root, site_path) for site_path in allowed_sites):
         raise _EnvironmentNotReady("installed package did not resolve under site-packages")
+    expected_package_files = _wheel_package_files(settings.wheel)
+    if installed_package_files != expected_package_files:
+        raise _EnvironmentNotReady("installed package files differ from the configured wheel")
     report.data["environment"] = {
         "installed_python": str(settings.installed_python.path),
         "wheel": str(settings.wheel.path),
         "wheel_version": settings.wheel_version,
         "module": str(module),
+        "package_root": str(package_root),
+        "package_files": [
+            {"relative_path": name, "size": size, "sha256": digest}
+            for name, (size, digest) in sorted(installed_package_files.items())
+        ],
         "site_packages": [str(item) for item in allowed_sites],
     }
     report.write()
@@ -899,6 +983,16 @@ def _load_settings() -> _Settings:
         request,
         identities["source_step"],
     )
+    request_values = _as_object(request["values"], "preparation_request.values")
+    request_material = _as_object(
+        request_values["material"], "preparation_request.values.material"
+    )
+    baseline_modulus = _quantity_si(
+        request_material["youngs_modulus"],
+        "preparation_request.values.material.youngs_modulus",
+    )
+    if baseline_modulus == youngs_modulus_pa:
+        raise _EnvironmentNotReady("settings.edit.youngs_modulus_Pa is a no-op")
     axes, fixed_conditions = _validate_axes(
         settings["comparison"],
         part_body_id=part_body_id,
@@ -912,9 +1006,13 @@ def _load_settings() -> _Settings:
     )
     preparation_calls = limits["preparation_calls"]
     solver_calls = limits["solver_calls"]
-    if type(preparation_calls) is not int or preparation_calls != 1:
+    if (
+        isinstance(preparation_calls, bool)
+        or not isinstance(preparation_calls, int)
+        or preparation_calls != 1
+    ):
         raise _EnvironmentNotReady("settings.limits.preparation_calls must be exactly 1")
-    if type(solver_calls) is not int or solver_calls != 2:
+    if isinstance(solver_calls, bool) or not isinstance(solver_calls, int) or solver_calls != 2:
         raise _EnvironmentNotReady("settings.limits.solver_calls must be exactly 2")
     command_timeout = _finite(
         limits["command_timeout_seconds"],
@@ -1214,16 +1312,7 @@ def _spec_without_material(spec: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def _read_db_payload(case_root: Path, sql: str, value: str, field: str) -> dict[str, Any]:
-    database = case_root / "registry.sqlite3"
-    try:
-        with sqlite3.connect(database) as connection:
-            row = connection.execute(sql, (value,)).fetchone()
-    except sqlite3.Error as error:
-        raise _AcceptanceFailure(f"cannot read {field} from registered storage: {error}") from error
-    if row is None:
-        raise _AcceptanceFailure(f"registered storage has no {field} for {value!r}")
-    payload = row[0]
+def _decode_db_payload(payload: object, field: str) -> dict[str, Any]:
     if isinstance(payload, memoryview):
         payload = payload.tobytes()
     if not isinstance(payload, bytes):
@@ -1239,27 +1328,72 @@ def _read_db_payload(case_root: Path, sql: str, value: str, field: str) -> dict[
     return _require_dict(result, f"registered {field}")
 
 
+def _read_db_payload(case_root: Path, sql: str, value: str, field: str) -> dict[str, Any]:
+    database = case_root / "registry.sqlite3"
+    try:
+        with sqlite3.connect(database) as connection:
+            row = connection.execute(sql, (value,)).fetchone()
+    except sqlite3.Error as error:
+        raise _AcceptanceFailure(f"cannot read {field} from registered storage: {error}") from error
+    if row is None:
+        raise _AcceptanceFailure(f"registered storage has no {field} for {value!r}")
+    return _decode_db_payload(row[0], field)
+
+
+def _read_db_payloads(case_root: Path, sql: str, value: str, field: str) -> list[dict[str, Any]]:
+    database = case_root / "registry.sqlite3"
+    try:
+        with sqlite3.connect(database) as connection:
+            rows = connection.execute(sql, (value,)).fetchall()
+    except sqlite3.Error as error:
+        raise _AcceptanceFailure(f"cannot read {field} from registered storage: {error}") from error
+    return [_decode_db_payload(row[0], f"{field}[{index}]") for index, row in enumerate(rows)]
+
+
 def _record_preparation_process(
     report: _Report,
     case_root: Path,
     preparation: dict[str, Any],
     native_index: int | None,
-) -> None:
+) -> dict[str, Any]:
     preparation_id = _require_id(preparation.get("preparation_id"), "preparation_id")
     prepared_path = case_root / "preparation" / preparation_id / "prepared.json"
     prepared = _read_json(prepared_path, "prepared producer receipt", environment=False)
+    _expect(prepared.get("status") == "PREPARED", "prepared receipt is not PREPARED")
+    _expect(prepared.get("preparation_id") == preparation_id, "prepared ID differs")
+    _expect(prepared.get("case_id") == preparation.get("case_id"), "prepared case differs")
+    _expect(
+        prepared.get("revision_id") == preparation.get("revision_id"),
+        "prepared revision differs",
+    )
+    state_paths = sorted((case_root / "preparation").glob("*/state.json"))
+    _expect(len(state_paths) == 1, "preparation persisted more than one state record")
+    state = _read_json(state_paths[0], "preparation state", environment=False)
+    _expect(state.get("status") == "PREPARED", "preparation state is not PREPARED")
+    _expect(state.get("preparation_id") == preparation_id, "preparation state ID differs")
+    _expect(state.get("case_id") == preparation.get("case_id"), "preparation state case differs")
+    _expect(
+        state.get("revision_id") == preparation.get("revision_id"),
+        "preparation state revision differs",
+    )
+    state_limits = _require_dict(state.get("limits"), "preparation state limits")
+    _expect(
+        state_limits.get("mesh_generations") == 1,
+        "preparation state mesh generation budget differs",
+    )
+    limits = _require_dict(prepared.get("limits"), "prepared limits")
+    _expect(limits.get("mesh_generations") == 1, "prepared mesh generation budget differs")
     producer = _require_dict(prepared.get("producer"), "prepared producer")
+    _expect(producer.get("mesh_generations") == 1, "producer mesh generation count differs")
     process = _require_dict(producer.get("process"), "prepared producer process")
     argv = _require_list(process.get("argv"), "prepared producer process.argv")
     _expect(bool(argv), "prepared producer process.argv is empty")
     _expect(
-        len(argv) >= 4
+        len(argv) >= 3
         and argv[1] == "-I"
         and argv[2] == "-c"
-        and isinstance(argv[3], str)
-        and "febio_cae.adapters.geometry.preparation" in argv[3]
-        and "_main" in argv[3],
-        "preparation child did not use the installed isolated producer entry point",
+        and all(isinstance(item, str) for item in argv),
+        "preparation child did not use an isolated producer entry point",
     )
     _expect(
         _same_path(Path(str(argv[0])), Path(report.data["environment"]["installed_python"])),
@@ -1278,6 +1412,7 @@ def _record_preparation_process(
             "creation_time": process.get("creation_time"),
         },
     )
+    return prepared
 
 
 def _locate_run(
@@ -1341,7 +1476,9 @@ def _record_solver_process(
     )
     owner_generation = attempt.get("owner_generation")
     _expect(
-        type(owner_generation) is int and owner_generation >= 0,
+        isinstance(owner_generation, int)
+        and not isinstance(owner_generation, bool)
+        and owner_generation >= 0,
         "registered attempt owner generation is invalid",
     )
     _expect(
@@ -1376,13 +1513,136 @@ def _record_solver_process(
     return attempt
 
 
+def _validate_persisted_solver_budget(
+    case_root: Path,
+    case_id: str,
+    *,
+    baseline: dict[str, Any],
+    candidate: dict[str, Any],
+) -> dict[str, Any]:
+    expected_attempts = {
+        baseline["attempt_id"]: baseline["attempt"],
+        candidate["attempt_id"]: candidate["attempt"],
+    }
+    owners = _read_db_payloads(
+        case_root,
+        "SELECT payload FROM owners WHERE case_id=? ORDER BY run_id",
+        case_id,
+        "solver owners",
+    )
+    _expect(len(owners) == 2, "persisted solver owner count differs from the finite budget")
+    owner_attempt_ids = set()
+    for owner in owners:
+        attempt_id = _require_id(owner.get("attempt_id"), "persisted attempt_id")
+        owner_attempt_ids.add(attempt_id)
+        _expect(attempt_id in expected_attempts, "persisted solver owner is not a returned run")
+        _expect(owner == expected_attempts[attempt_id], "persisted solver attempt differs")
+        _expect(owner.get("state") == "SUCCEEDED", "persisted solver attempt is not SUCCEEDED")
+        _expect(owner.get("process") is not None, "persisted solver attempt lacks process evidence")
+    _expect(
+        owner_attempt_ids == set(expected_attempts),
+        "persisted solver attempts are not distinct",
+    )
+
+    manifests = _read_db_payloads(
+        case_root,
+        "SELECT payload FROM manifests "
+        "WHERE attempt_id IN (SELECT attempt_id FROM owners WHERE case_id=?) "
+        "ORDER BY manifest_id",
+        case_id,
+        "solver manifests",
+    )
+    _expect(len(manifests) == 2, "persisted solver manifest count differs from the finite budget")
+    expected_manifests = {
+        baseline["attempt_id"]: baseline["manifest"],
+        candidate["attempt_id"]: candidate["manifest"],
+    }
+    manifest_attempt_ids = set()
+    manifest_ids = set()
+    for manifest in manifests:
+        attempt_id = _require_id(manifest.get("attempt_id"), "persisted manifest.attempt_id")
+        manifest_id = _require_id(manifest.get("manifest_id"), "persisted manifest.manifest_id")
+        manifest_attempt_ids.add(attempt_id)
+        manifest_ids.add(manifest_id)
+        _expect(attempt_id in expected_manifests, "persisted manifest is not a returned result")
+        _expect(manifest == expected_manifests[attempt_id], "persisted manifest differs")
+    _expect(
+        manifest_attempt_ids == set(expected_manifests) and len(manifest_ids) == 2,
+        "persisted manifests are not one distinct result per solver attempt",
+    )
+    return {
+        "solver_budget": 2,
+        "solver_owner_count": len(owners),
+        "solver_manifest_count": len(manifests),
+        "solver_attempt_ids": sorted(owner_attempt_ids),
+        "solver_manifest_ids": sorted(manifest_ids),
+    }
+
+
+def _validate_manifest_files(
+    manifest: dict[str, Any], attempt_root: Path
+) -> dict[str, dict[str, Any]]:
+    entries: dict[str, dict[str, Any]] = {}
+    seen_paths: set[str] = set()
+    raw_files = _require_list(manifest.get("files"), "manifest.files")
+    for index, raw_file in enumerate(raw_files):
+        entry = _require_dict(raw_file, f"manifest.files[{index}]")
+        logical_path = _text(entry.get("logical_path"), f"manifest.files[{index}].logical_path")
+        if (
+            "\\" in logical_path
+            or logical_path.startswith("/")
+            or ":" in logical_path
+            or any(part in {"", ".", ".."} for part in logical_path.split("/"))
+        ):
+            raise _AcceptanceFailure(f"manifest.files[{index}] has an unsafe logical path")
+        folded = logical_path.casefold()
+        _expect(folded not in seen_paths, "manifest has duplicate paths")
+        seen_paths.add(folded)
+        digest = _require_digest(entry.get("digest"), f"manifest.files[{index}].digest")
+        size = entry.get("size_bytes")
+        _expect(
+            not isinstance(size, bool) and isinstance(size, int) and size >= 0,
+            f"manifest.files[{index}].size_bytes is invalid",
+        )
+        _text(entry.get("role"), f"manifest.files[{index}].role")
+        persisted = attempt_root.joinpath(*logical_path.split("/"))
+        _expect(persisted.is_file(), f"manifest file is missing: {logical_path}")
+        resolved = persisted.resolve()
+        _expect(
+            _same_path(persisted, resolved) and _under(resolved, attempt_root.resolve()),
+            f"manifest file escaped its attempt: {logical_path}",
+        )
+        try:
+            content = persisted.read_bytes()
+        except OSError as error:
+            raise _AcceptanceFailure(
+                f"cannot read manifest file {logical_path}: {error}"
+            ) from error
+        _expect(len(content) == size, f"manifest file size differs: {logical_path}")
+        _expect(
+            hashlib.sha256(content).hexdigest() == digest,
+            f"manifest file digest differs: {logical_path}",
+        )
+        entries[logical_path] = entry
+    _expect("input/case.feb" in entries, "manifest lacks the compiled input")
+    _expect("output/results.xplt" in entries, "manifest lacks the XPLT result")
+    _expect(entries["input/case.feb"].get("role") == "input", "compiled input role differs")
+    _expect(entries["output/results.xplt"].get("role") == "result", "XPLT result role differs")
+    for logical_path, entry in entries.items():
+        if entry.get("role") == "solver_log":
+            _expect(logical_path == "output/solver.log", "solver log has an unexpected path")
+        if logical_path == "output/solver.log":
+            _expect(entry.get("role") == "solver_log", "solver log role is not declared")
+    return entries
+
+
 def _validate_numeric_data(
     case_root: Path,
     *,
     manifest: dict[str, Any],
     revision: dict[str, Any],
-    run_id: str,
     attempt_id: str,
+    attempt_root: Path,
 ) -> None:
     read_result = _require_dict(manifest.get("read_result"), "manifest.read_result")
     _expect(read_result.get("status") == "VALIDATED", "manifest read result is not VALIDATED")
@@ -1412,25 +1672,9 @@ def _validate_numeric_data(
         len(observations) == len(requests),
         "manifest contains duplicate or missing observations",
     )
-    files = _require_list(manifest.get("files"), "manifest.files")
-    result_entries = [
-        _require_dict(entry, "manifest file")
-        for entry in files
-        if _require_dict(entry, "manifest file").get("logical_path") == "output/results.xplt"
-    ]
-    _expect(len(result_entries) == 1, "manifest lacks exactly one results.xplt entry")
-    result_entry = result_entries[0]
-    result_path = (
-        case_root
-        / "cases"
-        / revision["case_id"]
-        / "runs"
-        / run_id
-        / "attempts"
-        / attempt_id
-        / "output"
-        / "results.xplt"
-    )
+    file_entries = _validate_manifest_files(manifest, attempt_root)
+    result_entry = file_entries["output/results.xplt"]
+    result_path = attempt_root / "output" / "results.xplt"
     _expect(result_path.is_file(), "persisted XPLT result is missing")
     try:
         result_bytes = result_path.read_bytes()
@@ -1649,8 +1893,8 @@ def _validate_run(
         case_root,
         manifest=manifest,
         revision=revision,
-        run_id=run_id,
         attempt_id=attempt_id,
+        attempt_root=attempt_root,
     )
     attempt = _record_solver_process(
         report,
@@ -1727,6 +1971,7 @@ def _validate_run(
         "quality_status": response.get("quality_status"),
         "numerical_statuses": quality_statuses,
         "manifest": manifest,
+        "attempt": attempt,
     }
 
 
@@ -1799,11 +2044,47 @@ def _validate_comparison(
         request.get("candidate_manifest_id") == candidate["manifest_id"],
         "comparison candidate manifest differs",
     )
+    expected_axes = {
+        _require_id(
+            _require_dict(axis, "expected comparison axis").get("axis_id"),
+            "expected comparison axis_id",
+        ): _require_dict(axis, "expected comparison axis")
+        for axis in _require_list(expected_request.get("axes"), "expected_request.axes")
+    }
+    _expect(set(expected_axes) == set(_COMPARISON_AXES), "comparison request axes differ")
+    expected_intervals = [
+        _require_dict(axis.get("interval"), "expected comparison interval")
+        for axis in expected_axes.values()
+    ]
+    _expect(
+        bool(expected_intervals)
+        and all(interval == expected_intervals[0] for interval in expected_intervals),
+        "comparison request intervals differ",
+    )
+    expected_interval = expected_intervals[0]
     common_axis = _require_dict(comparison.get("common_axis"), "comparison.common_axis")
     values = _require_list(common_axis.get("values"), "comparison.common_axis.values")
     _expect(len(values) >= 2, "comparison common axis has fewer than two coordinates")
+    _expect(
+        common_axis.get("id") == "positive_imposed_tool_compression"
+        and common_axis.get("unit") == "m"
+        and common_axis.get("interpolation") == "linear"
+        and common_axis.get("extrapolation") == "forbidden"
+        and common_axis.get("requested_interval") == expected_interval,
+        "comparison common axis semantics differ",
+    )
+    lower = _finite(expected_interval.get("lower"), "expected comparison interval.lower")
+    upper = _finite(expected_interval.get("upper"), "expected comparison interval.upper")
+    previous_coordinate: float | None = None
     for index, value in enumerate(values):
-        _finite(value, f"comparison.common_axis.values[{index}]")
+        coordinate = _finite(value, f"comparison.common_axis.values[{index}]")
+        _expect(
+            lower <= coordinate <= upper,
+            "comparison common axis leaves the requested interval",
+        )
+        if previous_coordinate is not None:
+            _expect(coordinate > previous_coordinate, "comparison common axis is not ordered")
+        previous_coordinate = coordinate
     series = [
         _require_dict(item, f"comparison.series[{index}]")
         for index, item in enumerate(
@@ -1816,14 +2097,46 @@ def _validate_comparison(
         "comparison series inventory differs",
     )
     for index, item in enumerate(series):
+        axis_id = _require_id(item.get("axis_id"), f"comparison.series[{index}].axis_id")
+        axis = expected_axes[axis_id]
+        expected_measure, expected_aggregation = _COMPARISON_AXES[axis_id]
+        expected_unit = "N" if axis_id.endswith("force_z") else "m"
+        _expect(
+            (
+                item.get("measure_id"),
+                item.get("unit"),
+                item.get("frame"),
+                item.get("component"),
+                item.get("roi_id"),
+                item.get("aggregation"),
+            )
+            == (
+                expected_measure,
+                expected_unit,
+                "World",
+                "z",
+                axis.get("roi_id"),
+                expected_aggregation,
+            ),
+            f"comparison series {axis_id!r} semantics differ",
+        )
+        curves: dict[str, list[Any]] = {}
         for field in ("baseline", "candidate", "difference"):
             curve = _require_list(item.get(field), f"comparison.series[{index}].{field}")
             _expect(
                 len(curve) == len(values) >= 2,
                 f"comparison series {field} is not aligned to the common axis",
             )
+            curves[field] = curve
             for curve_index, value in enumerate(curve):
                 _finite(value, f"comparison.series[{index}].{field}[{curve_index}]")
+        for curve_index, (baseline_value, candidate_value, difference_value) in enumerate(
+            zip(curves["baseline"], curves["candidate"], curves["difference"])
+        ):
+            _expect(
+                difference_value == candidate_value - baseline_value,
+                f"comparison series {axis_id!r}[{curve_index}] has incorrect arithmetic",
+            )
     sources = _require_list(comparison.get("sources"), "comparison.sources")
     _expect(len(sources) == 2, "comparison did not retain both actual source identities")
     source_manifest_ids = {
@@ -1861,7 +2174,8 @@ def test_installed_synthetic_cli_flow(tmp_path: Path) -> None:
         generated_inputs = tmp_path / "generated-inputs"
         generated_inputs.mkdir()
         timeout = settings.command_timeout_seconds
-        native_counts = {"preparation": 0, "solver": 0}
+        dispatch_counts = {"preparation": 0, "solver": 0}
+        report.data["dispatch_counts"] = dict(dispatch_counts)
 
         def cli(
             stage: str,
@@ -1870,15 +2184,16 @@ def test_installed_synthetic_cli_flow(tmp_path: Path) -> None:
             native_kind: str | None = None,
         ) -> tuple[int, dict[str, Any], int | None]:
             if native_kind is not None:
-                native_counts[native_kind] += 1
+                dispatch_counts[native_kind] += 1
+                report.data["dispatch_counts"] = dict(dispatch_counts)
                 limit = (
                     settings.preparation_calls
                     if native_kind == "preparation"
                     else settings.solver_calls
                 )
                 _expect(
-                    native_counts[native_kind] <= limit,
-                    f"{native_kind} native-attempt budget exceeded before {stage}",
+                    dispatch_counts[native_kind] <= limit,
+                    f"{native_kind} dispatch budget exceeded before {stage}",
                 )
             return _run_cli(
                 settings,
@@ -1937,7 +2252,16 @@ def test_installed_synthetic_cli_flow(tmp_path: Path) -> None:
         parent_revision_id = _require_id(prepared.get("revision_id"), "prepared.revision_id")
         preparation_id = _require_id(prepared.get("preparation_id"), "prepared.preparation_id")
         _expect(prepared.get("generation") == 1, "prepared generation is not one")
-        _record_preparation_process(report, case_root, prepared, preparation_native_index)
+        preparation_receipt = _record_preparation_process(
+            report, case_root, prepared, preparation_native_index
+        )
+        report.data["preparation_evidence"] = {
+            "preparation_id": preparation_id,
+            "status": preparation_receipt.get("status"),
+            "mesh_generations": _require_dict(
+                preparation_receipt.get("producer"), "prepared producer"
+            ).get("mesh_generations"),
+        }
         parent_revision = _revision_file(case_root, case_id, parent_revision_id)
         _expect(parent_revision.get("case_id") == case_id, "prepared revision case binding differs")
         _expect(
@@ -2257,10 +2581,14 @@ def test_installed_synthetic_cli_flow(tmp_path: Path) -> None:
             native_index=candidate_native_index,
             solver=settings.solver,
         )
-        _expect(
-            native_counts == {"preparation": 1, "solver": 2},
-            "native attempt count differs from the finite configured budget",
+        persisted_budget = _validate_persisted_solver_budget(
+            case_root,
+            case_id,
+            baseline=baseline,
+            candidate=candidate,
         )
+        report.data["persisted_budget"] = persisted_budget
+        report.write()
         _expect(
             baseline["run_id"] != candidate["run_id"],
             "baseline and candidate run IDs are not distinct",
