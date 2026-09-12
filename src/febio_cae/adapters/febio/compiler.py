@@ -653,19 +653,23 @@ class CompilerAdapter:
 
         boundary = ET.SubElement(root, "Boundary")
         for support in spec.support.supports:
-            fixed = ET.SubElement(
-                boundary,
-                "bc",
-                {
-                    "type": "zero displacement",
-                    "name": support.support_id.value,
-                    "node_set": resolved[(self._selection_digest(support.selection), "node")],
-                },
-            )
             for axis in ("x", "y", "z"):
-                ET.SubElement(fixed, f"{axis}_dof").text = (
-                    "1" if getattr(support, axis).state == "fixed" else "0"
+                if getattr(support, axis).state != "fixed":
+                    continue
+                fixed = ET.SubElement(
+                    boundary,
+                    "bc",
+                    {
+                        "type": "prescribed displacement",
+                        "name": self._allocate_name(
+                            f"{support.support_id.value}-{axis}", allocated
+                        ),
+                        "node_set": resolved[(self._selection_digest(support.selection), "node")],
+                    },
                 )
+                ET.SubElement(fixed, "dof").text = axis
+                ET.SubElement(fixed, "value", {"lc": "1"}).text = "0"
+                ET.SubElement(fixed, "relative").text = "0"
         rigid = ET.SubElement(root, "Rigid")
         fixed_rigid = ET.SubElement(rigid, "rigid_bc", {"type": "rigid_fixed"})
         ET.SubElement(fixed_rigid, "rb").text = "tool-rigid"
