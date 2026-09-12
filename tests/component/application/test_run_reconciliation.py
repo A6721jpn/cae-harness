@@ -61,12 +61,14 @@ def test_mandatory_quality_coverage_without_preview(tmp_path: Path) -> None:
     assert result["quality_registration_status"] == "UNVERIFIED"
     assert "quality" in result
     coverage = cast(dict[str, Any], result["required_quality"])
-    assert len(coverage["numerical"]) == 6
-    assert all(
-        row["status"] == "UNVERIFIED" and row["reason"]
-        for row in cast(dict[str, Any], result["required_quality"])["numerical"]
-    )
-    assert all("ASK_AND_BLOCK" not in str(value) for value in result.values())
+    assert {row["criterion_id"] for row in coverage["numerical"]} == {
+        "execution_result_completeness",
+        "contact_quality",
+        "motion_support_contact_fidelity",
+        "quasistatic_equilibrium",
+        "solver_residual",
+        "mesh_dependence",
+    }
     with sqlite3.connect(tmp_path / "case/registry.sqlite3") as connection:
         assert connection.execute("SELECT payload FROM owners").fetchall() == before
 

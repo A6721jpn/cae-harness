@@ -304,11 +304,18 @@ Public post-run summaries independently enumerate execution/result completeness,
 contact quality, motion/support/contact-set fidelity, quasi-static equilibrium,
 solver residuals and mesh dependence, regardless of the declared criterion list.
 Missing implementation or qualified evidence is UNVERIFIED with category-specific
-reasons and prevents COMPLETE. The initial gate has no qualified PASS or
-NOT_APPLICABLE producer; arithmetic methods, criterion names, arbitrary evidence
-references and registered profile labels cannot discharge an obligation. Current
-public paths therefore cannot attain mandatory numerical COMPLETE until qualified
-verifiers exist. No physics, signs, thresholds or applicability exclusions are guessed.
+reasons and prevents COMPLETE. Execution/result completeness has a bounded producer:
+it verifies the successful registered attempt and exact revision, bundle, mesh,
+profile, reader and result bindings; every declared output must cover its requested
+entities, components, layout, frame and units with finite registered state data
+through the declared endpoint. Complete coverage may produce PASS; unavailable
+data-level coverage remains UNVERIFIED and corrupt registration remains INTEGRITY.
+This does not qualify native physics, signs or the reader itself. The other five
+numerical obligations still have no qualified PASS or NOT_APPLICABLE producer.
+Arithmetic methods, criterion names, arbitrary evidence references and registered
+profile labels cannot discharge them. Public paths therefore still cannot attain
+mandatory numerical COMPLETE. No physics, signs, thresholds or applicability
+exclusions are guessed.
 
 Expose derived required_quality with the exact resolved revision/spec, mesh,
 profile, attempt/bundle/manifest and arithmetic-assessment identities/digests.
