@@ -84,6 +84,14 @@ _PLOT_VARIABLES: Final[dict[str, tuple[str, str, str]]] = {
     "rigid force": ("rigid_body", "VEC3F", "N"),
     "rigid position": ("rigid_body", "VEC3F", "m"),
     "stress": ("element", "MAT3FS", "Pa"),
+    "nodal contact gap": ("surface_node", "FLOAT", "m"),
+    "nodal contact pressure": ("surface_node", "FLOAT", "Pa"),
+    "nodal contact traction": ("surface_node", "VEC3F", "Pa"),
+    "contact area": ("surface", "FLOAT", "m2"),
+    "contact force": ("surface", "VEC3F", "N"),
+    "contact pressure": ("face", "FLOAT", "Pa"),
+    "contact status": ("face", "FLOAT", "1"),
+    "contact traction": ("face", "VEC3F", "Pa"),
 }
 
 _REQUIRED_CAPABILITIES: Final[frozenset[str]] = frozenset(
@@ -787,7 +795,13 @@ class CompilerAdapter:
             *(
                 (
                     request.selection,
-                    {"element": "element", "rigid_body": "body"}.get(request.location, "node"),
+                    {
+                        "element": "element",
+                        "rigid_body": "body",
+                        "face": "face",
+                        "surface": "face",
+                        "surface_node": "face",
+                    }.get(request.location, "node"),
                 )
                 for request in revision.spec.outputs.requests
             ),

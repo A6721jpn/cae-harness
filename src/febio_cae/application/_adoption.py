@@ -121,6 +121,10 @@ def adopt(
             }
             for location in sorted(locations):
                 kind = str(location)
+                if location in {"face", "surface", "surface_node"}:
+                    if any(item.kind == "face" for item in mapped):
+                        continue
+                    raise ValueError("unsupported whole-body output projection")
                 if any(item.kind == location for item in mapped):
                     continue
                 body = selection.body_id.value

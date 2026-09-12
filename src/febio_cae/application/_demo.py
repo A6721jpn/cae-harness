@@ -41,6 +41,7 @@ from febio_cae.domain import (
 )
 from febio_cae.domain.codec import decode_record, encode_record
 from febio_cae.domain.lifecycle import TaskStatus
+from febio_cae.domain.results import surface_node_entity_id
 from febio_cae.storage import CaseStorage
 from febio_cae.storage.mesh_quality import PlanarDemoRegistration, PlanarPreparationRegistration
 
@@ -63,12 +64,54 @@ def _read_native_result(
     data = LocalResultDataStore()
     part = revision.spec.geometry.body_id.value
     tool = revision.spec.rigid_tool.primitive.body_id.value
+    face_by_id = {face.face_id: face for face in mesh.faces}
+    contact_entities: dict[str, tuple[str, ...]] = {}
+    contact_locations = {
+        mapping.location
+        for mapping in profile.output_mappings
+        if mapping.location in {"face", "surface", "surface_node"}
+    }
+    for location in ("face", "surface", "surface_node"):
+        if location not in contact_locations:
+            continue
+        ids: list[str] = []
+        for selection in (
+            revision.spec.contact.part_surface,
+            revision.spec.contact.tool_surface,
+        ):
+            digest = hashlib.sha256(selection.to_bytes()).hexdigest()
+            matches = [
+                item
+                for item in mesh.sets
+                if item.kind == "face"
+                and item.source_selection_digest == digest
+                and item.body_id == selection.body_id.value
+            ]
+            if len(matches) != 1:
+                raise PortError(
+                    PortErrorCategory.INTEGRITY,
+                    f"contact selection does not resolve to one face set: {selection.name}",
+                )
+            face_set = matches[0]
+            face_ids = tuple(str(face_id) for face_id in face_set.member_ids)
+            if location == "surface":
+                ids.append(face_set.set_id)
+            elif location == "face":
+                ids.extend(face_ids)
+            else:
+                ids.extend(
+                    surface_node_entity_id(face_id, node_id)
+                    for face_id in face_ids
+                    for node_id in face_by_id[face_id].node_ids
+                )
+        contact_entities[location] = tuple(ids)
     entities = {
         "node": tuple(str(node.node_id) for node in mesh.nodes),
         "element": tuple(
             str(element.element_id) for element in mesh.elements if element.body_id == part
         ),
         "rigid_body": (tool,),
+        **contact_entities,
     }
     data.register_source(
         attempt,

@@ -58,6 +58,12 @@ def _sequence(value: object, field_name: str) -> tuple[object, ...]:
     return tuple(value)
 
 
+def surface_node_entity_id(face_id: str, node_id: int) -> str:
+    """Return the canonical identity of one node local to an oriented face."""
+
+    return canonical_bytes([face_id, node_id]).decode("utf-8")
+
+
 class ReadStatus(str, Enum):
     VALIDATED = "VALIDATED"
     UNVERIFIED = "UNVERIFIED"
@@ -463,4 +469,5 @@ __all__ = [
     "ResultDataRef",
     "ResultManifest",
     "ResultsValidationError",
+    "surface_node_entity_id",
 ]

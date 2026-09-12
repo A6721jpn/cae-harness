@@ -18,9 +18,17 @@ from .units import Dimension, Quantity, unit_definition
 SCHEMA_VERSION = "1"
 _TIME = Dimension(time=1)
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-_LOCATIONS = frozenset({"node", "element", "integration_point", "face", "surface", "rigid_body"})
+_LOCATIONS = frozenset(
+    {"node", "element", "integration_point", "face", "surface", "surface_node", "rigid_body"}
+)
 type OutputLocation = Literal[
-    "node", "element", "integration_point", "face", "surface", "rigid_body"
+    "node",
+    "element",
+    "integration_point",
+    "face",
+    "surface",
+    "surface_node",
+    "rigid_body",
 ]
 
 
@@ -39,7 +47,8 @@ def _require_identifier(value: object, field: str) -> str:
 def _require_location(value: object) -> OutputLocation:
     if not isinstance(value, str) or value not in _LOCATIONS:
         raise OutputPolicyValidationError(
-            "location must be one of node, element, integration_point, face, surface, rigid_body"
+            "location must be one of node, element, integration_point, face, surface, "
+            "surface_node, rigid_body"
         )
     return cast(OutputLocation, value)
 

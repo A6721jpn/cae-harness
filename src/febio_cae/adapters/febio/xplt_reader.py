@@ -35,6 +35,7 @@ from febio_cae.domain import (
 )
 from febio_cae.domain.canonical import canonical_bytes
 from febio_cae.domain.codec import decode_record, encode_record
+from febio_cae.domain.results import surface_node_entity_id
 
 _OUTPUT_PATH = "output/results.xplt"
 _CODEC_ID = "numeric-result-v1"
@@ -43,6 +44,7 @@ _MAX_BLOCK = 16 * 1024 * 1024
 _MAX_BLOCKS = 900000
 _NODE_DICTIONARY = 0x01023000
 _DOMAIN_DICTIONARY = 0x01024000
+_CONTACT_DICTIONARY = 0x01025000
 _VECTOR = ("x", "y", "z")
 _TENSOR = ("xx", "yy", "zz", "xy", "yz", "xz")
 _LAYOUTS = {
@@ -51,6 +53,38 @@ _LAYOUTS = {
     "stress": (_DOMAIN_DICTIONARY, 2, 1, "element", "MAT3FS", "Pa", _TENSOR),
     "rigid force": (_DOMAIN_DICTIONARY, 1, 3, "rigid_body", "VEC3F", "N", _VECTOR),
     "rigid position": (_DOMAIN_DICTIONARY, 1, 3, "rigid_body", "VEC3F", "m", _VECTOR),
+    "nodal contact gap": (
+        _CONTACT_DICTIONARY,
+        0,
+        2,
+        "surface_node",
+        "FLOAT",
+        "m",
+        ("value",),
+    ),
+    "nodal contact pressure": (
+        _CONTACT_DICTIONARY,
+        0,
+        2,
+        "surface_node",
+        "FLOAT",
+        "Pa",
+        ("value",),
+    ),
+    "nodal contact traction": (
+        _CONTACT_DICTIONARY,
+        1,
+        2,
+        "surface_node",
+        "VEC3F",
+        "Pa",
+        _VECTOR,
+    ),
+    "contact area": (_CONTACT_DICTIONARY, 0, 3, "surface", "FLOAT", "m2", ("value",)),
+    "contact force": (_CONTACT_DICTIONARY, 1, 3, "surface", "VEC3F", "N", _VECTOR),
+    "contact pressure": (_CONTACT_DICTIONARY, 0, 1, "face", "FLOAT", "Pa", ("value",)),
+    "contact status": (_CONTACT_DICTIONARY, 0, 1, "face", "FLOAT", "1", ("value",)),
+    "contact traction": (_CONTACT_DICTIONARY, 1, 1, "face", "VEC3F", "Pa", _VECTOR),
 }
 _OBJECT_NAMES = (
     "Position",
@@ -288,10 +322,18 @@ class _Domain:
 
 
 @dataclass(frozen=True)
+class _Surface:
+    native_id: int
+    name: str
+    face_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class _Mesh:
     node_ids: tuple[int, ...]
     domains: tuple[_Domain, ...]
     objects: tuple[int, ...]
+    surfaces: tuple[_Surface, ...]
 
 
 class _NativeParser:
@@ -354,7 +396,7 @@ class _NativeParser:
         if 0x01010007 in header and _text(header[0x01010007], "units") != "SI":
             raise _ParseError("unsupported XPLT unit system")
         variables = self.dictionary(root[0x01020000])
-        mesh = self.mesh(top[1].payload)
+        mesh = self.mesh(top[1].payload, variables)
         states = tuple(self.state(item.payload, variables, mesh) for item in top[2:])
         times = tuple(time for time, _ in states)
         if any(b <= a for a, b in pairwise(times)):
@@ -366,7 +408,10 @@ class _NativeParser:
 
     def dictionary(self, payload: bytes) -> tuple[_Variable, ...]:
         groups = self.fields(
-            payload, set(), {_NODE_DICTIONARY, _DOMAIN_DICTIONARY}, label="dictionary layout"
+            payload,
+            set(),
+            {_NODE_DICTIONARY, _DOMAIN_DICTIONARY, _CONTACT_DICTIONARY},
+            label="dictionary layout",
         )
         mappings = {mapping.native_name: mapping for mapping in self.profile.output_mappings}
         if len(mappings) != len(self.profile.output_mappings):
@@ -396,6 +441,12 @@ class _NativeParser:
                     raise _ParseError("unsupported array dictionary layout")
                 if 0x01020007 in fields and len(fields[0x01020007]) != 64:
                     raise _ParseError("invalid observed dictionary ancillary width")
+                if group == _CONTACT_DICTIONARY and (
+                    0x01020007 not in fields
+                    or _text(fields[0x01020007], "contact dictionary unit", fixed=True)
+                    != layout[5]
+                ):
+                    raise _ParseError("contact dictionary unit differs from native layout")
                 if (mapping.location, mapping.value_type, mapping.unit) != layout[
                     3:6
                 ] or mapping.frame != self.source.mesh.frame:
@@ -408,7 +459,7 @@ class _NativeParser:
             raise _ParseError("registered output entity policy differs from dictionary")
         return tuple(variables)
 
-    def mesh(self, payload: bytes) -> _Mesh:
+    def mesh(self, payload: bytes, variables: tuple[_Variable, ...]) -> _Mesh:
         fields = self.fields(
             payload,
             {0x01041000, 0x01042000, 0x01045000},
@@ -498,11 +549,34 @@ class _NativeParser:
             self.region_sets(fields[0x01044000], 0x01044000, set(range(len(node_ids))))
         if 0x01046000 in fields:
             self.region_sets(fields[0x01046000], 0x01046000, observed_elements)
-        for tag in (0x01043000, 0x01047000):
-            if tag in fields:
-                self.surfaces(fields[tag], tag, len(node_ids))
+        has_contact_outputs = any(
+            variable.group == _CONTACT_DICTIONARY for variable in variables
+        )
+        expected_surface_names = (
+            {
+                entity_id
+                for variable in variables
+                if variable.mapping.location == "surface"
+                for entity_id in self.source.entity_ids[variable.mapping.canonical_id]
+            }
+            if has_contact_outputs
+            else None
+        )
+        surfaces: tuple[_Surface, ...] = ()
+        if 0x01043000 in fields:
+            surfaces = self.surfaces(
+                fields[0x01043000],
+                0x01043000,
+                tuple(node_ids),
+                expected_surface_names,
+            )
+        elif expected_surface_names:
+            raise _ParseError("contact output requires the native surface section")
+        if 0x01047000 in fields:
+            self.surfaces(fields[0x01047000], 0x01047000, tuple(node_ids), None)
+        self._validate_contact_entities(variables, surfaces)
         objects = self.objects(fields[0x01050000]) if 0x01050000 in fields else ()
-        return _Mesh(node_ids, tuple(domains), objects)
+        return _Mesh(node_ids, tuple(domains), objects, surfaces)
 
     def region_sets(self, payload: bytes, base: int, allowed_members: set[int]) -> None:
         seen: set[int] = set()
@@ -528,8 +602,20 @@ class _NativeParser:
             seen.add(identifier)
             _text(header[base + 0x103], "region name")
 
-    def surfaces(self, payload: bytes, base: int, node_count: int) -> None:
+    def surfaces(
+        self,
+        payload: bytes,
+        base: int,
+        node_ids: tuple[int, ...],
+        expected_names: set[str] | None,
+    ) -> tuple[_Surface, ...]:
         seen: set[int] = set()
+        names: set[str] = set()
+        result: list[_Surface] = []
+        face_by_id = {face.face_id: face for face in self.source.mesh.faces}
+        face_sets = {
+            item.set_id: item for item in self.source.mesh.sets if item.kind == "face"
+        }
         for item in self.blocks(payload):
             if item.identifier != base + 0x100:
                 raise _ParseError("unknown surface/facet-set layout")
@@ -541,29 +627,94 @@ class _NativeParser:
             )
             identifier = _uint(header[base + 0x102], "surface ID")
             name_offset, count_offset = (0x104, 0x103) if base == 0x01043000 else (0x103, 0x104)
-            _text(header[base + name_offset], "surface name")
+            name = _text(header[base + name_offset], "surface name")
             maximum = _uint(header[base + 0x105], "surface maximum width")
-            if identifier <= 0 or identifier in seen or maximum not in {4, 6, 10}:
+            if (
+                identifier <= 0
+                or identifier in seen
+                or name in names
+                or maximum not in {4, 6, 10}
+            ):
                 raise _ParseError("unsupported surface identity/layout")
             seen.add(identifier)
+            names.add(name)
             faces = self.blocks(fields[base + 0x200])
             if len(faces) != _uint(header[base + count_offset], "surface face count"):
                 raise _ParseError("surface face count mismatch")
             face_ids: set[int] = set()
-            for face in faces:
+            native_face_ids: list[str] = []
+            expected_set = face_sets.get(name) if base == 0x01043000 else None
+            if expected_names is not None and (
+                expected_set is None or name not in expected_names
+            ):
+                raise _ParseError("native contact surface is not a registered mesh set")
+            if expected_names is not None and maximum != 6:
+                raise _ParseError("contact surfaces require ordered tri6 connectivity")
+            for ordinal, face in enumerate(faces, 1):
                 if face.identifier != base + 0x201 or len(face.payload) != (maximum + 2) * 4:
                     raise _ParseError("unsupported surface connectivity layout")
                 face_id, count, *indices = _uints(face.payload, "surface connectivity")
                 if (
                     face_id <= 0
                     or face_id in face_ids
-                    or count not in {4, 6}
+                    or (expected_names is not None and face_id != ordinal)
+                    or (count != 6 if expected_names is not None else count not in {4, 6})
                     or count > maximum
-                    or any(index >= node_count for index in indices[:count])
+                    or any(index >= len(node_ids) for index in indices[:count])
                     or len(set(indices[:count])) != count
                 ):
                     raise _ParseError("invalid surface connectivity")
                 face_ids.add(face_id)
+                if expected_names is not None:
+                    native_nodes = tuple(node_ids[index] for index in indices[:count])
+                    if expected_set is None or ordinal > len(expected_set.member_ids):
+                        raise _ParseError("native contact surface membership is incomplete")
+                    canonical_face_id = str(expected_set.member_ids[ordinal - 1])
+                    canonical_face = face_by_id.get(canonical_face_id)
+                    if canonical_face is None or native_nodes != tuple(canonical_face.node_ids):
+                        raise _ParseError(
+                            "native contact surface orientation/connectivity differs from mesh"
+                        )
+                    native_face_ids.append(canonical_face.face_id)
+            if expected_names is not None:
+                if expected_set is None or tuple(native_face_ids) != tuple(expected_set.member_ids):
+                    raise _ParseError("native contact surface face order differs from mesh")
+            result.append(_Surface(identifier, name, tuple(native_face_ids)))
+        if expected_names is not None and names != expected_names:
+            raise _ParseError("native contact surfaces do not match registered mesh sets")
+        return tuple(result)
+
+    def _validate_contact_entities(
+        self, variables: tuple[_Variable, ...], surfaces: tuple[_Surface, ...]
+    ) -> None:
+        if not any(variable.group == _CONTACT_DICTIONARY for variable in variables):
+            return
+        face_by_id = {face.face_id: face for face in self.source.mesh.faces}
+        surface_face_ids = tuple(
+            face_id for surface in surfaces for face_id in surface.face_ids
+        )
+        surface_node_ids = tuple(
+            surface_node_entity_id(face_id, node_id)
+            for surface in surfaces
+            for face_id in surface.face_ids
+            for node_id in face_by_id[face_id].node_ids
+        )
+        expected_surface_ids = tuple(surface.name for surface in surfaces)
+        expected_by_location = {
+            "surface": set(expected_surface_ids),
+            "face": set(surface_face_ids),
+            "surface_node": set(surface_node_ids),
+        }
+        for variable in variables:
+            if variable.group != _CONTACT_DICTIONARY:
+                continue
+            registered = self.source.entity_ids[variable.mapping.canonical_id]
+            expected = expected_by_location.get(variable.mapping.location)
+            if expected is None or set(registered) != expected:
+                raise _ParseError(
+                    "registered contact entities do not match native surfaces: "
+                    f"{variable.mapping.canonical_id}"
+                )
 
     def objects(self, payload: bytes) -> tuple[int, ...]:
         identifiers = []
@@ -633,10 +784,28 @@ class _NativeParser:
             raise _ParseError("state object metadata/data mismatch")
         if mesh.objects:
             self.state_objects(fields[0x02040000], mesh.objects)
-        category_tags = {0x02020300: _NODE_DICTIONARY, 0x02020400: _DOMAIN_DICTIONARY}
+        category_tags = {
+            0x02020300: _NODE_DICTIONARY,
+            0x02020400: _DOMAIN_DICTIONARY,
+            0x02020500: _CONTACT_DICTIONARY,
+        }
         categories = self.fields(fields[0x02020000], set(), set(category_tags), label="state data")
         result: dict[str, tuple[float, ...]] = {}
         expected_entities = dict(self.source.entity_ids)
+        contact_surfaces = {surface.native_id: surface for surface in mesh.surfaces}
+        contact_faces = {face.face_id: face for face in self.source.mesh.faces}
+        contact_entities = {
+            surface.native_id: {
+                1: surface.face_ids,
+                2: tuple(
+                    surface_node_entity_id(face_id, node_id)
+                    for face_id in surface.face_ids
+                    for node_id in contact_faces[face_id].node_ids
+                ),
+                3: (surface.name,),
+            }
+            for surface in mesh.surfaces
+        }
         for tag, data in categories.items():
             known = {
                 variable.index: variable
@@ -663,7 +832,7 @@ class _NativeParser:
                         if region.identifier != 0:
                             raise _ParseError("unsupported node data region")
                         ids = tuple(str(value) for value in mesh.node_ids)
-                    else:
+                    elif variable.group == _DOMAIN_DICTIONARY:
                         if not 1 <= region.identifier <= len(mesh.domains):
                             raise _ParseError("unknown domain data region")
                         domain = mesh.domains[region.identifier - 1]
@@ -672,6 +841,13 @@ class _NativeParser:
                             if variable.storage_format == 3
                             else tuple(str(value) for value in domain.element_ids)
                         )
+                    else:
+                        surface = contact_surfaces.get(region.identifier)
+                        if surface is None:
+                            raise _ParseError("unknown contact surface data region")
+                        ids = contact_entities[surface.native_id].get(variable.storage_format)
+                        if ids is None:
+                            raise _ParseError("unsupported contact storage format")
                     width = len(variable.components)
                     values_raw = _floats(region.payload, len(ids) * width, "state variable")
                     for offset, entity in enumerate(ids):
