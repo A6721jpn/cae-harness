@@ -214,6 +214,12 @@ def run_case(arguments: Namespace) -> int:
             payload = _created_payload(created)
             _print(payload) if arguments.json else print(created.case_id)
             return 0
+        if arguments.case_action == "provision-planar-profiles":
+            payload = service.provision_planar_profiles(
+                arguments.case_id, bundle_path=Path(arguments.bundle_path)
+            )
+            _print(payload) if arguments.json else print(payload["status"])
+            return 0
         if arguments.case_action == "inspect":
             if arguments.native:
                 payload = service.inspect_native(

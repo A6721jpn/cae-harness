@@ -47,6 +47,13 @@ def _build_parser() -> argparse.ArgumentParser:
     create.add_argument("--case-root", required=True)
     create.add_argument("--cad", required=True)
     create.add_argument("--json", action="store_true")
+    provision = case_commands.add_parser(
+        "provision-planar-profiles",
+        help="provision the reviewed planar compatibility bundle",
+    )
+    provision.add_argument("case_id")
+    provision.add_argument("--bundle-path", required=True)
+    provision.add_argument("--json", action="store_true")
     inspect = case_commands.add_parser("inspect", help="read registered case metadata")
     inspect.add_argument("case_id")
     inspect.add_argument("--json", action="store_true")
