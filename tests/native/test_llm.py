@@ -300,7 +300,6 @@ def test_live_ai02_japanese_intent_answer_freeze_and_e_edit(
                 "action": "intent_reentry",
                 "operation_id": intent_operation,
                 "status": replay["status"],
-                "network_requests": 0,
             }
         )
 
