@@ -799,21 +799,43 @@ def assess_reported_residual(
         ):
             raise ValueError("complete admitted final cycles and the frozen policy are required")
         configured = {control.name: control.value for control in policy.controls}
-        control = configured["rtol"]
-        if isinstance(control, Quantity):
-            if control.dimension != Quantity(0, "1").dimension:
-                raise ValueError("rtol must be dimensionless")
-            value = float(control.to_si().value)
-        elif type(control) is int:
-            value = float(control)
-        else:
-            raise ValueError("rtol must be an explicit numeric control")
-        if not math.isfinite(value) or value <= 0:
-            raise ValueError("the residual criterion must be enabled")
-        tolerance = Fraction.from_float(value)
+        bounds: dict[str, Fraction] = {}
+        for name, unit in (("rtol", "1"), ("tolerance", "1"), ("gaptol", "m")):
+            control = configured[name]
+            if isinstance(control, Quantity):
+                if control.dimension != Quantity(0, unit).dimension:
+                    raise ValueError(f"{name} has incompatible dimensions")
+                value = float(control.to_si().value)
+            elif type(control) is int and unit == "1":
+                value = float(control)
+            else:
+                raise ValueError(f"{name} must be an explicit numeric control with units")
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be enabled")
+            bounds[name] = Fraction.from_float(value)
+        tolerance = bounds["rtol"]
+        contact_requirements = {
+            "D multiplier": bounds["tolerance"],
+            "maximum gap": bounds["gaptol"],
+        }
         blocks = report["blocks"]
         residual_bounds: dict[int, tuple[Fraction, Fraction]] = {}
         for index, block in enumerate(blocks):
+            if block["kind"] == "augmentation":
+                rows = block["rows"]
+                if len(rows) != 2 or {row["name"] for row in rows} != set(contact_requirements):
+                    raise ValueError("augmentation lacks its two unambiguous norm rows")
+                for row in rows:
+                    required = _printed_interval(row["required"])
+                    if not required[0] <= contact_requirements[row["name"]] <= required[1]:
+                        return CriterionAssessment(
+                            identifier,
+                            "numeric",
+                            AssessmentStatus.FAIL,
+                            (),
+                            "reported augmentation requirement contradicts the frozen contact control",
+                        )
+                continue
             if block["kind"] != "nonlinear":
                 continue
             rows = [row for row in block["rows"] if row["name"] == "residual"]

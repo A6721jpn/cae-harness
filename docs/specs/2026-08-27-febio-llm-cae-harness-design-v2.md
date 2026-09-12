@@ -361,6 +361,9 @@ Within that scope, all declared saved states and units must be registered and fi
   accepted increments, accepted nonlinear/augmentation norms and the declared solver
   policy. Printed decimal precision is bounded conservatively; ambiguous threshold
   comparisons remain UNVERIFIED. A reported convergence banner alone is insufficient.
+  Every printed augmentation requirement must contain its frozen `tolerance` or
+  SI `gaptol` value within the printed-precision interval; a looser printed
+  requirement cannot override the declared contact control.
 - `mesh_dependence` requires three explicitly declared decreasing global tet10 sizes,
   a relative force-change bound and an absolute force floor. Both registered
   refinements must increase part element count and decrease observed maximum part

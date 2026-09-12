@@ -443,3 +443,34 @@ def test_residual_ratio_requires_every_accepted_final_cycle() -> None:
         reported_norms.assess_reported_residual(incomplete, policy.solver_policy).status.value
         == "UNVERIFIED"
     )
+
+
+@pytest.mark.parametrize(
+    ("original", "loosened"),
+    [
+        (
+            b"maximum gap : 1.000000e-09 1.000000e-08",
+            b"maximum gap : 2.000000e-08 1.000000e-06",
+        ),
+        (
+            b"D multiplier : 1.000000e-03 1.000000e-02",
+            b"D multiplier : 2.000000e-02 1.000000e-01",
+        ),
+    ],
+)
+def test_residual_acceptance_binds_contact_requirements_to_policy(
+    original: bytes, loosened: bytes
+) -> None:
+    from febio_cae.adapters.febio import reported_norms
+
+    source, policy, profile, invocation = _context()
+    report = assess_reported_norm_observations(
+        source,
+        _resolved("output/solver.log", "solver_log", _log().content.replace(original, loosened)),
+        policy=policy,
+        profile=profile,
+        invocation=invocation,
+    ).to_dict()
+    assert report["final_status"] == "PASS"
+    result = reported_norms.assess_reported_residual(report, policy.solver_policy)
+    assert result.status.value == "FAIL"
