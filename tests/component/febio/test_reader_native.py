@@ -333,3 +333,82 @@ def test_compiler_runner_registered_reader_codec_connection(tmp_path: Path) -> N
         _cleanup_process(managed.process)
         managed.stdout.close()
         managed.stderr.close()
+
+
+def test_native_composition_resolves_two_body_requests_and_quality_fields(tmp_path: Path) -> None:
+    from typing import Any, cast
+
+    from febio_cae.application._demo import _read_native_result
+    from febio_cae.domain import CaseRevision
+    from febio_cae.storage import CaseStorage
+
+    from .fixtures import evidence
+
+    revisions: list[CaseRevision] = []
+
+    def add_tool_displacement(revision: CaseRevision) -> CaseRevision:
+        requests = revision.spec.outputs.requests
+        force = next(item for item in requests if item.quantity_id == "contact_force")
+        tool_motion = replace(
+            requests[0],
+            request_id="tool_motion",
+            selection=force.selection,
+            evidence=evidence("outputs.requests.tool_motion", "reader-tool-motion"),
+        )
+        revision = replace(
+            revision,
+            spec=replace(
+                revision.spec,
+                outputs=replace(revision.spec.outputs, requests=(*requests, tool_motion)),
+            ),
+        )
+        revisions.append(revision)
+        return revision
+
+    reader, attempt, bundle, mesh, payload = setup_reader(
+        tmp_path, quality_outputs=True, revision_update=add_tool_displacement
+    )
+    entry = FileEntry(
+        "output/results.xplt", hashlib.sha256(payload).hexdigest(), len(payload), "result"
+    )
+    records: dict[str, NumericResultData] = {}
+
+    class Registered:
+        def _file_content(self, attempt: Any, entry: FileEntry) -> ResolvedFileContent:
+            return ResolvedFileContent(entry, payload)
+
+        def register_numeric_data(self, data: NumericResultData) -> NumericResultData:
+            records[data.reference.data_id] = data
+            return data
+
+    manifest = _read_native_result(
+        attempt,
+        bundle,
+        (entry,),
+        cast(CaseStorage, Registered()),
+        revisions[0],
+        mesh,
+        reader.profile,
+    )
+
+    def result(request_id: str) -> NumericResultData:
+        observation = next(
+            item for item in manifest.read_result.observations if item.output_id == request_id
+        )
+        assert observation.data_ref is not None
+        return records[observation.data_ref.data_id]
+
+    part = result(revisions[0].spec.outputs.requests[0].request_id)
+    tool = result("tool_motion")
+    part_node, tool_node = mesh.elements[0].node_ids[0], mesh.elements[1].node_ids[0]
+    assert part.values[-1][part.entity_ids.index(str(part_node)) * 3 + 2] == pytest.approx(
+        part_node / 100
+    )
+    assert tool.values[-1][tool.entity_ids.index(str(tool_node)) * 3 + 2] == pytest.approx(
+        tool_node / 100
+    )
+    reaction = result("support_reaction")
+    assert reaction.values[-1][reaction.entity_ids.index(str(part_node)) * 3 + 2] == pytest.approx(
+        part_node
+    )
+    assert result("tool_position").values[-1][2] == pytest.approx(-0.001)

@@ -62,7 +62,7 @@ def _completion(
         TaskStatus.FAILED
         if quality_status == "FAIL"
         else TaskStatus.NEEDS_QUALITY
-        if quality_status == "UNVERIFIED"
+        if quality_status == "UNVERIFIED" or quality_registration_status != "PASS"
         else TaskStatus.NEEDS_PREVIEW
     )
     with connect(storage.registry_path) as connection:

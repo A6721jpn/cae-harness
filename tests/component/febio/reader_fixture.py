@@ -76,7 +76,11 @@ def descriptor(name: str, value_type: int, storage_format: int) -> bytes:
 
 
 def native_bytes(
-    mesh: MeshArtifact, *, times: tuple[float, ...] = (0.0, 1.0), defect: str = ""
+    mesh: MeshArtifact,
+    *,
+    times: tuple[float, ...] = (0.0, 1.0),
+    defect: str = "",
+    quality_outputs: bool = False,
 ) -> bytes:
     header = (
         uint(0x01010001, 0x99 if defect == "version" else 0x35)
@@ -88,6 +92,9 @@ def native_bytes(
     domain_dictionary = block(0x01020001, descriptor("stress", 2, 1)) + block(
         0x01020001, descriptor("rigid force", 1, 1 if defect == "rigid-layout" else 3)
     )
+    if quality_outputs:
+        node_dictionary += block(0x01020001, descriptor("reaction forces", 1, 0))
+        domain_dictionary += block(0x01020001, descriptor("rigid position", 1, 3))
     dictionary = block(0x01023000, node_dictionary) + block(0x01024000, domain_dictionary)
     root = block(0x01000000, block(0x01010000, header) + block(0x01020000, dictionary))
     nodes = tuple(mesh.nodes)
@@ -154,11 +161,18 @@ def native_bytes(
                 0x02020001, uint(0x02020002, index) + block(0x02020003, vector(region, values))
             )
 
-        state_data = block(0x02020300, variable(1, 0, node_values)) + block(
-            0x02020400,
-            variable(1, 1, (time_value * 10.0, 2.0, 3.0, 4.0, 5.0, 6.0))
-            + variable(2, 99 if defect == "rigid-region" else 2, (0.0, 0.0, time_value * -2.0)),
+        node_fields = variable(1, 0, node_values)
+        domain_fields = variable(1, 1, (time_value * 10.0, 2.0, 3.0, 4.0, 5.0, 6.0)) + variable(
+            2, 99 if defect == "rigid-region" else 2, (0.0, 0.0, time_value * -2.0)
         )
+        if quality_outputs:
+            node_fields += variable(
+                2,
+                0,
+                tuple(value for node in nodes for value in (0.0, 0.0, -time_value * node.node_id)),
+            )
+            domain_fields += variable(3, 2, (0.0, 0.0, -0.001 * time_value))
+        state_data = block(0x02020300, node_fields) + block(0x02020400, domain_fields)
         object_state = (
             uint(0x01050001, 1)
             + vector(0x01050004, (0.0, 0.0, 0.0))
@@ -186,6 +200,8 @@ def setup_reader(
     defect: str = "",
     register: bool = True,
     renumber: bool = False,
+    quality_outputs: bool = False,
+    revision_update: Any = None,
 ) -> tuple[Any, Any, Any, Any, Any]:
     revision, mesh, profile = _case()
     if renumber:
@@ -263,6 +279,60 @@ def setup_reader(
             OutputMapping("stress", "stress", "element", "MAT3FS", "Pa", mesh.frame, 1, 1, "value"),
         ),
     )
+    if quality_outputs:
+        force = next(
+            item for item in revision.spec.outputs.requests if item.quantity_id == "contact_force"
+        )
+        revision = replace(
+            revision,
+            spec=replace(
+                revision.spec,
+                outputs=replace(
+                    revision.spec.outputs,
+                    requests=(
+                        *revision.spec.outputs.requests,
+                        replace(
+                            output,
+                            request_id="support_reaction",
+                            quantity_id="reaction",
+                            display_unit="N",
+                            evidence=evidence(
+                                "outputs.requests.support_reaction", "reader-reaction"
+                            ),
+                        ),
+                        replace(
+                            force,
+                            request_id="tool_position",
+                            quantity_id="rigid_position",
+                            display_unit="m",
+                            evidence=evidence("outputs.requests.tool_position", "reader-position"),
+                        ),
+                    ),
+                ),
+            ),
+        )
+        profile = replace(
+            profile,
+            output_mappings=(
+                *profile.output_mappings,
+                OutputMapping(
+                    "reaction", "reaction forces", "node", "VEC3F", "N", mesh.frame, -1, 1, "value"
+                ),
+                OutputMapping(
+                    "rigid_position",
+                    "rigid position",
+                    "rigid_body",
+                    "VEC3F",
+                    "m",
+                    mesh.frame,
+                    1,
+                    1,
+                    "value",
+                ),
+            ),
+        )
+    if revision_update is not None:
+        revision = revision_update(revision)
     store = LocalBundleStore(tmp_path / "bundles")
     bundle = CompilerAdapter(store=store, executable=sys.executable).compile(
         revision, mesh, profile
@@ -270,7 +340,7 @@ def setup_reader(
     attempt_root = tmp_path / "attempt"
     output_path = attempt_root / "output/results.xplt"
     output_path.parent.mkdir(parents=True)
-    payload = native_bytes(mesh, times=times, defect=defect)
+    payload = native_bytes(mesh, times=times, defect=defect, quality_outputs=quality_outputs)
     output_path.write_bytes(payload)
     attempt = AttemptRecord(
         "reader-attempt",
@@ -311,6 +381,14 @@ def setup_reader(
                 "displacement": tuple(str(node.node_id) for node in mesh.nodes),
                 "stress": (str(mesh.elements[0].element_id),),
                 "contact_force": (mesh.elements[1].body_id,),
+                **(
+                    {
+                        "reaction": tuple(str(node.node_id) for node in mesh.nodes),
+                        "rigid_position": (mesh.elements[1].body_id,),
+                    }
+                    if quality_outputs
+                    else {}
+                ),
             },
         )
     return XpltReaderAdapter(profile=profile, data_store=data_store), attempt, bundle, mesh, payload

@@ -83,7 +83,7 @@ def preview_summary(store: RegisteredPreviewStore, preview_id: str) -> dict[str,
         else "FAILED"
         if quality_status == "FAIL"
         else TaskStatus.NEEDS_QUALITY.value
-        if quality_status == "UNVERIFIED"
+        if quality_status == "UNVERIFIED" or quality_registration_status != "PASS"
         else "NEEDS_PREVIEW",
         "receipt": receipt,
         "quality": quality.to_dict(),

@@ -259,7 +259,14 @@ def required_quality_summary(
         for identifier, dimension, reason in _UNVERIFIED_NUMERICAL
     )
     report = assess_reported_norms(manifest, revision, mesh, profile, context).to_dict()
-    qualified = has_qualified_runtime(context[1])
+    attempt, bundle, _, _ = context
+    # The storage resolver already verifies owned drain when a process is present.
+    qualified = (
+        has_qualified_runtime(bundle)
+        and attempt.process is not None
+        and attempt.process.executable_digest == bundle.tool.executable_digest
+        and tuple(attempt.process.argv) == tuple(bundle.argv)
+    )
     refinement_evidence: dict[str, object] = {}
     if qualified and execution_row.status is AssessmentStatus.PASS:
         planar = assess_planar_requirements(manifest, revision, mesh, profile, storage)

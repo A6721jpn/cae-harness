@@ -448,3 +448,25 @@ def test_solver_log_binding_demo_and_confirmed_preview(tmp_path: Path) -> None:
     with pytest.raises(PortError) as failure:
         store.get(preview_id)
     assert failure.value.category is PortErrorCategory.INTEGRITY
+
+
+def test_missing_registration_remains_quality_work_after_numerical_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from febio_cae.application import _preview, _run_reconciliation
+    from febio_cae.domain.lifecycle import TaskStatus
+    from febio_cae.storage.run_reconciliation import snapshot
+
+    store, preview_id, _ = _quality_preview(tmp_path)
+    monkeypatch.setattr(_preview, "required_quality_summary", lambda *args: ("PASS", {}))
+    monkeypatch.setattr(_run_reconciliation, "required_quality_summary", lambda *args: ("PASS", {}))
+    summary = _preview.preview_summary(store, preview_id)
+    assert summary["quality_status"] == "PASS"
+    assert summary["quality_registration_status"] == "UNVERIFIED"
+    assert summary["preview_status"] == "CONFIRMED"
+    assert summary["task_status"] == "NEEDS_QUALITY"
+    current = snapshot(store.storage, str(summary["run_id"]))
+    numerical, _, task, details = _run_reconciliation._completion(store.storage, current)
+    assert numerical == "PASS"
+    assert details["quality_registration_status"] == "UNVERIFIED"
+    assert task is TaskStatus.NEEDS_QUALITY

@@ -28,6 +28,7 @@ from febio_cae.adapters.geometry import (
 from febio_cae.domain import (
     AttemptRecord,
     CaseRevision,
+    CompatibilityProfile,
     ExecutionBundle,
     FileEntry,
     FrameId,
@@ -47,6 +48,57 @@ from ._required_quality import required_quality_summary
 
 if TYPE_CHECKING:
     from .service import RegisteredCaseService
+
+
+def _read_native_result(
+    attempt: AttemptRecord,
+    bundle: ExecutionBundle,
+    files: tuple[FileEntry, ...],
+    registered: CaseStorage,
+    revision: CaseRevision,
+    mesh: MeshArtifact,
+    profile: CompatibilityProfile,
+) -> ResultManifest:
+    entry = next(e for e in files if e.logical_path == "output/results.xplt")
+    data = LocalResultDataStore()
+    part = revision.spec.geometry.body_id.value
+    tool = revision.spec.rigid_tool.primitive.body_id.value
+    entities = {
+        "node": tuple(str(node.node_id) for node in mesh.nodes),
+        "element": tuple(
+            str(element.element_id) for element in mesh.elements if element.body_id == part
+        ),
+        "rigid_body": (tool,),
+    }
+    data.register_source(
+        attempt,
+        bundle,
+        registered._file_content(attempt, entry),
+        mesh=mesh,
+        state_times=tuple(t.to_si().value for t in revision.spec.outputs.saved_times),
+        part_bodies={1: part, 2: tool},
+        entity_ids={
+            mapping.canonical_id: entities[mapping.location] for mapping in profile.output_mappings
+        },
+    )
+    manifest = XpltReaderAdapter(profile=profile, data_store=data).read(attempt, bundle)
+    for observation in manifest.read_result.observations:
+        if observation.data_ref is None:
+            raise ValueError("reader produced no numeric reference")
+        registered.register_numeric_data(data.resolve(observation.data_ref))
+    decoded = {
+        observation.output_id: observation for observation in manifest.read_result.observations
+    }
+    observations = tuple(
+        replace(
+            decoded[profile.mapping_for(request.quantity_id).canonical_id],
+            output_id=request.request_id,
+        )
+        for request in revision.spec.outputs.requests
+    )
+    return replace(
+        manifest, files=files, read_result=replace(manifest.read_result, observations=observations)
+    )
 
 
 class _BundleBytes:
@@ -189,29 +241,7 @@ def run_demo(
         files: tuple[FileEntry, ...],
         registered: CaseStorage,
     ) -> ResultManifest:
-        entry = next(e for e in files if e.logical_path == "output/results.xplt")
-        data = LocalResultDataStore()
-        part = revision.spec.geometry.body_id.value
-        tool = revision.spec.rigid_tool.primitive.body_id.value
-        data.register_source(
-            attempt,
-            bundle,
-            registered._file_content(attempt, entry),
-            mesh=mesh,
-            state_times=tuple(t.to_si().value for t in revision.spec.outputs.saved_times),
-            part_bodies={1: part, 2: tool},
-            entity_ids={
-                "displacement": tuple(str(n.node_id) for n in mesh.nodes),
-                "stress": tuple(str(e.element_id) for e in mesh.elements if e.body_id == part),
-                "contact_force": (tool,),
-            },
-        )
-        manifest = XpltReaderAdapter(profile=profile, data_store=data).read(attempt, bundle)
-        for observation in manifest.read_result.observations:
-            if observation.data_ref is None:
-                raise ValueError("reader produced no numeric reference")
-            registered.register_numeric_data(data.resolve(observation.data_ref))
-        return replace(manifest, files=files)
+        return _read_native_result(attempt, bundle, files, registered, revision, mesh, profile)
 
     if preflight:
         with storage.evidence_snapshot(), storage.revision_snapshot(case_id, revision_id):

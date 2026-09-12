@@ -231,6 +231,22 @@ def _registered_publication_summary(
     return service.run_status(created.case_id, str(row[0]))
 
 
+def test_synchronous_results_cannot_claim_a_native_runtime_binding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from febio_cae.application import _required_quality
+
+    monkeypatch.setattr(_required_quality, "has_qualified_runtime", lambda bundle: True)
+    summary = _registered_publication_summary(tmp_path)
+    rows, coverage = _numerical_rows(summary)
+    assert coverage["native_runtime_binding"]["status"] == "UNVERIFIED"
+    assert all(
+        row["status"] == "UNVERIFIED"
+        for identifier, row in rows.items()
+        if identifier != "execution_result_completeness"
+    )
+
+
 def test_missing_required_entity_is_unverified_after_observable_valid_baseline(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
