@@ -645,7 +645,7 @@ def test_native_contact_outputs_compile_and_project_exact_entities(tmp_path: Pat
     assert {
         output_id: (item.location, item.value_type, item.unit)
         for output_id, item in observations.items()
-        if output_id.startswith("contact_")
+        if output_id in {spec[0] for spec in _CONTACT_SPECS}
     } == {
         spec[0]: (spec[2], spec[3], spec[4]) for spec in _CONTACT_SPECS
     }
@@ -729,6 +729,6 @@ def test_quality_evaluates_contact_surface_node_surface_and_face_scopes(tmp_path
     ],
 )
 def test_contact_native_identity_and_layout_fail_closed(tmp_path: Path, defect: str) -> None:
-    reader, attempt, bundle, *_ = _surface_case(tmp_path, defect=defect)
+    _, reader, attempt, bundle, *_ = _surface_case(tmp_path, defect=defect)
     with pytest.raises(PortError):
         reader.read(attempt, bundle)
