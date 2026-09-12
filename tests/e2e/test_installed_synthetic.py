@@ -19,6 +19,7 @@ import subprocess
 import uuid
 import zipfile
 from collections.abc import Sequence
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -99,6 +100,7 @@ _FORBIDDEN_INPUT_KEYS = {
 }
 _UNIT_FACTORS = {
     "1": 1.0,
+    "N": 1.0,
     "Pa": 1.0,
     "kPa": 1.0e3,
     "MPa": 1.0e6,
@@ -132,7 +134,7 @@ class _Settings:
     wheel: _FileIdentity
     solver: _FileIdentity
     source_step: _FileIdentity
-    preparation_request: _FileIdentity
+    preparation_requests: tuple[_FileIdentity, ...]
     youngs_modulus_pa: float
     instruction: str
     axes: tuple[dict[str, Any], ...]
@@ -140,7 +142,6 @@ class _Settings:
     preparation_calls: int
     solver_calls: int
     command_timeout_seconds: float
-    request: dict[str, Any]
     wheel_version: str
     part_body_id: str
     tool_body_id: str
@@ -545,15 +546,26 @@ def _validate_request(request: dict[str, Any], source: _FileIdentity) -> tuple[s
         request = _as_object(request_value, f"outputs.requests[{index}]")
         quantity_id = _text(request.get("quantity_id"), f"outputs.requests[{index}].quantity_id")
         by_quantity.setdefault(quantity_id, []).append(request)
-    if any(
-        len(by_quantity.get(quantity, [])) != 1 for quantity in ("contact_force", "displacement")
+    if (
+        len(by_quantity.get("contact_force", [])) != 1
+        or len(by_quantity.get("displacement", [])) != 2
     ):
-        raise _EnvironmentNotReady("exactly one force and one displacement output are required")
+        raise _EnvironmentNotReady(
+            "one tool force and separate part/tool displacement outputs are required"
+        )
     for quantity, location, unit, body in (
         ("contact_force", "rigid_body", "N", tool_body_id),
         ("displacement", "node", "m", part_body_id),
+        ("displacement", "node", "m", tool_body_id),
     ):
-        request = by_quantity[quantity][0]
+        matching = [
+            item
+            for item in by_quantity[quantity]
+            if _as_object(item.get("selection"), f"{quantity}.selection").get("body_id") == body
+        ]
+        if len(matching) != 1:
+            raise _EnvironmentNotReady(f"{quantity} requires one declared output for body {body}")
+        request = matching[0]
         if (
             request.get("measure_id") != "value"
             or request.get("component_id") != "z"
@@ -607,6 +619,91 @@ def _validate_request(request: dict[str, Any], source: _FileIdentity) -> tuple[s
             raise _EnvironmentNotReady("motion samples must increase in time and compression")
         previous_time, previous_displacement = current_time, current_displacement
     return part_body_id, tool_body_id, len(saved_times)
+
+
+def _validate_refinement_requests(
+    requests: Sequence[dict[str, Any]], source: _FileIdentity
+) -> tuple[str, str, int]:
+    if len(requests) != 3:
+        raise _EnvironmentNotReady("exactly three ordered preparation requests are required")
+    identities = [_validate_request(request, source) for request in requests]
+    first = requests[0]
+    values = _as_object(first["values"], "coarse.values")
+    mesh = _as_object(values["mesh_policy"], "coarse.mesh_policy")
+    budget = _as_object(values["budget"], "coarse.budget")
+    if type(mesh.get("max_refinements")) is not int or mesh["max_refinements"] < 2:
+        raise _EnvironmentNotReady("the study must declare at least two refinements")
+    if type(budget.get("max_attempts")) is not int or budget["max_attempts"] != 4:
+        raise _EnvironmentNotReady("the study must declare four solver attempts")
+    policy = _as_object(values["quality_policy"], "coarse.quality_policy")
+    criteria = policy.get("criteria")
+    if not isinstance(criteria, list):
+        raise _EnvironmentNotReady("quality criteria must be an array")
+    studies = [
+        _as_object(item, "quality criterion")
+        for item in criteria
+        if isinstance(item, dict) and item.get("metric_id") == "mesh_dependence"
+    ]
+    if len(studies) != 1:
+        raise _EnvironmentNotReady("one explicit mesh-dependence study is required")
+    thresholds = studies[0].get("thresholds")
+    if not isinstance(thresholds, list):
+        raise _EnvironmentNotReady("mesh study thresholds must be an array")
+    quantities = {
+        _text(
+            _as_object(item, "mesh threshold").get("parameter_id"), "threshold.parameter_id"
+        ): _as_object(item, "mesh threshold").get("value")
+        for item in thresholds
+    }
+    required = {
+        "coarse_size",
+        "refined_size",
+        "fine_size",
+        "relative_max",
+        "absolute_floor",
+        "material_scaling_relative_max",
+    }
+    if len(quantities) != len(thresholds) or set(quantities) != required:
+        raise _EnvironmentNotReady(
+            "mesh study requires three sizes, force bounds and E-scaling bound"
+        )
+    normalized = {}
+    for name, quantity in quantities.items():
+        record = _as_object(quantity, f"mesh study {name}")
+        units = (
+            {"m", "mm", "um"}
+            if name.endswith("_size")
+            else {"N"}
+            if name == "absolute_floor"
+            else {"1"}
+        )
+        value = _quantity_si(record, f"mesh study {name}")
+        positive = name.endswith("_size") or name == "absolute_floor"
+        if record["unit"] not in units or value < 0 or (positive and value == 0):
+            raise _EnvironmentNotReady(f"mesh study {name} has an invalid dimension or bound")
+        normalized[name] = value
+    sizes = tuple(normalized[name] for name in ("coarse_size", "refined_size", "fine_size"))
+    if not sizes[0] > sizes[1] > sizes[2]:
+        raise _EnvironmentNotReady("mesh study sizes must be strictly decreasing")
+    for request, expected_size in zip(requests, sizes, strict=True):
+        restored = copy.deepcopy(request)
+        requested_mesh = _as_object(
+            _as_object(restored["values"], "refinement.values")["mesh_policy"],
+            "refinement.mesh_policy",
+        )
+        if (
+            _quantity_si(requested_mesh.get("global_size"), "refinement.global_size")
+            != expected_size
+        ):
+            raise _EnvironmentNotReady(
+                "preparations must follow the declared coarse/refined/fine sizes"
+            )
+        requested_mesh["global_size"] = copy.deepcopy(mesh["global_size"])
+        if restored != first:
+            raise _EnvironmentNotReady("refinement requests may differ only in global mesh size")
+    if any(identity != identities[0] for identity in identities[1:]):
+        raise _EnvironmentNotReady("refinement output bodies or saved states changed")
+    return identities[0]
 
 
 def _validate_axes(
@@ -911,7 +1008,7 @@ def _load_settings() -> _Settings:
         "wheel",
         "solver",
         "source_step",
-        "preparation_request",
+        "preparation_requests",
         "edit",
         "comparison",
         "limits",
@@ -923,8 +1020,17 @@ def _load_settings() -> _Settings:
         )
     identities = {
         name: _file_identity(settings[name], f"settings.{name}")
-        for name in ("installed_python", "wheel", "solver", "source_step", "preparation_request")
+        for name in ("installed_python", "wheel", "solver", "source_step")
     }
+    raw_requests = settings["preparation_requests"]
+    if not isinstance(raw_requests, list) or len(raw_requests) != 3:
+        raise _EnvironmentNotReady(
+            "settings.preparation_requests must contain three file identities"
+        )
+    preparation_requests = tuple(
+        _file_identity(item, f"settings.preparation_requests[{index}]")
+        for index, item in enumerate(raw_requests)
+    )
     wheel_version = _wheel_version(identities["wheel"])
     edit = _strict_object(
         settings["edit"],
@@ -947,15 +1053,14 @@ def _load_settings() -> _Settings:
         raise _EnvironmentNotReady(
             "settings.edit.instruction must be an explicit E-only instruction"
         )
-    request = _read_json(
-        identities["preparation_request"].path,
-        "preparation_request",
-        environment=True,
+    requests = [
+        _read_json(identity.path, f"preparation_requests[{index}]", environment=True)
+        for index, identity in enumerate(preparation_requests)
+    ]
+    part_body_id, tool_body_id, saved_time_count = _validate_refinement_requests(
+        requests, identities["source_step"]
     )
-    part_body_id, tool_body_id, saved_time_count = _validate_request(
-        request,
-        identities["source_step"],
-    )
+    request = requests[0]
     request_values = _as_object(request["values"], "preparation_request.values")
     request_material = _as_object(request_values["material"], "preparation_request.values.material")
     baseline_modulus = _quantity_si(
@@ -980,11 +1085,11 @@ def _load_settings() -> _Settings:
     if (
         isinstance(preparation_calls, bool)
         or not isinstance(preparation_calls, int)
-        or preparation_calls != 1
+        or preparation_calls != 3
     ):
-        raise _EnvironmentNotReady("settings.limits.preparation_calls must be exactly 1")
-    if isinstance(solver_calls, bool) or not isinstance(solver_calls, int) or solver_calls != 2:
-        raise _EnvironmentNotReady("settings.limits.solver_calls must be exactly 2")
+        raise _EnvironmentNotReady("settings.limits.preparation_calls must be exactly 3")
+    if isinstance(solver_calls, bool) or not isinstance(solver_calls, int) or solver_calls != 4:
+        raise _EnvironmentNotReady("settings.limits.solver_calls must be exactly 4")
     command_timeout = _finite(
         limits["command_timeout_seconds"],
         "settings.limits.command_timeout_seconds",
@@ -997,7 +1102,7 @@ def _load_settings() -> _Settings:
         wheel=identities["wheel"],
         solver=identities["solver"],
         source_step=identities["source_step"],
-        preparation_request=identities["preparation_request"],
+        preparation_requests=preparation_requests,
         youngs_modulus_pa=youngs_modulus_pa,
         instruction=instruction,
         axes=axes,
@@ -1005,7 +1110,6 @@ def _load_settings() -> _Settings:
         preparation_calls=preparation_calls,
         solver_calls=solver_calls,
         command_timeout_seconds=command_timeout,
-        request=request,
         wheel_version=wheel_version,
         part_body_id=part_body_id,
         tool_body_id=tool_body_id,
@@ -1299,7 +1403,7 @@ def _decode_db_payload(payload: object, field: str) -> dict[str, Any]:
 def _read_db_payload(case_root: Path, sql: str, value: str, field: str) -> dict[str, Any]:
     database = case_root / "registry.sqlite3"
     try:
-        with sqlite3.connect(database) as connection:
+        with closing(sqlite3.connect(database)) as connection:
             row = connection.execute(sql, (value,)).fetchone()
     except sqlite3.Error as error:
         raise _AcceptanceFailure(f"cannot read {field} from registered storage: {error}") from error
@@ -1311,7 +1415,7 @@ def _read_db_payload(case_root: Path, sql: str, value: str, field: str) -> dict[
 def _read_db_payloads(case_root: Path, sql: str, value: str, field: str) -> list[dict[str, Any]]:
     database = case_root / "registry.sqlite3"
     try:
-        with sqlite3.connect(database) as connection:
+        with closing(sqlite3.connect(database)) as connection:
             rows = connection.execute(sql, (value,)).fetchall()
     except sqlite3.Error as error:
         raise _AcceptanceFailure(f"cannot read {field} from registered storage: {error}") from error
@@ -1323,6 +1427,7 @@ def _record_preparation_process(
     case_root: Path,
     preparation: dict[str, Any],
     native_index: int | None,
+    expected_count: int,
 ) -> dict[str, Any]:
     preparation_id = _require_id(preparation.get("preparation_id"), "preparation_id")
     prepared_path = case_root / "preparation" / preparation_id / "prepared.json"
@@ -1335,8 +1440,15 @@ def _record_preparation_process(
         "prepared revision differs",
     )
     state_paths = sorted((case_root / "preparation").glob("*/state.json"))
-    _expect(len(state_paths) == 1, "preparation persisted more than one state record")
-    state = _read_json(state_paths[0], "preparation state", environment=False)
+    _expect(
+        len(state_paths) == expected_count,
+        "preparation state count differs from issued generations",
+    )
+    state = _read_json(
+        case_root / "preparation" / preparation_id / "state.json",
+        "preparation state",
+        environment=False,
+    )
     _expect(state.get("status") == "PREPARED", "preparation state is not PREPARED")
     _expect(state.get("preparation_id") == preparation_id, "preparation state ID differs")
     _expect(state.get("case_id") == preparation.get("case_id"), "preparation state case differs")
@@ -1480,20 +1592,22 @@ def _validate_persisted_solver_budget(
     case_root: Path,
     case_id: str,
     *,
-    baseline: dict[str, Any],
-    candidate: dict[str, Any],
+    runs: Sequence[dict[str, Any]],
+    preparation_ids: Sequence[str],
 ) -> dict[str, Any]:
-    expected_attempts = {
-        baseline["attempt_id"]: baseline["attempt"],
-        candidate["attempt_id"]: candidate["attempt"],
-    }
+    _expect(len(runs) == 4 and len(preparation_ids) == 3, "finite study inventory differs")
+    expected_attempts = {run["attempt_id"]: run["attempt"] for run in runs}
+    _expect(
+        len(expected_attempts) == 4 and len(set(preparation_ids)) == 3,
+        "each native study operation must have a distinct registered identity",
+    )
     owners = _read_db_payloads(
         case_root,
         "SELECT payload FROM owners WHERE case_id=? ORDER BY run_id",
         case_id,
         "solver owners",
     )
-    _expect(len(owners) == 2, "persisted solver owner count differs from the finite budget")
+    _expect(len(owners) == 4, "persisted solver owner count differs from the finite budget")
     owner_attempt_ids = set()
     for owner in owners:
         attempt_id = _require_id(owner.get("attempt_id"), "persisted attempt_id")
@@ -1515,11 +1629,8 @@ def _validate_persisted_solver_budget(
         case_id,
         "solver manifests",
     )
-    _expect(len(manifests) == 2, "persisted solver manifest count differs from the finite budget")
-    expected_manifests = {
-        baseline["attempt_id"]: baseline["manifest"],
-        candidate["attempt_id"]: candidate["manifest"],
-    }
+    _expect(len(manifests) == 4, "persisted solver manifest count differs from the finite budget")
+    expected_manifests = {run["attempt_id"]: run["manifest"] for run in runs}
     manifest_attempt_ids = set()
     manifest_ids = set()
     for manifest in manifests:
@@ -1530,11 +1641,28 @@ def _validate_persisted_solver_budget(
         _expect(attempt_id in expected_manifests, "persisted manifest is not a returned result")
         _expect(manifest == expected_manifests[attempt_id], "persisted manifest differs")
     _expect(
-        manifest_attempt_ids == set(expected_manifests) and len(manifest_ids) == 2,
+        manifest_attempt_ids == set(expected_manifests) and len(manifest_ids) == 4,
         "persisted manifests are not one distinct result per solver attempt",
     )
+    try:
+        with closing(sqlite3.connect(case_root / "registry.sqlite3")) as connection:
+            reservations = connection.execute(
+                "SELECT kind,operation_id FROM prototype_demo_starts WHERE case_id=?", (case_id,)
+            ).fetchall()
+    except sqlite3.Error as error:
+        raise _AcceptanceFailure(f"cannot read persisted native reservations: {error}") from error
+    expected_reservations = {
+        *(("gmsh", preparation_id) for preparation_id in preparation_ids),
+        *(("febio", attempt_id) for attempt_id in expected_attempts),
+    }
+    _expect(
+        len(reservations) == 7 and set(reservations) == expected_reservations,
+        "native reservations differ from the exact three-generation/four-solver study",
+    )
     return {
-        "solver_budget": 2,
+        "solver_budget": 4,
+        "mesh_budget": 3,
+        "native_reservations": sorted(reservations),
         "solver_owner_count": len(owners),
         "solver_manifest_count": len(manifests),
         "solver_attempt_ids": sorted(owner_attempt_ids),
@@ -2187,118 +2315,149 @@ def test_installed_synthetic_cli_flow(tmp_path: Path) -> None:
         report.data["artifacts"]["case_id"] = case_id
         report.write()
 
-        prepared_code, prepared, preparation_native_index = cli(
-            "prepare-planar",
-            [
+        revisions: list[dict[str, Any]] = []
+        studies: list[dict[str, Any]] = []
+        preparation_ids: list[str] = []
+        immutable_files: dict[Path, str] = {}
+        generation = 0
+        report.data["artifacts"]["revisions"] = []
+        report.data["preparation_evidence"] = []
+        for stage, request_identity in zip(
+            ("coarse", "refined", "fine"), settings.preparation_requests, strict=True
+        ):
+            prepare_args = [
                 "prepare-planar",
                 case_id,
                 "--file",
-                str(settings.preparation_request.path),
+                str(request_identity.path),
                 "--expected-generation",
-                "0",
+                str(generation),
                 "--json",
-            ],
-            native_kind="preparation",
-        )
-        _expect(
-            prepared_code == 0 and prepared.get("status") == "PREPARED",
-            "planar preparation failed",
-        )
-        parent_revision_id = _require_id(prepared.get("revision_id"), "prepared.revision_id")
-        preparation_id = _require_id(prepared.get("preparation_id"), "prepared.preparation_id")
-        _expect(prepared.get("generation") == 1, "prepared generation is not one")
-        preparation_receipt = _record_preparation_process(
-            report, case_root, prepared, preparation_native_index
-        )
-        report.data["preparation_evidence"] = {
-            "preparation_id": preparation_id,
-            "status": preparation_receipt.get("status"),
-            "mesh_generations": _require_dict(
-                preparation_receipt.get("producer"), "prepared producer"
-            ).get("mesh_generations"),
-        }
-        parent_revision = _revision_file(case_root, case_id, parent_revision_id)
-        _expect(parent_revision.get("case_id") == case_id, "prepared revision case binding differs")
-        _expect(
-            parent_revision.get("revision_id") == parent_revision_id,
-            "prepared revision ID differs",
-        )
-        _expect(
-            parent_revision.get("parent_revision_id") is None,
-            "prepared origin unexpectedly has a parent",
-        )
-        parent_spec_digest = _require_digest(
-            parent_revision.get("spec_digest"), "parent spec digest"
-        )
-        report.data["artifacts"]["preparation_id"] = preparation_id
-        report.data["artifacts"]["revisions"] = [
-            {
-                "label": "baseline",
-                "revision_id": parent_revision_id,
-                "spec_digest": parent_spec_digest,
-                "generation": prepared.get("generation"),
-            }
-        ]
-        report.write()
-
-        validate_code, validated, _ = cli("validate-prepared", ["validate", case_id, "--json"])
-        _expect(
-            validate_code == 0 and validated.get("status") == "VALIDATED",
-            "prepared case did not validate",
-        )
-        validated_draft = _require_dict(validated.get("draft"), "validated.draft")
-        _expect(
-            validated_draft.get("generation") == prepared.get("generation"),
-            "validation changed prepared generation",
-        )
-
-        baseline_preflight_code, baseline_preflight, _ = cli(
-            "baseline-preflight",
-            [
+            ]
+            if revisions:
+                prepare_args.extend(["--parent-revision-id", revisions[-1]["revision_id"]])
+            prepared_code, prepared, preparation_native_index = cli(
+                f"{stage}-prepare-planar", prepare_args, native_kind="preparation"
+            )
+            _expect(
+                prepared_code == 0 and prepared.get("status") == "PREPARED",
+                f"{stage} planar preparation failed",
+            )
+            revision_id = _require_id(prepared.get("revision_id"), "prepared.revision_id")
+            preparation_id = _require_id(prepared.get("preparation_id"), "prepared.preparation_id")
+            _expect(
+                prepared.get("generation") == generation + 1, "prepared generation is not monotonic"
+            )
+            generation += 1
+            preparation_receipt = _record_preparation_process(
+                report, case_root, prepared, preparation_native_index, len(revisions) + 1
+            )
+            revision = _revision_file(case_root, case_id, revision_id)
+            _expect(revision.get("case_id") == case_id, "prepared revision case binding differs")
+            _expect(revision.get("revision_id") == revision_id, "prepared revision ID differs")
+            previous = revisions[-1] if revisions else None
+            _expect(
+                revision.get("parent_revision_id")
+                == (previous["revision_id"] if previous else None),
+                "refinement parent revision differs",
+            )
+            _expect(
+                revision.get("parent_spec_digest")
+                == (previous["spec_digest"] if previous else None),
+                "refinement parent spec digest differs",
+            )
+            spec_digest = _require_digest(revision.get("spec_digest"), "refinement spec digest")
+            revisions.append(revision)
+            preparation_ids.append(preparation_id)
+            report.data["preparation_evidence"].append(
+                {
+                    "label": stage,
+                    "preparation_id": preparation_id,
+                    "status": preparation_receipt.get("status"),
+                    "mesh_generations": _require_dict(
+                        preparation_receipt.get("producer"), "prepared producer"
+                    ).get("mesh_generations"),
+                }
+            )
+            report.data["artifacts"]["revisions"].append(
+                {
+                    "label": stage,
+                    "revision_id": revision_id,
+                    "spec_digest": spec_digest,
+                    "generation": generation,
+                }
+            )
+            revision_path = (
+                case_root / "cases" / case_id / "revisions" / revision_id / "revision.json"
+            )
+            for path in (
+                revision_path,
+                *(case_root / "preparation" / preparation_id).glob("*.json"),
+            ):
+                immutable_files[path] = _file_sha256(path)
+            report.write()
+            validate_code, validated, _ = cli(
+                f"{stage}-validate-prepared", ["validate", case_id, "--json"]
+            )
+            _expect(
+                validate_code == 0 and validated.get("status") == "VALIDATED",
+                f"{stage} prepared case did not validate",
+            )
+            validated_draft = _require_dict(validated.get("draft"), "validated.draft")
+            _expect(
+                validated_draft.get("generation") == generation, "validation changed generation"
+            )
+            run_args = [
                 "run-demo",
                 case_id,
                 "--revision-id",
-                parent_revision_id,
-                "--solver",
-                str(settings.solver.path),
-                "--preflight",
-                "--json",
-            ],
-        )
-        _expect(
-            baseline_preflight_code == 0
-            and baseline_preflight.get("status") == "PREFLIGHT_PASSED"
-            and baseline_preflight.get("native_starts") == 0,
-            "baseline preflight failed or launched native software",
-        )
-
-        baseline_code, baseline_response, baseline_native_index = cli(
-            "baseline-real-run",
-            [
-                "run-demo",
-                case_id,
-                "--revision-id",
-                parent_revision_id,
+                revision_id,
                 "--solver",
                 str(settings.solver.path),
                 "--json",
-            ],
-            native_kind="solver",
-        )
-        _mark_native_observed_from_command(
-            report, baseline_native_index, response=baseline_response
-        )
-        baseline = _validate_run(
-            report,
-            response=baseline_response,
-            code=baseline_code,
-            case_root=case_root,
-            case_id=case_id,
-            revision=parent_revision,
-            run_label="baseline",
-            native_index=baseline_native_index,
-            solver=settings.solver,
-        )
+            ]
+            preflight_code, preflight, _ = cli(f"{stage}-preflight", [*run_args, "--preflight"])
+            _expect(
+                preflight_code == 0
+                and preflight.get("status") == "PREFLIGHT_PASSED"
+                and preflight.get("native_starts") == 0,
+                f"{stage} preflight failed or launched native software",
+            )
+            run_code, run_response, run_native_index = cli(
+                f"{stage}-real-run", run_args, native_kind="solver"
+            )
+            _mark_native_observed_from_command(report, run_native_index, response=run_response)
+            run = _validate_run(
+                report,
+                response=run_response,
+                code=run_code,
+                case_root=case_root,
+                case_id=case_id,
+                revision=revision,
+                run_label=stage,
+                native_index=run_native_index,
+                solver=settings.solver,
+            )
+            for criterion_id, status in run["numerical_statuses"].items():
+                if stage != "fine" and criterion_id == "mesh_dependence":
+                    _expect(status == "UNVERIFIED", f"{stage} claimed premature mesh convergence")
+                else:
+                    _expect(
+                        status in _ALLOWED_NUMERICAL,
+                        f"{stage} required numerical evidence is not qualified: {criterion_id}={status}",
+                    )
+            studies.append(run)
+            _expect(
+                all(
+                    path.is_file() and _file_sha256(path) == digest
+                    for path, digest in immutable_files.items()
+                ),
+                "refinement or solver execution changed a retained origin",
+            )
+        parent_revision = revisions[-1]
+        parent_revision_id = _require_id(parent_revision.get("revision_id"), "fine revision ID")
+        parent_spec_digest = _require_digest(parent_revision.get("spec_digest"), "fine spec digest")
+        baseline = studies[-1]
 
         registration_request = {
             "schema_version": "1",
@@ -2327,7 +2486,7 @@ def test_installed_synthetic_cli_flow(tmp_path: Path) -> None:
                 "--file",
                 str(registration_path),
                 "--expected-generation",
-                str(validated_draft["generation"]),
+                str(generation),
                 "--json",
             ],
         )
@@ -2537,11 +2696,18 @@ def test_installed_synthetic_cli_flow(tmp_path: Path) -> None:
         persisted_budget = _validate_persisted_solver_budget(
             case_root,
             case_id,
-            baseline=baseline,
-            candidate=candidate,
+            runs=(*studies, candidate),
+            preparation_ids=preparation_ids,
         )
         report.data["persisted_budget"] = persisted_budget
         report.write()
+        _expect(
+            all(
+                path.is_file() and _file_sha256(path) == digest
+                for path, digest in immutable_files.items()
+            ),
+            "material edit or execution changed a retained refinement origin",
+        )
         _expect(
             baseline["run_id"] != candidate["run_id"],
             "baseline and candidate run IDs are not distinct",

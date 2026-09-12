@@ -167,6 +167,12 @@ coarse→refined→fineの順に生成・実行する。`prepare-planar --parent
 判定する。既存の世代CAS、固定条件、未公開生成の拒否、旧demo予算の回帰検査を保持する。
 sourceのRED/GREENと独立レビュー後にfresh installed CLIで新しい有限実行記録を作る。
 これはHertz、他の材料・摩擦・治具profile、Studio、live LLM、実モデルの免除ではない。
+installed gateの`FEBIO_CAE_E2E_SETTINGS`は、`preparation_requests`にcoarse・refined・fine順の
+3つの内容ハッシュ付き要求ファイルを指定し、`limits`をpreparation3回・solver4回に固定する。
+要求間で変えてよいのはglobal_sizeだけとし、3サイズ・相対収束限界・力のfloor・
+Young率変更時の正規化限界を同じ根拠で宣言する。部品と治具の変位要求は別IDで保持する。
+四番目は新規prepareではなくfine親の明示的な材料patchとする。全生成記録・旧版の不変性と、
+3生成・4実行の永続予約を確認する。設定の受理やsource smokeを実E2E合格として扱わない。
 
 ## 6. 逆境・ライフサイクル試験
 

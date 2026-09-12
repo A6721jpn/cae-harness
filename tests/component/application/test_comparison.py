@@ -301,9 +301,28 @@ def _result(
 
 
 def comparison_fixture(
-    tmp_path: Path, *, changed_nu: bool = False, quality_fail: bool = False
+    tmp_path: Path,
+    *,
+    changed_nu: bool = False,
+    quality_fail: bool = False,
+    tool_displacement: bool = False,
 ) -> tuple[Any, ...]:
-    service, created, storage, parent = prepared(tmp_path, _configure)
+    def configure(service: Any, spec: Any) -> Any:
+        spec = _configure(service, spec)
+        if tool_displacement:
+            part = next(r for r in spec.outputs.requests if r.quantity_id == "displacement")
+            tool = replace(
+                part,
+                request_id="tool_displacement",
+                selection=spec.rigid_tool.contact_surface,
+                evidence=_evidence("outputs.requests.tool_displacement"),
+            )
+            spec = replace(
+                spec, outputs=replace(spec.outputs, requests=(*spec.outputs.requests, tool))
+            )
+        return spec
+
+    service, created, storage, parent = prepared(tmp_path, configure)
     baseline = _result(service, storage, parent, "baseline", (0, 0.5, 1), 1)
     material = replace(
         parent.spec.material,
@@ -363,8 +382,13 @@ def _compare(service: Any, created: Any, spec: Any) -> Any:
     )
 
 
-def test_registered_comparison_interpolates_signed_curve_and_part_roi(tmp_path: Path) -> None:
-    service, created, storage, spec = comparison_fixture(tmp_path)
+@pytest.mark.parametrize("tool_displacement", [False, True])
+def test_registered_comparison_interpolates_signed_curve_and_part_roi(
+    tmp_path: Path, tool_displacement: bool
+) -> None:
+    service, created, storage, spec = comparison_fixture(
+        tmp_path, tool_displacement=tool_displacement
+    )
     result = _compare(service, created, spec)
     assert result["status"] == "COMPARED"
     comparison = result["comparison"]

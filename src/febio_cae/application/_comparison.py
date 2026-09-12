@@ -90,12 +90,18 @@ def _curve(
     storage: CaseStorage, item: ComparisonTarget, quantity: str
 ) -> tuple[NumericResultData, tuple[float, ...]]:
     spec = item.revision.spec
-    requests = [r for r in spec.outputs.requests if r.quantity_id == quantity]
-    if len(requests) != 1:
-        raise ValueError("comparison requires exactly one explicitly registered output per measure")
-    request = requests[0]
     force = quantity == "contact_force"
     body = spec.rigid_tool.primitive.body_id if force else spec.geometry.body_id
+    requests = [
+        request
+        for request in spec.outputs.requests
+        if request.quantity_id == quantity and request.selection.body_id == body
+    ]
+    if len(requests) != 1:
+        raise ValueError(
+            "comparison requires one registered output for the requested body and measure"
+        )
+    request = requests[0]
     if (
         request.component_id != "z"
         or request.frame.value != "World"
