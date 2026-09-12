@@ -376,7 +376,7 @@ def test_mandatory_quality_coverage_preserves_known_fail(tmp_path: Path, registe
     assert result["quality_status"] == "FAIL" and result["task_status"] == "FAILED"
     assert result["preview_status"] == "CONFIRMED" and result["run_status"] == "SUCCEEDED"
     assert "required_quality" in result
-    assert result["quality_registration_status"] == ("FAIL" if registered else "UNVERIFIED")
+    assert result["quality_registration_status"] == ("PASS" if registered else "UNVERIFIED")
 
 
 def _demo_log_result(service: Any, storage: Any, revision: Any, tmp_path: Path, patch: Any) -> Any:

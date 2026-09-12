@@ -71,10 +71,11 @@ def prepare_planar(
             if parent_revision_id is None:
                 if (
                     not isinstance(registration, PlanarPreparationRegistration)
+                    or old.parent_revision_id is not None
                     or records.read(registration.preparation_id)["status"] != "FAILED"
                 ):
                     raise ValueError(
-                        "preparation cannot replace an accepted or unresolved frozen origin"
+                        "initial preparation cannot replace a frozen descendant or accepted origin"
                     )
             else:
                 if not isinstance(registration, PlanarPreparationRegistration):

@@ -618,3 +618,45 @@ def test_refinement_rejects_changed_physics_or_skipped_size(
     assert storage.current_draft(created.case_id) == before
     assert storage.current_frozen_revision(created.case_id) == prepared["revision_id"]
     assert len(backend.mesh_requests) == 1
+
+
+def test_failed_refinement_cannot_restart_as_changed_initial_preparation(
+    prepared_input: tuple[Any, ...], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from febio_cae.storage.preparation import PreparationStore
+
+    service, created, request, backend, _ = prepared_input
+    _isolate(monkeypatch, backend)
+    payload = _mesh_study_request(request)
+    payload["values"]["budget"]["max_attempts"] = 2
+    prepared = service.prepare_planar(created.case_id, payload, expected_generation=0)
+    storage = service._storage(created.case_id)
+    parent = storage.get_revision(created.case_id, prepared["revision_id"])
+    payload["values"]["mesh_policy"]["global_size"] = {"value": 1.0, "unit": "mm"}
+
+    def fail_publication(*args: Any, **kwargs: Any) -> None:
+        raise OSError("injected descendant publication failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(PreparationStore, "publish", fail_publication)
+        with pytest.raises(RuntimeError):
+            service.prepare_planar(
+                created.case_id,
+                payload,
+                expected_generation=prepared["generation"],
+                parent_revision_id=parent.revision_id,
+            )
+    failed = PreparationStore(storage).latest(created.case_id)
+    assert failed["status"] == "FAILED"
+    before = storage.current_draft(created.case_id)
+    payload["values"]["budget"]["max_attempts"] = 4
+    payload["values"]["material"]["youngs_modulus"]["value"] *= 2
+    with pytest.raises(ValueError):
+        service.prepare_planar(
+            created.case_id,
+            payload,
+            expected_generation=before.generation,
+        )
+    assert storage.current_draft(created.case_id) == before
+    assert storage.get_revision(created.case_id, parent.revision_id) == parent
+    assert len(backend.mesh_requests) == 2

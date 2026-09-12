@@ -354,6 +354,24 @@ def test_signed_force_sum_invalid_evidence_is_unverified(tmp_path: Path, defect:
                 replace(second, output_request_id="alias", selection=first.selection),
             ),
         )
+        case.store.register(
+            case.manifest.manifest_id, alias.request_id, case.numeric(original.request_id)
+        )
+        observation = next(
+            item
+            for item in case.manifest.read_result.observations
+            if item.output_id == original.request_id
+        )
+        case.manifest = replace(
+            case.manifest,
+            read_result=replace(
+                case.manifest.read_result,
+                observations=(
+                    *case.manifest.read_result.observations,
+                    replace(observation, output_id=alias.request_id),
+                ),
+            ),
+        )
     elif defect == "component":
         outputs = replace(
             outputs,
