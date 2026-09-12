@@ -32,18 +32,38 @@ from .reader_fixture import native_bytes
 from .test_compiler_native import _case
 
 
+class RequestDataStore(LocalResultDataStore):
+    """Project immutable native fields onto declared request IDs, as case storage does."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.requests: dict[tuple[str, str], str] = {}
+
+    def register(self, manifest_id: str, output_id: str, data: NumericResultData) -> None:
+        super().register(manifest_id, data.mapping.canonical_id, data)
+        self.requests[(manifest_id, output_id)] = data.mapping.canonical_id
+
+    def resolve_manifest_output(self, manifest_id: str, output_id: str) -> NumericResultData:
+        return super().resolve_manifest_output(manifest_id, self.requests[(manifest_id, output_id)])
+
+
 @dataclass
 class QualityCase:
     revision: CaseRevision
     mesh: MeshArtifact
     profile: CompatibilityProfile
     manifest: ResultManifest
-    store: LocalResultDataStore
+    store: RequestDataStore
 
-    def numeric(self, output_id: str = "displacement") -> NumericResultData:
+    def numeric(self, output_id: str = "request_part") -> NumericResultData:
         return self.store.resolve_manifest_output(self.manifest.manifest_id, output_id)
 
     def replace_numeric(self, numeric: NumericResultData, *, bind: bool = True) -> None:
+        output_ids = {
+            request.request_id
+            for request in self.revision.spec.outputs.requests
+            if request.quantity_id == numeric.mapping.canonical_id
+        }
         numeric = replace(
             numeric,
             reference=replace(
@@ -53,11 +73,11 @@ class QualityCase:
         )
         numeric = decode_record(encode_record(numeric), NumericResultData)
         # A new consumer store deliberately has no privileged reader internals.
-        store = LocalResultDataStore()
+        store = RequestDataStore()
         for observation in self.manifest.read_result.observations:
             value = (
                 numeric
-                if observation.output_id == numeric.mapping.canonical_id
+                if observation.output_id in output_ids
                 else (self.numeric(observation.output_id))
             )
             store.register(self.manifest.manifest_id, observation.output_id, value)
@@ -74,7 +94,7 @@ class QualityCase:
                             unit=numeric.mapping.unit,
                             state_count=len(numeric.axis_values),
                         )
-                        if item.output_id == numeric.mapping.canonical_id
+                        if item.output_id in output_ids
                         else item
                         for item in self.manifest.read_result.observations
                     ),
@@ -241,9 +261,21 @@ def quality_case(
         },
     )
     manifest = XpltReaderAdapter(profile=profile, data_store=store).read(attempt, bundle)
-    consumer = LocalResultDataStore()
+    decoded = {item.output_id: item for item in manifest.read_result.observations}
+    manifest = replace(
+        manifest,
+        read_result=replace(
+            manifest.read_result,
+            observations=tuple(
+                replace(decoded[request.quantity_id], output_id=request.request_id)
+                for request in revision.spec.outputs.requests
+            ),
+        ),
+    )
+    consumer = RequestDataStore()
     for observation in manifest.read_result.observations:
-        numeric = store.resolve_manifest_output(manifest.manifest_id, observation.output_id)
+        assert observation.data_ref is not None
+        numeric = store.resolve(observation.data_ref)
         consumer.register(
             manifest.manifest_id,
             observation.output_id,
@@ -305,7 +337,7 @@ def signed_force_case(tmp_path: Path, tool_values: tuple[float, ...]) -> Quality
             ),
         )
     )
-    tool_numeric = case.numeric("contact_force")
+    tool_numeric = case.numeric("request_tool")
     case.replace_numeric(
         replace(tool_numeric, values=tuple((0.0, 0.0, value) for value in tool_values))
     )

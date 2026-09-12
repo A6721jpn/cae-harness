@@ -283,7 +283,12 @@ def run_demo(
     quality_status, coverage = required_quality_summary(
         manifest, revision, mesh, profile, quality, storage
     )
-    force = storage.resolve_manifest_output(manifest.manifest_id, "contact_force")
+    force_request = next(
+        request
+        for request in revision.spec.outputs.requests
+        if request.quantity_id == "contact_force"
+    )
+    force = storage.resolve_manifest_output(manifest.manifest_id, force_request.request_id)
     final_force = force.values[-1]
     connected = all(math.isfinite(v) for v in final_force) and any(v != 0 for v in final_force)
     return {

@@ -112,6 +112,16 @@ def _quality_preview(
 
     def configure(service: Any, spec: Any) -> Any:
         spec = _configure(service, spec)
+        if mode == "two_body":
+            tool = replace(
+                next(r for r in spec.outputs.requests if r.quantity_id == "displacement"),
+                request_id="tool_displacement",
+                selection=spec.rigid_tool.contact_surface,
+                evidence=_evidence("outputs.requests.tool_displacement"),
+            )
+            spec = replace(
+                spec, outputs=replace(spec.outputs, requests=(*spec.outputs.requests, tool))
+            )
         if mode == "native_time":
             times = (Quantity(0, "s"), Quantity(0.1, "s"))
             spec = replace(
@@ -182,6 +192,22 @@ def _quality_preview(
 
         def configure(service: Any, spec: Any) -> Any:
             spec = base_configure(service, spec)
+            spec = replace(
+                spec,
+                outputs=replace(
+                    spec.outputs,
+                    requests=tuple(
+                        replace(
+                            request,
+                            request_id="tool_result",
+                            evidence=_evidence("outputs.requests.tool_result"),
+                        )
+                        if request.quantity_id == "contact_force"
+                        else request
+                        for request in spec.outputs.requests
+                    ),
+                ),
+            )
             profile = service.compatibility.get_profile(spec.solver_policy.profile.profile_id)
             profile = replace(
                 profile,
@@ -355,6 +381,7 @@ def test_mandatory_quality_coverage_preserves_known_fail(tmp_path: Path, registe
 
 def _demo_log_result(service: Any, storage: Any, revision: Any, tmp_path: Path, patch: Any) -> Any:
     """Real demo read closure over the existing synthetic issued storage fixture."""
+    from dataclasses import replace
     from types import SimpleNamespace
 
     from test_comparison import _result
@@ -398,7 +425,21 @@ def _demo_log_result(service: Any, storage: Any, revision: Any, tmp_path: Path, 
             _, lineage = storage._lineage(attempt)
             xplt = tuple(e for e in storage._sealed_entries(lineage) if e.role == "result")
             # Existing fixture supplies real registered numeric data, no native parser claim.
-            return context["synthetic_read"](attempt, bundle, xplt, storage)
+            manifest = context["synthetic_read"](attempt, bundle, xplt, storage)
+            decoded = {
+                numeric[item.data_ref.data_id].mapping.canonical_id: item
+                for item in manifest.read_result.observations
+            }
+            return replace(
+                manifest,
+                read_result=replace(
+                    manifest.read_result,
+                    observations=tuple(
+                        replace(item, output_id=canonical_id)
+                        for canonical_id, item in decoded.items()
+                    ),
+                ),
+            )
 
     def execute(case_id: str, revision_id: str, **kwargs: Any) -> Any:
         def read(owner: Any, synthetic_read: Any) -> Any:
@@ -470,3 +511,11 @@ def test_missing_registration_remains_quality_work_after_numerical_pass(
     assert numerical == "PASS"
     assert details["quality_registration_status"] == "UNVERIFIED"
     assert task is TaskStatus.NEEDS_QUALITY
+
+
+def test_preview_accepts_separate_part_and_tool_displacement_requests(tmp_path: Path) -> None:
+    from febio_cae.application._preview import preview_summary
+
+    store, receipt_id, quality = _quality_preview(tmp_path, mode="two_body")
+    assert preview_summary(store, receipt_id)["preview_status"] == "CONFIRMED"
+    assert quality.criteria[0].measured[0].value == pytest.approx(1e-5)

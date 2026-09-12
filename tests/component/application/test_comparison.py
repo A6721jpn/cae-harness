@@ -274,6 +274,11 @@ def _result(
                     data.reference,
                 )
             )
+        decoded = {item.output_id: item for item in observations}
+        observations = [
+            replace(decoded[request.quantity_id], output_id=request.request_id)
+            for request in revision.spec.outputs.requests
+        ]
         return ResultManifest(
             "manifest-" + label,
             attempt.attempt_id,

@@ -177,6 +177,7 @@ def run_case(arguments: Namespace) -> int:
                 arguments.case_id,
                 _read_json(Path(arguments.file)),
                 expected_generation=arguments.expected_generation,
+                parent_revision_id=arguments.parent_revision_id,
             )
             _print(payload) if arguments.json else print(payload["status"])
             return 0

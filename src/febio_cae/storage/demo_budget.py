@@ -1,12 +1,8 @@
-"""Private prototype-demo-v1 admission ledger; reservations are never refunded.
-
-This is not a general user-budget configuration API. Its fixed limits reflect
-the explicit demo decision: GM03 exhausted mesh allocation, two solver starts,
-one Studio start. Every native launcher must reserve against the same registered
-case root before launch and must not launch when the return value is False.
-"""
+"""Case-wide native reservations; failed and interrupted starts are never refunded."""
 
 from __future__ import annotations
+
+from febio_cae.domain import CaseRevision
 
 from ._sqlite import connect
 from .registry import CaseStorage, StorageConflictError, _now, _safe_identifier
@@ -14,15 +10,13 @@ from .registry import CaseStorage, StorageConflictError, _now, _safe_identifier
 _LIMITS = {"gmsh": 0, "febio": 2, "studio": 1}
 
 
-def reserve_demo_attempt(storage: CaseStorage, case_id: str, kind: str, operation_id: str) -> bool:
+def _reserve(storage: CaseStorage, case_id: str, kind: str, operation_id: str, limit: int) -> bool:
     """Durably consume one start; False means already reserved, never retry permission.
 
     No revision key or caller-selected cohort is accepted, so reconstruction,
     failed runs and new revisions cannot allocate a fresh allowance. A crash
     after commit and before launch conservatively consumes its reservation.
     """
-    if kind not in _LIMITS:
-        raise ValueError("unknown prototype demo native operation")
     _safe_identifier(operation_id, "operation_id")
     with storage.transaction(), connect(storage.registry_path) as connection:
         connection.execute("BEGIN IMMEDIATE")
@@ -46,11 +40,45 @@ def reserve_demo_attempt(storage: CaseStorage, case_id: str, kind: str, operatio
             "SELECT COUNT(*) FROM prototype_demo_starts WHERE case_id=? AND kind=?",
             (case_id, kind),
         ).fetchone()[0]
-        if count >= _LIMITS[kind]:
-            raise StorageConflictError(f"prototype demo {kind} budget exhausted")
+        if count >= limit:
+            raise StorageConflictError(f"registered {kind} budget exhausted")
         connection.execute(
             "INSERT INTO prototype_demo_starts VALUES(?,?,?,?)",
             (case_id, kind, operation_id, _now()),
         )
         connection.commit()
         return True
+
+
+def reserve_demo_attempt(storage: CaseStorage, case_id: str, kind: str, operation_id: str) -> bool:
+    """Keep the original registered demo's fixed, case-wide allowance."""
+    if kind not in _LIMITS:
+        raise ValueError("unknown prototype demo native operation")
+    return _reserve(storage, case_id, kind, operation_id, _LIMITS[kind])
+
+
+def reserve_preparation_mesh_attempt(storage: CaseStorage, case_id: str, operation_id: str) -> bool:
+    """Reserve one of the three public preparation generations before spawning."""
+    return _reserve(storage, case_id, "gmsh", operation_id, 3)
+
+
+def reserve_prepared_solver_attempt(
+    storage: CaseStorage, revision: CaseRevision, operation_id: str
+) -> bool:
+    """Bound the prepared study to four starts and the unchanged declared attempt cap."""
+    from .mesh_quality import PlanarPreparationRegistration
+
+    with storage.transaction():
+        if storage.get_revision(revision.case_id, revision.revision_id) != revision:
+            raise StorageConflictError("prepared solver revision differs from registration")
+        if not isinstance(
+            storage.resolve_revision_mesh_quality(revision), PlanarPreparationRegistration
+        ):
+            raise StorageConflictError("prepared solver budget requires a generated origin")
+        return _reserve(
+            storage,
+            revision.case_id,
+            "febio",
+            operation_id,
+            min(4, revision.spec.budget.max_attempts),
+        )

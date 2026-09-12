@@ -488,3 +488,133 @@ def test_prepared_material_child(
     assert len(backend.mesh_requests) == 1
     assert service.get_revision(created.case_id, parent.revision_id).to_bytes() == root_bytes
     assert all(path.read_bytes() == data for path, data in originals.items())
+
+
+def _mesh_study_request(request: dict[str, Any]) -> dict[str, Any]:
+    import copy
+
+    from febio_cae.domain import QualityThreshold, Quantity
+
+    payload = copy.deepcopy(request)
+    values = payload["values"]
+    values["mesh_policy"]["max_refinements"] = 2
+    values["budget"]["max_attempts"] = 4
+    criterion = copy.deepcopy(values["quality_policy"]["criteria"][0])
+    criterion.update(
+        criterion_id="mesh_study",
+        metric_id="mesh_dependence",
+        thresholds=[
+            QualityThreshold(name, Quantity(value, unit)).to_dict()
+            for name, value, unit in (
+                ("coarse_size", 2.0, "mm"),
+                ("refined_size", 1.0, "mm"),
+                ("fine_size", 0.5, "mm"),
+                ("relative_max", 0.02, "1"),
+                ("absolute_floor", 0.001, "N"),
+            )
+        ],
+    )
+    criterion["evidence"]["target_field"] = "quality_policy.criteria.mesh_study"
+    values["quality_policy"]["criteria"].append(criterion)
+    return payload
+
+
+def test_explicit_refinement_preserves_parent_mesh_and_publishes_new_origins(
+    prepared_input: tuple[Any, ...], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import copy
+
+    service, created, request, backend, _ = prepared_input
+    _isolate(monkeypatch, backend)
+    payload = _mesh_study_request(request)
+    prepared = service.prepare_planar(created.case_id, payload, expected_generation=0)
+    storage = service._storage(created.case_id)
+    parent = service.get_revision(created.case_id, prepared["revision_id"])
+    parent_registration = storage.resolve_revision_mesh_quality(parent)
+    parent_mesh = service._planar_execution_mesh(storage, parent_registration, parent)
+    immutable = {
+        path: path.read_bytes()
+        for path in (storage.root / "preparation" / prepared["preparation_id"]).glob("*.json")
+    }
+    original_parent = parent
+    for size in (1.0, 0.5):
+        child_request = copy.deepcopy(payload)
+        child_request["values"]["mesh_policy"]["global_size"] = {"value": size, "unit": "mm"}
+        prepared = service.prepare_planar(
+            created.case_id,
+            child_request,
+            expected_generation=prepared["generation"],
+            parent_revision_id=parent.revision_id,
+        )
+        child = service.get_revision(created.case_id, prepared["revision_id"])
+        assert child.parent_revision_id == parent.revision_id
+        assert child.parent_spec_digest == parent.spec_digest
+        child_registration = storage.resolve_revision_mesh_quality(child)
+        assert child_registration.preparation_id != parent_registration.preparation_id
+        assert service.validate_case(created.case_id).status == "VALIDATED"
+        assert storage.get_revision(created.case_id, original_parent.revision_id) == original_parent
+        assert (
+            service._planar_execution_mesh(storage, parent_registration, original_parent)
+            == parent_mesh
+        )
+        assert all(path.read_bytes() == content for path, content in immutable.items())
+        parent = child
+
+
+def test_prepared_case_reservations_are_finite_and_not_reset_by_reopening(
+    prepared_input: tuple[Any, ...], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from febio_cae.storage import CaseStorage, StorageConflictError
+    from febio_cae.storage.demo_budget import (
+        reserve_preparation_mesh_attempt,
+        reserve_prepared_solver_attempt,
+    )
+
+    service, created, request, backend, _ = prepared_input
+    _isolate(monkeypatch, backend)
+    prepared = service.prepare_planar(
+        created.case_id, _mesh_study_request(request), expected_generation=0
+    )
+    storage = service._storage(created.case_id)
+    revision = service.get_revision(created.case_id, prepared["revision_id"])
+    for number in range(4):
+        assert reserve_prepared_solver_attempt(
+            CaseStorage(storage.root), revision, f"solver-{number}"
+        )
+    assert not reserve_prepared_solver_attempt(storage, revision, "solver-0")
+    with pytest.raises(StorageConflictError):
+        reserve_prepared_solver_attempt(storage, revision, "solver-over-budget")
+    for number in (2, 3):
+        assert reserve_preparation_mesh_attempt(storage, created.case_id, f"mesh-{number}")
+    with pytest.raises(StorageConflictError):
+        reserve_preparation_mesh_attempt(CaseStorage(storage.root), created.case_id, "mesh-4")
+
+
+@pytest.mark.parametrize("change", ["skipped_size", "budget", "material"])
+def test_refinement_rejects_changed_physics_or_skipped_size(
+    prepared_input: tuple[Any, ...], monkeypatch: pytest.MonkeyPatch, change: str
+) -> None:
+    service, created, request, backend, _ = prepared_input
+    _isolate(monkeypatch, backend)
+    payload = _mesh_study_request(request)
+    prepared = service.prepare_planar(created.case_id, payload, expected_generation=0)
+    storage = service._storage(created.case_id)
+    before = storage.current_draft(created.case_id)
+    payload["values"]["mesh_policy"]["global_size"] = {
+        "value": 0.5 if change == "skipped_size" else 1.0,
+        "unit": "mm",
+    }
+    if change == "budget":
+        payload["values"]["budget"]["max_attempts"] = 5
+    elif change == "material":
+        payload["values"]["material"]["youngs_modulus"]["value"] *= 2
+    with pytest.raises(ValueError):
+        service.prepare_planar(
+            created.case_id,
+            payload,
+            expected_generation=prepared["generation"],
+            parent_revision_id=prepared["revision_id"],
+        )
+    assert storage.current_draft(created.case_id) == before
+    assert storage.current_frozen_revision(created.case_id) == prepared["revision_id"]
+    assert len(backend.mesh_requests) == 1

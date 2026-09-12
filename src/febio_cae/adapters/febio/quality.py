@@ -158,14 +158,14 @@ class QualityAdapter:
                     (
                         item
                         for item in manifest.read_result.observations
-                        if item.output_id == mapping.canonical_id
+                        if item.output_id == request.request_id
                     ),
                     None,
                 )
                 if observation is None:
                     raise PortError(
                         PortErrorCategory.QUALITY,
-                        f"validated manifest does not contain output {mapping.canonical_id}",
+                        f"validated manifest does not contain output {request.request_id}",
                     )
                 if (
                     observation.location != request.location
@@ -177,7 +177,7 @@ class QualityAdapter:
                         PortErrorCategory.QUALITY,
                         f"manifest output does not match request semantics: {request.request_id}",
                     )
-                numeric = data.resolve_manifest_output(manifest.manifest_id, mapping.canonical_id)
+                numeric = data.resolve_manifest_output(manifest.manifest_id, request.request_id)
                 if not isinstance(numeric, NumericResultData):
                     raise PortError(
                         PortErrorCategory.QUALITY, "result data resolver returned an invalid record"

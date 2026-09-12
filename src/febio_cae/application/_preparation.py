@@ -14,10 +14,11 @@ from febio_cae.adapters.geometry.preparation import (
     resource_snapshot,
     run_preparation,
 )
-from febio_cae.domain import CaseRevision, EvidenceRef, MeshArtifact
+from febio_cae.domain import CaseRevision, EvidenceRef, MeshArtifact, Quantity
 from febio_cae.domain.canonical import canonical_bytes
 from febio_cae.domain.codec import decode_record
 from febio_cae.domain.compatibility import CapabilityStatus
+from febio_cae.storage.demo_budget import reserve_preparation_mesh_attempt
 from febio_cae.storage.mesh_quality import MeshQualityRegistration, PlanarPreparationRegistration
 from febio_cae.storage.preparation import PreparationStore, digest
 
@@ -37,7 +38,12 @@ def geometry_from_output(output: dict[str, Any], source: Any) -> StepGeometryMes
 
 
 def prepare_planar(
-    service: RegisteredCaseService, case_id: str, payload: object, expected_generation: int
+    service: RegisteredCaseService,
+    case_id: str,
+    payload: object,
+    expected_generation: int,
+    *,
+    parent_revision_id: str | None = None,
 ) -> dict[str, object]:
     from .service import (
         ConcurrentUpdateError,
@@ -56,16 +62,88 @@ def prepare_planar(
         if type(expected_generation) is not int or current.generation != expected_generation:
             raise ConcurrentUpdateError("preparation draft generation is stale")
         frozen_id = storage.current_frozen_revision(case_id)
+        parent = None
+        if parent_revision_id is not None and frozen_id != parent_revision_id:
+            raise ConcurrentUpdateError("refinement parent is not the current frozen revision")
         if frozen_id is not None:
             old = storage.get_revision(case_id, frozen_id)
             registration = storage.resolve_revision_mesh_quality(old)
-            if (
-                not isinstance(registration, PlanarPreparationRegistration)
-                or records.read(registration.preparation_id)["status"] != "FAILED"
-            ):
-                raise ValueError(
-                    "preparation cannot replace an accepted or unresolved frozen origin"
+            if parent_revision_id is None:
+                if (
+                    not isinstance(registration, PlanarPreparationRegistration)
+                    or records.read(registration.preparation_id)["status"] != "FAILED"
+                ):
+                    raise ValueError(
+                        "preparation cannot replace an accepted or unresolved frozen origin"
+                    )
+            else:
+                if not isinstance(registration, PlanarPreparationRegistration):
+                    raise ValueError("refinement requires a current prepared origin")
+                records.origin_output(registration, old)
+                if current.values.to_case_spec().to_bytes() != old.spec.to_bytes():
+                    raise ConcurrentUpdateError("refinement cannot discard a changed draft")
+                parsed = normalize_request(
+                    request,
+                    geometry_digest=old.spec.geometry.geometry_digest,
+                    inspection_digest=old.spec.geometry.inspection_digest,
                 )
+                preliminary = parsed.values.to_case_spec()
+                if preliminary.mesh_policy.quality_profile != registration.generation_profile:
+                    raise ValueError("refinement must preserve the generation profile")
+                parent_selections = {
+                    replace(selection, resolution=None).to_bytes(): selection.resolution
+                    for selection in _registered_selections(current.values)
+                }
+                resolutions = {}
+                for selection in _registered_selections(parsed.values):
+                    resolution = parent_selections.get(
+                        replace(selection, resolution=None).to_bytes()
+                    )
+                    if resolution is None:
+                        raise ValueError("refinement changed a declared selection")
+                    resolutions[selection.to_bytes()] = resolution
+                restored = _resolved_values(preliminary, resolutions)
+                restored = replace(
+                    restored,
+                    mesh_policy=replace(
+                        restored.mesh_policy,
+                        global_size=old.spec.mesh_policy.global_size,
+                        quality_profile=old.spec.mesh_policy.quality_profile,
+                    ),
+                )
+                if restored.to_bytes() != old.spec.to_bytes():
+                    raise ValueError("refinement may change only the declared global mesh size")
+                criteria = [
+                    criterion
+                    for criterion in old.spec.quality_policy.criteria
+                    if criterion.metric_id == "mesh_dependence"
+                ]
+                if len(criteria) != 1:
+                    raise ValueError("refinement requires one declared mesh-dependence criterion")
+                thresholds = {
+                    threshold.parameter_id: threshold.value for threshold in criteria[0].thresholds
+                }
+                names = ("coarse_size", "refined_size", "fine_size")
+                if any(
+                    name not in thresholds
+                    or thresholds[name].dimension != Quantity(1, "m").dimension
+                    for name in names
+                ):
+                    raise ValueError("refinement requires three declared physical mesh sizes")
+                sizes = tuple(float(thresholds[name].to_si().value) for name in names)
+                if not sizes[0] > sizes[1] > sizes[2] > 0:
+                    raise ValueError("refinement sizes must be positive and strictly decreasing")
+                previous_size = float(old.spec.mesh_policy.global_size.to_si().value)
+                if previous_size not in sizes:
+                    raise ValueError("parent mesh size is outside the declared refinement study")
+                next_index = sizes.index(previous_size) + 1
+                if (
+                    next_index >= len(sizes)
+                    or next_index > old.spec.mesh_policy.max_refinements
+                    or float(preliminary.mesh_policy.global_size.to_si().value) != sizes[next_index]
+                ):
+                    raise ValueError("refinement must use the next declared mesh size")
+                parent = old
         source = storage.resolve_source(storage.source_asset("cad"))
         if preliminary.geometry.source_step_digest != source.source_asset.content_digest:
             raise ValueError("preparation source digest differs from registered STEP")
@@ -119,6 +197,8 @@ def prepare_planar(
                 request_asset.content_digest,
             )
             with storage.evidence_snapshot():
+                if not reserve_preparation_mesh_attempt(storage, case_id, record["preparation_id"]):
+                    raise ValueError("preparation generation was already reserved")
                 producer = run_preparation(
                     source,
                     request,
@@ -182,6 +262,7 @@ def prepare_planar(
                     expected_generation=expected_generation,
                     evidence=evidence,
                     input_intent=parsed.input_intent,
+                    parent_revision_id=parent.revision_id if parent is not None else None,
                 )
                 service.geometry = geometry
                 service._placed_selection = geometry.resolve_placed_selection

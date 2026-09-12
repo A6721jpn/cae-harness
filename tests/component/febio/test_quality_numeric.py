@@ -118,7 +118,7 @@ def test_observation_metadata_must_match_numeric_record(tmp_path: Path, field: s
                     if field == "value_type"
                     else replace(item, state_count=99)
                 )
-                if item.output_id == "displacement"
+                if item.output_id == "request_part"
                 else item
                 for item in case.manifest.read_result.observations
             ),
@@ -328,10 +328,10 @@ def test_signed_force_sum_invalid_evidence_is_unverified(tmp_path: Path, defect:
     outputs = case.revision.spec.outputs
     first, second = outputs.evaluations
     if defect == "missing-state":
-        numeric = case.numeric("contact_force")
+        numeric = case.numeric("request_tool")
         case.replace_numeric(replace(numeric, axis_values=(0.0, 0.4, 1.0)))
     elif defect == "foreign":
-        numeric = case.numeric("contact_force")
+        numeric = case.numeric("request_tool")
         case.replace_numeric(
             replace(numeric, reference=replace(numeric.reference, attempt_id="other"))
         )

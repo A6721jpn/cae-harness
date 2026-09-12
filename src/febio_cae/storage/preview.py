@@ -81,9 +81,14 @@ class RegisteredPreviewStore:
                 raise StorageConflictError("preview requires completed registered execution")
             bundle = decode_record(bytes(lineage["bundle"]), ExecutionBundle)
             revision = storage.get_revision(attempt.case_id, attempt.revision_id)
-            outputs = [r for r in revision.spec.outputs.requests if r.quantity_id == "displacement"]
+            outputs = [
+                request
+                for request in revision.spec.outputs.requests
+                if request.quantity_id == "displacement"
+                and request.selection.body_id == revision.spec.geometry.body_id
+            ]
             if len(outputs) != 1:
-                raise ValueError("preview requires one registered displacement request")
+                raise ValueError("preview requires one registered part displacement request")
             output = outputs[0]
             numeric = storage.resolve_manifest_output(manifest_id, output.request_id)
             final_time = max(t.to_si().value for t in revision.spec.outputs.saved_times)

@@ -45,7 +45,11 @@ from febio_cae.domain.results import ResultManifest
 from febio_cae.domain.selection import FaceSetRule, ResolutionSnapshot, SelectionRef
 from febio_cae.domain.units import Quantity
 from febio_cae.storage.catalog import CaseCatalog, CaseCatalogError
-from febio_cae.storage.mesh_quality import MeshQualityRecord, PlanarDemoRegistration
+from febio_cae.storage.mesh_quality import (
+    MeshQualityRecord,
+    PlanarDemoRegistration,
+    PlanarPreparationRegistration,
+)
 from febio_cae.storage.profiles import SQLiteCompatibilityRegistry
 from febio_cae.storage.registry import (
     CaseStorage,
@@ -239,11 +243,18 @@ class RegisteredCaseService:
         return self._storage(case_id).current_draft(case_id)
 
     def prepare_planar(
-        self, case_id: str, payload: object, *, expected_generation: int
+        self,
+        case_id: str,
+        payload: object,
+        *,
+        expected_generation: int,
+        parent_revision_id: str | None = None,
     ) -> dict[str, object]:
         from ._preparation import prepare_planar
 
-        return prepare_planar(self, case_id, payload, expected_generation)
+        return prepare_planar(
+            self, case_id, payload, expected_generation, parent_revision_id=parent_revision_id
+        )
 
     def get_revision(self, case_id: str, revision_id: str) -> CaseRevision:
         return self._storage(case_id).get_revision(case_id, revision_id)
@@ -346,6 +357,7 @@ class RegisteredCaseService:
         evidence: Sequence[EvidenceRef] = (),
         source_declarations: Sequence[SourceDeclaration] = (),
         input_intent: str = "",
+        parent_revision_id: str | None = None,
     ) -> CaseDraft:
         if not isinstance(values, PartialCaseSpec):
             raise ServiceConflictError("values must be a PartialCaseSpec")
@@ -356,6 +368,13 @@ class RegisteredCaseService:
                 raise ConcurrentUpdateError(
                     "expected draft generation is stale before source declarations"
                 )
+            parent = None
+            if parent_revision_id is not None:
+                if storage.current_frozen_revision(case_id) != parent_revision_id:
+                    raise ConcurrentUpdateError(
+                        "specified parent is not the current frozen revision"
+                    )
+                parent = storage.get_revision(case_id, parent_revision_id)
             resolved_evidence = self._resolve_declarations(storage, source_declarations, evidence)
             merged_values = self._merge_values(current.values, values)
             merged_evidence = _merge_evidence(current.evidence, resolved_evidence)
@@ -364,8 +383,12 @@ class RegisteredCaseService:
                 draft_id=f"draft-{uuid.uuid4().hex[:12]}",
                 generation=expected_generation + 1,
                 input_intent=input_intent if input_intent else current.input_intent,
-                parent_revision_id=current.parent_revision_id,
-                parent_spec_digest=current.parent_spec_digest,
+                parent_revision_id=parent.revision_id
+                if parent is not None
+                else current.parent_revision_id,
+                parent_spec_digest=parent.spec_digest
+                if parent is not None
+                else current.parent_spec_digest,
                 values=merged_values,
                 evidence=merged_evidence,
             )
@@ -625,7 +648,6 @@ class RegisteredCaseService:
         geometry_port = self.geometry
         placed_selection = self._placed_selection
         if geometry_port is None:
-            from febio_cae.storage.mesh_quality import PlanarPreparationRegistration
             from febio_cae.storage.preparation import PreparationStore
 
             from ._preparation import geometry_from_output
@@ -1115,7 +1137,6 @@ class RegisteredCaseService:
     ) -> MeshArtifact:
         """Rebind material-only descendants, preserving the registered root mesh/receipt."""
         from febio_cae.domain.codec import decode_record, encode_record
-        from febio_cae.storage.mesh_quality import PlanarPreparationRegistration
 
         if isinstance(registration, PlanarPreparationRegistration):
             from febio_cae.storage.preparation import PreparationStore
@@ -1238,7 +1259,12 @@ class RegisteredCaseService:
                     raise PortError(
                         PortErrorCategory.EXECUTION, "preparation exhausted operation budget"
                     )
-                if isinstance(registration, PlanarDemoRegistration):
+                if isinstance(registration, PlanarPreparationRegistration):
+                    from febio_cae.storage.demo_budget import reserve_prepared_solver_attempt
+
+                    if not reserve_prepared_solver_attempt(storage, revision, owner.attempt_id):
+                        raise PortError(PortErrorCategory.CONFLICT, "native start already reserved")
+                elif isinstance(registration, PlanarDemoRegistration):
                     from febio_cae.storage.demo_budget import reserve_demo_attempt
 
                     if not reserve_demo_attempt(storage, case_id, "febio", owner.attempt_id):

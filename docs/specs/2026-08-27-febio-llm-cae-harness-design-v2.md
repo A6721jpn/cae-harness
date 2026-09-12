@@ -192,6 +192,24 @@ Tet10の候補経路では、GmshからFEBioへの節点順と面節点順を明
 
 公開準備済みの版からYoung率だけを明示変更した子孫版は、登録済み親版の内容・parent spec digest・祖先関係を検証し、元のPREPARED rootへ到達できる場合に限り既存meshを再利用できる。各親子間で、対応する等方線形弾性のYoung率とその必須根拠以外の材料条件、geometry、mesh recipe/profile、配置・接触・支持・運動・出力・品質・予算を変更してはならない。既存adoptionにより子版へmeshの結合を導出し、元のreceiptとmeshは不変の生成根拠として保持する。子版を新規生成・PREPAREDと表示せず、要求からproducer根拠を受け入れない。現在の草案世代・spec・evidenceと固定版の一致検査は実行・preflight時に引き続き必要とする。変更形状への自動再mesh、物理既定値や品質主張の変更は含めない。
 
+必須mesh依存性のための明示的な再分割は、`prepare-planar`の
+`--parent-revision-id REVISION_ID`で指定する。親は同じcaseの現在の固定版で、
+PREPARED生成根拠が有効でなければならない。現在世代と親spec digestをCASで検証し、
+事前宣言した`mesh_dependence`のcoarse→refined→fineの次のglobal_sizeだけを許す。
+生成profileは親の登録済み生成profileを使い、形状・材料・支持・配置・接触・運動・
+出力・品質基準・予算を変更しない。親指定なしの受理済みorigin置換は引き続き拒否する。
+
+再分割は古いmeshの再利用ではない。登録STEPを改めて検査・生成し、固有の生成記録・
+mesh・子版を公開する。親版・旧mesh・旧結果・旧PREPARED記録を変更せず、各版は
+その版自身の生成根拠を持つ。失敗・未回収・世代競合を成功にせず、暗黙の再試行や
+別caseの結果による収束証拠の代用をしない。新しいfine版からのYoung率のみの編集は、
+上記の既存mesh再利用契約に従う。
+
+公開準備経路のcase-wide native上限はメッシュ生成3回、FEBio起動4回
+（3サイズとYoung率変更1回）とする。各起動前に永続予約し、失敗・中断・新しい版でも
+消費を戻さない。既存の各操作の時間・CPU・メモリ・試行上限も維持する。
+旧登録demoのメッシュ追加禁止・FEBio2回・Studio1回の契約は緩和しない。
+
 ## 7. 入力生成と実行管理
 
 ### 7.1 コンパイルと実行権限
