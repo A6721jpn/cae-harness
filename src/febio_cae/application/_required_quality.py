@@ -136,8 +136,7 @@ def _execution_result_completeness(
                 )
             entry = manifest_entries.get(numeric.reference.logical_path)
             if entry is None or entry.role not in {"result", request.request_id}:
-                raise PortError(
-                    PortErrorCategory.INTEGRITY,
+                raise ValueError(
                     f"registered numeric result source is not an output for request {request.request_id}",
                 )
             if numeric.reference.codec_id != "numeric-result-v1":
@@ -148,10 +147,7 @@ def _execution_result_completeness(
                 "VEC3F": ("x", "y", "z"),
                 "MAT3FS": ("xx", "yy", "zz", "xy", "yz", "xz"),
             }.get(numeric.mapping.value_type)
-            if (
-                expected_components is not None
-                and tuple(numeric.component_ids) != expected_components
-            ):
+            if expected_components is None or tuple(numeric.component_ids) != expected_components:
                 raise ValueError(
                     f"numeric result for {request.request_id} has an unsupported component layout"
                 )
