@@ -266,7 +266,21 @@ def _public(
             def read(self, attempt: Any, bundle: Any) -> Any:
                 _, lineage = storage._lineage(attempt)
                 xplt = tuple(e for e in storage._sealed_entries(lineage) if e.role == "result")
-                return context["reader"](attempt, bundle, xplt, storage)
+                manifest = context["reader"](attempt, bundle, xplt, storage)
+                decoded = {
+                    numeric[item.data_ref.data_id].mapping.canonical_id: item
+                    for item in manifest.read_result.observations
+                }
+                return replace(
+                    manifest,
+                    read_result=replace(
+                        manifest.read_result,
+                        observations=tuple(
+                            replace(item, output_id=canonical_id)
+                            for canonical_id, item in decoded.items()
+                        ),
+                    ),
+                )
 
         def execute(case_id: str, revision_id: str, **kwargs: Any) -> Any:
             def read(owner: Any, synthetic: Any) -> Any:

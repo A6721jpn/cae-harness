@@ -240,7 +240,6 @@ def _junction(link: Path, target: Path) -> None:
     result = subprocess.run(
         ["cmd", "/d", "/c", "mklink", "/J", str(link), str(target)],
         capture_output=True,
-        text=True,
         timeout=10,
         check=False,
     )

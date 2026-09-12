@@ -1432,13 +1432,6 @@ def _record_preparation_process(
     preparation_id = _require_id(preparation.get("preparation_id"), "preparation_id")
     prepared_path = case_root / "preparation" / preparation_id / "prepared.json"
     prepared = _read_json(prepared_path, "prepared producer receipt", environment=False)
-    _expect(prepared.get("status") == "PREPARED", "prepared receipt is not PREPARED")
-    _expect(prepared.get("preparation_id") == preparation_id, "prepared ID differs")
-    _expect(prepared.get("case_id") == preparation.get("case_id"), "prepared case differs")
-    _expect(
-        prepared.get("revision_id") == preparation.get("revision_id"),
-        "prepared revision differs",
-    )
     state_paths = sorted((case_root / "preparation").glob("*/state.json"))
     _expect(
         len(state_paths) == expected_count,
@@ -1456,13 +1449,33 @@ def _record_preparation_process(
         state.get("revision_id") == preparation.get("revision_id"),
         "preparation state revision differs",
     )
+    _expect(
+        state.get("generation") == preparation.get("generation"),
+        "preparation state generation differs",
+    )
+    _expect(
+        _require_digest(state.get("output_digest"), "preparation output digest")
+        == _file_sha256(prepared_path),
+        "prepared output differs from its published state digest",
+    )
+    revision_path = (
+        case_root
+        / "cases"
+        / _require_id(preparation.get("case_id"), "prepared.case_id")
+        / "revisions"
+        / _require_id(preparation.get("revision_id"), "prepared.revision_id")
+        / "revision.json"
+    )
+    _expect(
+        _require_digest(state.get("revision_digest"), "preparation revision digest")
+        == _file_sha256(revision_path),
+        "prepared revision differs from its published state digest",
+    )
     state_limits = _require_dict(state.get("limits"), "preparation state limits")
     _expect(
         state_limits.get("mesh_generations") == 1,
         "preparation state mesh generation budget differs",
     )
-    limits = _require_dict(prepared.get("limits"), "prepared limits")
-    _expect(limits.get("mesh_generations") == 1, "prepared mesh generation budget differs")
     producer = _require_dict(prepared.get("producer"), "prepared producer")
     _expect(producer.get("mesh_generations") == 1, "producer mesh generation count differs")
     process = _require_dict(producer.get("process"), "prepared producer process")
@@ -1492,7 +1505,7 @@ def _record_preparation_process(
             "creation_time": process.get("creation_time"),
         },
     )
-    return prepared
+    return {"state": state, "producer": producer}
 
 
 def _locate_run(
@@ -2373,7 +2386,7 @@ def test_installed_synthetic_cli_flow(tmp_path: Path) -> None:
                 {
                     "label": stage,
                     "preparation_id": preparation_id,
-                    "status": preparation_receipt.get("status"),
+                    "status": preparation_receipt["state"]["status"],
                     "mesh_generations": _require_dict(
                         preparation_receipt.get("producer"), "prepared producer"
                     ).get("mesh_generations"),

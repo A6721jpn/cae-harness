@@ -96,11 +96,10 @@ def test_catalog_rejects_windows_junction_case_root(tmp_path: Path) -> None:
         f"cmd.exe /d /c {command}",
         shell=True,
         capture_output=True,
-        text=True,
         check=False,
     )
     if result.returncode != 0:
-        pytest.fail(f"could not create the required junction: {result.stdout}{result.stderr}")
+        pytest.fail(f"could not create the required junction: {result.stdout!r}{result.stderr!r}")
     try:
         reopened_service = RegisteredCaseService(state_dir=tmp_path / "state")
         with pytest.raises(ServiceConflictError):
