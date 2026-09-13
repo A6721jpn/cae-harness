@@ -42,6 +42,7 @@ from .backend import (
     BackendMeshFace,
     BackendNode,
 )
+from .native_backend import _primitive_source_digest
 
 _STEP_TEXT_ENCODING = "latin-1"
 _SI_LENGTH_RE = re.compile(
@@ -1166,27 +1167,6 @@ def _primitive_length_si(primitive: RigidPrimitive, name: str) -> float:
             f"primitive dimension {name!r} must be positive and finite",
         )
     return value
-
-
-def _primitive_source_digest(
-    primitive: RigidPrimitive,
-    *,
-    geometry_digest: str,
-    global_size_si: float | None,
-    local_refinements: Sequence[BackendLocalRefinement] = (),
-) -> str:
-    payload: dict[str, object] = {
-        "schema_version": "1",
-        "backend_id": "gmsh-occ",
-        "primitive": primitive.to_dict(),
-        "geometry_digest": geometry_digest,
-        "native_length_unit": "m",
-        "global_size_si": global_size_si,
-        "ordering_id": BACKEND_TET10_ORDER_ID if global_size_si is not None else None,
-    }
-    if local_refinements:
-        payload["local_refinements"] = [item.to_dict() for item in local_refinements]
-    return hashlib.sha256(canonical_bytes(payload)).hexdigest()
 
 
 def _require_ap214_header(content: bytes) -> None:

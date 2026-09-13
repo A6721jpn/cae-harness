@@ -224,6 +224,7 @@ def test_preparation_uses_finite_owned_process_deadline(tmp_path: Path) -> None:
         module._run_owned(
             (sys.executable, "-I", "-c", "import time; time.sleep(60)"),
             tmp_path,
+            cpu_workers=1,
             timeout_seconds=0.15,
             memory_bytes=128 * 1024 * 1024,
         )
@@ -660,3 +661,401 @@ def test_failed_refinement_cannot_restart_as_changed_initial_preparation(
     assert storage.current_draft(created.case_id) == before
     assert storage.get_revision(created.case_id, parent.revision_id) == parent
     assert len(backend.mesh_requests) == 2
+
+
+def test_native_preparation_replays_nonidentity_placement_without_regeneration(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    import copy
+    from dataclasses import replace
+    from types import MethodType
+
+    from febio_cae.adapters.geometry import (
+        BACKEND_TET10_ORDER_ID,
+        BackendBody,
+        BackendElement,
+        BackendFace,
+        BackendInspection,
+        BackendMesh,
+        BackendMeshFace,
+        BackendNode,
+        StepGeometryMeshAdapter,
+    )
+    from febio_cae.adapters.meshing.approximation import NATIVE_ALGORITHM
+    from febio_cae.application._preparation import _bound_generation_criteria, geometry_from_output
+    from febio_cae.domain import (
+        BodyId,
+        EvidenceRef,
+        FrameId,
+        PortError,
+        ProperRotation,
+        Quantity,
+        RigidTransform,
+        Translation3,
+    )
+    from febio_cae.storage.mesh_quality import MeshQualityRegistration
+
+    service, created, request, backend, _ = prepared_input.__wrapped__(tmp_path, monkeypatch)
+    _isolate(monkeypatch, backend)
+    fixtures = importlib.import_module("geometry.conftest")
+    primitive = fixtures.make_case_spec("0" * 64).rigid_tool.primitive
+    placement = RigidTransform(
+        fixtures.TOOL_LOCAL,
+        fixtures.WORLD,
+        Translation3(
+            fixtures.WORLD,
+            Quantity(10, "mm"),
+            Quantity(20, "mm"),
+            Quantity(30, "mm"),
+        ),
+        ProperRotation(((0, -1, 0), (1, 0, 0), (0, 0, 1))),
+    )
+    primitive = replace(
+        primitive,
+        kind="sphere",
+        placement=placement,
+        dimensions={"radius": Quantity(1, "mm")},
+        dimension_evidence={"radius": fixtures._evidence("rigid_tool.radius", "native-radius")},
+    )
+    payload = copy.deepcopy(request)
+    payload["values"]["rigid_tool"]["primitive"] = primitive.to_dict()
+    source = service.resolve_source(created.case_id, "cad")
+    quality = MeshQualityRegistration(
+        "native-prepared",
+        Quantity(1, "mm"),
+        ("sphere",),
+        NATIVE_ALGORITHM,
+        "1",
+        "synthetic",
+        (
+            EvidenceRef(
+                "1",
+                "registered_document",
+                "cad",
+                "mesh_quality.qualification",
+                source.source_asset.content_digest,
+            ),
+        ),
+    )
+    quality_ref = service.register_mesh_quality(created.case_id, quality)
+    payload["values"]["mesh_policy"]["quality_profile"] = quality_ref.to_dict()
+    limits: dict[str, Any] = {
+        "cpu_workers": 1,
+        "max_nodes": 1000,
+        "max_tetrahedra": 100,
+        "wall_seconds": 600.0,
+    }
+    limits["_generation_criteria"] = _bound_generation_criteria(quality, "sphere", 100)
+    native_inspections: list[BackendInspection] = []
+    native_meshes: list[BackendMesh] = []
+
+    def inspect_native(
+        self: Any, current: Any, *, geometry_digest: str
+    ) -> BackendInspection:
+        native_backend = importlib.import_module(
+            "febio_cae.adapters.geometry.native_backend"
+        )
+        face = BackendFace(
+            "tool-body:face-1",
+            current.body_id.value,
+            current.local_frame,
+            1.0e-6,
+            (0.001, 0.002, 0.003),
+        )
+        report = BackendInspection(
+            native_backend.primitive_source_digest(
+                current,
+                geometry_digest=geometry_digest,
+                global_size_si=None,
+            ),
+            geometry_digest,
+            ("m",),
+            current.local_frame,
+            (BackendBody(current.body_id.value, True, 1.0e-9, (face,)),),
+        )
+        native_inspections.append(report)
+        return report
+
+    def mesh_native(
+        self: Any,
+        current: Any,
+        *,
+        geometry_digest: str,
+        global_size_si: float,
+        local_refinements: tuple[Any, ...] = (),
+    ) -> BackendMesh:
+        del self, global_size_si, local_refinements
+        points = (
+            (0.0, 0.0, 0.0),
+            (0.004, 0.0, 0.0),
+            (0.0, 0.004, 0.0),
+            (0.0, 0.0, 0.004),
+            (0.002, 0.0, 0.0),
+            (0.002, 0.002, 0.0),
+            (0.0, 0.002, 0.0),
+            (0.0, 0.0, 0.002),
+            (0.0, 0.002, 0.002),
+            (0.002, 0.0, 0.002),
+        )
+        nodes = tuple(BackendNode(index, point) for index, point in enumerate(points, 1))
+        element = BackendElement(
+            1,
+            "tet10",
+            tuple(range(1, 11)),
+            current.body_id.value,
+            BACKEND_TET10_ORDER_ID,
+        )
+        mesh = BackendMesh(
+            hashlib.sha256(current.to_bytes()).hexdigest(),
+            geometry_digest,
+            current.local_frame,
+            current.body_id.value,
+            nodes,
+            (element,),
+            (
+                BackendMeshFace(
+                    "tool-mesh-face",
+                    (1,),
+                    (0,),
+                    source_face_id=f"{current.body_id.value}:face-1",
+                ),
+            ),
+            BACKEND_TET10_ORDER_ID,
+        )
+        native_meshes.append(mesh)
+        return mesh
+
+    backend.inspect_rigid_primitive = MethodType(inspect_native, backend)
+    backend.mesh_rigid_primitive = MethodType(mesh_native, backend)
+    monkeypatch.setattr(
+        StepGeometryMeshAdapter,
+        "_native_approximation",
+        lambda self, mesh, inspection, primitive, criteria, deadline: {
+            "algorithm_id": criteria.algorithm_id,
+            "criteria": criteria.to_dict(),
+            "evidence_scope": criteria.evidence_scope,
+            "maximum_boundary_deviation_si": 0.0,
+            "deviation_upper_bound_si": 0.0,
+        },
+    )
+
+    output = importlib.import_module("febio_cae.adapters.geometry.preparation").produce(
+        source, payload, limits
+    )
+    assert native_inspections and native_meshes
+    carrier = importlib.import_module("febio_cae.domain.codec").decode_record(
+        importlib.import_module("febio_cae.domain.canonical").canonical_bytes(output["carrier"]),
+        importlib.import_module("febio_cae.domain").CaseRevision,
+    )
+    resolved = carrier.spec.rigid_tool.contact_surface.resolution
+    assert resolved is not None
+    centroid = resolved.faces[0].centroid
+    centroid_values = tuple(value.to_si().value for value in (centroid.x, centroid.y, centroid.z))
+    assert centroid_values == pytest.approx(
+        (0.008, 0.021, 0.033)
+    )
+
+    replay_output = json.loads(
+        importlib.import_module("febio_cae.domain.canonical").canonical_bytes(output)
+    )
+    stale_native_output = copy.deepcopy(replay_output)
+    stale_native_output["native_tool_inspection"]["source_digest"] = "0" * 64
+    with pytest.raises(ValueError, match="source identity"):
+        geometry_from_output(
+            stale_native_output,
+            source,
+            expected_primitive=primitive,
+            expected_tool_geometry_digest="b" * 64,
+        )
+    replay = geometry_from_output(
+        replay_output,
+        source,
+        expected_primitive=primitive,
+        expected_tool_geometry_digest="b" * 64,
+    )
+    before_inspections = len(native_inspections)
+    placed = replay.inspect_rigid_tool(primitive, "b" * 64)
+    placed_centroid = placed.bodies[0].faces[0].centroid_si
+    assert placed.frame == fixtures.WORLD
+    assert placed_centroid == pytest.approx((0.008, 0.021, 0.033))
+    assert len(native_inspections) == before_inspections
+    before_meshes = len(native_meshes)
+    with pytest.raises(PortError, match="not permitted during replay"):
+        replay._backend.mesh_rigid_primitive(  # type: ignore[attr-defined]
+            primitive,
+            geometry_digest="b" * 64,
+            global_size_si=0.002,
+        )
+    assert len(native_meshes) == before_meshes
+
+    stale = replace(primitive, dimensions={"radius": Quantity(2, "mm")})
+    for bad_primitive, bad_digest in (
+        (stale, "b" * 64),
+        (primitive, "c" * 64),
+        (replace(primitive, body_id=BodyId("foreign-tool")), "b" * 64),
+        (
+            replace(
+                primitive,
+                local_frame=FrameId("OtherTool"),
+                placement=replace(primitive.placement, source_frame=FrameId("OtherTool")),
+            ),
+            "b" * 64,
+        ),
+    ):
+        with pytest.raises(PortError):
+            replay._backend.inspect_rigid_primitive(  # type: ignore[attr-defined]
+                bad_primitive, geometry_digest=bad_digest
+            )
+    bad_limits = copy.deepcopy(limits)
+    bad_limits["_generation_criteria"]["algorithm_id"] = "affine-polyhedron-v1"
+    before = (len(native_inspections), len(native_meshes))
+    with pytest.raises(ValueError, match="generation criteria binding"):
+        importlib.import_module("febio_cae.adapters.geometry.preparation").produce(
+            source, payload, bad_limits
+        )
+    assert (len(native_inspections), len(native_meshes)) == before
+
+    def inspect_stale(
+        self: Any, current: Any, *, geometry_digest: str
+    ) -> BackendInspection:
+        return replace(
+            inspect_native(self, current, geometry_digest=geometry_digest),
+            source_digest="0" * 64,
+        )
+
+    monkeypatch.setattr(backend, "inspect_rigid_primitive", MethodType(inspect_stale, backend))
+    before_generation = (len(backend.mesh_requests), len(native_meshes))
+    with pytest.raises(ValueError, match="source identity"):
+        importlib.import_module("febio_cae.adapters.geometry.preparation").produce(
+            source, payload, limits
+        )
+    assert (len(backend.mesh_requests), len(native_meshes)) == before_generation
+
+
+def test_box_preparation_preserves_core_record_and_producer_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dataclasses import replace
+
+    from febio_cae.application._preparation import geometry_from_output
+    from febio_cae.application.service import RegisteredCaseService
+    from febio_cae.domain import (
+        CaseRevision,
+        EvidenceRef,
+        GeometryInspectionRequest,
+        MeshArtifact,
+        Quantity,
+        SourceAssetContent,
+        SourceAssetRef,
+    )
+    from febio_cae.domain.canonical import canonical_bytes
+    from febio_cae.domain.codec import decode_record
+    from febio_cae.storage.mesh_quality import (
+        PlanarPreparationRegistration,
+        decode_mesh_quality,
+    )
+
+    monkeypatch.syspath_prepend(str(Path(__file__).parents[1]))
+    fixtures = importlib.import_module("geometry.conftest")
+    step = (
+        b"ISO-10303-21; HEADER; FILE_SCHEMA(('AUTOMOTIVE_DESIGN')); ENDSEC; "
+        b"DATA; ENDSEC; END-ISO-10303-21;"
+    )
+    source = SourceAssetContent(
+        SourceAssetRef(
+            "synthetic-step-registered",
+            hashlib.sha256(step).hexdigest(),
+            "model/step",
+        ),
+        step,
+    )
+    raw = fixtures.make_case_spec("0" * 64).to_dict()
+    raw["geometry"]["source_step_digest"] = source.source_asset.content_digest
+    raw["geometry"]["inspection_digest"] = None
+    request = {"schema_version": "1", "values": raw, "evidence": [], "source_declarations": []}
+    backend = fixtures.SyntheticBackend()
+    backend.evidence = {
+        "module": "synthetic-only",
+        "module_sha256": "f" * 64,
+        "gmsh_version": "4.15.2",
+        "occt_version": "7.8.1",
+        "build_info": "synthetic injected backend",
+    }
+    worker = importlib.import_module("febio_cae.adapters.geometry.preparation")
+    monkeypatch.setattr(worker, "_make_backend", lambda cpu: backend)
+    limits = {
+        "cpu_workers": 1,
+        "max_nodes": 1000,
+        "max_tetrahedra": 100,
+    }
+    output = worker.produce(source, request, limits)
+    assert set(output) == {
+        "carrier",
+        "mesh",
+        "inspection",
+        "backend",
+        "backend_id",
+        "backend_version",
+        "mesh_generations",
+    }
+    carrier = decode_record(canonical_bytes(output["carrier"]), CaseRevision)
+    original = decode_record(canonical_bytes(output["mesh"]), MeshArtifact)
+    replay = geometry_from_output(
+        output,
+        source,
+        expected_primitive=carrier.spec.rigid_tool.primitive,
+        expected_tool_geometry_digest=carrier.spec.rigid_tool.contact_surface.geometry_digest,
+    )
+    assert replay.inspect(
+        GeometryInspectionRequest(source.source_asset, (carrier.spec.geometry.body_id.value,)),
+        source,
+    ).source_asset.content_digest == source.source_asset.content_digest
+    registration = PlanarPreparationRegistration(
+        "box-current",
+        source.source_asset.content_digest,
+        carrier.spec.geometry.geometry_digest,
+        original.artifact_digest,
+        original.provenance.mesh_recipe_digest,
+        carrier.spec.mesh_policy.quality_profile,
+        (fixtures._evidence("mesh.admission", "box-admission"),),
+        "0" * 32,
+    )
+    assert decode_mesh_quality(registration.to_bytes()).to_bytes() == registration.to_bytes()
+    revision = replace(
+        carrier,
+        case_id="case-box",
+        revision_id="revision-box",
+        spec=replace(
+            carrier.spec,
+            mesh_policy=replace(carrier.spec.mesh_policy, quality_profile=registration.reference),
+        ),
+    )
+    _, receipt = RegisteredCaseService._adopt_planar_mesh(
+        registration, original, carrier, revision
+    )
+    assert receipt["operation"] == "explicit-planar-metadata-adoption"
+
+    selection = revision.spec.rigid_tool.contact_surface
+    resolution = selection.resolution
+    assert resolution is not None
+    face = resolution.faces[0]
+    altered = replace(
+        selection,
+        resolution=replace(
+            resolution,
+            faces=(
+                replace(face, area=Quantity(face.area.value * 2, face.area.unit)),
+                *resolution.faces[1:],
+            ),
+        ),
+    )
+    changed = replace(
+        revision,
+        spec=replace(
+            revision.spec,
+            rigid_tool=replace(revision.spec.rigid_tool, contact_surface=altered),
+            contact=replace(revision.spec.contact, tool_surface=altered),
+        ),
+    )
+    with pytest.raises(ValueError, match="resolved selection snapshot"):
+        RegisteredCaseService._adopt_planar_mesh(registration, original, carrier, changed)

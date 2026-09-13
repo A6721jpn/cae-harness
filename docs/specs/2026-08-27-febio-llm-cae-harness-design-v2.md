@@ -965,3 +965,26 @@ kill-on-close, retained-handle cleanup and zero-active-process drain remain inta
 Runner allocation follows the bundle thread count already checked against the
 case budget; preparation follows its resolved CPU allocation. Library thread
 environment variables remain controls, not proof of the operating-system bound.
+
+### Motion-scaled native sign-calibration control
+
+The controlled low-penalty planar sign probe is not a physical contact-quality
+qualification. Its endpoint geometric-overlap interval remains
+`[1e-6, 1.1e-5] m`. At an intermediate saved state, multiply both endpoints by
+the declared approach displacement divided by its declared final value. Use the
+frozen motion schedule, never measured overlap or fitted solver output, for this
+scale. Require a positive final approach, a valid nonnegative monotone schedule
+and a declared sample for every saved state before launch.
+
+Check every positive-approach state against its scaled interval; do not exclude
+early states or classify failed positive-approach samples as zero-contact evidence.
+Zero-approach states retain their explicit zero test. Unique signed-gap residual
+criteria, traction tolerances, positive-sample requirements, physical inputs and
+the two declared solver-control overrides remain unchanged.
+
+Calibration05 remains FAILED: its first declared approach is approximately
+`1e-6 m`, so applying the endpoint's `1e-6 m` lower bound at that state leaves
+no allowance for elastic displacement. Its recorded-output diagnostic does not
+convert that execution to PASS. A revised protocol requires new immutable
+identities, independent review and a separate bounded release; no automatic
+numerical tuning or reuse of failed output as a fresh successful run is allowed.

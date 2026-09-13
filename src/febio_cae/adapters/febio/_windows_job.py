@@ -62,6 +62,14 @@ def _kernel() -> Any:
             [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD],
             wintypes.BOOL,
         ),
+        "GetProcessAffinityMask": (
+            [
+                wintypes.HANDLE,
+                ctypes.POINTER(ctypes.c_size_t),
+                ctypes.POINTER(ctypes.c_size_t),
+            ],
+            wintypes.BOOL,
+        ),
         "AssignProcessToJobObject": ([wintypes.HANDLE, wintypes.HANDLE], wintypes.BOOL),
         "QueryInformationJobObject": (
             [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p],
@@ -98,11 +106,14 @@ class WindowsJobProcess:
         *,
         environment: dict[str, str] | None = None,
         memory_limit_bytes: int | None = None,
+        cpu_workers: int | None = None,
     ) -> None:
         if memory_limit_bytes is not None and (
             type(memory_limit_bytes) is not int or memory_limit_bytes <= 0
         ):
             raise ValueError("memory_limit_bytes must be a positive integer")
+        if cpu_workers is not None and (type(cpu_workers) is not int or cpu_workers <= 0):
+            raise ValueError("cpu_workers must be a positive integer")
         self._api = _kernel()
         self._win = importlib.import_module("_winapi")
         self._job: int | None = None
@@ -123,13 +134,30 @@ class WindowsJobProcess:
                 limits.basic.flags |= 0x100 | 0x200  # PROCESS_MEMORY | JOB_MEMORY
                 limits.process_memory = memory_limit_bytes
                 limits.job_memory = memory_limit_bytes
+            msvcrt = importlib.import_module("msvcrt")
+            current = self._win.GetCurrentProcess()
+            if cpu_workers is not None:
+                process_mask, system_mask = ctypes.c_size_t(), ctypes.c_size_t()
+                self._check(
+                    self._api.GetProcessAffinityMask(
+                        current, ctypes.byref(process_mask), ctypes.byref(system_mask)
+                    )
+                )
+                available = int(process_mask.value)
+                selected = 0
+                while available and selected.bit_count() < cpu_workers:
+                    bit = available & -available
+                    selected |= bit
+                    available &= ~bit
+                if not selected:
+                    raise OSError("launch process has no available CPU affinity")
+                limits.basic.flags |= 0x10  # JOB_OBJECT_LIMIT_AFFINITY.
+                limits.basic.affinity = selected
             self._check(
                 self._api.SetInformationJobObject(
                     self._job, 9, ctypes.byref(limits), ctypes.sizeof(limits)
                 )
             )
-            msvcrt = importlib.import_module("msvcrt")
-            current = self._win.GetCurrentProcess()
             with open(os.devnull, "rb") as stdin:
                 for stream in (stdin, stdout, stderr):
                     inherited.append(

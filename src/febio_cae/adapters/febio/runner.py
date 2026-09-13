@@ -363,7 +363,12 @@ class RunnerAdapter:
             try:
                 return (
                     WindowsJobProcess(
-                        tuple(bundle.argv), attempt_root, stdout, stderr, environment=environment
+                        tuple(bundle.argv),
+                        attempt_root,
+                        stdout,
+                        stderr,
+                        environment=environment,
+                        cpu_workers=bundle.thread_count,
                     ),
                     stdout,
                     stderr,

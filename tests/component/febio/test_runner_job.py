@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import ctypes
+import io
+import json
 import os
 import subprocess
 import sys
@@ -13,8 +15,9 @@ from typing import Any
 
 import pytest
 
+from febio_cae.adapters.febio import _windows_job as windows_job_module
 from febio_cae.adapters.febio import runner as runner_module
-from febio_cae.domain import Quantity, RunState
+from febio_cae.domain import PortError, Quantity, RunState
 
 from .runner_fixture import _compiled, _owner, _Ownership
 
@@ -31,6 +34,21 @@ def _until(predicate: Any, seconds: float = 5) -> None:
     while not predicate():
         assert time.monotonic() < deadline, "bounded fixture observation expired"
         time.sleep(0.02)
+
+
+def _current_affinity() -> int:
+    api = ctypes.WinDLL("kernel32", use_last_error=True)
+    api.GetProcessAffinityMask.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.POINTER(ctypes.c_size_t),
+    ]
+    api.GetProcessAffinityMask.restype = ctypes.c_int
+    process_mask, system_mask = ctypes.c_size_t(), ctypes.c_size_t()
+    assert api.GetProcessAffinityMask(
+        ctypes.c_void_p(-1), ctypes.byref(process_mask), ctypes.byref(system_mask)
+    )
+    return int(process_mask.value)
 
 
 @pytest.fixture(autouse=True)
@@ -65,7 +83,9 @@ def _cleanup(runner: Any, attempt: Any) -> None:
     if runner._managed:
         managed = next(iter(runner._managed.values()))
         managed.process.terminate_tree()
-        _until(lambda: managed.process.active_processes() == 0)
+        _until(
+            lambda: managed.process.active_processes() == 0 and managed.process.poll() is not None
+        )
         managed.process.close()
         managed.stdout.close()
         managed.stderr.close()
@@ -220,3 +240,107 @@ def test_assignment_failure_never_executes_and_releases_handles(
     print(
         "assignment failure: suspended root terminated by retained handle before resume; handles closed"
     )
+
+
+def test_cpu_affinity_bounds_root_and_descendant_and_drains(tmp_path: Path) -> None:
+    allowed = _current_affinity()
+    if allowed.bit_count() < 2:
+        pytest.skip("host process is limited to one CPU; subset bound is not observable")
+    child = (
+        "import ctypes,json,os,time;from pathlib import Path;"
+        "api=ctypes.WinDLL('kernel32',use_last_error=True);"
+        "api.GetProcessAffinityMask.argtypes=[ctypes.c_void_p,ctypes.POINTER(ctypes.c_size_t),"
+        "ctypes.POINTER(ctypes.c_size_t)];api.GetProcessAffinityMask.restype=ctypes.c_int;"
+        "p=ctypes.c_size_t();s=ctypes.c_size_t();"
+        "assert api.GetProcessAffinityMask(ctypes.c_void_p(-1),ctypes.byref(p),ctypes.byref(s));"
+        "report=Path('output/descendant-affinity.json');temporary=report.with_suffix('.tmp');"
+        "temporary.write_text(json.dumps({'mask':p.value}));temporary.replace(report);\n"
+        "deadline=time.monotonic()+15\n"
+        "while not Path('output/release-descendant').exists():\n"
+        "    if time.monotonic() >= deadline: raise TimeoutError('descendant release expired')\n"
+        "    time.sleep(.01)\n"
+    )
+    code = (
+        "import ctypes,json,subprocess,sys,time;from pathlib import Path;"
+        "api=ctypes.WinDLL('kernel32',use_last_error=True);"
+        "api.GetProcessAffinityMask.argtypes=[ctypes.c_void_p,ctypes.POINTER(ctypes.c_size_t),"
+        "ctypes.POINTER(ctypes.c_size_t)];api.GetProcessAffinityMask.restype=ctypes.c_int;"
+        "p=ctypes.c_size_t();s=ctypes.c_size_t();"
+        "assert api.GetProcessAffinityMask(ctypes.c_void_p(-1),ctypes.byref(p),ctypes.byref(s));"
+        "report=Path('output/root-affinity.json');temporary=report.with_suffix('.tmp');"
+        "temporary.write_text(json.dumps({'mask':p.value}));temporary.replace(report);"
+        f"subprocess.Popen([sys.executable,'-c',{child!r}])"
+    )
+    runner, attempt = _start(tmp_path, code, budget_seconds=20)
+    managed = next(iter(runner._managed.values()))
+    process = managed.process
+    try:
+        root_file = managed.attempt_root / "output/root-affinity.json"
+        child_file = managed.attempt_root / "output/descendant-affinity.json"
+        _until(lambda: root_file.exists() and child_file.exists())
+        root_mask = json.loads(root_file.read_text())["mask"]
+        child_mask = json.loads(child_file.read_text())["mask"]
+        for observed in (root_mask, child_mask):
+            assert observed and observed & ~allowed == 0 and observed.bit_count() <= 1
+        _until(lambda: process.poll() == 0)
+        draining = runner.poll(attempt, _owner()).attempt
+        assert draining.state is RunState.DRAINING
+        assert process.active_processes() >= 1
+        (managed.attempt_root / "output/release-descendant").touch(exist_ok=False)
+        _until(lambda: process.active_processes() == 0)
+        assert runner.reconcile(draining, _owner()).attempt.state is RunState.VALIDATING
+        assert process.closed and not runner._managed
+        print(
+            f"CPU bound: parent=0x{allowed:x}, root=0x{root_mask:x}, "
+            f"descendant=0x{child_mask:x}; root exited, descendant drained, job closed"
+        )
+    finally:
+        _cleanup(runner, attempt)
+
+
+def test_unavailable_cpu_affinity_refuses_before_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    queried: list[bool] = []
+    original_kernel = windows_job_module._kernel
+
+    def unavailable_kernel() -> Any:
+        api = original_kernel()
+
+        def unavailable(*args: Any) -> int:
+            del args
+            queried.append(True)
+            return 0
+
+        api.GetProcessAffinityMask = unavailable
+        return api
+
+    monkeypatch.setattr(windows_job_module, "_kernel", unavailable_kernel)
+    marker = tmp_path / "must-not-execute"
+    runner = None
+    attempt = None
+    try:
+        with pytest.raises(PortError):
+            runner, attempt = _start(
+                tmp_path, f"from pathlib import Path;Path({str(marker)!r}).touch()"
+            )
+        assert queried == [True]
+        assert not marker.exists()
+    finally:
+        if runner is not None:
+            _cleanup(runner, attempt)
+
+
+@pytest.mark.parametrize("value", [True, 0, -1, 1.5])
+def test_cpu_workers_validation_precedes_windows_setup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: Any
+) -> None:
+    monkeypatch.setattr(
+        windows_job_module,
+        "_kernel",
+        lambda: pytest.fail("invalid CPU allocation reached Windows setup"),
+    )
+    with pytest.raises(ValueError, match="cpu_workers"):
+        windows_job_module.WindowsJobProcess(
+            (sys.executable,), tmp_path, io.BytesIO(), io.BytesIO(), cpu_workers=value
+        )

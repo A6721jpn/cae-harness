@@ -800,3 +800,17 @@ evidence or authorized real-model/BottomFrame acceptance.
 - Independently review exact source commits, then run the final local gates
   and fresh installed native acceptance. None of these source changes waive
   native geometry, physics, live-LLM or authorized real-model qualification.
+
+### Controlled sign-probe correction after calibration05
+
+- Preserve calibration05's failed receipt, successful solver drain and fresh
+  registered-reader evidence separately. The overall calibration did not pass.
+- Validate the motion-scaled overlap rule from the design against the declared
+  saved-state schedule before release, including nonzero elastic displacement
+  at an early state. Keep endpoint bounds and gap/traction criteria unchanged.
+- Freeze a fresh protocol without changing material, geometry, motion, mesh or
+  the declared solver controls. Correct the archived decoder-attribution label
+  in the new version; do not rewrite old records.
+- Independently review its exact artifacts, then release at most one new bounded
+  native attempt. Recorded-output diagnostics are not that new execution and
+  cannot establish public physical/profile or full-E2E qualification.

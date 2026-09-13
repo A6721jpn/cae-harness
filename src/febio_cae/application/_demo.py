@@ -1,4 +1,4 @@
-"""Concrete private planar-demo composition over registered native GM03 evidence."""
+"""Concrete private execution composition over registered preparation evidence."""
 
 from __future__ import annotations
 
@@ -44,7 +44,7 @@ from febio_cae.domain.codec import decode_record, encode_record
 from febio_cae.domain.lifecycle import TaskStatus
 from febio_cae.domain.results import surface_node_entity_id
 from febio_cae.storage import CaseStorage
-from febio_cae.storage.mesh_quality import PlanarDemoRegistration, PlanarPreparationRegistration
+from febio_cae.storage.mesh_quality import CurrentPreparationRegistration, PlanarDemoRegistration
 
 from ._required_quality import required_quality_summary
 
@@ -248,13 +248,14 @@ def run_demo(
 
     revision = storage.get_revision(case_id, revision_id)
     registration = storage.resolve_revision_mesh_quality(revision)
-    if not isinstance(registration, PlanarDemoRegistration):
+    if not isinstance(registration, (PlanarDemoRegistration, CurrentPreparationRegistration)):
         raise PortError(
-            PortErrorCategory.INVALID_INPUT, "run-demo requires registered planar admission"
+            PortErrorCategory.INVALID_INPUT,
+            "run-demo requires a registered preparation admission",
         )
     mesh = service._planar_execution_mesh(storage, registration, revision)
     service._verify_execution_mesh(storage, registration, revision, mesh)
-    if isinstance(registration, PlanarPreparationRegistration):
+    if isinstance(registration, CurrentPreparationRegistration):
         from febio_cae.storage.preparation import PreparationStore
 
         from ._preparation import geometry_from_output
@@ -262,6 +263,8 @@ def run_demo(
         geometry = geometry_from_output(
             PreparationStore(storage).origin_output(registration, revision),
             storage.resolve_source(storage.source_asset("cad")),
+            expected_primitive=revision.spec.rigid_tool.primitive,
+            expected_tool_geometry_digest=revision.spec.rigid_tool.contact_surface.geometry_digest,
         )
     else:
         geometry = recorded_geometry(storage, registration)
@@ -273,7 +276,7 @@ def run_demo(
         raise ValueError("solver executable differs from registered identity")
     reader_payload = Path(xplt_reader.__file__).read_bytes()
     if hashlib.sha256(reader_payload).hexdigest() != profile.reader.executable_digest or (
-        not isinstance(registration, PlanarPreparationRegistration)
+        not isinstance(registration, CurrentPreparationRegistration)
         and reader_payload != source("registered-reader-source")
     ):
         raise ValueError("active reader bytes differ from registered identity")
@@ -309,7 +312,7 @@ def run_demo(
     if preflight:
         with storage.evidence_snapshot(), storage.revision_snapshot(case_id, revision_id):
             validated = service._validate(case_id)
-            if isinstance(registration, PlanarPreparationRegistration):
+            if isinstance(registration, CurrentPreparationRegistration):
                 draft = validated.draft
                 if (
                     validated.status != "VALIDATED"

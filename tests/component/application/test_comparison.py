@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
 import sqlite3
 from dataclasses import replace
 from pathlib import Path
@@ -60,7 +61,30 @@ FIXED = (
 )
 
 
-def _configure(service: Any, spec: Any) -> Any:
+def _configure(
+    service: Any, spec: Any, *, source_digest: str | None = None
+) -> Any:
+    def bind_profile_evidence(profile: Any) -> Any:
+        if source_digest is None:
+            return profile
+        capabilities = tuple(
+            replace(
+                capability,
+                evidence=tuple(
+                    replace(item, content_digest=source_digest)
+                    for item in capability.evidence
+                ),
+            )
+            for capability in profile.capabilities
+        )
+        return replace(
+            profile,
+            capabilities=capabilities,
+            evidence=tuple(
+                replace(item, content_digest=source_digest) for item in profile.evidence
+            ),
+        )
+
     profile = replace(
         _profile("comparison-synthetic"),
         output_mappings=(
@@ -88,6 +112,7 @@ def _configure(service: Any, spec: Any) -> Any:
             ),
         ),
     )
+    profile = bind_profile_evidence(profile)
     service.register_profile(profile)
     digest = hashlib.sha256(profile.to_bytes()).hexdigest()
 
@@ -114,6 +139,7 @@ def _configure(service: Any, spec: Any) -> Any:
     criterion = replace(
         spec.quality_policy.criteria[0],
         metric_id="peak_abs_value",
+        evaluation_ids=(evaluation.evaluation_id,),
         thresholds=(QualityThreshold("max_value", Quantity(1e-4, "m")),),
     )
     return replace(
@@ -449,3 +475,129 @@ def test_comparison_refuses_incompatible_or_ineligible_results(tmp_path: Path, d
     assert not (
         created.case_root / f"cases/{created.case_id}/comparisons/comparison-one/comparison.json"
     ).exists()
+
+
+def test_current_prepared_box_is_an_explicit_comparison_origin(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    from types import SimpleNamespace
+
+    from test_planar_preparation import _isolate, prepared_input
+
+    from febio_cae.application import _comparison
+    from febio_cae.application._preparation_request import normalize_request
+    from febio_cae.domain import CasePatch, CasePatchEdit
+    from febio_cae.storage.comparison import target
+    from febio_cae.storage.mesh_quality import PlanarPreparationRegistration
+    from febio_cae.storage.preparation import PreparationStore
+
+    service, created, request, backend, _ = prepared_input.__wrapped__(tmp_path, monkeypatch)
+    _isolate(monkeypatch, backend)
+    storage = service._storage(created.case_id)
+    source_digest = storage.source_asset("cad").content_digest
+    configured = _configure(
+        service,
+        normalize_request(request).values.to_case_spec(),
+        source_digest=source_digest,
+    )
+    request["values"] = configured.to_dict()
+
+    def bind_evidence(value: Any) -> None:
+        if isinstance(value, dict):
+            if {"reference", "target_field", "content_digest"} <= value.keys():
+                value["reference"] = "cad"
+                value["content_digest"] = source_digest
+            if value.get("body_id") == request["values"]["geometry"]["body_id"]:
+                if "geometry_digest" in value:
+                    value["geometry_digest"] = None
+            if "inspection_digest" in value:
+                value["inspection_digest"] = None
+            for child in value.values():
+                bind_evidence(child)
+        elif isinstance(value, list):
+            for child in value:
+                bind_evidence(child)
+
+    bind_evidence(request["values"])
+
+    prepared = service.prepare_planar(created.case_id, request, expected_generation=0)
+    parent = service.get_revision(created.case_id, prepared["revision_id"])
+    registration = storage.resolve_revision_mesh_quality(parent)
+    assert isinstance(registration, PlanarPreparationRegistration)
+    origin_store = PreparationStore(storage)
+    origin = origin_store.origin(registration, parent)
+    stored_output = origin_store.origin_output(registration, parent)
+    assert origin == parent
+    assert stored_output["adoption"]["operation"] == "explicit-planar-metadata-adoption"
+    assert service._planar_execution_mesh(storage, registration, parent).to_dict() == stored_output[
+        "mesh"
+    ]
+
+    baseline = _result(service, storage, parent, "baseline", (0, 0.5, 1), 1)
+    material = replace(parent.spec.material, youngs_modulus=Quantity(2e6, "Pa"))
+    service.apply_patch(
+        created.case_id,
+        CasePatch(
+            parent.revision_id,
+            parent.spec_digest,
+            (CasePatchEdit("material", material, True),),
+            (replace(_evidence("material.youngs_modulus"), content_digest=source_digest),),
+        ),
+    )
+    child = service.freeze_case(created.case_id).revision
+    assert child is not None
+    candidate = _result(service, storage, child, "candidate", (0, 0.25, 0.75, 1), 1.5)
+    interval = ComparisonInterval("m", 0, 1e-5)
+    spec = ComparisonSpec(
+        "comparison-current-prepared",
+        baseline.manifest_id,
+        candidate.manifest_id,
+        ("material.youngs_modulus",),
+        FIXED,
+        (
+            ComparisonAxis(
+                "tool_compression.force_z",
+                "m",
+                child.spec.rigid_tool.primitive.body_id.value,
+                "contact_force.world_z",
+                "identity",
+                interval,
+                "linear",
+            ),
+            ComparisonAxis(
+                "tool_compression.part_peak_abs_displacement_z",
+                "m",
+                child.spec.geometry.body_id.value,
+                "displacement.world_z",
+                "peak_abs",
+                interval,
+                "linear",
+            ),
+        ),
+    )
+    result = service.compare_case(
+        created.case_id,
+        spec,
+        baseline_run_id="run-baseline",
+        candidate_run_id="run-candidate",
+    )
+    assert result["status"] == "COMPARED"
+    assert result["comparison"]["sources"][0]["root_mesh_digest"] == (
+        registration.original_mesh_digest
+    )
+
+    baseline_target = target(storage, baseline.manifest_id, "run-baseline")
+    curved_item = replace(
+        baseline_target,
+        revision=SimpleNamespace(
+            case_id=baseline_target.revision.case_id,
+            revision_id=baseline_target.revision.revision_id,
+            to_bytes=baseline_target.revision.to_bytes,
+            spec=SimpleNamespace(
+                rigid_tool=SimpleNamespace(primitive=SimpleNamespace(kind="sphere")),
+                mesh_policy=baseline_target.revision.spec.mesh_policy,
+            ),
+        ),
+    )
+    with pytest.raises(PortError, match="explicit planar box"):
+        _comparison._eligible(service, storage, curved_item)
