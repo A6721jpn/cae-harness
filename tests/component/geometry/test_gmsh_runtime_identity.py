@@ -574,14 +574,26 @@ def test_verified_load_rejects_pre_admission_ctypes_resolver_tampering(
         runtime.load_verified_gmsh(expected)
 
 
+def test_verified_load_rejects_pre_admission_ctypes_cast_code_tampering(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    expected, _library = _synthetic_cdll_setup(monkeypatch, tmp_path)
+
+    def replacement(*args: Any, **kwargs: Any) -> Any:
+        del args, kwargs
+        return None
+
+    monkeypatch.setattr(ctypes.cast, "__code__", replacement.__code__)
+
+    with pytest.raises((OSError, ValueError), match="ctypes|cast|code|dispatch"):
+        runtime.load_verified_gmsh(expected)
+
+
 def test_verified_load_rejects_cast_errcheck_before_pointer_use(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     expected, _library = _synthetic_cdll_setup(monkeypatch, tmp_path)
     loaded, _ = runtime.load_verified_gmsh(expected)
-    native = _synthetic_native_callable()
-    _install_synthetic_native_export(monkeypatch, loaded, "gmshIsInitialized", native)
-    runtime.load_verified_gmsh(expected)
 
     marker = tmp_path / "unsafe-cast-called"
     def errcheck(result: Any, function: Any, arguments: Any) -> Any:
@@ -589,10 +601,208 @@ def test_verified_load_rejects_cast_errcheck_before_pointer_use(
         marker.write_text("called", encoding="ascii")
         return result
 
-    native.errcheck = errcheck
+    try:
+        ctypes._cast.errcheck = errcheck
+        with pytest.raises((OSError, ValueError)):
+            runtime.load_verified_gmsh(expected)
+        assert not marker.exists()
+    finally:
+        del ctypes._cast.errcheck
 
-    with pytest.raises((OSError, ValueError)):
+
+def test_verified_load_rejects_cast_restype_callback_before_pointer_use(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    expected, _library = _synthetic_cdll_setup(monkeypatch, tmp_path)
+    loaded, _ = runtime.load_verified_gmsh(expected)
+    del loaded
+    marker = tmp_path / "unsafe-cast-restype-called"
+
+    def restype(*args: Any, **kwargs: Any) -> Any:
+        del args, kwargs
+        marker.write_text("called", encoding="ascii")
+        return None
+
+    original = ctypes._cast.restype
+    try:
+        ctypes._cast.restype = restype
+        with pytest.raises((OSError, ValueError)):
+            runtime.load_verified_gmsh(expected)
+        assert not marker.exists()
+    finally:
+        ctypes._cast.restype = original
+
+
+@pytest.mark.parametrize("replacement_kind", ["instance", "class"])
+def test_verified_load_rejects_unauthenticated_callable_dependency_before_import(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, replacement_kind: str
+) -> None:
+    marker = tmp_path / f"unsafe-callable-{replacement_kind}"
+    source = (
+        "import platform\n"
+        "platform.system()\n"
+        "__version__ = '4.15.2'\n"
+        "class Lib:\n"
+        "    _handle = 99\n"
+        "lib = Lib()\n"
+    )
+
+    if replacement_kind == "instance":
+
+        class CallableInstance:
+            def __call__(self) -> str:
+                marker.write_text("called", encoding="ascii")
+                return "Windows"
+
+        replacement: Any = CallableInstance()
+    else:
+
+        class CallableMeta(type):
+            def __call__(cls: type, *args: Any, **kwargs: Any) -> str:
+                del cls, args, kwargs
+                marker.write_text("called", encoding="ascii")
+                return "Windows"
+
+        class CallableClass(metaclass=CallableMeta):
+            pass
+
+        replacement = CallableClass
+
+    monkeypatch.setattr(platform, "system", replacement)
+    expected, _library = _synthetic_cdll_setup(monkeypatch, tmp_path)
+    module = expected["module"]
+    assert isinstance(module, dict)
+    module_path = Path(module["path"])
+    module_path.write_text(source, encoding="utf-8")
+    expected["module"] = {
+        "path": str(module_path.resolve()),
+        "size": module_path.stat().st_size,
+        "sha256": hashlib.sha256(module_path.read_bytes()).hexdigest(),
+    }
+
+    with pytest.raises((OSError, ValueError), match="dependency|callable|import"):
         runtime.load_verified_gmsh(expected)
+    assert not marker.exists()
+
+
+def test_verified_load_rejects_recursive_module_dependency_before_import(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    marker = tmp_path / "unsafe-recursive-signal"
+    source = (
+        "import signal\n"
+        "signal.signal(signal.SIGINT, None)\n"
+        "__version__ = '4.15.2'\n"
+        "class Lib:\n"
+        "    _handle = 99\n"
+        "lib = Lib()\n"
+    )
+
+    def poisoned(*args: Any, **kwargs: Any) -> Any:
+        del args, kwargs
+        marker.write_text("called", encoding="ascii")
+        return None
+
+    signal_module = signal.signal.__globals__["_signal"]
+    monkeypatch.setattr(signal_module, "signal", poisoned)
+    expected, _library = _synthetic_cdll_setup(monkeypatch, tmp_path)
+    module = expected["module"]
+    assert isinstance(module, dict)
+    module_path = Path(module["path"])
+    module_path.write_text(source, encoding="utf-8")
+    expected["module"] = {
+        "path": str(module_path.resolve()),
+        "size": module_path.stat().st_size,
+        "sha256": hashlib.sha256(module_path.read_bytes()).hexdigest(),
+    }
+
+    with pytest.raises((OSError, ValueError), match="dependency|source|owner|callable"):
+        runtime.load_verified_gmsh(expected)
+    assert not marker.exists()
+
+
+def test_verified_load_rejects_dependency_dict_descriptor_without_execution(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    marker = tmp_path / "unsafe-dependency-dict"
+    source = (
+        "import numpy\n"
+        "numpy.ctypeslib.as_array(())\n"
+        "__version__ = '4.15.2'\n"
+        "class Lib:\n"
+        "    _handle = 99\n"
+        "lib = Lib()\n"
+    )
+
+    class DescriptorNamespace:
+        @property
+        def __dict__(self) -> dict[str, object]:
+            marker.write_text("called", encoding="ascii")
+            return {}
+
+    numpy = ModuleType("numpy")
+    numpy.ctypeslib = DescriptorNamespace()
+    monkeypatch.setitem(sys.modules, "numpy", numpy)
+    monkeypatch.setitem(sys.modules, "numpy.ctypeslib", numpy.ctypeslib)
+    expected, _library = _synthetic_cdll_setup(monkeypatch, tmp_path)
+    module = expected["module"]
+    assert isinstance(module, dict)
+    module_path = Path(module["path"])
+    module_path.write_text(source, encoding="utf-8")
+    expected["module"] = {
+        "path": str(module_path.resolve()),
+        "size": module_path.stat().st_size,
+        "sha256": hashlib.sha256(module_path.read_bytes()).hexdigest(),
+    }
+
+    with pytest.raises((OSError, ValueError), match="dependency|available|module"):
+        runtime.load_verified_gmsh(expected)
+    assert not marker.exists()
+
+
+def test_ctypes_bootstrap_rejects_preexisting_cast_restype_callback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _isolated(monkeypatch)
+    marker = tmp_path / "unsafe-bootstrap-cast-restype"
+
+    def poisoned(*args: Any, **kwargs: Any) -> Any:
+        del args, kwargs
+        marker.write_text("called", encoding="ascii")
+        return None
+
+    with monkeypatch.context() as context:
+        context.setattr(ctypes._cast, "restype", poisoned)
+        with pytest.raises((OSError, ValueError), match="ctypes|cast|metadata|restype"):
+            runtime._build_ctypes_trust()
+    runtime._build_ctypes_trust()
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("target", ["CDLL", "WinDLL"])
+def test_ctypes_bootstrap_rejects_custom_dispatch_descriptor(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, target: str
+) -> None:
+    _isolated(monkeypatch)
+    marker = tmp_path / f"unsafe-bootstrap-{target.lower()}-dispatch"
+
+    class CallableDescriptor:
+        def __get__(self, instance: Any, owner: type | None = None) -> Any:
+            del instance, owner
+            marker.write_text("called", encoding="ascii")
+            return None
+
+        def __call__(self, *args: Any, **kwargs: Any) -> Any:
+            del args, kwargs
+            marker.write_text("called", encoding="ascii")
+            return None
+
+    owner = getattr(ctypes, target)
+    with monkeypatch.context() as context:
+        context.setattr(owner, "__getattribute__", CallableDescriptor())
+        with pytest.raises((OSError, ValueError), match="ctypes|descriptor|dispatch"):
+            runtime._build_ctypes_trust()
+    runtime._build_ctypes_trust()
     assert not marker.exists()
 
 
@@ -1649,6 +1859,58 @@ def test_verified_load_rejects_function_builtins_mapping_mismatch(
     sys.modules.pop("gmsh", None)
 
     with pytest.raises((OSError, ValueError)):
+        runtime.load_verified_gmsh(expected)
+    assert not marker.exists()
+
+
+def test_verified_load_rejects_forged_function_actual_builtins(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _isolated(monkeypatch)
+    marker = tmp_path / "unsafe-forged-builtin-called"
+    source = (
+        "__version__ = '4.15.2'\n"
+        "def poisoned(value):\n"
+        "    __import__('pathlib').Path(_marker).write_text('called', encoding='ascii')\n"
+        "    return False\n"
+        "def uses_bool(value):\n"
+        "    return bool(value)\n"
+        "def forge():\n"
+        "    namespace = dict(globals())\n"
+        "    poisoned_builtins = dict(namespace['__builtins__'])\n"
+        "    poisoned_builtins['bool'] = poisoned\n"
+        "    forged_globals = dict(namespace)\n"
+        "    forged_globals['__builtins__'] = poisoned_builtins\n"
+        "    forged = __import__('types').FunctionType(\n"
+        "        uses_bool.__code__, forged_globals, uses_bool.__name__, uses_bool.__defaults__\n"
+        "    )\n"
+        "    forged_globals['__builtins__'] = namespace['__builtins__']\n"
+        "    return forged\n"
+        "uses_bool = forge()\n"
+        "class Lib:\n"
+        "    _handle = 99\n"
+        "lib = Lib()\n"
+        "_marker = "
+        + repr(str(marker))
+        + "\n"
+    )
+    module, _library, launcher, image, python_library = _files(tmp_path, source)
+    expected = _binding(tmp_path, module=module, library=_library)
+    monkeypatch.setattr(
+        runtime,
+        "_current_process_binding",
+        lambda: {
+            "python": _identity(launcher),
+            "python_image": _identity(image),
+            "python_library": _identity(python_library),
+            "pyvenv_cfg": None,
+        },
+    )
+    monkeypatch.setattr(runtime, "_mapped_module_path", lambda handle: _library)
+    monkeypatch.syspath_prepend(str(module.parent))
+    sys.modules.pop("gmsh", None)
+
+    with pytest.raises((OSError, ValueError), match="builtins|function|dependency"):
         runtime.load_verified_gmsh(expected)
     assert not marker.exists()
 
