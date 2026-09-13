@@ -16,7 +16,7 @@ import uuid
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
-from typing import BinaryIO
+from typing import Any, BinaryIO
 
 
 def identity(path: Path) -> tuple[int, int]:
@@ -24,24 +24,47 @@ def identity(path: Path) -> tuple[int, int]:
     return info.st_dev, info.st_ino
 
 
+_api_lock = threading.Lock()
+_kernel32: Any | None = None
+_create_file: Any | None = None
+_close_handle: Any | None = None
+
+
+def _win32_api() -> tuple[Any, Any]:
+    global _close_handle, _create_file, _kernel32
+    if _create_file is None or _close_handle is None:
+        with _api_lock:
+            if _create_file is None or _close_handle is None:
+                from ctypes import wintypes
+
+                kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+                create = kernel.CreateFileW
+                create.argtypes = [
+                    wintypes.LPCWSTR,
+                    wintypes.DWORD,
+                    wintypes.DWORD,
+                    ctypes.c_void_p,
+                    wintypes.DWORD,
+                    wintypes.DWORD,
+                    wintypes.HANDLE,
+                ]
+                create.restype = wintypes.HANDLE
+                close = kernel.CloseHandle
+                close.argtypes = [wintypes.HANDLE]
+                close.restype = wintypes.BOOL
+                _kernel32 = kernel
+                _create_file = create
+                _close_handle = close
+    assert _create_file is not None and _close_handle is not None
+    return _create_file, _close_handle
+
+
 def _open(path: Path, *, directory: bool = False, writable: bool = False) -> int:
     if os.name != "nt":
         raise OSError("registered storage requires Windows handle identity protection")
     import msvcrt
-    from ctypes import wintypes
 
-    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-    create = kernel.CreateFileW
-    create.argtypes = [
-        wintypes.LPCWSTR,
-        wintypes.DWORD,
-        wintypes.DWORD,
-        ctypes.c_void_p,
-        wintypes.DWORD,
-        wintypes.DWORD,
-        wintypes.HANDLE,
-    ]
-    create.restype = wintypes.HANDLE
+    create, close = _win32_api()
     access = 0x80000000 | (0x40000000 if writable else 0)
     share = 3 if directory or writable else 1  # never FILE_SHARE_DELETE
     flags = 0x00200000 | (0x02000000 if directory else 0)  # OPEN_REPARSE_POINT
@@ -54,8 +77,6 @@ def _open(path: Path, *, directory: bool = False, writable: bool = False) -> int
             raise OSError(f"reparse point is outside registered storage: {path}")
         return msvcrt.open_osfhandle(handle, os.O_BINARY | (os.O_RDWR if writable else os.O_RDONLY))
     except BaseException:
-        close = kernel.CloseHandle
-        close.argtypes = [wintypes.HANDLE]
         close(handle)
         raise
 
