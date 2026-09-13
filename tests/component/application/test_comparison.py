@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
 import sqlite3
 from dataclasses import replace
 from pathlib import Path
@@ -449,3 +450,109 @@ def test_comparison_refuses_incompatible_or_ineligible_results(tmp_path: Path, d
     assert not (
         created.case_root / f"cases/{created.case_id}/comparisons/comparison-one/comparison.json"
     ).exists()
+
+
+def test_current_prepared_box_is_an_explicit_comparison_origin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    from febio_cae.application import _comparison
+    from febio_cae.domain import AsPlaced, PortError
+    from febio_cae.storage.mesh_quality import CurrentPreparationRegistration
+
+    source_digest = "a" * 64
+    geometry_digest = "b" * 64
+    spec = SimpleNamespace(
+        geometry=SimpleNamespace(
+            source_step_digest=source_digest,
+            geometry_digest=geometry_digest,
+        ),
+        rigid_tool=SimpleNamespace(primitive=SimpleNamespace(kind="box")),
+        contact=SimpleNamespace(arrangement=AsPlaced(_evidence("contact.arrangement"))),
+    )
+    current = CurrentPreparationRegistration(
+        "current-prepared",
+        source_digest,
+        geometry_digest,
+        "c" * 64,
+        "d" * 64,
+        NumericalProfileRef("mesh", "mesh_quality", "e" * 64),
+        (_evidence("mesh.admission"),),
+        "0" * 32,
+    )
+
+    class _Quality:
+        assessment_id = "quality-current"
+        overall_status = SimpleNamespace(value="PASS")
+
+        @staticmethod
+        def to_dict() -> dict[str, str]:
+            return {"status": "PASS"}
+
+    quality = _Quality()
+    revision = SimpleNamespace(
+        case_id="case-current",
+        revision_id="revision-current",
+        spec_digest="f" * 64,
+        spec=spec,
+        to_bytes=lambda: b"revision-current",
+    )
+    item = SimpleNamespace(
+        profile=SimpleNamespace(
+            profile_id="comparison-profile",
+            evidence=(),
+            capabilities=(),
+            to_bytes=lambda: b"comparison-profile",
+        ),
+        revision=revision,
+        mesh=SimpleNamespace(artifact_digest="1" * 64),
+        manifest=SimpleNamespace(
+            manifest_id="manifest-current", to_bytes=lambda: b"manifest-current"
+        ),
+        attempt=SimpleNamespace(
+            attempt_id="attempt-current",
+            run_id="run-current",
+            state=SimpleNamespace(value="SUCCEEDED"),
+        ),
+        bundle=SimpleNamespace(bundle_digest="2" * 64),
+    )
+    storage = SimpleNamespace(
+        resolve_revision_mesh_quality=lambda _revision: current,
+        source_asset=lambda _asset_id: SimpleNamespace(asset_id="quality-current"),
+        resolve_source=lambda _asset: SimpleNamespace(content=b"quality-record"),
+    )
+    service = SimpleNamespace(
+        compatibility=SimpleNamespace(get_profile=lambda _profile_id: item.profile),
+        _resolve_declarations=lambda *_args: None,
+    )
+    verified: list[str] = []
+
+    def verify(_storage: Any, registration: Any, revision: Any, mesh: Any) -> None:
+        assert registration is current
+        assert mesh is not None
+        verified.append(revision.revision_id)
+
+    service._verify_execution_mesh = verify
+    monkeypatch.setattr(
+        _comparison,
+        "QualityAdapter",
+        lambda: SimpleNamespace(assess=lambda *args: quality),
+    )
+    required = importlib.import_module("febio_cae.application._required_quality")
+    monkeypatch.setattr(required, "required_quality_summary", lambda *args: ("PASS", {}))
+    monkeypatch.setattr(_comparison, "encode_record", lambda _value: b"quality-record")
+
+    identity = _comparison._eligible(service, storage, item)
+    assert identity["root_mesh_digest"] == current.original_mesh_digest
+    assert verified == [revision.revision_id]
+    curved_spec = SimpleNamespace(
+        geometry=spec.geometry,
+        rigid_tool=SimpleNamespace(primitive=SimpleNamespace(kind="sphere")),
+        contact=spec.contact,
+    )
+    curved_revision = SimpleNamespace(**{**vars(revision), "spec": curved_spec})
+    curved_item = SimpleNamespace(**{**vars(item), "revision": curved_revision})
+    with pytest.raises(PortError, match="explicit planar box"):
+        _comparison._eligible(service, storage, curved_item)
+    assert verified == [revision.revision_id]

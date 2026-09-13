@@ -114,17 +114,14 @@ def geometry_from_output(
             raise ValueError("curved preparation requires its native tool record")
         try:
             native_inspection = inspection_from_dict(native_raw)
-            native_primitive = decode_record(
-                canonical_bytes(native_primitive_raw), RigidPrimitive
-            )
         except (TypeError, ValueError, OverflowError) as error:
             raise ValueError("preparation native tool record is malformed") from error
         if (
             canonical_bytes(native_inspection.to_dict()) != canonical_bytes(native_raw)
-            or canonical_bytes(native_primitive.to_dict()) != canonical_bytes(native_primitive_raw)
-            or native_primitive.to_bytes() != primitive.to_bytes()
+            or canonical_bytes(native_primitive_raw) != primitive.to_bytes()
         ):
             raise ValueError("preparation native tool record differs from the carrier")
+        native_primitive = primitive
     elif native_raw is not None or native_primitive_raw is not None:
         raise ValueError("flat-box preparation must not carry a native tool record")
     return StepGeometryMeshAdapter(

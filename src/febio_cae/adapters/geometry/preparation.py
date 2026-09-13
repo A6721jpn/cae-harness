@@ -133,6 +133,7 @@ class _MeasuredGmsh(GmshOCCBackend):
             GmshOCCConfig(expected_occt_version="7.8.1", require_step_ap214=True, cpu_workers=cpu)
         )
         self.evidence: dict[str, Any] = {}
+        self._native_context_depth = 0
 
     def _prepare_owned_session(self, gmsh: Any) -> None:
         super()._prepare_owned_session(gmsh)
@@ -152,11 +153,19 @@ class _MeasuredGmsh(GmshOCCBackend):
         self, gmsh: Any, body_id: str, volume_tag: int, native_scale_to_si: float
     ) -> tuple[BackendFace, ...]:
         faces = super()._inspect_faces(gmsh, body_id, volume_tag, native_scale_to_si)
-        for face in faces:
-            tag = int(face.face_id.rsplit("-", 1)[1])
-            if gmsh.model.getType(2, tag) != "Plane":
-                raise ValueError("public preparation currently requires planar STEP faces")
+        if self._native_context_depth == 0:
+            for face in faces:
+                tag = int(face.face_id.rsplit("-", 1)[1])
+                if gmsh.model.getType(2, tag) != "Plane":
+                    raise ValueError("public preparation currently requires planar STEP faces")
         return faces
+
+    def _primitive_context(self, gmsh: Any, volume_tag: int, primitive: RigidPrimitive) -> Any:
+        self._native_context_depth += 1
+        try:
+            return super()._primitive_context(gmsh, volume_tag, primitive)
+        finally:
+            self._native_context_depth -= 1
 
 
 def _make_backend(cpu: int) -> Any:
