@@ -76,3 +76,39 @@ def test_malformed_local_refinement_is_rejected_before_native_entry(
             local_refinements=(object(),),
         )
     assert error.value.category is BackendErrorCategory.INVALID_INPUT
+
+
+@pytest.mark.parametrize(
+    ("body_id", "frame"),
+    (
+        ("foreign-body", FrameId("ToolLocal")),
+        ("native-local-body", FrameId("World")),
+    ),
+    ids=("foreign-body", "placed-frame"),
+)
+def test_foreign_local_refinement_is_rejected_before_native_entry(
+    monkeypatch: pytest.MonkeyPatch, body_id: str, frame: FrameId
+) -> None:
+    from febio_cae.adapters.geometry.backend import BackendLocalRefinement
+
+    refinement = BackendLocalRefinement(
+        body_id=body_id,
+        frame=frame,
+        center_si=(0.0, 0.0, -0.01),
+        radius_si=0.004,
+        size_si=0.001,
+    )
+    backend = GmshOCCBackend(GmshOCCConfig(module_name="module-that-must-not-be-loaded"))
+
+    def forbidden_native_entry() -> Any:
+        pytest.fail("foreign refinement entered the native backend")
+
+    monkeypatch.setattr(backend, "_load_module", forbidden_native_entry)
+    with pytest.raises(BackendError) as error:
+        backend.mesh_rigid_primitive(
+            _primitive(),
+            geometry_digest="a" * 64,
+            global_size_si=0.005,
+            local_refinements=(refinement,),
+        )
+    assert error.value.category is BackendErrorCategory.INVALID_INPUT
