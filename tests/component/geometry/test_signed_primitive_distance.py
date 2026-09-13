@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import math
 import sys
+from fractions import Fraction
 from typing import Any
 
 import pytest
@@ -41,7 +42,6 @@ def test_sphere_minimum_finds_interior_penetration_between_outside_nodes() -> No
 def test_signed_radial_sqrt_subtracts_radius_before_float_conversion(kind: str) -> None:
     maximum = sys.float_info.max
     points: tuple[Point, ...] = ((maximum, maximum, 0.0),) * 6
-    expected = (math.sqrt(2.0) - 1.0) * maximum
 
     if kind == "sphere":
         lower, upper = _native_surface().primitive_face_minimum_signed_distance_interval(
@@ -60,9 +60,32 @@ def test_signed_radial_sqrt_subtracts_radius_before_float_conversion(kind: str) 
         )
 
     assert math.isfinite(lower) and math.isfinite(upper)
-    assert lower <= upper
-    assert math.isclose(lower, expected, rel_tol=1.0e-15)
-    assert math.isclose(upper, expected, rel_tol=1.0e-15)
+    exact_radius = Fraction(maximum)
+    translated_lower = Fraction(lower) + exact_radius
+    translated_upper = Fraction(upper) + exact_radius
+    assert 0 <= translated_lower <= translated_upper
+    assert translated_lower**2 <= 2 * exact_radius**2 <= translated_upper**2
+
+
+def test_signed_distance_rejects_unrepresentable_final_result() -> None:
+    points: tuple[Point, ...] = ((sys.float_info.max, sys.float_info.max, 0.0),) * 6
+
+    with pytest.raises(ValueError):
+        _native_surface().primitive_face_minimum_signed_distance_interval(
+            "sphere", points, radius_si=1.0, tolerance_si=1.0
+        )
+
+
+def test_box_center_encloses_nonzero_distance_below_float_range() -> None:
+    scale = math.ldexp(1.0, -1074)
+    points: tuple[Point, ...] = ((0.0, 0.0, 0.0),) * 6
+
+    lower, upper = _native_surface().primitive_face_minimum_signed_distance_interval(
+        "box", points, dimensions_si=(scale, scale, scale), tolerance_si=scale
+    )
+
+    assert Fraction(lower) <= -Fraction(scale) / 2 <= Fraction(upper)
+    assert -scale <= lower <= upper <= 0.0
 
 
 def test_signed_leaf_accepts_a_reversed_patch_orientation() -> None:
