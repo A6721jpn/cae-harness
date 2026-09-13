@@ -88,6 +88,7 @@ from .mesh_policy import (
     MeshPolicy,
     MeshPolicyValidationError,
     NumericalProfileRef,
+    SourceLocalRefinementBall,
 )
 from .motion import MotionApplicability, MotionProfile, MotionSample, MotionValidationError
 from .output_policy import (
@@ -377,6 +378,7 @@ __all__ = [
     "SourceAssetContent",
     "SourceAssetRef",
     "SourceAssetResolverPort",
+    "SourceLocalRefinementBall",
     "SpatialValidationError",
     "SpecifiedGap",
     "SupportCollection",

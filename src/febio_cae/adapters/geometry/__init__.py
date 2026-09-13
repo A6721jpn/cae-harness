@@ -10,10 +10,12 @@ from .backend import (
     BackendErrorCategory,
     BackendFace,
     BackendInspection,
+    BackendLocalRefinement,
     BackendMesh,
     BackendMeshFace,
     BackendNode,
     GeometryMeshBackend,
+    NativeCurvedGeometryBackend,
 )
 from .gmsh_occ import GmshOCCBackend, GmshOCCConfig
 
@@ -26,6 +28,7 @@ __all__ = [
     "BackendErrorCategory",
     "BackendFace",
     "BackendInspection",
+    "BackendLocalRefinement",
     "BackendMesh",
     "BackendMeshFace",
     "BackendNode",
@@ -33,5 +36,6 @@ __all__ = [
     "GmshOCCBackend",
     "GmshOCCConfig",
     "InitialContactPlacement",
+    "NativeCurvedGeometryBackend",
     "StepGeometryMeshAdapter",
 ]

@@ -10,7 +10,10 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, NoReturn, cast
 
 if TYPE_CHECKING:
-    from febio_cae.adapters.meshing.approximation import CriteriaProvider
+    from febio_cae.adapters.meshing.approximation import (
+        ApproximationCriteria,
+        CriteriaProvider,
+    )
     from febio_cae.adapters.meshing.primitives import GeneratedPrimitiveMesh
 from febio_cae.domain import (
     AsPlaced,
@@ -24,6 +27,7 @@ from febio_cae.domain import (
     GeometryIntent,
     GeometryPort,
     GeometrySelectionRequest,
+    LocalRefinement,
     MeshArtifact,
     MeshElement,
     MeshFace,
@@ -37,12 +41,14 @@ from febio_cae.domain import (
     PortErrorCategory,
     Quantity,
     ResolutionSnapshot,
+    RigidPrimitive,
     RigidToolIntent,
     RigidTransform,
     SelectionRef,
     SourceAssetContent,
     SourceAssetRef,
     SourceAssetResolverPort,
+    SourceLocalRefinementBall,
     SpecifiedGap,
     UnitDirection,
     WholeBodyRule,
@@ -62,8 +68,10 @@ from .backend import (
     BackendErrorCategory,
     BackendFace,
     BackendInspection,
+    BackendLocalRefinement,
     BackendMesh,
     GeometryMeshBackend,
+    NativeCurvedGeometryBackend,
 )
 
 _LENGTH = Dimension(length=1)
@@ -137,6 +145,7 @@ class _MappedMesh:
     elements: tuple[MeshElement, ...]
     faces: tuple[MeshFace, ...]
     signed_volumes: tuple[float, ...]
+    corner_volumes: tuple[float, ...]
 
 
 class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
@@ -221,12 +230,89 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
         """Inspect generated rigid-tool boundary faces in the placement target frame."""
 
         from febio_cae.adapters.meshing.primitives import generate_primitive_mesh
-        from febio_cae.domain.rigid import RigidPrimitive
 
         if not isinstance(primitive, RigidPrimitive):
             raise TypeError("primitive must be a RigidPrimitive")
+        if primitive.kind in {"sphere", "cylinder"} and self._native_curved_capability():
+            return self._inspect_native_primitive(primitive, geometry_digest)
         generated = generate_primitive_mesh(primitive, geometry_digest=geometry_digest)
         return self._tool_inspection(generated, primitive, geometry_digest)
+
+    def _native_curved_capability(self) -> bool:
+        has_inspection = callable(getattr(self._backend, "inspect_rigid_primitive", None))
+        has_meshing = callable(getattr(self._backend, "mesh_rigid_primitive", None))
+        if has_inspection != has_meshing:
+            self._raise(
+                PortErrorCategory.UNSUPPORTED_CAPABILITY,
+                "native curved backend capability is incomplete",
+            )
+        return has_inspection
+
+    def _inspect_native_primitive(
+        self, primitive: RigidPrimitive, geometry_digest: str
+    ) -> BackendInspection:
+        backend = cast(NativeCurvedGeometryBackend, self._backend)
+        try:
+            report = backend.inspect_rigid_primitive(primitive, geometry_digest=geometry_digest)
+        except PortError:
+            raise
+        except BackendError as error:
+            self._raise_backend(error)
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            self._raise(
+                PortErrorCategory.ENVIRONMENT,
+                f"native primitive inspection failed: {error}",
+            )
+        if not isinstance(report, BackendInspection):
+            self._raise(
+                PortErrorCategory.ENVIRONMENT,
+                "native backend returned an invalid primitive inspection record",
+            )
+        self._validate_native_inspection(report, primitive, geometry_digest)
+        return report
+
+    def _validate_native_inspection(
+        self,
+        report: BackendInspection,
+        primitive: RigidPrimitive,
+        geometry_digest: str,
+    ) -> None:
+        if report.geometry_digest != geometry_digest:
+            self._raise(
+                PortErrorCategory.INTEGRITY,
+                "native primitive inspection geometry digest is stale",
+            )
+        if report.frame != primitive.local_frame:
+            self._raise(
+                PortErrorCategory.INTEGRITY,
+                "native primitive inspection frame does not match local frame",
+            )
+        if tuple(report.declared_units) != ("m",):
+            self._raise(
+                PortErrorCategory.INTEGRITY,
+                "native primitive inspection coordinates must be declared in metres",
+            )
+        if len(report.bodies) != 1 or report.bodies[0].body_id != primitive.body_id.value:
+            self._raise(
+                PortErrorCategory.INTEGRITY,
+                "native primitive inspection must contain the declared tool body",
+            )
+        body = report.bodies[0]
+        if not body.closed_solid:
+            self._raise(
+                PortErrorCategory.UNSUPPORTED_CAPABILITY,
+                "native primitive did not produce a closed solid",
+            )
+        if (
+            report.unsupported_topology
+            or report.defects
+            or body.defects
+            or any(face.defects for face in body.faces)
+        ):
+            self._raise(
+                PortErrorCategory.UNSUPPORTED_CAPABILITY,
+                "native primitive inspection contains unsupported topology defects",
+            )
 
     def resolve_placed_selection(
         self,
@@ -301,16 +387,42 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
         return self._initial_placement(spec, report, generated)
 
     def _generate_tool(self, spec: CaseSpec, deadline: float) -> GeneratedPrimitiveMesh:
-        from febio_cae.adapters.meshing.approximation import check_deadline, resolve_criteria
+        from febio_cae.adapters.meshing.approximation import (
+            ALGORITHM,
+            NATIVE_ALGORITHM,
+            check_deadline,
+            resolve_criteria,
+        )
         from febio_cae.adapters.meshing.primitives import generate_primitive_mesh
 
         check_deadline(deadline)
         primitive = spec.rigid_tool.primitive
-        criteria = (
-            resolve_criteria(self._resolve_mesh_quality, spec.mesh_policy, primitive.kind)
-            if primitive.kind in {"sphere", "cylinder"}
-            else None
-        )
+        is_curved = primitive.kind in {"sphere", "cylinder"}
+        native = is_curved and self._native_curved_capability()
+        criteria = None
+        if is_curved:
+            criteria = resolve_criteria(
+                self._resolve_mesh_quality,
+                spec.mesh_policy,
+                primitive.kind,
+                algorithm_id=NATIVE_ALGORITHM if native else ALGORITHM,
+            )
+        if native:
+            if isinstance(spec.contact.arrangement, SpecifiedGap):
+                self._raise(
+                    PortErrorCategory.UNSUPPORTED_CAPABILITY,
+                    "native curved contact placement requires an explicit AsPlaced arrangement",
+                )
+            return self._generate_native_tool(
+                spec,
+                criteria,
+                deadline,
+            )
+        if spec.mesh_policy.local_refinements:
+            self._raise(
+                PortErrorCategory.UNSUPPORTED_CAPABILITY,
+                "backend local-refinement mapping is not qualified for this adapter",
+            )
         try:
             return generate_primitive_mesh(
                 primitive,
@@ -324,6 +436,292 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
                 PortErrorCategory.QUALITY, f"primitive numerical quality failure: {error}"
             ) from error
 
+    def _generate_native_tool(
+        self, spec: CaseSpec, criteria: ApproximationCriteria | None, deadline: float
+    ) -> GeneratedPrimitiveMesh:
+        from febio_cae.adapters.meshing.approximation import (
+            ApproximationCriteria as RuntimeApproximationCriteria,
+        )
+        from febio_cae.adapters.meshing.approximation import check_deadline
+        from febio_cae.adapters.meshing.primitives import GeneratedPrimitiveMesh
+
+        check_deadline(deadline)
+        primitive = spec.rigid_tool.primitive
+
+        if not isinstance(criteria, RuntimeApproximationCriteria):
+            self._raise(PortErrorCategory.INTEGRITY, "native criteria are unavailable")
+        local_refinements = self._native_local_refinements(spec)
+        inspection = self._inspect_native_primitive(
+            primitive,
+            spec.rigid_tool.contact_surface.geometry_digest,
+        )
+        placed_inspection = _placed_inspection(inspection, primitive.placement)
+        for selection in _spec_selections(spec):
+            if selection.body_id == primitive.body_id:
+                self._resolve_selection_from_report(selection, placed_inspection)
+        check_deadline(deadline)
+        backend = cast(NativeCurvedGeometryBackend, self._backend)
+        try:
+            mesh = backend.mesh_rigid_primitive(
+                primitive,
+                geometry_digest=spec.rigid_tool.contact_surface.geometry_digest,
+                global_size_si=float(spec.mesh_policy.global_size.to_si().value),
+                local_refinements=local_refinements,
+            )
+        except PortError:
+            raise
+        except BackendError as error:
+            self._raise_backend(error)
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            self._raise(
+                PortErrorCategory.ENVIRONMENT,
+                f"native primitive meshing failed: {error}",
+            )
+        if not isinstance(mesh, BackendMesh):
+            self._raise(
+                PortErrorCategory.ENVIRONMENT,
+                "native backend returned an invalid primitive mesh record",
+            )
+        if len(mesh.elements) > criteria.max_elements:
+            self._raise(
+                PortErrorCategory.QUALITY,
+                "native primitive element budget exhausted",
+            )
+        approximation = self._native_approximation(
+            mesh,
+            inspection,
+            primitive,
+            criteria,
+            deadline,
+        )
+        return GeneratedPrimitiveMesh(
+            mesh=mesh,
+            boundary_faces=tuple(inspection.bodies[0].faces),
+            approximation=approximation,
+            native_inspection=inspection,
+        )
+
+    def _native_local_refinements(self, spec: CaseSpec) -> tuple[BackendLocalRefinement, ...]:
+        primitive = spec.rigid_tool.primitive
+        geometry_digest = spec.rigid_tool.contact_surface.geometry_digest
+        result: list[BackendLocalRefinement] = []
+        for refinement in spec.mesh_policy.local_refinements:
+            if not isinstance(refinement, LocalRefinement):
+                self._raise(
+                    PortErrorCategory.INVALID_INPUT,
+                    "mesh policy contains an invalid local refinement",
+                )
+            region = refinement.region
+            selection = refinement.selection
+            if not isinstance(region, SourceLocalRefinementBall):
+                self._raise(
+                    PortErrorCategory.UNSUPPORTED_CAPABILITY,
+                    "native curved meshing requires a source-local refinement ball",
+                )
+            if selection.body_id != primitive.body_id:
+                self._raise(
+                    PortErrorCategory.INVALID_INPUT,
+                    "native local refinement selection must identify the tool body",
+                )
+            if selection.geometry_digest != geometry_digest:
+                self._raise(
+                    PortErrorCategory.INTEGRITY,
+                    "native local refinement selection references stale tool geometry",
+                )
+            if selection.frame != primitive.placement.target_frame:
+                self._raise(
+                    PortErrorCategory.INVALID_INPUT,
+                    "native local refinement selection must use the placed tool frame",
+                )
+            if selection.stated_role != "mesh_refinement":
+                self._raise(
+                    PortErrorCategory.INVALID_INPUT,
+                    "native local refinement selection role must be mesh_refinement",
+                )
+            if not isinstance(selection.rule, WholeBodyRule):
+                self._raise(
+                    PortErrorCategory.UNSUPPORTED_CAPABILITY,
+                    "native local refinement selection must resolve the whole tool body",
+                )
+            if region.center.frame != primitive.local_frame:
+                self._raise(
+                    PortErrorCategory.INVALID_INPUT,
+                    "native local refinement center must use the primitive local frame",
+                )
+            try:
+                center = _point_values(region.center)
+                radius = float(region.radius.to_si().value)
+                size = float(refinement.size.to_si().value)
+            except (TypeError, ValueError, OverflowError) as error:
+                self._raise(
+                    PortErrorCategory.INVALID_INPUT,
+                    f"native local refinement dimensions are invalid: {error}",
+                )
+            result.append(
+                BackendLocalRefinement(
+                    body_id=primitive.body_id.value,
+                    frame=primitive.local_frame,
+                    center_si=center,
+                    radius_si=radius,
+                    size_si=size,
+                )
+            )
+        return tuple(result)
+
+    def _native_approximation(
+        self,
+        mesh: BackendMesh,
+        inspection: BackendInspection,
+        primitive: RigidPrimitive,
+        criteria: object,
+        deadline: float,
+    ) -> dict[str, object]:
+        from febio_cae.adapters.meshing.approximation import (
+            NATIVE_ALGORITHM,
+            ApproximationCriteria,
+            check_deadline,
+        )
+        from febio_cae.adapters.meshing.native_surface import (
+            primitive_face_distance_upper_bound,
+        )
+
+        if (
+            not isinstance(criteria, ApproximationCriteria)
+            or criteria.algorithm_id != NATIVE_ALGORITHM
+        ):
+            self._raise(
+                PortErrorCategory.INTEGRITY,
+                "native approximation criteria binding mismatch",
+            )
+        if mesh.ordering_id != BACKEND_TET10_ORDER_ID:
+            self._raise(
+                PortErrorCategory.UNSUPPORTED_CAPABILITY,
+                f"unsupported native backend Tet10 ordering: {mesh.ordering_id!r}",
+            )
+        if mesh.body_id != primitive.body_id.value:
+            self._raise(
+                PortErrorCategory.INTEGRITY,
+                "native primitive mesh body does not match the declared tool body",
+            )
+        if mesh.geometry_digest != inspection.geometry_digest:
+            self._raise(
+                PortErrorCategory.INTEGRITY,
+                "native primitive mesh geometry digest is stale",
+            )
+        if mesh.frame != primitive.local_frame:
+            self._raise(
+                PortErrorCategory.INTEGRITY,
+                "native primitive mesh frame does not match the local frame",
+            )
+
+        cad_face_ids = {face.face_id for face in inspection.bodies[0].faces}
+        nodes = {node.node_id: node.coordinates_si for node in mesh.nodes}
+        elements = {element.element_id: element for element in mesh.elements}
+        boundary_faces = sorted(
+            (face for face in mesh.faces if len(face.adjacent_element_ids) == 1),
+            key=lambda face: face.face_id,
+        )
+        if not boundary_faces:
+            self._raise(
+                PortErrorCategory.INTEGRITY,
+                "native primitive mesh contains no boundary faces",
+            )
+        radius = float(primitive.dimensions["radius"].to_si().value)
+        height = (
+            None
+            if primitive.kind == "sphere"
+            else float(primitive.dimensions["height"].to_si().value)
+        )
+        records: list[dict[str, object]] = []
+        covered: set[str] = set()
+        for face in boundary_faces:
+            check_deadline(deadline)
+            cad_face_id = face.source_face_id
+            if cad_face_id is None:
+                self._raise(
+                    PortErrorCategory.INTEGRITY,
+                    f"native boundary face {face.face_id!r} has no CAD membership",
+                )
+            if cad_face_id not in cad_face_ids:
+                self._raise(
+                    PortErrorCategory.INTEGRITY,
+                    f"native boundary face {face.face_id!r} references an unknown CAD face",
+                )
+            if len(face.local_face_ids) != 1:
+                self._raise(
+                    PortErrorCategory.INTEGRITY,
+                    f"native boundary face {face.face_id!r} is not a complete exterior Tri6",
+                )
+            try:
+                element = elements[face.adjacent_element_ids[0]]
+                canonical_node_ids = tuple(
+                    element.node_ids[position] for position in BACKEND_TET10_TO_CANONICAL_POSITIONS
+                )
+                positions = TET10_FACE_NODE_POSITIONS[face.local_face_ids[0]]
+                points = tuple(nodes[canonical_node_ids[position]] for position in positions)
+            except (IndexError, KeyError) as error:
+                self._raise(
+                    PortErrorCategory.INTEGRITY,
+                    f"native boundary face {face.face_id!r} has incomplete Tri6 "
+                    f"connectivity: {error}",
+                )
+            try:
+                bound = primitive_face_distance_upper_bound(
+                    points,
+                    kind=primitive.kind,
+                    radius_si=radius,
+                    height_si=height,
+                )
+            except (ArithmeticError, TypeError, ValueError) as error:
+                self._raise(
+                    PortErrorCategory.QUALITY,
+                    f"native boundary certificate failed for face {face.face_id!r}: {error}",
+                )
+            if not math.isfinite(bound) or bound < 0.0:
+                self._raise(
+                    PortErrorCategory.QUALITY,
+                    f"native boundary certificate is not finite for face {face.face_id!r}",
+                )
+            covered.add(cad_face_id)
+            records.append(
+                {
+                    "mesh_face_id": face.face_id,
+                    "cad_face_id": cad_face_id,
+                    "deviation_upper_bound_si": bound,
+                }
+            )
+        if covered != cad_face_ids:
+            missing = sorted(cad_face_ids.difference(covered))
+            self._raise(
+                PortErrorCategory.INTEGRITY,
+                "native CAD boundary faces are not completely covered: " + ", ".join(missing),
+            )
+        deviation = max(cast(float, item["deviation_upper_bound_si"]) for item in records)
+        limit = float(criteria.max_boundary_deviation.to_si().value)
+        if deviation > limit:
+            self._raise(
+                PortErrorCategory.QUALITY,
+                "native primitive boundary deviation exceeds the declared criterion",
+            )
+        return {
+            "algorithm_id": criteria.algorithm_id,
+            "criteria": criteria.to_dict(),
+            "evidence_scope": criteria.evidence_scope,
+            "native_inspection_source_digest": inspection.source_digest,
+            "native_mesh_source_digest": mesh.source_digest,
+            "native_backend_id": self.backend_id,
+            "native_backend_version": self.backend_version,
+            "representation": "native-quadratic-tet10-v1",
+            "scope": "complete native Tri6 mesh faces to analytic primitive boundary; "
+            "no bidirectional CAD claim",
+            "boundary_face_count": len(boundary_faces),
+            "certified_face_count": len(records),
+            "face_deviation_upper_bounds_si": records,
+            "deviation_upper_bound_si": deviation,
+            "max_elements": criteria.max_elements,
+            "element_count": len(mesh.elements),
+        }
+
     def _initial_placement(
         self, spec: CaseSpec, report: BackendInspection, generated: GeneratedPrimitiveMesh
     ) -> InitialContactPlacement:
@@ -332,11 +730,16 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
             spec.rigid_tool.primitive,
             spec.rigid_tool.contact_surface.geometry_digest,
         )
+        arrangement = spec.contact.arrangement
+        if generated.native_inspection is not None and isinstance(arrangement, SpecifiedGap):
+            self._raise(
+                PortErrorCategory.UNSUPPORTED_CAPABILITY,
+                "native curved contact placement requires an explicit AsPlaced arrangement",
+            )
         part_resolution = self._resolve_selection_from_report(spec.contact.part_surface, report)
         tool_resolution = self._resolve_selection_from_report(
             spec.contact.tool_surface, tool_report
         )
-        arrangement = spec.contact.arrangement
         if isinstance(arrangement, AsPlaced):
             return InitialContactPlacement(
                 calculated=False,
@@ -426,9 +829,48 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
                 "declared geometry body is not a closed solid",
             )
         if spec.mesh_policy.local_refinements:
-            self._raise(
-                PortErrorCategory.UNSUPPORTED_CAPABILITY,
-                "backend local-refinement mapping is not qualified for this adapter",
+            native_tool = (
+                spec.rigid_tool.primitive.kind
+                in {
+                    "sphere",
+                    "cylinder",
+                }
+                and self._native_curved_capability()
+            )
+            if not native_tool:
+                self._raise(
+                    PortErrorCategory.UNSUPPORTED_CAPABILITY,
+                    "backend local-refinement mapping is not qualified for this adapter",
+                )
+        selections = _spec_selections(spec)
+        selection_resolutions = {
+            _selection_digest(selection): self._resolve_selection_from_report(selection, report)
+            for selection in selections
+            if selection.body_id.value == part_body_id
+        }
+        generated = self._generate_tool(spec, deadline)
+        applied = self._initial_placement(spec, report, generated)
+        placed_tool = replace(spec.rigid_tool.primitive, placement=applied.placement)
+        tool_report = self._tool_inspection(
+            generated,
+            placed_tool,
+            spec.rigid_tool.contact_surface.geometry_digest,
+        )
+        for selection in selections:
+            selection_digest = _selection_digest(selection)
+            if selection_digest in selection_resolutions:
+                continue
+            selected_report = report if selection.body_id.value == part_body_id else tool_report
+            if selection.body_id.value not in {
+                part_body_id,
+                spec.rigid_tool.primitive.body_id.value,
+            }:
+                self._raise(
+                    PortErrorCategory.INVALID_INPUT,
+                    f"selection {selection.name!r} identifies an unknown mesh body",
+                )
+            selection_resolutions[selection_digest] = self._resolve_selection_from_report(
+                selection, selected_report
             )
         try:
             part_mesh = self._backend.mesh(
@@ -450,9 +892,6 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
             )
         if part_mesh.geometry_digest != spec.geometry.geometry_digest:
             self._raise(PortErrorCategory.INTEGRITY, "backend mesh geometry digest is stale")
-        generated = self._generate_tool(spec, deadline)
-        applied = self._initial_placement(spec, report, generated)
-        placed_tool = replace(spec.rigid_tool.primitive, placement=applied.placement)
         tool_mesh = generated.mesh
         part_mapped = self._map_backend_mesh(
             part_mesh,
@@ -461,6 +900,7 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
             node_start=1,
             element_start=1,
             expected_geometry_digest=spec.geometry.geometry_digest,
+            measure_quadratic_volume=generated.native_inspection is not None,
             deadline=deadline,
         )
         tool_node_start = len(part_mapped.nodes) + 1
@@ -472,6 +912,7 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
             node_start=tool_node_start,
             element_start=tool_element_start,
             expected_geometry_digest=spec.rigid_tool.contact_surface.geometry_digest,
+            measure_quadratic_volume=generated.native_inspection is not None,
             deadline=deadline,
         )
         all_faces = part_mapped.faces + tool_mapped.faces
@@ -479,29 +920,6 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
             self._raise(PortErrorCategory.INTEGRITY, "part and rigid-tool mesh face IDs overlap")
         all_nodes = part_mapped.nodes + tool_mapped.nodes
         all_elements = part_mapped.elements + tool_mapped.elements
-        tool_report = self._tool_inspection(
-            generated,
-            placed_tool,
-            spec.rigid_tool.contact_surface.geometry_digest,
-        )
-        selections = _spec_selections(spec)
-        selection_resolutions: dict[str, ResolutionSnapshot] = {}
-        for selection in selections:
-            selection_digest = _selection_digest(selection)
-            if selection_digest in selection_resolutions:
-                continue
-            selected_report = report if selection.body_id.value == part_body_id else tool_report
-            if selection.body_id.value not in {
-                part_body_id,
-                spec.rigid_tool.primitive.body_id.value,
-            }:
-                self._raise(
-                    PortErrorCategory.INVALID_INPUT,
-                    f"selection {selection.name!r} identifies an unknown mesh body",
-                )
-            selection_resolutions[selection_digest] = self._resolve_selection_from_report(
-                selection, selected_report
-            )
         coverage: dict[tuple[str, str], list[str]] = {}
         for backend_mesh in (part_mesh, tool_mesh):
             for face in backend_mesh.faces:
@@ -538,6 +956,8 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
             )
         signed_volumes = part_mapped.signed_volumes + tool_mapped.signed_volumes
         minimum_volume = min(signed_volumes)
+        corner_minimum_volume = min(part_mapped.corner_volumes + tool_mapped.corner_volumes)
+        native_volume = generated.native_inspection is not None
         selection_digests = tuple(sorted(selection_resolutions))
         recipe_digest = _mesh_recipe_digest(
             source_asset=self._source_asset,
@@ -570,7 +990,7 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
             ),
             MeshQualityRecord(
                 "tet10-positive-corner-volume",
-                minimum_volume,
+                corner_minimum_volume,
                 "m3",
                 0.0,
                 "PASS",
@@ -598,9 +1018,26 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
                 "m",
                 None,
                 "UNVERIFIED",
-                "bidirectional CAD-to-mesh approximation evidence is backend-dependent",
+                (
+                    "native complete-face mesh-to-analytic-primitive evidence does not "
+                    "establish a bidirectional CAD-to-mesh bound"
+                    if native_volume
+                    else "bidirectional CAD-to-mesh approximation evidence is backend-dependent"
+                ),
             ),
         )
+        if native_volume:
+            quality_records += (
+                MeshQualityRecord(
+                    "tet10-positive-quadratic-volume",
+                    minimum_volume,
+                    "m3",
+                    0.0,
+                    "PASS",
+                    "all mapped native Tet10 quadratic mappings have positive "
+                    "integrated signed volume",
+                ),
+            )
         if generated.approximation is not None:
             quality_records += (
                 MeshQualityRecord(
@@ -879,6 +1316,13 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
 
         if not isinstance(primitive, RigidPrimitive):
             self._raise(PortErrorCategory.INVALID_INPUT, "primitive must be a RigidPrimitive")
+        if generated.native_inspection is not None:
+            self._validate_native_inspection(
+                generated.native_inspection,
+                primitive,
+                geometry_digest,
+            )
+            return _placed_inspection(generated.native_inspection, primitive.placement)
         faces = tuple(
             _transform_backend_face(face, primitive.placement) for face in generated.boundary_faces
         )
@@ -901,6 +1345,7 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
         node_start: int,
         element_start: int,
         expected_geometry_digest: str,
+        measure_quadratic_volume: bool = False,
         deadline: float | None = None,
     ) -> _MappedMesh:
         if mesh.ordering_id != BACKEND_TET10_ORDER_ID:
@@ -941,6 +1386,7 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
         }
         elements: list[MeshElement] = []
         signed_volumes: list[float] = []
+        corner_volumes: list[float] = []
         for source_id in ordered_source_elements:
             if deadline is not None:
                 from febio_cae.adapters.meshing.approximation import check_deadline
@@ -964,13 +1410,20 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
             from .quadratic_quality import require_positive_quadratic_mapping
 
             try:
-                signed_volume = require_positive_quadratic_mapping(
-                    tuple(
-                        nodes[node_id - node_start].coordinates_si for node_id in canonical_node_ids
-                    )
+                mapped_points = tuple(
+                    nodes[node_id - node_start].coordinates_si for node_id in canonical_node_ids
                 )
+                source_points = tuple(
+                    source_nodes[source_element.node_ids[position]].coordinates_si
+                    for position in BACKEND_TET10_TO_CANONICAL_POSITIONS
+                )
+                corner_volume = require_positive_quadratic_mapping(mapped_points)
+                signed_volume = corner_volume
+                if measure_quadratic_volume:
+                    signed_volume = _quadratic_tet10_volume(source_points)
             except ValueError as error:
                 self._raise(PortErrorCategory.QUALITY, f"element {source_id}: {error}")
+            corner_volumes.append(corner_volume)
             signed_volumes.append(signed_volume)
             elements.append(
                 MeshElement(
@@ -1002,7 +1455,13 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
                     local_face_ids=local_face_ids,
                 )
             )
-        return _MappedMesh(tuple(nodes), tuple(elements), tuple(faces), tuple(signed_volumes))
+        return _MappedMesh(
+            tuple(nodes),
+            tuple(elements),
+            tuple(faces),
+            tuple(signed_volumes),
+            tuple(corner_volumes),
+        )
 
     @staticmethod
     def _raise_backend(error: BackendError) -> NoReturn:
@@ -1138,6 +1597,83 @@ def _mesh_volume(mesh: BackendMesh) -> float:
         abs(_signed_volume_points(tuple(nodes[node_id] for node_id in element.node_ids[:4])))
         for element in mesh.elements
     )
+
+
+def _quadratic_tet10_volume(points: Sequence[Sequence[float]]) -> float:
+    """Integrate the quadratic Tet10 Jacobian over the reference tetrahedron.
+
+    The determinant of a quadratic tetrahedral map is cubic in barycentric
+    coordinates. The five-point tetrahedron rule below is therefore exact for
+    the represented mapping; it is not the affine corner-volume proxy.
+    """
+
+    if len(points) != 10 or any(len(point) != 3 for point in points):
+        raise ValueError("quadratic Tet10 requires ten three-component points")
+    if any(
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        for point in points
+        for value in point
+    ):
+        raise ValueError("quadratic Tet10 requires finite coordinates")
+    edges = ((0, 1), (1, 2), (2, 0), (0, 3), (1, 3), (2, 3))
+    barycentric_gradients = (
+        (-1.0, -1.0, -1.0),
+        (1.0, 0.0, 0.0),
+        (0.0, 1.0, 0.0),
+        (0.0, 0.0, 1.0),
+    )
+
+    def determinant(barycentric: Sequence[float]) -> float:
+        gradients: list[tuple[float, float, float]] = []
+        for index in range(4):
+            coefficient = 4.0 * barycentric[index] - 1.0
+            gradient = barycentric_gradients[index]
+            gradients.append(
+                (coefficient * gradient[0], coefficient * gradient[1], coefficient * gradient[2])
+            )
+        for first_node, second_node in edges:
+            first_value, second_value = barycentric[first_node], barycentric[second_node]
+            first_gradient = barycentric_gradients[first_node]
+            second_gradient = barycentric_gradients[second_node]
+            gradients.append(
+                (
+                    4.0 * (first_gradient[0] * second_value + first_value * second_gradient[0]),
+                    4.0 * (first_gradient[1] * second_value + first_value * second_gradient[1]),
+                    4.0 * (first_gradient[2] * second_value + first_value * second_gradient[2]),
+                )
+            )
+        jacobian = tuple(
+            tuple(
+                math.fsum(
+                    float(points[node][axis]) * gradients[node][direction] for node in range(10)
+                )
+                for axis in range(3)
+            )
+            for direction in range(3)
+        )
+        first, second, third = jacobian
+        cross = (
+            second[1] * third[2] - second[2] * third[1],
+            second[2] * third[0] - second[0] * third[2],
+            second[0] * third[1] - second[1] * third[0],
+        )
+        value = first[0] * cross[0] + first[1] * cross[1] + first[2] * cross[2]
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError("quadratic mapping has a non-positive integrated Jacobian sample")
+        return value
+
+    center = (0.25, 0.25, 0.25, 0.25)
+    vertex_points = tuple(
+        tuple(0.5 if index == vertex else 1.0 / 6.0 for index in range(4)) for vertex in range(4)
+    )
+    value = (
+        -0.8 * determinant(center) + 0.45 * math.fsum(determinant(point) for point in vertex_points)
+    ) / 6.0
+    if not math.isfinite(value) or value <= 0.0:
+        raise ValueError("quadratic mapping volume is not positive or representable")
+    return value
 
 
 def _selection_digest(selection: SelectionRef) -> str:

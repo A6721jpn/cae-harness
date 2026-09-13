@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Sequence
 from typing import Any
 
 import pytest
@@ -9,8 +10,11 @@ from febio_cae.adapters.geometry import (
     BACKEND_TET10_ORDER_ID,
     BackendBody,
     BackendElement,
+    BackendError,
+    BackendErrorCategory,
     BackendFace,
     BackendInspection,
+    BackendLocalRefinement,
     BackendMesh,
     BackendMeshFace,
     BackendNode,
@@ -145,7 +149,7 @@ class SyntheticBackend:
     def inspect(
         self,
         content: bytes,
-        requested_body_ids: tuple[str, ...],
+        requested_body_ids: Sequence[str],
     ) -> BackendInspection:
         centroid_z = 0.011 if self.changed_measurement else 0.01
         faces = (
@@ -203,7 +207,19 @@ class SyntheticBackend:
             defects=self.defects,
         )
 
-    def mesh(self, content: bytes, body_id: str, global_size_si: float) -> BackendMesh:
+    def mesh(
+        self,
+        content: bytes,
+        body_id: str,
+        global_size_si: float,
+        *,
+        local_refinements: tuple[BackendLocalRefinement, ...] = (),
+    ) -> BackendMesh:
+        if local_refinements:
+            raise BackendError(
+                BackendErrorCategory.UNSUPPORTED_CAPABILITY,
+                "synthetic backend does not support local refinement requests",
+            )
         self.mesh_requests.append((body_id, global_size_si))
         node_coordinates = (
             (0.0, 0.0, 0.0),

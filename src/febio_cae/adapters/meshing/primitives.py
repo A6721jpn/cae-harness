@@ -11,6 +11,7 @@ from febio_cae.adapters.geometry.backend import (
     BACKEND_TET10_ORDER_ID,
     BackendElement,
     BackendFace,
+    BackendInspection,
     BackendMesh,
     BackendMeshFace,
     BackendNode,
@@ -31,6 +32,7 @@ class GeneratedPrimitiveMesh:
     mesh: BackendMesh
     boundary_faces: tuple[BackendFace, ...]
     approximation: dict[str, object] | None = None
+    native_inspection: BackendInspection | None = None
 
 
 def _add(left: Coordinates, right: Coordinates) -> Coordinates:

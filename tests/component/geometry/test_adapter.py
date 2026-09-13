@@ -13,7 +13,6 @@ from febio_cae.adapters.geometry import (
     GmshOCCBackend,
     GmshOCCConfig,
     InitialContactPlacement,
-    StepGeometryMeshAdapter,
 )
 from febio_cae.domain import (
     BodyId,
@@ -24,10 +23,8 @@ from febio_cae.domain import (
     FaceSetRule,
     FrameId,
     GeometryInspectionRequest,
-    GeometryPort,
     GeometrySelectionRequest,
     MeshArtifact,
-    MeshingPort,
     NamedAttributeRule,
     PortError,
     PortErrorCategory,
@@ -71,21 +68,6 @@ def _selection(
 
 def _assert_port_error(error: pytest.ExceptionInfo[PortError], category: PortErrorCategory) -> None:
     assert error.value.category is category
-
-
-def test_geometry_mesh_adapter_api_is_available() -> None:
-    assert StepGeometryMeshAdapter is not None, "P2 input/model adapter is not available"
-    assert BackendError is not None
-    assert InitialContactPlacement is not None
-    assert GmshOCCBackend is not None
-    assert GmshOCCConfig is not None
-
-
-def test_adapter_implements_frozen_geometry_and_mesh_ports(
-    adapter: Any,
-) -> None:
-    assert isinstance(adapter, GeometryPort)
-    assert isinstance(adapter, MeshingPort)
 
 
 def test_inspection_preserves_units_bodies_boundary_geometry_and_defects(

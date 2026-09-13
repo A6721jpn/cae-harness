@@ -23,9 +23,9 @@ import threading
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Self
+from typing import Any, Self, cast
 
-from febio_cae.domain import FrameId, unit_definition
+from febio_cae.domain import FrameId, RigidPrimitive, unit_definition
 from febio_cae.domain.canonical import canonical_bytes
 
 from .backend import (
@@ -37,6 +37,7 @@ from .backend import (
     BackendErrorCategory,
     BackendFace,
     BackendInspection,
+    BackendLocalRefinement,
     BackendMesh,
     BackendMeshFace,
     BackendNode,
@@ -52,6 +53,7 @@ _CONVERSION_LENGTH_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 _BODY_ID_RE = re.compile(r"^body-(?P<tag>[1-9][0-9]*)$")
+_SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _TET10_TYPE = 11
 # Native Gmsh state is process-global even across different backend/module
 # wrappers. Non-reentrant admission avoids both query/initialize races and
@@ -135,6 +137,22 @@ class _ElementContext:
     canonical_node_ids: tuple[int, ...]
 
 
+_EdgeMidpointSignature = tuple[tuple[tuple[int, int], int], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _TetFaceContext:
+    element_id: int
+    local_face_id: int
+    edge_midpoints: _EdgeMidpointSignature
+
+
+@dataclass(frozen=True, slots=True)
+class _SurfaceFacet:
+    corner_key: tuple[int, int, int]
+    edge_midpoints: _EdgeMidpointSignature
+
+
 class GmshOCCBackend:
     """Concrete, optional Gmsh 4.x/OpenCASCADE backend.
 
@@ -154,6 +172,98 @@ class GmshOCCBackend:
     @property
     def backend_version(self) -> str:
         return self.config.expected_version
+
+    def inspect_rigid_primitive(
+        self, primitive: RigidPrimitive, *, geometry_digest: str
+    ) -> BackendInspection:
+        """Inspect a native OCC sphere or cylinder in its local frame."""
+
+        primitive = _require_curved_primitive(primitive)
+        geometry_digest = _require_geometry_digest(geometry_digest)
+        source_digest = _primitive_source_digest(
+            primitive,
+            geometry_digest=geometry_digest,
+            global_size_si=None,
+        )
+        gmsh = self._load_module()
+        with _GmshSession(gmsh, self.config.geometry_kernel):
+            self._prepare_owned_session(gmsh)
+            volume_tag = self._create_rigid_primitive(gmsh, primitive)
+            context = self._primitive_context(gmsh, volume_tag, primitive)
+        if not context.closed_solid:
+            raise BackendError(
+                BackendErrorCategory.UNSUPPORTED_CAPABILITY,
+                f"native {primitive.kind} did not produce a closed solid",
+            )
+        body = BackendBody(
+            context.body_id,
+            context.closed_solid,
+            context.volume_si,
+            context.faces,
+        )
+        return BackendInspection(
+            source_digest=source_digest,
+            geometry_digest=geometry_digest,
+            declared_units=("m",),
+            frame=primitive.local_frame,
+            bodies=(body,),
+        )
+
+    def mesh_rigid_primitive(
+        self,
+        primitive: RigidPrimitive,
+        *,
+        geometry_digest: str,
+        global_size_si: float,
+        local_refinements: tuple[BackendLocalRefinement, ...] = (),
+    ) -> BackendMesh:
+        """Generate a native curved Tet10 mesh for a local sphere or cylinder."""
+
+        primitive = _require_curved_primitive(primitive)
+        geometry_digest = _require_geometry_digest(geometry_digest)
+        global_size_si = _require_global_size_si(global_size_si)
+        local_refinements = _validated_local_refinements(
+            local_refinements,
+            body_id=primitive.body_id.value,
+            frame=primitive.local_frame,
+            global_size_si=global_size_si,
+        )
+        source_digest = _primitive_source_digest(
+            primitive,
+            geometry_digest=geometry_digest,
+            global_size_si=global_size_si,
+            local_refinements=local_refinements,
+        )
+        gmsh = self._load_module()
+        with _GmshSession(gmsh, self.config.geometry_kernel):
+            self._prepare_owned_session(gmsh)
+            volume_tag = self._create_rigid_primitive(gmsh, primitive)
+            context = self._primitive_context(gmsh, volume_tag, primitive)
+            if not context.closed_solid:
+                raise BackendError(
+                    BackendErrorCategory.UNSUPPORTED_CAPABILITY,
+                    f"native {primitive.kind} did not produce a closed solid",
+                )
+            if local_refinements:
+                return self._mesh_context(
+                    gmsh,
+                    context,
+                    source_digest,
+                    geometry_digest,
+                    _OCC_TARGET_SCALE_TO_SI,
+                    global_size_si,
+                    frame=primitive.local_frame,
+                    local_refinements=local_refinements,
+                )
+            return self._mesh_context(
+                gmsh,
+                context,
+                source_digest,
+                geometry_digest,
+                _OCC_TARGET_SCALE_TO_SI,
+                global_size_si,
+                frame=primitive.local_frame,
+            )
 
     def inspect(self, content: bytes, requested_body_ids: Sequence[str]) -> BackendInspection:
         source_digest = _source_digest(content)
@@ -192,20 +302,27 @@ class GmshOCCBackend:
             bodies=bodies,
         )
 
-    def mesh(self, content: bytes, body_id: str, global_size_si: float) -> BackendMesh:
+    def mesh(
+        self,
+        content: bytes,
+        body_id: str,
+        global_size_si: float,
+        *,
+        local_refinements: tuple[BackendLocalRefinement, ...] = (),
+    ) -> BackendMesh:
         source_digest = _source_digest(content)
         if self.config.require_step_ap214:
             _require_ap214_header(content)
-        gmsh = self._load_module()
+        body_id = _require_body_id(body_id)
+        global_size_si = _require_global_size_si(global_size_si)
+        local_refinements = _validated_local_refinements(
+            local_refinements,
+            body_id=body_id,
+            frame=FrameId(self.config.frame_id),
+            global_size_si=global_size_si,
+        )
         declared_unit, _declared_scale_to_si = _declared_length_unit(content)
-        if not isinstance(body_id, str) or not body_id or body_id != body_id.strip():
-            raise BackendError(BackendErrorCategory.INVALID_INPUT, "body_id must be non-empty text")
-        if isinstance(global_size_si, bool) or not isinstance(global_size_si, (int, float)):
-            raise BackendError(BackendErrorCategory.INVALID_INPUT, "global_size_si must be numeric")
-        if not math.isfinite(float(global_size_si)) or float(global_size_si) <= 0.0:
-            raise BackendError(
-                BackendErrorCategory.INVALID_INPUT, "global_size_si must be positive and finite"
-            )
+        gmsh = self._load_module()
 
         with _GmshSession(gmsh, self.config.geometry_kernel) as session:
             self._prepare_owned_session(gmsh)
@@ -237,13 +354,23 @@ class GmshOCCBackend:
                     BackendErrorCategory.UNSUPPORTED_CAPABILITY,
                     f"body {body_id!r} is not a closed solid",
                 )
+            if local_refinements:
+                return self._mesh_context(
+                    gmsh,
+                    context,
+                    source_digest,
+                    geometry_digest,
+                    _OCC_TARGET_SCALE_TO_SI,
+                    global_size_si,
+                    local_refinements=local_refinements,
+                )
             return self._mesh_context(
                 gmsh,
                 context,
                 source_digest,
                 geometry_digest,
                 _OCC_TARGET_SCALE_TO_SI,
-                float(global_size_si),
+                global_size_si,
             )
 
     def _prepare_owned_session(self, gmsh: Any) -> None:
@@ -298,6 +425,108 @@ class GmshOCCBackend:
                 f"Gmsh version {actual_version!r} does not match configured {self.config.expected_version!r}",
             )
         return module
+
+    def _create_rigid_primitive(self, gmsh: Any, primitive: RigidPrimitive) -> int:
+        radius = _primitive_length_si(primitive, "radius")
+        try:
+            option = getattr(gmsh, "option", None)
+            set_string = getattr(option, "setString", None)
+            if not callable(set_string):
+                raise BackendError(
+                    BackendErrorCategory.UNSUPPORTED_CAPABILITY,
+                    "configured Gmsh module has no OCC target-unit option API",
+                )
+            # Direct OCC dimensions are passed in SI metres. Keep the same
+            # explicit target-unit declaration used by the STEP path.
+            set_string("Geometry.OCCTargetUnit", _OCC_TARGET_UNIT)
+            model = gmsh.model
+            model.add("febio_cae_rigid_primitive")
+            occ = model.occ
+            if primitive.kind == "sphere":
+                add_sphere = getattr(occ, "addSphere", None)
+                if not callable(add_sphere):
+                    raise BackendError(
+                        BackendErrorCategory.UNSUPPORTED_CAPABILITY,
+                        "configured Gmsh OCC module has no addSphere API",
+                    )
+                native_tag = add_sphere(0.0, 0.0, 0.0, radius)
+            else:
+                height = _primitive_length_si(primitive, "height")
+                add_cylinder = getattr(occ, "addCylinder", None)
+                if not callable(add_cylinder):
+                    raise BackendError(
+                        BackendErrorCategory.UNSUPPORTED_CAPABILITY,
+                        "configured Gmsh OCC module has no addCylinder API",
+                    )
+                native_tag = add_cylinder(
+                    0.0,
+                    0.0,
+                    -height / 2.0,
+                    0.0,
+                    0.0,
+                    height,
+                    radius,
+                )
+            synchronize = getattr(occ, "synchronize", None)
+            if not callable(synchronize):
+                raise BackendError(
+                    BackendErrorCategory.UNSUPPORTED_CAPABILITY,
+                    "configured Gmsh OCC module has no synchronize API",
+                )
+            synchronize()
+        except BackendError:
+            raise
+        except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as error:
+            raise BackendError(
+                BackendErrorCategory.ENVIRONMENT,
+                f"Gmsh OCC primitive creation failed: {error}",
+            ) from error
+        try:
+            volume_tag = int(native_tag)
+        except (NameError, TypeError, ValueError, OverflowError) as error:
+            raise BackendError(
+                BackendErrorCategory.INTEGRITY,
+                "Gmsh OCC primitive creation returned an invalid volume tag",
+            ) from error
+        if volume_tag <= 0:
+            raise BackendError(
+                BackendErrorCategory.INTEGRITY,
+                "Gmsh OCC primitive creation returned a non-positive volume tag",
+            )
+        return volume_tag
+
+    def _primitive_context(
+        self, gmsh: Any, volume_tag: int, primitive: RigidPrimitive
+    ) -> _BodyContext:
+        contexts = self._inspect_contexts(gmsh, _OCC_TARGET_SCALE_TO_SI)
+        matches = tuple(context for context in contexts if context.volume_tag == volume_tag)
+        if len(contexts) != 1 or len(matches) != 1:
+            raise BackendError(
+                BackendErrorCategory.UNSUPPORTED_CAPABILITY,
+                "native rigid primitive did not produce exactly one volume",
+            )
+        native = matches[0]
+        body_id = primitive.body_id.value
+        faces = tuple(
+            BackendFace(
+                face_id=f"{body_id}:face-{_surface_tag(face.face_id)}",
+                body_id=body_id,
+                frame=primitive.local_frame,
+                area_si=face.area_si,
+                centroid_si=face.centroid_si,
+                boundary_points_si=face.boundary_points_si,
+                attributes=face.attributes,
+                defects=face.defects,
+            )
+            for face in native.faces
+        )
+        return _BodyContext(
+            body_id=body_id,
+            volume_tag=native.volume_tag,
+            faces=faces,
+            volume_si=native.volume_si,
+            closed_solid=native.closed_solid,
+        )
 
     def _import_step(self, gmsh: Any, path: Path) -> None:
         if self.config.geometry_kernel != "OpenCASCADE":
@@ -421,7 +650,18 @@ class GmshOCCBackend:
         geometry_digest: str,
         native_scale_to_si: float,
         global_size_si: float,
+        *,
+        frame: FrameId | None = None,
+        local_refinements: tuple[BackendLocalRefinement, ...] = (),
     ) -> BackendMesh:
+        global_size_si = _require_global_size_si(global_size_si)
+        mesh_frame = frame if frame is not None else FrameId(self.config.frame_id)
+        local_refinements = _validated_local_refinements(
+            local_refinements,
+            body_id=context.body_id,
+            frame=mesh_frame,
+            global_size_si=global_size_si,
+        )
         try:
             mesh_api = gmsh.model.mesh
             # OCC import is explicitly normalized to metres. The native size
@@ -433,6 +673,13 @@ class GmshOCCBackend:
                     BackendErrorCategory.UNSUPPORTED_CAPABILITY,
                     "configured Gmsh module has no second-order mesh API",
                 )
+            if local_refinements:
+                self._configure_local_refinement_fields(
+                    gmsh,
+                    local_refinements,
+                    native_scale_to_si=native_scale_to_si,
+                    global_size_si=global_size_si,
+                )
             set_size = getattr(mesh_api, "setSize", None)
             get_entities = getattr(gmsh.model, "getEntities", None)
             used_point_sizes = False
@@ -441,7 +688,25 @@ class GmshOCCBackend:
                 if point_entities:
                     set_size(list(point_entities), native_size)
                     used_point_sizes = True
-            if (
+            if local_refinements:
+                option = getattr(gmsh, "option", None)
+                set_number = getattr(option, "setNumber", None)
+                if not callable(set_number):
+                    raise BackendError(
+                        BackendErrorCategory.UNSUPPORTED_CAPABILITY,
+                        "configured Gmsh module has no mesh size option API",
+                    )
+                # Keep the global field as an exterior upper target.  In
+                # particular, never set MeshSizeMin to the global target: use
+                # the smallest local request so a prior session's global
+                # floor cannot erase the smaller local sizes.
+                set_number(
+                    "Mesh.MeshSizeMin",
+                    min(item.size_si for item in local_refinements) / native_scale_to_si,
+                )
+                set_number("Mesh.MeshSizeMax", native_size)
+                set_number("Mesh.MeshSizeExtendFromBoundary", 0)
+            elif (
                 not used_point_sizes
                 and hasattr(gmsh, "option")
                 and hasattr(gmsh.option, "setNumber")
@@ -469,7 +734,7 @@ class GmshOCCBackend:
         return BackendMesh(
             source_digest=source_digest,
             geometry_digest=geometry_digest,
-            frame=FrameId(self.config.frame_id),
+            frame=frame if frame is not None else FrameId(self.config.frame_id),
             body_id=context.body_id,
             nodes=nodes,
             elements=tuple(
@@ -485,6 +750,82 @@ class GmshOCCBackend:
             faces=faces,
             ordering_id=BACKEND_TET10_ORDER_ID,
         )
+
+    def _configure_local_refinement_fields(
+        self,
+        gmsh: Any,
+        local_refinements: tuple[BackendLocalRefinement, ...],
+        *,
+        native_scale_to_si: float,
+        global_size_si: float,
+    ) -> None:
+        try:
+            field_api = gmsh.model.mesh.field
+        except AttributeError as error:
+            raise BackendError(
+                BackendErrorCategory.UNSUPPORTED_CAPABILITY,
+                "configured Gmsh module has no mesh size-field API",
+            ) from error
+        add = getattr(field_api, "add", None)
+        set_number = getattr(field_api, "setNumber", None)
+        set_numbers = getattr(field_api, "setNumbers", None)
+        set_background = getattr(field_api, "setAsBackgroundMesh", None)
+        if (
+            not callable(add)
+            or not callable(set_number)
+            or not callable(set_numbers)
+            or not callable(set_background)
+        ):
+            raise BackendError(
+                BackendErrorCategory.UNSUPPORTED_CAPABILITY,
+                "configured Gmsh module has an incomplete mesh size-field API",
+            )
+
+        native_global = global_size_si / native_scale_to_si
+        ball_fields: list[int] = []
+        try:
+            for refinement in local_refinements:
+                tag = int(add("Ball"))
+                if tag <= 0:
+                    raise BackendError(
+                        BackendErrorCategory.INTEGRITY,
+                        "Gmsh returned an invalid local refinement field tag",
+                    )
+                ball_fields.append(tag)
+                native_center = tuple(
+                    coordinate / native_scale_to_si for coordinate in refinement.center_si
+                )
+                set_number(tag, "VIn", refinement.size_si / native_scale_to_si)
+                set_number(tag, "VOut", native_global)
+                set_number(tag, "XCenter", native_center[0])
+                set_number(tag, "YCenter", native_center[1])
+                set_number(tag, "ZCenter", native_center[2])
+                set_number(tag, "Radius", refinement.radius_si / native_scale_to_si)
+                set_number(tag, "Thickness", native_global)
+            background = ball_fields[0]
+            if len(ball_fields) > 1:
+                background = int(add("Min"))
+                if background <= 0:
+                    raise BackendError(
+                        BackendErrorCategory.INTEGRITY,
+                        "Gmsh returned an invalid combined refinement field tag",
+                    )
+                set_numbers(background, "FieldsList", ball_fields)
+            set_background(background)
+        except BackendError:
+            raise
+        except (
+            AttributeError,
+            OSError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+            OverflowError,
+        ) as error:
+            raise BackendError(
+                BackendErrorCategory.ENVIRONMENT,
+                f"Gmsh local refinement field setup failed: {error}",
+            ) from error
 
     def _tet10_elements(
         self, gmsh: Any, volume_tag: int, node_coordinates: dict[int, tuple[float, float, float]]
@@ -549,37 +890,74 @@ class GmshOCCBackend:
         elements: Sequence[_ElementContext],
         node_coordinates: dict[int, tuple[float, float, float]],
     ) -> tuple[BackendMeshFace, ...]:
-        by_key: dict[tuple[int, int, int], list[tuple[int, int]]] = {}
+        by_key: dict[tuple[int, int, int], list[_TetFaceContext]] = {}
         for element in elements:
             for local_face_id, positions in enumerate(_tet10_face_positions()):
-                key = _sorted_triple(
-                    tuple(element.canonical_node_ids[position] for position in positions[:3])
+                face_nodes = tuple(element.canonical_node_ids[position] for position in positions)
+                key = _sorted_triple(face_nodes[:3])
+                by_key.setdefault(key, []).append(
+                    _TetFaceContext(
+                        element.element_id,
+                        local_face_id,
+                        _edge_midpoint_signature(face_nodes[:3], face_nodes[3:]),
+                    )
                 )
-                by_key.setdefault(key, []).append((element.element_id, local_face_id))
 
-        result: list[BackendMeshFace] = []
+        cad_facets: list[tuple[BackendFace, tuple[_SurfaceFacet, ...]]] = []
+        seen_surface_keys: set[tuple[int, int, int]] = set()
         for cad_face in context.faces:
             surface_tag = _surface_tag(cad_face.face_id)
-            surface_keys = _surface_mesh_keys(gmsh, surface_tag)
-            if not surface_keys:
+            surface_facets = _surface_mesh_keys(gmsh, surface_tag)
+            if not surface_facets:
                 raise BackendError(
                     BackendErrorCategory.INTEGRITY,
                     f"Gmsh produced no surface facets for CAD face {cad_face.face_id!r}",
                 )
-            for facet_index, key in enumerate(sorted(surface_keys)):
-                adjacency = tuple(sorted(by_key.get(key, ())))
-                if not adjacency or len(adjacency) > 2:
+            for facet in surface_facets:
+                if facet.corner_key in seen_surface_keys:
+                    raise BackendError(
+                        BackendErrorCategory.INTEGRITY,
+                        f"CAD face {cad_face.face_id!r} contains a duplicate surface facet",
+                    )
+                seen_surface_keys.add(facet.corner_key)
+            cad_facets.append((cad_face, surface_facets))
+
+        exterior_keys = {key for key, adjacency in by_key.items() if len(adjacency) == 1}
+        if seen_surface_keys != exterior_keys:
+            raise BackendError(
+                BackendErrorCategory.INTEGRITY,
+                "CAD boundary facets do not cover every exterior Tet10 face exactly once",
+            )
+
+        result: list[BackendMeshFace] = []
+        for cad_face, surface_facets in cad_facets:
+            for facet_index, facet in enumerate(
+                sorted(surface_facets, key=lambda item: item.corner_key)
+            ):
+                adjacency = tuple(
+                    sorted(
+                        by_key.get(facet.corner_key, ()),
+                        key=lambda item: (item.element_id, item.local_face_id),
+                    )
+                )
+                if len(adjacency) != 1:
                     raise BackendError(
                         BackendErrorCategory.INTEGRITY,
                         f"CAD face {cad_face.face_id!r} has an invalid Tet10 boundary adjacency",
                     )
-                corner_points = tuple(node_coordinates[node_id] for node_id in key)
+                face_context = adjacency[0]
+                if facet.edge_midpoints != face_context.edge_midpoints:
+                    raise BackendError(
+                        BackendErrorCategory.INTEGRITY,
+                        f"CAD face {cad_face.face_id!r} has mismatched Tet10 midside connectivity",
+                    )
+                corner_points = tuple(node_coordinates[node_id] for node_id in facet.corner_key)
                 area, centroid = _triangle_measure(corner_points)
                 result.append(
                     BackendMeshFace(
                         face_id=f"{cad_face.face_id}:facet-{facet_index}",
-                        adjacent_element_ids=tuple(item[0] for item in adjacency),
-                        local_face_ids=tuple(item[1] for item in adjacency),
+                        adjacent_element_ids=(face_context.element_id,),
+                        local_face_ids=(face_context.local_face_id,),
                         area_si=area,
                         centroid_si=centroid,
                         boundary_points_si=corner_points,
@@ -681,6 +1059,134 @@ def _source_digest(content: bytes) -> str:
             BackendErrorCategory.INVALID_INPUT, "STEP content must be non-empty bytes"
         )
     return hashlib.sha256(content).hexdigest()
+
+
+def _require_curved_primitive(value: object) -> RigidPrimitive:
+    if not isinstance(value, RigidPrimitive):
+        raise BackendError(BackendErrorCategory.INVALID_INPUT, "primitive must be a RigidPrimitive")
+    if value.kind not in {"sphere", "cylinder"}:
+        raise BackendError(
+            BackendErrorCategory.UNSUPPORTED_CAPABILITY,
+            f"native OCC primitive kind is unsupported: {value.kind!r}",
+        )
+    return value
+
+
+def _require_geometry_digest(value: object) -> str:
+    if not isinstance(value, str) or _SHA256_RE.fullmatch(value) is None:
+        raise BackendError(
+            BackendErrorCategory.INVALID_INPUT,
+            "geometry_digest must be a lowercase SHA-256 digest",
+        )
+    return value
+
+
+def _require_body_id(value: object) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        raise BackendError(BackendErrorCategory.INVALID_INPUT, "body_id must be non-empty text")
+    return value
+
+
+def _require_global_size_si(value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise BackendError(BackendErrorCategory.INVALID_INPUT, "global_size_si must be numeric")
+    try:
+        result = float(value)
+    except OverflowError as error:
+        raise BackendError(
+            BackendErrorCategory.INVALID_INPUT, "global_size_si must be finite"
+        ) from error
+    if not math.isfinite(result) or result <= 0.0:
+        raise BackendError(
+            BackendErrorCategory.INVALID_INPUT, "global_size_si must be positive and finite"
+        )
+    return result
+
+
+def _validated_local_refinements(
+    value: object,
+    *,
+    body_id: str,
+    frame: FrameId,
+    global_size_si: float,
+) -> tuple[BackendLocalRefinement, ...]:
+    if isinstance(value, (str, bytes, bytearray)) or not isinstance(value, Sequence):
+        raise BackendError(
+            BackendErrorCategory.INVALID_INPUT,
+            "local_refinements must be a sequence of BackendLocalRefinement values",
+        )
+    entries = tuple(value)
+    if any(not isinstance(item, BackendLocalRefinement) for item in entries):
+        raise BackendError(
+            BackendErrorCategory.INVALID_INPUT,
+            "local_refinements must contain BackendLocalRefinement values",
+        )
+    typed_entries = tuple(cast(BackendLocalRefinement, item) for item in entries)
+    for index, refinement in enumerate(typed_entries):
+        if refinement.body_id != body_id:
+            raise BackendError(
+                BackendErrorCategory.INVALID_INPUT,
+                f"local_refinements[{index}] body_id does not match the meshed body",
+            )
+        if refinement.frame != frame:
+            raise BackendError(
+                BackendErrorCategory.INVALID_INPUT,
+                f"local_refinements[{index}] frame does not match the source frame",
+            )
+        if (
+            not math.isfinite(refinement.radius_si)
+            or refinement.radius_si <= 0.0
+            or not math.isfinite(refinement.size_si)
+            or refinement.size_si <= 0.0
+            or refinement.size_si > global_size_si
+        ):
+            raise BackendError(
+                BackendErrorCategory.INVALID_INPUT,
+                f"local_refinements[{index}] has invalid dimensions or exceeds global_size_si",
+            )
+    return typed_entries
+
+
+def _primitive_length_si(primitive: RigidPrimitive, name: str) -> float:
+    try:
+        value = float(primitive.dimensions[name].to_si().value)
+    except (AttributeError, KeyError, TypeError, ValueError, OverflowError) as error:
+        raise BackendError(
+            BackendErrorCategory.INVALID_INPUT,
+            f"primitive dimension {name!r} is not a finite length",
+        ) from error
+    if not math.isfinite(value) or value <= 0.0:
+        raise BackendError(
+            BackendErrorCategory.INVALID_INPUT,
+            f"primitive dimension {name!r} must be positive and finite",
+        )
+    return value
+
+
+def _primitive_source_digest(
+    primitive: RigidPrimitive,
+    *,
+    geometry_digest: str,
+    global_size_si: float | None,
+    local_refinements: Sequence[BackendLocalRefinement] = (),
+) -> str:
+    payload: dict[str, object] = {
+        "schema_version": "1",
+        "backend_id": "gmsh-occ",
+        "primitive": primitive.to_dict(),
+        "geometry_digest": geometry_digest,
+        "native_length_unit": "m",
+        "global_size_si": global_size_si,
+        "ordering_id": BACKEND_TET10_ORDER_ID if global_size_si is not None else None,
+    }
+    if local_refinements:
+        payload["local_refinements"] = [item.to_dict() for item in local_refinements]
+    return hashlib.sha256(canonical_bytes(payload)).hexdigest()
 
 
 def _require_ap214_header(content: bytes) -> None:
@@ -1039,17 +1545,33 @@ def _tet10_face_positions() -> tuple[tuple[int, ...], ...]:
     )
 
 
-def _surface_mesh_keys(gmsh: Any, surface_tag: int) -> set[tuple[int, int, int]]:
+def _surface_mesh_keys(gmsh: Any, surface_tag: int) -> tuple[_SurfaceFacet, ...]:
     try:
-        element_types, _, node_tags = gmsh.model.mesh.getElements(2, surface_tag)
+        element_types, element_tags, node_tags = gmsh.model.mesh.getElements(2, surface_tag)
     except (AttributeError, RuntimeError, TypeError, ValueError) as error:
         raise BackendError(
             BackendErrorCategory.ENVIRONMENT,
             f"Gmsh surface mesh read failed for {surface_tag}: {error}",
         ) from error
-    keys: set[tuple[int, int, int]] = set()
-    for type_id_raw, flat_raw in zip(element_types, node_tags, strict=True):
-        type_id = int(type_id_raw)
+    try:
+        types = _as_ints(element_types)
+        tags_by_type = [_as_ints(item) for item in element_tags]
+        nodes_by_type = [_as_ints(item) for item in node_tags]
+    except (BackendError, TypeError, ValueError) as error:
+        if isinstance(error, BackendError):
+            raise
+        raise BackendError(
+            BackendErrorCategory.INTEGRITY,
+            "Gmsh surface element arrays are not valid sequences",
+        ) from error
+    if len(types) != len(tags_by_type) or len(types) != len(nodes_by_type):
+        raise BackendError(
+            BackendErrorCategory.INTEGRITY, "Gmsh surface element arrays are inconsistent"
+        )
+    facets: list[_SurfaceFacet] = []
+    seen_corner_keys: set[tuple[int, int, int]] = set()
+    seen_element_tags: set[int] = set()
+    for type_id, tags, flat in zip(types, tags_by_type, nodes_by_type, strict=True):
         try:
             properties = gmsh.model.mesh.getElementProperties(type_id)
         except (AttributeError, RuntimeError, TypeError, ValueError) as error:
@@ -1061,22 +1583,58 @@ def _surface_mesh_keys(gmsh: Any, surface_tag: int) -> set[tuple[int, int, int]]
             raise BackendError(
                 BackendErrorCategory.INTEGRITY, "Gmsh surface element properties are incomplete"
             )
-        node_count = int(properties[3])
-        primary_count = int(properties[5])
-        if primary_count != 3 or node_count < 3:
+        try:
+            dimension = int(properties[1])
+            order = int(properties[2])
+            node_count = int(properties[3])
+            primary_count = int(properties[5])
+        except (TypeError, ValueError, OverflowError) as error:
+            raise BackendError(
+                BackendErrorCategory.INTEGRITY,
+                f"Gmsh surface element properties are invalid for type {type_id}",
+            ) from error
+        if dimension != 2 or order != 2 or primary_count != 3 or node_count != 6:
             raise BackendError(
                 BackendErrorCategory.UNSUPPORTED_CAPABILITY,
-                f"Gmsh surface element type {type_id} is not triangular",
+                f"Gmsh surface element type {type_id} is not a complete quadratic triangle",
             )
-        flat = _as_ints(flat_raw)
-        tags = flat
-        if len(tags) % node_count:
+        if any(tag <= 0 for tag in tags) or len(set(tags)) != len(tags):
+            raise BackendError(
+                BackendErrorCategory.INTEGRITY,
+                f"Gmsh surface element tags are invalid for type {type_id}",
+            )
+        if seen_element_tags.intersection(tags):
+            raise BackendError(
+                BackendErrorCategory.INTEGRITY,
+                f"Gmsh surface element tags are duplicated for surface {surface_tag}",
+            )
+        seen_element_tags.update(tags)
+        if len(flat) != len(tags) * node_count:
             raise BackendError(
                 BackendErrorCategory.INTEGRITY, "Gmsh surface connectivity length is inconsistent"
             )
-        for index in range(0, len(tags), node_count):
-            keys.add(_sorted_triple(tuple(tags[index + offset] for offset in range(3))))
-    return keys
+        for index, element_tag in enumerate(tags):
+            del element_tag
+            node_ids = tuple(flat[index * node_count : (index + 1) * node_count])
+            if len(set(node_ids)) != 6 or any(node_id <= 0 for node_id in node_ids):
+                raise BackendError(
+                    BackendErrorCategory.INTEGRITY,
+                    "Gmsh quadratic surface facet must contain six distinct positive nodes",
+                )
+            corner_key = _sorted_triple(node_ids[:3])
+            if corner_key in seen_corner_keys:
+                raise BackendError(
+                    BackendErrorCategory.INTEGRITY,
+                    f"Gmsh surface {surface_tag} contains a duplicate facet",
+                )
+            seen_corner_keys.add(corner_key)
+            facets.append(
+                _SurfaceFacet(
+                    corner_key=corner_key,
+                    edge_midpoints=_edge_midpoint_signature(node_ids[:3], node_ids[3:]),
+                )
+            )
+    return tuple(facets)
 
 
 def _surface_tag(face_id: str) -> int:
@@ -1093,6 +1651,26 @@ def _sorted_triple(values: Sequence[int]) -> tuple[int, int, int]:
         raise BackendError(BackendErrorCategory.INTEGRITY, "a surface key must contain three nodes")
     first, second, third = sorted(values)
     return first, second, third
+
+
+def _edge_midpoint_signature(
+    corner_nodes: Sequence[int], midpoint_nodes: Sequence[int]
+) -> _EdgeMidpointSignature:
+    if len(corner_nodes) != 3 or len(midpoint_nodes) != 3:
+        raise BackendError(
+            BackendErrorCategory.INTEGRITY,
+            "a quadratic triangle must contain three corners and three midsides",
+        )
+    edges: list[tuple[tuple[int, int], int]] = []
+    for first, second, midpoint in zip(
+        corner_nodes,
+        (*corner_nodes[1:], corner_nodes[0]),
+        midpoint_nodes,
+        strict=True,
+    ):
+        edge = (first, second) if first < second else (second, first)
+        edges.append((edge, midpoint))
+    return tuple(sorted(edges))
 
 
 def _triangle_measure(
