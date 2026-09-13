@@ -26,7 +26,13 @@ from febio_cae.domain.canonical import canonical_bytes
 from febio_cae.domain.codec import decode_record
 
 from .adapter import StepGeometryMeshAdapter
-from .backend import BackendBody, BackendFace, BackendInspection, BackendMesh
+from .backend import (
+    BackendBody,
+    BackendFace,
+    BackendInspection,
+    BackendLocalRefinement,
+    BackendMesh,
+)
 from .gmsh_occ import GmshOCCBackend, GmshOCCConfig, _require_ap214_header
 
 _pending: list[WindowsJobProcess] = []
@@ -168,7 +174,15 @@ class CurrentInspection:
             raise ValueError("current preparation inspection source/body mismatch")
         return self.report
 
-    def mesh(self, content: bytes, body_id: str, global_size_si: float) -> BackendMesh:
+    def mesh(
+        self,
+        content: bytes,
+        body_id: str,
+        global_size_si: float,
+        *,
+        local_refinements: tuple[BackendLocalRefinement, ...] = (),
+    ) -> BackendMesh:
+        del local_refinements
         raise ValueError("current preparation generation allowance has already been consumed")
 
 

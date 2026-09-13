@@ -110,6 +110,40 @@ def _positive_int(value: object, field: str) -> int:
 
 
 @dataclass(frozen=True, slots=True)
+class BackendLocalRefinement:
+    """One immutable source-local spherical native size-field request."""
+
+    body_id: str
+    frame: FrameId
+    center_si: tuple[float, float, float]
+    radius_si: float
+    size_si: float
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "body_id", _text(self.body_id, "body_id"))
+        if not isinstance(self.frame, FrameId):
+            raise TypeError("frame must be a FrameId")
+        object.__setattr__(self, "center_si", _coordinates(self.center_si, "center_si"))
+        radius = _finite(self.radius_si, "radius_si")
+        if radius <= 0.0:
+            raise ValueError("radius_si must be positive")
+        object.__setattr__(self, "radius_si", radius)
+        size = _finite(self.size_si, "size_si")
+        if size <= 0.0:
+            raise ValueError("size_si must be positive")
+        object.__setattr__(self, "size_si", size)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "body_id": self.body_id,
+            "frame": self.frame.value,
+            "center_si": list(self.center_si),
+            "radius_si": self.radius_si,
+            "size_si": self.size_si,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class BackendFace:
     """One backend-observed boundary face and its geometric measurements.
 
@@ -467,7 +501,14 @@ class GeometryMeshBackend(Protocol):
     def inspect(self, content: bytes, requested_body_ids: Sequence[str]) -> BackendInspection:
         """Inspect exact source bytes and return backend geometry facts."""
 
-    def mesh(self, content: bytes, body_id: str, global_size_si: float) -> BackendMesh:
+    def mesh(
+        self,
+        content: bytes,
+        body_id: str,
+        global_size_si: float,
+        *,
+        local_refinements: tuple[BackendLocalRefinement, ...] = (),
+    ) -> BackendMesh:
         """Generate a Tet10 mesh for one body, with SI coordinates."""
 
 
@@ -480,6 +521,7 @@ __all__ = [
     "BackendErrorCategory",
     "BackendFace",
     "BackendInspection",
+    "BackendLocalRefinement",
     "BackendMesh",
     "BackendMeshFace",
     "BackendNode",

@@ -7,7 +7,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 from .canonical import canonical_bytes
-from .selection import FaceSetRule, SelectionRef
+from .selection import FaceSetRule, SelectionRef, WholeBodyRule
+from .spatial import Point3
 from .units import Dimension, Quantity
 
 SCHEMA_VERSION = "1"
@@ -104,12 +105,43 @@ class NumericalProfileRef:
 
 
 @dataclass(frozen=True, slots=True)
+class SourceLocalRefinementBall:
+    """An explicit spherical source-local region for one mesh refinement."""
+
+    center: Point3
+    radius: Quantity
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.center, Point3):
+            raise MeshPolicyValidationError("center must be a Point3")
+        object.__setattr__(self, "radius", _require_positive_length(self.radius, "radius"))
+        try:
+            self.to_bytes()
+        except (TypeError, ValueError) as error:
+            raise MeshPolicyValidationError(
+                f"source-local refinement ball is not canonically serializable: {error}"
+            ) from error
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "kind": "source_local_ball",
+            "center": self.center.to_dict(),
+            "radius": _quantity_dict(self.radius),
+        }
+
+    def to_bytes(self) -> bytes:
+        return canonical_bytes(self.to_dict())
+
+
+@dataclass(frozen=True, slots=True)
 class LocalRefinement:
     """A named local upper element-size bound over an explicit selection."""
 
     refinement_id: str
     selection: SelectionRef
     size: Quantity
+    region: SourceLocalRefinementBall | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -120,6 +152,15 @@ class LocalRefinement:
         if not isinstance(self.selection, SelectionRef):
             raise MeshPolicyValidationError("selection must be a SelectionRef")
         object.__setattr__(self, "size", _require_positive_length(self.size, "size"))
+        if self.region is not None:
+            if not isinstance(self.region, SourceLocalRefinementBall):
+                raise MeshPolicyValidationError(
+                    "region must be a SourceLocalRefinementBall or None"
+                )
+            if not isinstance(self.selection.rule, WholeBodyRule):
+                raise MeshPolicyValidationError(
+                    "source-local refinement balls require a WholeBodyRule selection"
+                )
         try:
             self.to_bytes()
         except (TypeError, ValueError) as error:
@@ -133,6 +174,7 @@ class LocalRefinement:
             "refinement_id": self.refinement_id,
             "selection": self.selection.to_dict(),
             "size": _quantity_dict(self.size),
+            **({} if self.region is None else {"region": self.region.to_dict()}),
         }
 
     def to_bytes(self) -> bytes:
@@ -227,4 +269,5 @@ __all__ = [
     "MeshPolicy",
     "MeshPolicyValidationError",
     "NumericalProfileRef",
+    "SourceLocalRefinementBall",
 ]

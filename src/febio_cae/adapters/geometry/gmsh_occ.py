@@ -23,7 +23,7 @@ import threading
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Self
+from typing import Any, Self, cast
 
 from febio_cae.domain import FrameId, RigidPrimitive, unit_definition
 from febio_cae.domain.canonical import canonical_bytes
@@ -37,6 +37,7 @@ from .backend import (
     BackendErrorCategory,
     BackendFace,
     BackendInspection,
+    BackendLocalRefinement,
     BackendMesh,
     BackendMeshFace,
     BackendNode,
@@ -214,16 +215,24 @@ class GmshOCCBackend:
         *,
         geometry_digest: str,
         global_size_si: float,
+        local_refinements: tuple[BackendLocalRefinement, ...] = (),
     ) -> BackendMesh:
         """Generate a native curved Tet10 mesh for a local sphere or cylinder."""
 
         primitive = _require_curved_primitive(primitive)
         geometry_digest = _require_geometry_digest(geometry_digest)
         global_size_si = _require_global_size_si(global_size_si)
+        local_refinements = _validated_local_refinements(
+            local_refinements,
+            body_id=primitive.body_id.value,
+            frame=primitive.local_frame,
+            global_size_si=global_size_si,
+        )
         source_digest = _primitive_source_digest(
             primitive,
             geometry_digest=geometry_digest,
             global_size_si=global_size_si,
+            local_refinements=local_refinements,
         )
         gmsh = self._load_module()
         with _GmshSession(gmsh, self.config.geometry_kernel):
@@ -234,6 +243,17 @@ class GmshOCCBackend:
                 raise BackendError(
                     BackendErrorCategory.UNSUPPORTED_CAPABILITY,
                     f"native {primitive.kind} did not produce a closed solid",
+                )
+            if local_refinements:
+                return self._mesh_context(
+                    gmsh,
+                    context,
+                    source_digest,
+                    geometry_digest,
+                    _OCC_TARGET_SCALE_TO_SI,
+                    global_size_si,
+                    frame=primitive.local_frame,
+                    local_refinements=local_refinements,
                 )
             return self._mesh_context(
                 gmsh,
@@ -282,20 +302,27 @@ class GmshOCCBackend:
             bodies=bodies,
         )
 
-    def mesh(self, content: bytes, body_id: str, global_size_si: float) -> BackendMesh:
+    def mesh(
+        self,
+        content: bytes,
+        body_id: str,
+        global_size_si: float,
+        *,
+        local_refinements: tuple[BackendLocalRefinement, ...] = (),
+    ) -> BackendMesh:
         source_digest = _source_digest(content)
         if self.config.require_step_ap214:
             _require_ap214_header(content)
-        gmsh = self._load_module()
+        body_id = _require_body_id(body_id)
+        global_size_si = _require_global_size_si(global_size_si)
+        local_refinements = _validated_local_refinements(
+            local_refinements,
+            body_id=body_id,
+            frame=FrameId(self.config.frame_id),
+            global_size_si=global_size_si,
+        )
         declared_unit, _declared_scale_to_si = _declared_length_unit(content)
-        if not isinstance(body_id, str) or not body_id or body_id != body_id.strip():
-            raise BackendError(BackendErrorCategory.INVALID_INPUT, "body_id must be non-empty text")
-        if isinstance(global_size_si, bool) or not isinstance(global_size_si, (int, float)):
-            raise BackendError(BackendErrorCategory.INVALID_INPUT, "global_size_si must be numeric")
-        if not math.isfinite(float(global_size_si)) or float(global_size_si) <= 0.0:
-            raise BackendError(
-                BackendErrorCategory.INVALID_INPUT, "global_size_si must be positive and finite"
-            )
+        gmsh = self._load_module()
 
         with _GmshSession(gmsh, self.config.geometry_kernel) as session:
             self._prepare_owned_session(gmsh)
@@ -327,13 +354,23 @@ class GmshOCCBackend:
                     BackendErrorCategory.UNSUPPORTED_CAPABILITY,
                     f"body {body_id!r} is not a closed solid",
                 )
+            if local_refinements:
+                return self._mesh_context(
+                    gmsh,
+                    context,
+                    source_digest,
+                    geometry_digest,
+                    _OCC_TARGET_SCALE_TO_SI,
+                    global_size_si,
+                    local_refinements=local_refinements,
+                )
             return self._mesh_context(
                 gmsh,
                 context,
                 source_digest,
                 geometry_digest,
                 _OCC_TARGET_SCALE_TO_SI,
-                float(global_size_si),
+                global_size_si,
             )
 
     def _prepare_owned_session(self, gmsh: Any) -> None:
@@ -615,7 +652,16 @@ class GmshOCCBackend:
         global_size_si: float,
         *,
         frame: FrameId | None = None,
+        local_refinements: tuple[BackendLocalRefinement, ...] = (),
     ) -> BackendMesh:
+        global_size_si = _require_global_size_si(global_size_si)
+        mesh_frame = frame if frame is not None else FrameId(self.config.frame_id)
+        local_refinements = _validated_local_refinements(
+            local_refinements,
+            body_id=context.body_id,
+            frame=mesh_frame,
+            global_size_si=global_size_si,
+        )
         try:
             mesh_api = gmsh.model.mesh
             # OCC import is explicitly normalized to metres. The native size
@@ -627,6 +673,13 @@ class GmshOCCBackend:
                     BackendErrorCategory.UNSUPPORTED_CAPABILITY,
                     "configured Gmsh module has no second-order mesh API",
                 )
+            if local_refinements:
+                self._configure_local_refinement_fields(
+                    gmsh,
+                    local_refinements,
+                    native_scale_to_si=native_scale_to_si,
+                    global_size_si=global_size_si,
+                )
             set_size = getattr(mesh_api, "setSize", None)
             get_entities = getattr(gmsh.model, "getEntities", None)
             used_point_sizes = False
@@ -635,7 +688,25 @@ class GmshOCCBackend:
                 if point_entities:
                     set_size(list(point_entities), native_size)
                     used_point_sizes = True
-            if (
+            if local_refinements:
+                option = getattr(gmsh, "option", None)
+                set_number = getattr(option, "setNumber", None)
+                if not callable(set_number):
+                    raise BackendError(
+                        BackendErrorCategory.UNSUPPORTED_CAPABILITY,
+                        "configured Gmsh module has no mesh size option API",
+                    )
+                # Keep the global field as an exterior upper target.  In
+                # particular, never set MeshSizeMin to the global target: use
+                # the smallest local request so a prior session's global
+                # floor cannot erase the smaller local sizes.
+                set_number(
+                    "Mesh.MeshSizeMin",
+                    min(item.size_si for item in local_refinements) / native_scale_to_si,
+                )
+                set_number("Mesh.MeshSizeMax", native_size)
+                set_number("Mesh.MeshSizeExtendFromBoundary", 0)
+            elif (
                 not used_point_sizes
                 and hasattr(gmsh, "option")
                 and hasattr(gmsh.option, "setNumber")
@@ -679,6 +750,77 @@ class GmshOCCBackend:
             faces=faces,
             ordering_id=BACKEND_TET10_ORDER_ID,
         )
+
+    def _configure_local_refinement_fields(
+        self,
+        gmsh: Any,
+        local_refinements: tuple[BackendLocalRefinement, ...],
+        *,
+        native_scale_to_si: float,
+        global_size_si: float,
+    ) -> None:
+        try:
+            field_api = gmsh.model.mesh.field
+        except AttributeError as error:
+            raise BackendError(
+                BackendErrorCategory.UNSUPPORTED_CAPABILITY,
+                "configured Gmsh module has no mesh size-field API",
+            ) from error
+        add = getattr(field_api, "add", None)
+        set_number = getattr(field_api, "setNumber", None)
+        set_numbers = getattr(field_api, "setNumbers", None)
+        set_background = getattr(field_api, "setAsBackgroundMesh", None)
+        if not all(callable(item) for item in (add, set_number, set_numbers, set_background)):
+            raise BackendError(
+                BackendErrorCategory.UNSUPPORTED_CAPABILITY,
+                "configured Gmsh module has an incomplete mesh size-field API",
+            )
+
+        native_global = global_size_si / native_scale_to_si
+        ball_fields: list[int] = []
+        try:
+            for refinement in local_refinements:
+                tag = int(add("Ball"))
+                if tag <= 0:
+                    raise BackendError(
+                        BackendErrorCategory.INTEGRITY,
+                        "Gmsh returned an invalid local refinement field tag",
+                    )
+                ball_fields.append(tag)
+                native_center = tuple(
+                    coordinate / native_scale_to_si for coordinate in refinement.center_si
+                )
+                set_number(tag, "VIn", refinement.size_si / native_scale_to_si)
+                set_number(tag, "VOut", native_global)
+                set_number(tag, "XCenter", native_center[0])
+                set_number(tag, "YCenter", native_center[1])
+                set_number(tag, "ZCenter", native_center[2])
+                set_number(tag, "Radius", refinement.radius_si / native_scale_to_si)
+                set_number(tag, "Thickness", native_global)
+            background = ball_fields[0]
+            if len(ball_fields) > 1:
+                background = int(add("Min"))
+                if background <= 0:
+                    raise BackendError(
+                        BackendErrorCategory.INTEGRITY,
+                        "Gmsh returned an invalid combined refinement field tag",
+                    )
+                set_numbers(background, "FieldsList", ball_fields)
+            set_background(background)
+        except BackendError:
+            raise
+        except (
+            AttributeError,
+            OSError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+            OverflowError,
+        ) as error:
+            raise BackendError(
+                BackendErrorCategory.ENVIRONMENT,
+                f"Gmsh local refinement field setup failed: {error}",
+            ) from error
 
     def _tet10_elements(
         self, gmsh: Any, volume_tag: int, node_coordinates: dict[int, tuple[float, float, float]]
@@ -934,6 +1076,17 @@ def _require_geometry_digest(value: object) -> str:
     return value
 
 
+def _require_body_id(value: object) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        raise BackendError(BackendErrorCategory.INVALID_INPUT, "body_id must be non-empty text")
+    return value
+
+
 def _require_global_size_si(value: object) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise BackendError(BackendErrorCategory.INVALID_INPUT, "global_size_si must be numeric")
@@ -948,6 +1101,50 @@ def _require_global_size_si(value: object) -> float:
             BackendErrorCategory.INVALID_INPUT, "global_size_si must be positive and finite"
         )
     return result
+
+
+def _validated_local_refinements(
+    value: object,
+    *,
+    body_id: str,
+    frame: FrameId,
+    global_size_si: float,
+) -> tuple[BackendLocalRefinement, ...]:
+    if isinstance(value, (str, bytes, bytearray)) or not isinstance(value, Sequence):
+        raise BackendError(
+            BackendErrorCategory.INVALID_INPUT,
+            "local_refinements must be a sequence of BackendLocalRefinement values",
+        )
+    entries = tuple(value)
+    if any(not isinstance(item, BackendLocalRefinement) for item in entries):
+        raise BackendError(
+            BackendErrorCategory.INVALID_INPUT,
+            "local_refinements must contain BackendLocalRefinement values",
+        )
+    typed_entries = tuple(cast(BackendLocalRefinement, item) for item in entries)
+    for index, refinement in enumerate(typed_entries):
+        if refinement.body_id != body_id:
+            raise BackendError(
+                BackendErrorCategory.INVALID_INPUT,
+                f"local_refinements[{index}] body_id does not match the meshed body",
+            )
+        if refinement.frame != frame:
+            raise BackendError(
+                BackendErrorCategory.INVALID_INPUT,
+                f"local_refinements[{index}] frame does not match the source frame",
+            )
+        if (
+            not math.isfinite(refinement.radius_si)
+            or refinement.radius_si <= 0.0
+            or not math.isfinite(refinement.size_si)
+            or refinement.size_si <= 0.0
+            or refinement.size_si > global_size_si
+        ):
+            raise BackendError(
+                BackendErrorCategory.INVALID_INPUT,
+                f"local_refinements[{index}] has invalid dimensions or exceeds global_size_si",
+            )
+    return typed_entries
 
 
 def _primitive_length_si(primitive: RigidPrimitive, name: str) -> float:
@@ -971,20 +1168,20 @@ def _primitive_source_digest(
     *,
     geometry_digest: str,
     global_size_si: float | None,
+    local_refinements: Sequence[BackendLocalRefinement] = (),
 ) -> str:
-    return hashlib.sha256(
-        canonical_bytes(
-            {
-                "schema_version": "1",
-                "backend_id": "gmsh-occ",
-                "primitive": primitive.to_dict(),
-                "geometry_digest": geometry_digest,
-                "native_length_unit": "m",
-                "global_size_si": global_size_si,
-                "ordering_id": BACKEND_TET10_ORDER_ID if global_size_si is not None else None,
-            }
-        )
-    ).hexdigest()
+    payload: dict[str, object] = {
+        "schema_version": "1",
+        "backend_id": "gmsh-occ",
+        "primitive": primitive.to_dict(),
+        "geometry_digest": geometry_digest,
+        "native_length_unit": "m",
+        "global_size_si": global_size_si,
+        "ordering_id": BACKEND_TET10_ORDER_ID if global_size_si is not None else None,
+    }
+    if local_refinements:
+        payload["local_refinements"] = [item.to_dict() for item in local_refinements]
+    return hashlib.sha256(canonical_bytes(payload)).hexdigest()
 
 
 def _require_ap214_header(content: bytes) -> None:

@@ -11,13 +11,14 @@ from .canonical import canonical_bytes
 from .contact import ContactIntent
 from .geometry import GeometryIntent
 from .material import CompressibleNeoHookean, IsotropicLinearElastic, MaterialCandidate
-from .mesh_policy import MeshPolicy
+from .mesh_policy import MeshPolicy, SourceLocalRefinementBall
 from .motion import MotionProfile
 from .output_policy import OutputPolicy
 from .quality_policy import QualityPolicy
 from .rigid_kinematics import RigidToolIntent
 from .selection import SelectionRef
 from .solver_policy import SolverPolicy
+from .spatial import FrameId
 from .support import SupportSet
 
 SCHEMA_VERSION = "1"
@@ -98,6 +99,21 @@ def _require_selection_context(
         )
 
 
+def _source_frame_for_selection(
+    selection: SelectionRef,
+    geometry: GeometryIntent,
+    primitive: RigidToolIntent,
+    field: str,
+) -> FrameId:
+    if selection.body_id == geometry.body_id:
+        return geometry.placement.source_frame
+    if selection.body_id == primitive.primitive.body_id:
+        return primitive.primitive.local_frame
+    raise CaseSpecValidationError(
+        f"{field} selection must identify the declared part or rigid tool"
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class CaseSpec:
     """One explicit, locally cross-referenced case intent composition."""
@@ -175,12 +191,29 @@ class CaseSpec:
             )
 
         for index, refinement in enumerate(self.mesh_policy.local_refinements):
+            refinement_field = f"mesh_policy.local_refinements[{index}]"
             _require_selection_context(
                 refinement.selection,
-                f"mesh_policy.local_refinements[{index}]",
+                refinement_field,
                 part_context,
                 tool_context,
             )
+            if refinement.region is not None:
+                if not isinstance(refinement.region, SourceLocalRefinementBall):
+                    raise CaseSpecValidationError(
+                        f"{refinement_field} region must be a SourceLocalRefinementBall"
+                    )
+                expected_source_frame = _source_frame_for_selection(
+                    refinement.selection,
+                    geometry,
+                    self.rigid_tool,
+                    refinement_field,
+                )
+                if refinement.region.center.frame != expected_source_frame:
+                    raise CaseSpecValidationError(
+                        f"{refinement_field} region center must use the selected body's "
+                        "source-local frame"
+                    )
         for index, request in enumerate(self.outputs.requests):
             _require_selection_context(
                 request.selection,

@@ -22,6 +22,7 @@ from febio_cae.adapters.geometry import (
     BackendBody,
     BackendFace,
     BackendInspection,
+    BackendLocalRefinement,
     BackendMesh,
     StepGeometryMeshAdapter,
 )
@@ -133,7 +134,15 @@ class _RecordedInspection:
             raise ValueError("registered native inspection source/body mismatch")
         return self.report
 
-    def mesh(self, content: bytes, body_id: str, global_size_si: float) -> BackendMesh:
+    def mesh(
+        self,
+        content: bytes,
+        body_id: str,
+        global_size_si: float,
+        *,
+        local_refinements: tuple[BackendLocalRefinement, ...] = (),
+    ) -> BackendMesh:
+        del local_refinements
         raise PortError(PortErrorCategory.CONFLICT, "Gmsh demo budget is exhausted")
 
 

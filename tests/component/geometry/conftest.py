@@ -9,8 +9,11 @@ from febio_cae.adapters.geometry import (
     BACKEND_TET10_ORDER_ID,
     BackendBody,
     BackendElement,
+    BackendError,
+    BackendErrorCategory,
     BackendFace,
     BackendInspection,
+    BackendLocalRefinement,
     BackendMesh,
     BackendMeshFace,
     BackendNode,
@@ -203,7 +206,19 @@ class SyntheticBackend:
             defects=self.defects,
         )
 
-    def mesh(self, content: bytes, body_id: str, global_size_si: float) -> BackendMesh:
+    def mesh(
+        self,
+        content: bytes,
+        body_id: str,
+        global_size_si: float,
+        *,
+        local_refinements: tuple[BackendLocalRefinement, ...] = (),
+    ) -> BackendMesh:
+        if local_refinements:
+            raise BackendError(
+                BackendErrorCategory.UNSUPPORTED_CAPABILITY,
+                "synthetic backend does not support local refinement requests",
+            )
         self.mesh_requests.append((body_id, global_size_si))
         node_coordinates = (
             (0.0, 0.0, 0.0),

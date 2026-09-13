@@ -67,7 +67,12 @@ from .lifecycle import (
     TaskStatus,
 )
 from .material import CompressibleNeoHookean, IsotropicLinearElastic
-from .mesh_policy import LocalRefinement, MeshPolicy, NumericalProfileRef
+from .mesh_policy import (
+    LocalRefinement,
+    MeshPolicy,
+    NumericalProfileRef,
+    SourceLocalRefinementBall,
+)
 from .motion import MotionProfile
 from .output_policy import EvaluationRequest, OutputLocation, OutputPolicy, OutputRequest
 from .partial_case_spec import PartialCaseSpec
@@ -304,6 +309,17 @@ def _profile_ref(value: object, field: str) -> NumericalProfileRef:
         _text(payload["profile_id"], f"{field}.profile_id"),
         _text(payload["purpose"], f"{field}.purpose"),
         _digest(payload["record_digest"], f"{field}.record_digest"),
+    )
+
+
+def _source_local_ball(value: object, field: str) -> SourceLocalRefinementBall:
+    payload = _mapping(value, {"schema_version", "kind", "center", "radius"}, field)
+    _schema(payload, field)
+    if _text(payload["kind"], f"{field}.kind") != "source_local_ball":
+        _fail(field, "unsupported region kind")
+    return SourceLocalRefinementBall(
+        _point(payload["center"], f"{field}.center"),
+        _quantity(payload["radius"], f"{field}.radius"),
     )
 
 
@@ -783,19 +799,26 @@ def _mesh_policy(value: object, field: str) -> MeshPolicy:
     for index, item in enumerate(
         _sequence(payload["local_refinements"], f"{field}.local_refinements")
     ):
+        refinement_field = f"{field}.local_refinements[{index}]"
+        refinement_keys = {"schema_version", "refinement_id", "selection", "size"}
+        if isinstance(item, Mapping) and "region" in item:
+            refinement_keys.add("region")
         item_payload = _mapping(
             item,
-            {"schema_version", "refinement_id", "selection", "size"},
-            f"{field}.local_refinements[{index}]",
+            refinement_keys,
+            refinement_field,
         )
-        _schema(item_payload, f"{field}.local_refinements[{index}]")
+        _schema(item_payload, refinement_field)
         refinements.append(
             LocalRefinement(
                 _text(item_payload["refinement_id"], "refinement_id"),
                 _selection(
-                    item_payload["selection"], f"{field}.local_refinements[{index}].selection"
+                    item_payload["selection"], f"{refinement_field}.selection"
                 ),
-                _quantity(item_payload["size"], f"{field}.local_refinements[{index}].size"),
+                _quantity(item_payload["size"], f"{refinement_field}.size"),
+                None
+                if "region" not in item_payload
+                else _source_local_ball(item_payload["region"], f"{refinement_field}.region"),
             )
         )
     return MeshPolicy(
