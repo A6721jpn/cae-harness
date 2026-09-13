@@ -29,7 +29,7 @@ from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 from types import CodeType, FunctionType, GetSetDescriptorType, ModuleType
-from typing import Any, BinaryIO, cast
+from typing import Any, BinaryIO, Protocol, cast
 
 _SCHEMA_VERSION = "gmsh-runtime-identity-v1"
 _GMSH_DISTRIBUTION = "gmsh"
@@ -213,7 +213,7 @@ def _compare_file_records(
     expected_path = expected["path"]
     observed_path = observed["path"]
     if not isinstance(expected_path, str) or not isinstance(observed_path, str):
-        raise ValueError(f"runtime identity {label} path is malformed")
+        raise TypeError(f"runtime identity {label} path is malformed")
     if (
         _path_key(expected_path) != _path_key(observed_path)
         or expected["size"] != observed["size"]
@@ -342,7 +342,7 @@ def _distribution_paths() -> tuple[Path, Path]:
         }:
             continue
         try:
-            located = Path(distribution.locate_file(entry)).resolve(strict=True)
+            located = Path(str(distribution.locate_file(entry))).resolve(strict=True)
         except (OSError, RuntimeError, ValueError) as exc:
             raise _error("installed Gmsh distribution contains an unresolved file") from exc
         name = candidate_name.casefold()
@@ -608,6 +608,19 @@ _MISSING = object()
 _CFUNC_PTR_TYPE = getattr(ctypes, "_CFuncPtr", None)
 _CFUNC_PTR_METACLASS = type(_CFUNC_PTR_TYPE) if isinstance(_CFUNC_PTR_TYPE, type) else None
 
+_CFUNC_PTR_CALL_OWNER: type | None
+_CFUNC_PTR_CALL: object
+_CFUNC_PTR_GETATTRIBUTE_OWNER: type | None
+_CFUNC_PTR_GETATTRIBUTE: object
+_CFUNC_PTR_SETATTR_OWNER: type | None
+_CFUNC_PTR_SETATTR: object
+_CFUNC_PTR_METADATA: dict[str, tuple[type, object]]
+
+
+class _DescriptorWithGet(Protocol):
+    def __get__(self, instance: object, owner: type | None = None) -> object:
+        ...
+
 
 def _raw_type_descriptor(value_type: type, name: str) -> tuple[type, object]:
     try:
@@ -650,7 +663,13 @@ def _value_signature(value: object, *, depth: int = 0, budget: int = _MAX_VALUE_
     """Describe only bounded built-in values; never walk arbitrary user objects."""
 
     value_type = type(value)
-    if value is None or value_type in (bool, int, complex):
+    if value is None:
+        return (value_type.__name__, value)
+    if type(value) is bool:
+        return (value_type.__name__, value)
+    if type(value) is int:
+        return (value_type.__name__, value)
+    if type(value) is complex:
         return (value_type.__name__, value)
     if value_type is float:
         return (value_type.__name__, repr(value))
@@ -677,25 +696,25 @@ def _value_signature(value: object, *, depth: int = 0, budget: int = _MAX_VALUE_
         )
         return ("list", len(value), items)
     if value_type is dict:
-        items_list: list[object] = []
+        dict_items: list[object] = []
         for index, (key, item) in enumerate(value.items()):
             if index >= budget:
                 break
-            items_list.append(
+            dict_items.append(
                 (
                     _value_signature(key, depth=depth + 1, budget=budget - index - 1),
                     _value_signature(item, depth=depth + 1, budget=budget - index - 1),
                 )
             )
-        items = tuple(items_list)
+        items = tuple(dict_items)
         return ("dict", len(value), items)
     if value_type is frozenset:
-        items_list: list[object] = []
+        set_items: list[object] = []
         for index, item in enumerate(value):
             if index >= budget:
                 break
-            items_list.append(_value_signature(item, depth=depth + 1, budget=budget - index - 1))
-        items = tuple(sorted(items_list, key=repr))
+            set_items.append(_value_signature(item, depth=depth + 1, budget=budget - index - 1))
+        items = tuple(sorted(set_items, key=repr))
         return ("frozenset", len(value), items)
     return ("object", value_type, id(value))
 
@@ -1856,8 +1875,11 @@ def _ctypes_metadata_value(value: object, name: str, attribute: str) -> object:
     owner, descriptor = _raw_type_descriptor(value_type, attribute)
     if owner is not expected_owner or descriptor is not expected_descriptor:
         raise _error(f"cached native callable {name} metadata access was overridden")
+    if type(descriptor) is not GetSetDescriptorType:
+        raise _error(f"cached native callable {name} metadata uses an unsupported descriptor")
     try:
-        return descriptor.__get__(value, value_type)
+        metadata_descriptor = cast(_DescriptorWithGet, descriptor)
+        return metadata_descriptor.__get__(value, value_type)
     except (AttributeError, TypeError, ValueError) as exc:
         raise _error(f"cached native callable {name} has malformed call metadata") from exc
 
@@ -1900,9 +1922,12 @@ def _static_ctypes_value(node: ast.AST) -> object:
         function_name: str | None = None
         if isinstance(function, ast.Name):
             function_name = function.id
-        elif isinstance(function, ast.Attribute) and isinstance(function.value, ast.Name):
-            if function.value.id == "ctypes":
-                function_name = function.attr
+        elif (
+            isinstance(function, ast.Attribute)
+            and isinstance(function.value, ast.Name)
+            and function.value.id == "ctypes"
+        ):
+            function_name = function.attr
         if function_name == "POINTER":
             pointed_type = _static_ctypes_value(node.args[0])
             if isinstance(pointed_type, type):
@@ -1916,12 +1941,14 @@ def _static_ctypes_value(node: ast.AST) -> object:
 def _native_signature_policy(
     source: bytes, native_symbols: frozenset[str]
 ) -> dict[str, frozenset[tuple[object, ...]]]:
-    default = (
+    default: tuple[object, ...] = (
         _value_signature(None),
         _value_signature(ctypes.c_int),
         _value_signature(None),
     )
-    permitted = {name: {default} for name in native_symbols}
+    permitted: dict[str, set[tuple[object, ...]]] = {
+        name: {default} for name in native_symbols
+    }
     if not native_symbols:
         return {}
     try:
@@ -1929,17 +1956,19 @@ def _native_signature_policy(
     except (SyntaxError, UnicodeDecodeError, TypeError, ValueError) as exc:
         raise _error("Gmsh source native metadata cannot be inspected") from exc
 
-    assignments: list[tuple[int, int, str, str, ast.AST]] = []
+    assignments: list[tuple[int, int, str, str, ast.expr]] = []
     for node in ast.walk(tree):
+        targets: list[ast.expr]
+        expression: ast.expr | None
         if isinstance(node, ast.Assign):
             targets = node.targets
-            value = node.value
+            expression = node.value
         elif isinstance(node, ast.AnnAssign):
             targets = [node.target]
-            value = node.value
-            if value is None:
-                continue
+            expression = node.value
         else:
+            continue
+        if expression is None:
             continue
         for target in targets:
             if not isinstance(target, ast.Attribute) or target.attr not in _NATIVE_CALL_ATTRIBUTES:
@@ -1949,11 +1978,15 @@ def _native_signature_policy(
                 continue
             if not isinstance(owner.value, ast.Name) or owner.value.id != "lib":
                 continue
-            assignments.append((target.lineno, target.col_offset, owner.attr, target.attr, value))
+            assignments.append(
+                (target.lineno, target.col_offset, owner.attr, target.attr, expression)
+            )
     if len(assignments) > _MAX_LIVE_MEMBERS:
         raise _error("Gmsh native metadata exceeds the finite verification limit")
     assignments.sort(key=lambda item: (item[0], item[1]))
-    current = {name: list(default) for name in native_symbols}
+    current: dict[str, list[object]] = {
+        name: list(default) for name in native_symbols
+    }
     for _line, _column, name, attribute, expression in assignments:
         value = _static_ctypes_value(expression)
         if value is _MISSING:
@@ -1991,7 +2024,8 @@ def _library_namespace(
     if type(descriptor) is not GetSetDescriptorType:
         raise _error("Gmsh native library namespace uses an unsupported descriptor")
     try:
-        namespace = cast(Any, descriptor).__get__(library, type(library))
+        namespace_descriptor = cast(_DescriptorWithGet, descriptor)
+        namespace = namespace_descriptor.__get__(library, type(library))
     except (AttributeError, TypeError, ValueError) as exc:
         raise _error("Gmsh native library namespace cannot be inspected") from exc
     if not isinstance(namespace, dict):
@@ -2533,17 +2567,19 @@ def _validate_loaded_module(
     if getattr(module, "__version__", None) != _GMSH_VERSION:
         raise _error("executing Gmsh module has an unexpected version")
     loaded_spec = getattr(module, "__spec__", None)
+    if loaded_spec is None:
+        raise _error("executing Gmsh module import spec changed")
     if (
-        loaded_spec is None
-        or getattr(loaded_spec, "name", None) != "gmsh"
+        getattr(loaded_spec, "name", None) != "gmsh"
         or getattr(loaded_spec, "submodule_search_locations", None) is not None
         or not _same_path(str(getattr(spec, "origin", "")), str(getattr(loaded_spec, "origin", "")))
     ):
         raise _error("executing Gmsh module import spec changed")
     loader = getattr(module, "__loader__", None)
+    if not isinstance(loader, _SourceOnlyLoader):
+        raise _error("executing Gmsh module code identity changed")
     if (
-        not isinstance(loader, _SourceOnlyLoader)
-        or getattr(loaded_spec, "loader", None) is not loader
+        getattr(loaded_spec, "loader", None) is not loader
         or loader._verified_code_digest != expected_code_digest
         or (expected_code is not None and loader._verified_code is not expected_code)
     ):
@@ -2583,7 +2619,7 @@ def _cached_session(
             module_record = binding["module"]
             library_record = binding["library"]
             if not isinstance(module_record, dict) or not isinstance(library_record, dict):
-                raise ValueError("runtime identity module/library records are malformed")
+                raise TypeError("runtime identity module/library records are malformed")
             module_path = _resolve_regular_file(module_record["path"], "Gmsh Python module")
             library_path = _resolve_regular_file(library_record["path"], "Gmsh native library")
             with ExitStack() as admission:
@@ -2662,7 +2698,7 @@ def load_verified_gmsh(binding: dict[str, object]) -> tuple[Any, dict[str, objec
         module_record = expected["module"]
         library_record = expected["library"]
         if not isinstance(module_record, dict) or not isinstance(library_record, dict):
-            raise ValueError("runtime identity module/library records are malformed")
+            raise TypeError("runtime identity module/library records are malformed")
         module_path = _resolve_regular_file(module_record["path"], "Gmsh Python module")
         library_path = _resolve_regular_file(library_record["path"], "Gmsh native library")
         with ExitStack() as admission:

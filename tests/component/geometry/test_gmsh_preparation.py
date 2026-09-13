@@ -17,8 +17,8 @@ from febio_cae.adapters.geometry.preparation import _MeasuredGmsh
 from febio_cae.domain import Quantity, RigidPrimitive, SourceAssetContent, SourceAssetRef
 from febio_cae.domain.canonical import canonical_bytes
 
-from .test_gmsh_units import _FakeGmsh
 from .conftest import TOOL_BODY, TOOL_LOCAL, _evidence, _identity_transform
+from .test_gmsh_units import _FakeGmsh
 
 
 def _source(header: str = "FILE_SCHEMA(('AUTOMOTIVE_DESIGN'));") -> bytes:
@@ -289,8 +289,8 @@ def test_measured_backend_allows_verified_load_per_producer_operation(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     module = _NativePrimitiveGmsh()
-    binding = {"synthetic": "binding"}
-    identity = {"synthetic": "identity"}
+    binding: dict[str, object] = {"synthetic": "binding"}
+    identity: dict[str, object] = {"synthetic": "identity"}
     calls: list[object] = []
 
     def verified_load(value: object) -> tuple[Any, dict[str, object]]:
@@ -319,7 +319,7 @@ def test_measured_backend_allows_verified_load_per_producer_operation(
 
 def test_measured_backend_keeps_planar_guard_for_imported_step_faces() -> None:
     module = _NativePrimitiveGmsh()
-    module.model.getType = lambda dimension, tag: "BSpline surface"
+    setattr(module.model, "getType", lambda dimension, tag: "BSpline surface")
     backend = _MeasuredGmsh(1)
     with pytest.raises(ValueError, match="planar STEP faces"):
         backend._inspect_faces(module, "body-1", 1, 1.0)

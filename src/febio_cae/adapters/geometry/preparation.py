@@ -21,10 +21,10 @@ from febio_cae.domain import (
     NumericalProfileRef,
     PortError,
     PortErrorCategory,
+    Quantity,
     RigidPrimitive,
     SourceAssetContent,
     SourceAssetRef,
-    Quantity,
 )
 from febio_cae.domain.canonical import canonical_bytes
 from febio_cae.domain.codec import decode_record
@@ -347,7 +347,7 @@ def _criteria_from_limits(limits: dict[str, Any], profile: NumericalProfileRef, 
             raise ValueError("box preparation must not carry curved generation criteria")
         return None
     if not isinstance(raw, dict):
-        raise ValueError("curved preparation requires parent-bound generation criteria")
+        raise TypeError("curved preparation requires parent-bound generation criteria")
     expected = {
         "profile",
         "max_boundary_deviation_si",
@@ -361,7 +361,7 @@ def _criteria_from_limits(limits: dict[str, Any], profile: NumericalProfileRef, 
     profile_raw = raw["profile"]
     if set(profile_raw) != {"schema_version", "profile_id", "purpose", "record_digest"}:
         raise ValueError("generation criteria profile is not canonical")
-    from febio_cae.adapters.meshing.approximation import ApproximationCriteria, NATIVE_ALGORITHM
+    from febio_cae.adapters.meshing.approximation import NATIVE_ALGORITHM, ApproximationCriteria
 
     try:
         criteria = ApproximationCriteria(
@@ -610,7 +610,7 @@ def _main() -> None:
     try:
         runtime_binding = payload["runtime_binding"]
         if not isinstance(runtime_binding, dict):
-            raise ValueError("preparation runtime binding is missing")
+            raise TypeError("preparation runtime binding is missing")
         result = produce(source, payload["request"], payload["limits"], runtime_binding)
         Path("output.json").write_bytes(canonical_bytes(result))
     except Exception as error:

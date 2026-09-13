@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import importlib
 import importlib.util
@@ -10,7 +11,6 @@ import platform
 import py_compile
 import signal
 import sys
-import ctypes
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any
@@ -89,7 +89,7 @@ def _isolated(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     values = {name: getattr(current, name) for name in names}
     values["isolated"] = 1
-    monkeypatch.setattr(runtime.sys, "flags", SimpleNamespace(**values))
+    monkeypatch.setitem(vars(runtime.sys), "flags", SimpleNamespace(**values))
 
 
 def test_capture_runtime_binding_uses_distribution_metadata_without_importing_gmsh(
@@ -133,13 +133,17 @@ def test_verify_runtime_identity_requires_exact_files_and_normalized_paths(
 ) -> None:
     paths = _files(tmp_path, "__version__ = '4.15.2'\n")
     expected = _binding(tmp_path, pyvenv_cfg=None)
+    expected_python = expected["python"]
+    expected_library = expected["library"]
+    assert isinstance(expected_python, dict)
+    assert isinstance(expected_library, dict)
     observed = {
         **expected,
-        "python": {**expected["python"], "path": str(paths[2]).upper()},
+        "python": {**expected_python, "path": str(paths[2]).upper()},
     }
 
     runtime.verify_runtime_identity(expected, observed)
-    observed["library"] = {**expected["library"], "size": 999}
+    observed["library"] = {**expected_library, "size": 999}
     with pytest.raises(ValueError, match="runtime identity"):
         runtime.verify_runtime_identity(expected, observed)
 
@@ -153,7 +157,7 @@ def test_load_verified_gmsh_rejects_process_or_environment_mismatch_before_impor
     cfg = tmp_path / "pyvenv.cfg"
     cfg.write_text("version = 3.12.10\n", encoding="utf-8")
     expected = _binding(tmp_path, module=module, library=library, pyvenv_cfg=cfg)
-    process = {
+    process: dict[str, object] = {
         "python": _identity(launcher),
         "python_image": _identity(image),
         "python_library": _identity(python_library),
@@ -278,7 +282,10 @@ def test_load_verified_gmsh_refuses_stale_cache_and_unverified_preload(
     )
     monkeypatch.setattr(runtime, "_mapped_module_path", lambda handle: library)
     monkeypatch.syspath_prepend(str(module.parent))
-    sys.modules["gmsh"] = SimpleNamespace(__file__=str(module), __version__="4.15.2")
+    preloaded = ModuleType("gmsh")
+    setattr(preloaded, "__file__", str(module))
+    setattr(preloaded, "__version__", "4.15.2")
+    sys.modules["gmsh"] = preloaded
     with pytest.raises((OSError, ValueError), match="preloaded"):
         runtime.load_verified_gmsh(expected)
     sys.modules.pop("gmsh", None)
@@ -289,7 +296,9 @@ def test_load_verified_gmsh_refuses_stale_cache_and_unverified_preload(
 def test_load_verified_gmsh_refuses_nonisolated_calls_before_import_or_reuse(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    module, library, launcher, image, python_library = _files(tmp_path, "__version__ = '4.15.2'\n")
+    module, library, _launcher, _image, _python_library = _files(
+        tmp_path, "__version__ = '4.15.2'\n"
+    )
     expected = _binding(tmp_path, module=module, library=library)
     monkeypatch.setattr(
         runtime,
@@ -493,7 +502,7 @@ def _synthetic_native_callable() -> Any:
     """Create a harmless CFuncPtr for the synthetic native-symbol tests."""
 
     native = ctypes.CFUNCTYPE(ctypes.c_int)(lambda: 0)
-    native.argtypes = None
+    setattr(native, "argtypes", None)
     return native
 
 
@@ -953,7 +962,6 @@ def test_verified_session_does_not_execute_ctypes_symbol_name_fallback(
     def replacement(self: Any, name: str) -> None:
         del self
         calls.append(name)
-        return None
 
     monkeypatch.setattr(type(native), "__getattr__", replacement, raising=False)
     runtime.load_verified_gmsh(expected)
@@ -1078,13 +1086,19 @@ def test_verified_session_rejects_library_attribute_dispatch_tampering(
     sys.modules.pop("gmsh", None)
     loaded, _ = runtime.load_verified_gmsh(expected)
 
-    class RedirectingLib(type(loaded.lib)):
-        def __getattribute__(self, attribute: str) -> Any:
-            if attribute == "gmshIsInitialized":
-                return lambda: True
-            return super().__getattribute__(attribute)
+    library_type = type(loaded.lib)
 
-    monkeypatch.setattr(loaded.lib, "__class__", RedirectingLib)
+    def redirecting_getattribute(self: object, attribute: str) -> object:
+        if attribute == "gmshIsInitialized":
+            return lambda: True
+        return object.__getattribute__(self, attribute)
+
+    redirecting_type = type(
+        "RedirectingLib",
+        (library_type,),
+        {"__getattribute__": redirecting_getattribute},
+    )
+    monkeypatch.setattr(loaded.lib, "__class__", redirecting_type)
     with pytest.raises((OSError, ValueError), match="library|dispatch|attribute|type"):
         runtime.load_verified_gmsh(expected)
 
@@ -1122,23 +1136,33 @@ def test_verified_session_rejects_ctypes_metaclass_mro_spoof(
 
     native = _synthetic_native_callable()
     native_type = type(native)
+    native_mro = native_type.__mro__
 
-    class LyingMeta(type(native_type)):
-        def __getattribute__(cls, attribute: str) -> Any:
-            if attribute == "__mro__":
-                return native_type.__mro__
-            return super().__getattribute__(attribute)
+    def lying_meta_getattribute(cls: type, attribute: str) -> object:
+        if attribute == "__mro__":
+            return native_mro
+        return type.__getattribute__(cls, attribute)
 
-    class RedirectedCFunc(native_type, metaclass=LyingMeta):
-        _argtypes_ = native_type._argtypes_
-        _restype_ = native_type._restype_
-        _flags_ = native_type._flags_
+    lying_meta = type(
+        "LyingMeta",
+        (type(native_type),),
+        {"__getattribute__": lying_meta_getattribute},
+    )
 
-        def __call__(self, *args: Any, **kwargs: Any) -> Any:
-            del args, kwargs
-            return None
+    def redirected_call(self: object, *args: object, **kwargs: object) -> None:
+        del self, args, kwargs
 
-    native.__class__ = RedirectedCFunc
+    redirected_type = lying_meta(
+        "RedirectedCFunc",
+        (native_type,),
+        {
+            "_argtypes_": getattr(native_type, "_argtypes_"),
+            "_restype_": getattr(native_type, "_restype_"),
+            "_flags_": getattr(native_type, "_flags_"),
+            "__call__": redirected_call,
+        },
+    )
+    native.__class__ = redirected_type
     _install_synthetic_native_export(monkeypatch, loaded, "gmshIsInitialized", native)
     with pytest.raises((OSError, ValueError), match="dispatch|metaclass|type|native"):
         runtime.load_verified_gmsh(expected)

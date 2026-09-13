@@ -290,7 +290,7 @@ def _main() -> None:
         source = SourceAssetContent(source_ref, bytes.fromhex(payload["content_hex"]))
         runtime_binding = payload["runtime_binding"]
         if not isinstance(runtime_binding, dict):
-            raise ValueError("inspection runtime binding is missing")
+            raise TypeError("inspection runtime binding is missing")
         result = produce(source, payload["limits"], runtime_binding)
     except (PortError, BackendError) as error:
         result = {"status": "ERROR", "category": error.category.value, "message": str(error)}
