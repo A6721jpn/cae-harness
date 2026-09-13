@@ -11,6 +11,7 @@ is actually mapped by Windows.
 from __future__ import annotations
 
 import ast
+import builtins
 import ctypes
 import ctypes.wintypes
 import dis
@@ -57,8 +58,10 @@ _MAX_LIVE_MEMBERS = 8192
 _MAX_LIVE_GLOBALS = 16384
 _MAX_VALUE_ITEMS = 128
 _MAX_VALUE_DEPTH = 4
+_MAX_FUNCTION_DEPENDENCY_DEPTH = 4
 _NATIVE_SYMBOL_PREFIX = "gmsh"
 _NATIVE_CALL_ATTRIBUTES = ("argtypes", "restype", "errcheck")
+_REPARSE_POINT_ATTRIBUTE = getattr(ctypes.wintypes, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
 
 
 class _RuntimeBindingError(OSError):
@@ -92,16 +95,12 @@ def _resolve_regular_file(value: object, label: str) -> Path:
         raise _error(f"{label} file is unavailable") from exc
     if not stat.S_ISREG(info.st_mode):
         raise _error(f"{label} file is not regular")
-    if getattr(info, "st_file_attributes", 0) & getattr(
-        ctypes.wintypes, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400
-    ):
+    if getattr(info, "st_file_attributes", 0) & _REPARSE_POINT_ATTRIBUTE:
         raise _error(f"{label} file is a reparse point")
     return resolved
 
 
-def _read_stream_bounded(
-    stream: BinaryIO, limit: int, label: str
-) -> tuple[bytes, int, str, int]:
+def _read_stream_bounded(stream: BinaryIO, limit: int, label: str) -> tuple[bytes, int, str, int]:
     try:
         before = os.fstat(stream.fileno())
         digest = hashlib.sha256()
@@ -127,6 +126,17 @@ def _read_stream_bounded(
     ):
         raise _error(f"{label} file changed while it was being verified")
     return b"".join(chunks), size, digest.hexdigest(), getattr(after, "st_mtime_ns", 0)
+
+
+def _read_file_bounded(path: Path, limit: int, label: str) -> bytes:
+    try:
+        with path.open("rb") as stream:
+            content = stream.read(limit + 1)
+    except (OSError, TypeError, ValueError) as exc:
+        raise _error(f"{label} file cannot be read") from exc
+    if len(content) > limit:
+        raise _error(f"{label} file exceeds the finite verification limit")
+    return content
 
 
 def _pinned_file(admission: ExitStack, path: Path, label: str) -> BinaryIO:
@@ -236,7 +246,11 @@ def _coerce_module_handle(handle: object) -> ctypes.wintypes.HMODULE | None:
         return None
     if type(handle) is not int or handle <= 0:
         raise _error("native module handle is not a positive integer")
-    bits = ctypes.sizeof(ctypes.c_void_p) * 8
+    sizeof = _CTYPES_BINDINGS.get("sizeof", _MISSING)
+    c_void_p = _CTYPES_BINDINGS.get("c_void_p", _MISSING)
+    if sizeof is _MISSING or c_void_p is _MISSING:
+        raise _error("ctypes module-handle bindings are unavailable")
+    bits = sizeof(c_void_p) * 8
     if handle >= 1 << bits:
         raise _error("native module handle is outside the process address width")
     return ctypes.wintypes.HMODULE(handle)
@@ -245,17 +259,22 @@ def _coerce_module_handle(handle: object) -> ctypes.wintypes.HMODULE | None:
 def _mapped_module_path(handle: object) -> Path:
     """Resolve a Windows module handle using a bounded Unicode API call."""
 
+    _validate_ctypes_dependencies()
     if os.name != "nt":
         if handle is None:
             return _resolve_regular_file(sys.executable, "process image")
         raise _error("native module-handle lookup requires Windows")
     module_handle = _coerce_module_handle(handle)
     try:
-        api = ctypes.WinDLL("kernel32", use_last_error=True)
+        windll = _CTYPES_BINDINGS.get("WinDLL", _MISSING)
+        create_unicode_buffer = _CTYPES_BINDINGS.get("create_unicode_buffer", _MISSING)
+        if windll is _MISSING or create_unicode_buffer is _MISSING:
+            raise _error("ctypes Windows bindings are unavailable")
+        api = windll("kernel32", use_last_error=True)
         function = api.GetModuleFileNameW
         function.argtypes = [ctypes.wintypes.HMODULE, ctypes.wintypes.LPWSTR, ctypes.wintypes.DWORD]
         function.restype = ctypes.wintypes.DWORD
-        buffer = ctypes.create_unicode_buffer(_MAX_WINDOWS_PATH)
+        buffer = create_unicode_buffer(_MAX_WINDOWS_PATH)
         length = int(function(module_handle, buffer, _MAX_WINDOWS_PATH))
     except (AttributeError, OSError, TypeError, ValueError) as exc:
         raise _error("Windows module-handle lookup is unavailable") from exc
@@ -395,9 +414,7 @@ class _SourceSnapshot:
     code_digest: str
 
 
-def _source_snapshot(
-    module_record: dict[str, object], admission: ExitStack
-) -> _SourceSnapshot:
+def _source_snapshot(module_record: dict[str, object], admission: ExitStack) -> _SourceSnapshot:
     module_path = _resolve_regular_file(module_record.get("path"), "Gmsh Python module")
     stream = _pinned_file(admission, module_path, "Gmsh Python module")
     content, size, digest, mtime_ns = _read_stream_bounded(
@@ -529,9 +546,7 @@ def _require_isolated_interpreter() -> None:
         raise _error("verified Gmsh loading requires an isolated interpreter")
 
 
-def _verify_process_binding(
-    expected: dict[str, object], observed: dict[str, object]
-) -> None:
+def _verify_process_binding(expected: dict[str, object], observed: dict[str, object]) -> None:
     for field in _PROCESS_FIELDS:
         expected_value = expected[field]
         observed_value = observed[field]
@@ -546,9 +561,44 @@ def _verify_process_binding(
             )
 
 
+def _code_constant_fingerprint(value: object) -> object:
+    if isinstance(value, CodeType):
+        return ("code", _code_digest(value))
+    if type(value) is tuple:
+        return ("tuple", tuple(_code_constant_fingerprint(item) for item in value))
+    if type(value) is frozenset:
+        return (
+            "frozenset",
+            tuple(_code_constant_fingerprint(item) for item in value),
+        )
+    if type(value) in (type(None), bool, int, float, complex, str, bytes):
+        return (type(value).__name__, value)
+    return ("opaque", id(value))
+
+
 def _code_digest(code: CodeType) -> str:
+    payload = (
+        code.co_argcount,
+        code.co_posonlyargcount,
+        code.co_kwonlyargcount,
+        code.co_nlocals,
+        code.co_stacksize,
+        code.co_flags,
+        code.co_code,
+        tuple(_code_constant_fingerprint(value) for value in code.co_consts),
+        code.co_names,
+        code.co_varnames,
+        code.co_filename,
+        code.co_name,
+        code.co_qualname,
+        code.co_firstlineno,
+        code.co_linetable,
+        code.co_exceptiontable,
+        code.co_freevars,
+        code.co_cellvars,
+    )
     try:
-        content = marshal.dumps(code)
+        content = marshal.dumps(payload)
     except (TypeError, ValueError) as exc:
         raise _error("Gmsh module code cannot be attested") from exc
     return hashlib.sha256(content).hexdigest()
@@ -556,9 +606,7 @@ def _code_digest(code: CodeType) -> str:
 
 _MISSING = object()
 _CFUNC_PTR_TYPE = getattr(ctypes, "_CFuncPtr", None)
-_CFUNC_PTR_METACLASS = (
-    type(_CFUNC_PTR_TYPE) if isinstance(_CFUNC_PTR_TYPE, type) else None
-)
+_CFUNC_PTR_METACLASS = type(_CFUNC_PTR_TYPE) if isinstance(_CFUNC_PTR_TYPE, type) else None
 
 
 def _raw_type_descriptor(value_type: type, name: str) -> tuple[type, object]:
@@ -577,9 +625,7 @@ def _raw_type_descriptor(value_type: type, name: str) -> tuple[type, object]:
 
 
 if isinstance(_CFUNC_PTR_TYPE, type):
-    _CFUNC_PTR_CALL_OWNER, _CFUNC_PTR_CALL = _raw_type_descriptor(
-        _CFUNC_PTR_TYPE, "__call__"
-    )
+    _CFUNC_PTR_CALL_OWNER, _CFUNC_PTR_CALL = _raw_type_descriptor(_CFUNC_PTR_TYPE, "__call__")
     _CFUNC_PTR_GETATTRIBUTE_OWNER, _CFUNC_PTR_GETATTRIBUTE = _raw_type_descriptor(
         _CFUNC_PTR_TYPE, "__getattribute__"
     )
@@ -648,9 +694,7 @@ def _value_signature(value: object, *, depth: int = 0, budget: int = _MAX_VALUE_
         for index, item in enumerate(value):
             if index >= budget:
                 break
-            items_list.append(
-                _value_signature(item, depth=depth + 1, budget=budget - index - 1)
-            )
+            items_list.append(_value_signature(item, depth=depth + 1, budget=budget - index - 1))
         items = tuple(sorted(items_list, key=repr))
         return ("frozenset", len(value), items)
     return ("object", value_type, id(value))
@@ -695,15 +739,27 @@ class _FunctionState:
     qualname: str
     module_name: str | None
     global_states: dict[str, _GlobalState] | None = None
+    code_digest: str | None = None
+    source_path: Path | None = None
+    source_identity: dict[str, object] | None = None
 
 
 def _function_state(
-    function: FunctionType, *, capture_globals: bool = False
+    function: FunctionType,
+    *,
+    capture_globals: bool = False,
+    code: CodeType | None = None,
+    code_digest: str | None = None,
+    source_path: Path | None = None,
+    source_identity: dict[str, object] | None = None,
+    dependency_depth: int = 0,
+    dependency_seen: frozenset[int] = frozenset(),
 ) -> _FunctionState:
+    selected_code = function.__code__ if code is None else code
     function_dict = function.__dict__
     state = _FunctionState(
         function=function,
-        code=function.__code__,
+        code=selected_code,
         globals_dict=function.__globals__,
         defaults=function.__defaults__,
         defaults_signature=_value_signature(function.__defaults__),
@@ -718,37 +774,53 @@ def _function_state(
         name=function.__name__,
         qualname=function.__qualname__,
         module_name=function.__module__,
+        code_digest=code_digest,
+        source_path=source_path,
+        source_identity=source_identity,
     )
     if capture_globals:
-        state.global_states = _capture_function_globals(function)
+        state.global_states = _capture_function_globals(
+            function,
+            code=selected_code,
+            dependency_depth=dependency_depth,
+            dependency_seen=dependency_seen,
+        )
     return state
 
 
 def _validate_function_state(state: _FunctionState, label: str) -> None:
     function = state.function
-    if function.__code__ is not state.code:
+    if state.code_digest is None:
+        if function.__code__ is not state.code:
+            raise _error(f"live Gmsh executable function {label} code changed")
+    elif _code_digest(function.__code__) != state.code_digest:
         raise _error(f"live Gmsh executable function {label} code changed")
     if function.__globals__ is not state.globals_dict:
         raise _error(f"live Gmsh executable function {label} globals changed")
-    if function.__defaults__ is not state.defaults or _value_signature(
-        function.__defaults__
-    ) != state.defaults_signature:
+    if (
+        function.__defaults__ is not state.defaults
+        or _value_signature(function.__defaults__) != state.defaults_signature
+    ):
         raise _error(f"live Gmsh executable function {label} defaults changed")
-    if function.__kwdefaults__ is not state.kwdefaults or _value_signature(
-        function.__kwdefaults__
-    ) != state.kwdefaults_signature:
+    if (
+        function.__kwdefaults__ is not state.kwdefaults
+        or _value_signature(function.__kwdefaults__) != state.kwdefaults_signature
+    ):
         raise _error(f"live Gmsh executable function {label} keyword defaults changed")
-    if function.__annotations__ is not state.annotations or _value_signature(
-        function.__annotations__
-    ) != state.annotations_signature:
+    if (
+        function.__annotations__ is not state.annotations
+        or _value_signature(function.__annotations__) != state.annotations_signature
+    ):
         raise _error(f"live Gmsh executable function {label} annotations changed")
-    if function.__dict__ is not state.function_dict or _value_signature(
-        function.__dict__
-    ) != state.function_dict_signature:
+    if (
+        function.__dict__ is not state.function_dict
+        or _value_signature(function.__dict__) != state.function_dict_signature
+    ):
         raise _error(f"live Gmsh executable function {label} attributes changed")
-    if function.__closure__ is not state.closure or _closure_signature(
-        function.__closure__
-    ) != state.closure_signature:
+    if (
+        function.__closure__ is not state.closure
+        or _closure_signature(function.__closure__) != state.closure_signature
+    ):
         raise _error(f"live Gmsh executable function {label} closure changed")
     if (
         function.__name__ != state.name
@@ -756,6 +828,15 @@ def _validate_function_state(state: _FunctionState, label: str) -> None:
         or function.__module__ != state.module_name
     ):
         raise _error(f"live Gmsh executable function {label} metadata changed")
+    if state.source_path is not None or state.source_identity is not None:
+        if state.source_path is None or state.source_identity is None:
+            raise _error(f"live Gmsh executable function {label} source state malformed")
+        if not _same_path(function.__code__.co_filename, str(state.source_path)):
+            raise _error(f"live Gmsh executable function {label} source changed")
+        current_identity = _file_identity(state.source_path, f"Gmsh executable dependency {label}")
+        _compare_file_records(
+            state.source_identity, current_identity, f"Gmsh executable dependency {label}"
+        )
     _validate_function_globals(state, label)
 
 
@@ -815,6 +896,13 @@ class _DispatchDescriptorState:
 
 def _dispatch_descriptor_state(value_type: type, name: str) -> _DispatchDescriptorState:
     owner, descriptor = _raw_type_descriptor(value_type, name)
+    trusted = _CTYPES_TRUSTED_DESCRIPTORS.get((owner, name))
+    if trusted is not None:
+        trusted_descriptor, function_state = trusted
+        if descriptor is not trusted_descriptor:
+            raise _error(f"ctypes {name} descriptor changed before admission")
+        _validate_function_state(function_state, f"ctypes {name}")
+        return _DispatchDescriptorState(owner, descriptor, (function_state,))
     return _DispatchDescriptorState(
         owner,
         descriptor,
@@ -870,9 +958,7 @@ class _AttributeDispatchState:
     descriptors: dict[str, _DispatchDescriptorState]
 
 
-def _attribute_dispatch_state(
-    value: object, names: tuple[str, ...]
-) -> _AttributeDispatchState:
+def _attribute_dispatch_state(value: object, names: tuple[str, ...]) -> _AttributeDispatchState:
     value_type = type(value)
     if type(value_type) is not type:
         raise _error("Gmsh attribute dispatch uses an unsupported metaclass")
@@ -880,6 +966,67 @@ def _attribute_dispatch_state(
         value_type,
         {name: _dispatch_descriptor_state(value_type, name) for name in names},
     )
+
+
+@dataclass(slots=True)
+class _InstanceBindingState:
+    value: object
+    signature: object
+    function_state: _FunctionState | None = None
+
+
+_INSTANCE_DISPATCH_NAMES = (
+    "__getattribute__",
+    "__getattr__",
+    "__getitem__",
+    "__setattr__",
+    "_FuncPtr",
+    "_name",
+    "_handle",
+)
+
+
+def _capture_instance_bindings(
+    namespace: dict[str, object], label: str
+) -> dict[str, _InstanceBindingState]:
+    result: dict[str, _InstanceBindingState] = {}
+    for name in _INSTANCE_DISPATCH_NAMES:
+        value = namespace.get(name, _MISSING)
+        if name.startswith("__") and value is not _MISSING:
+            raise _error(f"{label} instance dispatch {name} is overridden")
+        function_state = (
+            _function_dependency_state(
+                value,
+                dependency_depth=0,
+                dependency_seen=frozenset(),
+            )
+            if isinstance(value, FunctionType)
+            else None
+        )
+        result[name] = _InstanceBindingState(
+            value,
+            _value_signature(value),
+            function_state,
+        )
+    return result
+
+
+def _validate_instance_bindings(
+    states: dict[str, _InstanceBindingState],
+    namespace: dict[str, object],
+    label: str,
+) -> None:
+    for name, state in states.items():
+        current = namespace.get(name, _MISSING)
+        if state.value is _MISSING:
+            if current is not _MISSING:
+                raise _error(f"live Gmsh {label} instance binding {name} was added")
+        elif current is not state.value:
+            raise _error(f"live Gmsh {label} instance binding {name} was replaced")
+        if state.value is not _MISSING and _value_signature(current) != state.signature:
+            raise _error(f"live Gmsh {label} instance binding {name} changed")
+        if state.function_state is not None:
+            _validate_function_state(state.function_state, f"{label}.{name}")
 
 
 @dataclass(slots=True)
@@ -914,8 +1061,13 @@ def _capture_class_state(
     class_state = _ClassState(class_object, {})
     classes[path] = class_state
     for name, descriptor in namespace.items():
-        member_functions = tuple(_function_state(function) for function in _descriptor_functions(descriptor))
-        nested = isinstance(descriptor, type) and getattr(descriptor, "__module__", None) == module_name
+        member_functions = tuple(
+            _function_state(function, capture_globals=True)
+            for function in _descriptor_functions(descriptor)
+        )
+        nested = (
+            isinstance(descriptor, type) and getattr(descriptor, "__module__", None) == module_name
+        )
         if member_functions or nested or callable(descriptor):
             if len(class_state.members) >= _MAX_LIVE_MEMBERS:
                 raise _error("Gmsh live class members exceed the finite verification limit")
@@ -931,6 +1083,7 @@ class _GlobalState:
     stable_signature: object | None
     builtin_value: object
     builtin_signature: object | None
+    function_state: _FunctionState | None = None
 
 
 def _builtin_binding_from_globals(globals_dict: dict[str, object], name: str) -> object:
@@ -946,27 +1099,121 @@ def _builtin_binding(module: ModuleType, name: str) -> object:
     return _builtin_binding_from_globals(vars(module), name)
 
 
-def _capture_function_globals(function: FunctionType) -> dict[str, _GlobalState]:
+def _code_object(root: CodeType, qualname: str, firstlineno: int) -> CodeType | None:
+    pending = [root]
+    candidates: list[CodeType] = []
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if current.co_qualname == qualname and current.co_firstlineno == firstlineno:
+            candidates.append(current)
+        pending.extend(constant for constant in current.co_consts if isinstance(constant, CodeType))
+    if len(candidates) != 1:
+        return None
+    return candidates[0]
+
+
+def _source_code_state(code: CodeType, label: str) -> tuple[Path, dict[str, object]]:
+    filename = code.co_filename
+    if not isinstance(filename, str) or not filename or filename.startswith("<"):
+        raise _error(f"Gmsh executable dependency {label} has no source file")
+    path = _resolve_regular_file(filename, f"Gmsh executable dependency {label}")
+    before = _file_identity(path, f"Gmsh executable dependency {label}")
+    content = _read_file_bounded(path, _MAX_SOURCE_BYTES, f"Gmsh executable dependency {label}")
+    after = _file_identity(path, f"Gmsh executable dependency {label}")
+    _compare_file_records(before, after, f"Gmsh executable dependency {label}")
+    compiled = _compile_source_bytes(content, path)
+    expected = _code_object(compiled, code.co_qualname, code.co_firstlineno)
+    if expected is None:
+        raise _error(f"Gmsh executable dependency {label} source function is missing")
+    if _code_digest(expected) != _code_digest(code):
+        raise _error(f"Gmsh executable dependency {label} code differs from source")
+    return path, before
+
+
+def _function_dependency_state(
+    function: FunctionType,
+    *,
+    dependency_depth: int,
+    dependency_seen: frozenset[int],
+) -> _FunctionState | None:
+    if id(function) in dependency_seen:
+        return None
+    if dependency_depth >= _MAX_FUNCTION_DEPENDENCY_DEPTH:
+        raise _error("Gmsh executable dependency graph exceeds the finite limit")
+    trusted = _CTYPES_TRUSTED_FUNCTIONS.get(id(function))
+    if trusted is not None:
+        _validate_function_state(trusted, f"imported {function.__qualname__}")
+        return trusted
+    source_path, source_identity = _source_code_state(function.__code__, function.__qualname__)
+    state = _function_state(
+        function,
+        capture_globals=True,
+        source_path=source_path,
+        source_identity=source_identity,
+        dependency_depth=dependency_depth + 1,
+        dependency_seen=dependency_seen | {id(function)},
+    )
+    _validate_function_state(state, f"imported {function.__qualname__}")
+    return state
+
+
+def _capture_function_globals(
+    function: FunctionType,
+    *,
+    code: CodeType | None = None,
+    dependency_depth: int = 0,
+    dependency_seen: frozenset[int] = frozenset(),
+) -> dict[str, _GlobalState]:
     globals_dict = function.__globals__
-    names = set(_code_global_names(function.__code__))
+    names = set(_code_global_names(function.__code__ if code is None else code))
     names.add("__builtins__")
     result: dict[str, _GlobalState] = {}
     for name in names:
         if name in globals_dict:
             value = globals_dict[name]
+            function_state = (
+                _function_dependency_state(
+                    value,
+                    dependency_depth=dependency_depth,
+                    dependency_seen=dependency_seen,
+                )
+                if isinstance(value, FunctionType)
+                else None
+            )
             result[name] = _GlobalState(
                 value,
                 _stable_global_signature(value),
                 _MISSING,
                 None,
+                function_state,
             )
         else:
             builtin = _builtin_binding_from_globals(globals_dict, name)
+            if (
+                builtin is not _MISSING
+                and name in vars(builtins)
+                and builtin is not vars(builtins)[name]
+            ):
+                raise _error(f"Gmsh executable dependency builtin {name} is replaced")
+            function_state = (
+                _function_dependency_state(
+                    builtin,
+                    dependency_depth=dependency_depth,
+                    dependency_seen=dependency_seen,
+                )
+                if isinstance(builtin, FunctionType)
+                else None
+            )
             result[name] = _GlobalState(
                 _MISSING,
                 None,
                 builtin,
                 _stable_global_signature(builtin),
+                function_state,
             )
         if len(result) > _MAX_LIVE_GLOBALS:
             raise _error("Gmsh dispatch globals exceed the finite verification limit")
@@ -985,17 +1232,204 @@ def _validate_function_globals(state: _FunctionState, label: str) -> None:
             builtin = _builtin_binding_from_globals(globals_dict, name)
             if builtin is not global_state.builtin_value:
                 raise _error(f"live Gmsh dispatch builtin {label}.{name} was replaced")
-            if global_state.builtin_signature is not None and _stable_global_signature(
-                builtin
-            ) != global_state.builtin_signature:
+            if (
+                global_state.builtin_signature is not None
+                and _stable_global_signature(builtin) != global_state.builtin_signature
+            ):
                 raise _error(f"live Gmsh dispatch builtin {label}.{name} changed")
         else:
             if current is not global_state.value:
                 raise _error(f"live Gmsh dispatch global {label}.{name} was replaced")
-            if global_state.stable_signature is not None and _stable_global_signature(
-                current
-            ) != global_state.stable_signature:
+            if (
+                global_state.stable_signature is not None
+                and _stable_global_signature(current) != global_state.stable_signature
+            ):
                 raise _error(f"live Gmsh dispatch global {label}.{name} changed")
+        if global_state.function_state is not None:
+            dependency = global_state.function_state
+            resolved = (
+                current
+                if global_state.value is not _MISSING
+                else _builtin_binding_from_globals(globals_dict, name)
+            )
+            if resolved is not dependency.function:
+                raise _error(f"live Gmsh executable dependency {label}.{name} was replaced")
+            _validate_function_state(dependency, f"{label}.{name}")
+
+
+_CTYPES_TRUSTED_FUNCTIONS: dict[int, _FunctionState] = {}
+_CTYPES_TRUSTED_FUNCTIONS_BY_NAME: dict[str, _FunctionState] = {}
+_CTYPES_TRUSTED_DESCRIPTORS: dict[tuple[type, str], tuple[object, _FunctionState]] = {}
+_CTYPES_BINDINGS: dict[str, object] = {}
+_CTYPES_INTERNAL_DISPATCH: tuple[type, object, type, object, type, object] | None = None
+_CTYPES_NAMESPACE: dict[str, object] | None = None
+_CTYPES_SOURCE_PATH: Path | None = None
+_CTYPES_SOURCE_IDENTITY: dict[str, object] | None = None
+
+
+def _build_ctypes_trust() -> None:
+    global _CTYPES_NAMESPACE
+    global _CTYPES_SOURCE_IDENTITY
+    global _CTYPES_SOURCE_PATH
+    global _CTYPES_INTERNAL_DISPATCH
+
+    namespace = vars(ctypes)
+    source_value = namespace.get("__file__", _MISSING)
+    if not isinstance(source_value, str) or not source_value.endswith(".py"):
+        raise _error("ctypes source file is unavailable")
+    source_path = _resolve_regular_file(source_value, "ctypes source")
+    source_identity = _file_identity(source_path, "ctypes source")
+    source = _read_file_bounded(source_path, _MAX_SOURCE_BYTES, "ctypes source")
+    compiled = _compile_source_bytes(source, source_path)
+    cdll = namespace.get("CDLL", _MISSING)
+    if not isinstance(cdll, type):
+        raise _error("ctypes CDLL type is unavailable")
+
+    definitions: dict[str, tuple[FunctionType, CodeType]] = {}
+    for public_name, qualname in (
+        ("cast", "cast"),
+        ("create_unicode_buffer", "create_unicode_buffer"),
+    ):
+        function = namespace.get(public_name, _MISSING)
+        expected = _code_object(
+            compiled,
+            qualname,
+            getattr(function, "__code__", _MISSING).co_firstlineno
+            if isinstance(function, FunctionType)
+            else -1,
+        )
+        if not isinstance(function, FunctionType) or expected is None:
+            raise _error(f"ctypes {public_name} implementation is unavailable")
+        definitions[public_name] = (function, expected)
+    descriptor_specs: dict[str, tuple[object, FunctionType, CodeType]] = {}
+    for method_name in ("__getattr__", "__getitem__", "__init__"):
+        owner, descriptor = _raw_type_descriptor(cdll, method_name)
+        functions = _descriptor_functions(descriptor)
+        if owner is not cdll or len(functions) != 1:
+            raise _error(f"ctypes CDLL {method_name} implementation is unavailable")
+        function = functions[0]
+        expected = _code_object(compiled, function.__qualname__, function.__code__.co_firstlineno)
+        if expected is None:
+            raise _error(f"ctypes CDLL {method_name} source implementation is unavailable")
+        descriptor_specs[method_name] = (descriptor, function, expected)
+
+    _CTYPES_NAMESPACE = namespace
+    _CTYPES_SOURCE_PATH = source_path
+    _CTYPES_SOURCE_IDENTITY = source_identity
+    _CTYPES_TRUSTED_FUNCTIONS.clear()
+    _CTYPES_TRUSTED_FUNCTIONS_BY_NAME.clear()
+    _CTYPES_TRUSTED_DESCRIPTORS.clear()
+    for name, (function, expected) in definitions.items():
+        state = _function_state(
+            function,
+            capture_globals=True,
+            code=expected,
+            code_digest=_code_digest(expected),
+            source_path=source_path,
+            source_identity=source_identity,
+        )
+        if state.globals_dict is not namespace:
+            raise _error(f"ctypes {name} globals are not its module namespace")
+        _CTYPES_TRUSTED_FUNCTIONS[id(function)] = state
+        _CTYPES_TRUSTED_FUNCTIONS_BY_NAME[name] = state
+    for name, (descriptor, function, expected) in descriptor_specs.items():
+        state = _function_state(
+            function,
+            capture_globals=True,
+            code=expected,
+            code_digest=_code_digest(expected),
+            source_path=source_path,
+            source_identity=source_identity,
+        )
+        if state.globals_dict is not namespace:
+            raise _error(f"ctypes CDLL {name} globals are not its module namespace")
+        _CTYPES_TRUSTED_FUNCTIONS[id(function)] = state
+        _CTYPES_TRUSTED_FUNCTIONS_BY_NAME[f"CDLL.{name}"] = state
+        _CTYPES_TRUSTED_DESCRIPTORS[(cdll, name)] = (descriptor, state)
+
+    for name in (
+        "cast",
+        "create_unicode_buffer",
+        "sizeof",
+        "POINTER",
+        "WinDLL",
+        "c_void_p",
+        "c_int",
+    ):
+        value = namespace.get(name, _MISSING)
+        if value is not _MISSING:
+            _CTYPES_BINDINGS[name] = value
+    internal_cast = namespace.get("_cast", _MISSING)
+    if not _is_ctypes_callable(internal_cast):
+        raise _error("ctypes internal cast implementation is unavailable")
+    _CTYPES_INTERNAL_DISPATCH = _ctypes_dispatch_descriptor(internal_cast, "ctypes._cast")
+
+
+def _validate_ctypes_source() -> None:
+    if _CTYPES_NAMESPACE is None or _CTYPES_SOURCE_PATH is None or _CTYPES_SOURCE_IDENTITY is None:
+        raise _error("ctypes trust state is unavailable")
+    current_source = vars(ctypes).get("__file__", _MISSING)
+    if not isinstance(current_source, str) or not _same_path(
+        current_source, str(_CTYPES_SOURCE_PATH)
+    ):
+        raise _error("ctypes source path changed")
+    current_identity = _file_identity(_CTYPES_SOURCE_PATH, "ctypes source")
+    _compare_file_records(_CTYPES_SOURCE_IDENTITY, current_identity, "ctypes source")
+
+
+def _validate_ctypes_function(name: str) -> None:
+    _validate_ctypes_source()
+    state = _CTYPES_TRUSTED_FUNCTIONS_BY_NAME.get(name)
+    if state is None or _CTYPES_NAMESPACE is None:
+        raise _error(f"ctypes {name} trust state is unavailable")
+    if name.startswith("CDLL."):
+        method_name = name.partition(".")[2]
+        cdll = _CTYPES_NAMESPACE.get("CDLL", _MISSING)
+        if not isinstance(cdll, type):
+            raise _error("ctypes CDLL type changed")
+        owner, descriptor = _raw_type_descriptor(cdll, method_name)
+        trusted = _CTYPES_TRUSTED_DESCRIPTORS.get((cdll, method_name))
+        functions = _descriptor_functions(descriptor)
+        if (
+            trusted is None
+            or owner is not cdll
+            or descriptor is not trusted[0]
+            or len(functions) != 1
+            or functions[0] is not state.function
+        ):
+            raise _error(f"ctypes CDLL {method_name} descriptor changed")
+        function = functions[0]
+    else:
+        function = _CTYPES_NAMESPACE.get(name, _MISSING)
+        if function is not state.function:
+            raise _error(f"ctypes {name} implementation changed")
+    if not isinstance(function, FunctionType) or function.__globals__ is not _CTYPES_NAMESPACE:
+        raise _error(f"ctypes {name} globals changed")
+    _validate_function_state(state, name)
+
+
+def _validate_ctypes_dependencies() -> None:
+    _validate_ctypes_source()
+    for name in (
+        "CDLL.__getattr__",
+        "CDLL.__getitem__",
+        "CDLL.__init__",
+        "cast",
+        "create_unicode_buffer",
+    ):
+        _validate_ctypes_function(name)
+    if _CTYPES_NAMESPACE is None:
+        raise _error("ctypes trust state is unavailable")
+    for name, expected in _CTYPES_BINDINGS.items():
+        if _CTYPES_NAMESPACE.get(name, _MISSING) is not expected:
+            raise _error(f"ctypes binding {name} changed")
+    internal_cast = _CTYPES_NAMESPACE.get("_cast", _MISSING)
+    if (
+        not _is_ctypes_callable(internal_cast)
+        or _CTYPES_INTERNAL_DISPATCH is None
+        or _ctypes_dispatch_descriptor(internal_cast, "ctypes._cast") != _CTYPES_INTERNAL_DISPATCH
+    ):
+        raise _error("ctypes internal cast dispatch changed")
 
 
 def _is_ctypes_callable(value: object) -> bool:
@@ -1014,9 +1448,7 @@ def _ctypes_dispatch_descriptor(
     if name_descriptor is not _MISSING:
         raise _error(f"cached native callable {name} has an unsupported name descriptor")
     call_owner, call_descriptor = _raw_type_descriptor(value_type, "__call__")
-    attribute_owner, attribute_descriptor = _raw_type_descriptor(
-        value_type, "__getattribute__"
-    )
+    attribute_owner, attribute_descriptor = _raw_type_descriptor(value_type, "__getattribute__")
     setattr_owner, setattr_descriptor = _raw_type_descriptor(value_type, "__setattr__")
     if (
         call_owner is not _CFUNC_PTR_CALL_OWNER
@@ -1028,16 +1460,9 @@ def _ctypes_dispatch_descriptor(
     ):
         raise _error(f"cached native callable {name} dispatch was overridden")
     for attribute in _NATIVE_CALL_ATTRIBUTES:
-        expected_owner, expected_descriptor = _CFUNC_PTR_METADATA.get(
-            attribute, (None, _MISSING)
-        )
-        metadata_owner, metadata_descriptor = _raw_type_descriptor(
-            value_type, attribute
-        )
-        if (
-            metadata_owner is not expected_owner
-            or metadata_descriptor is not expected_descriptor
-        ):
+        expected_owner, expected_descriptor = _CFUNC_PTR_METADATA.get(attribute, (None, _MISSING))
+        metadata_owner, metadata_descriptor = _raw_type_descriptor(value_type, attribute)
+        if metadata_owner is not expected_owner or metadata_descriptor is not expected_descriptor:
             raise _error(f"cached native callable {name} metadata access was overridden")
     return (
         call_owner,
@@ -1049,9 +1474,18 @@ def _ctypes_dispatch_descriptor(
     )
 
 
+_build_ctypes_trust()
+
+
 def _ctypes_pointer(value: object, name: str) -> int:
+    _validate_ctypes_dependencies()
+    cast_state = _CTYPES_TRUSTED_FUNCTIONS_BY_NAME.get("cast")
+    cast_function = None if cast_state is None else cast_state.function
+    c_void_p = _CTYPES_BINDINGS.get("c_void_p", _MISSING)
+    if not isinstance(cast_function, FunctionType) or c_void_p is _MISSING:
+        raise _error(f"cached native callable {name} ctypes cast binding is unavailable")
     try:
-        pointer = ctypes.cast(value, ctypes.c_void_p).value
+        pointer = cast_function(value, c_void_p).value
     except (AttributeError, OSError, TypeError, ValueError, OverflowError) as exc:
         raise _error(f"cached native callable {name} has no address") from exc
     if type(pointer) is not int or pointer <= 0:
@@ -1061,9 +1495,7 @@ def _ctypes_pointer(value: object, name: str) -> int:
 
 def _ctypes_metadata_value(value: object, name: str, attribute: str) -> object:
     value_type = type(value)
-    expected_owner, expected_descriptor = _CFUNC_PTR_METADATA.get(
-        attribute, (None, _MISSING)
-    )
+    expected_owner, expected_descriptor = _CFUNC_PTR_METADATA.get(attribute, (None, _MISSING))
     owner, descriptor = _raw_type_descriptor(value_type, attribute)
     if owner is not expected_owner or descriptor is not expected_descriptor:
         raise _error(f"cached native callable {name} metadata access was overridden")
@@ -1160,9 +1592,7 @@ def _native_signature_policy(
                 continue
             if not isinstance(owner.value, ast.Name) or owner.value.id != "lib":
                 continue
-            assignments.append(
-                (target.lineno, target.col_offset, owner.attr, target.attr, value)
-            )
+            assignments.append((target.lineno, target.col_offset, owner.attr, target.attr, value))
     if len(assignments) > _MAX_LIVE_MEMBERS:
         raise _error("Gmsh native metadata exceeds the finite verification limit")
     assignments.sort(key=lambda item: (item[0], item[1]))
@@ -1196,9 +1626,7 @@ def _library_namespace(
     library: object, expected: tuple[type, object] | None = None
 ) -> dict[str, object]:
     owner, descriptor = _raw_type_descriptor(type(library), "__dict__")
-    if expected is not None and (
-        owner is not expected[0] or descriptor is not expected[1]
-    ):
+    if expected is not None and (owner is not expected[0] or descriptor is not expected[1]):
         raise _error("Gmsh native library namespace descriptor changed")
     if type(descriptor) is not GetSetDescriptorType:
         raise _error("Gmsh native library namespace uses an unsupported descriptor")
@@ -1222,9 +1650,7 @@ def _library_handle_descriptor(
     return owner, descriptor
 
 
-def _library_handle(
-    library: object, expected: tuple[type, object] | None = None
-) -> int:
+def _library_handle(library: object, expected: tuple[type, object] | None = None) -> int:
     _owner, descriptor = _library_handle_descriptor(library, expected)
     handle = _library_namespace(library).get("_handle", _MISSING)
     if handle is _MISSING:
@@ -1239,7 +1665,10 @@ def _native_export_address(library: object, name: str) -> int | None:
         return None
     handle = _library_handle(library)
     try:
-        api = ctypes.WinDLL("kernel32", use_last_error=True)
+        windll = _CTYPES_BINDINGS.get("WinDLL", _MISSING)
+        if windll is _MISSING:
+            raise _error("ctypes Windows bindings are unavailable")
+        api = windll("kernel32", use_last_error=True)
         function = api.GetProcAddress
         function.argtypes = [ctypes.wintypes.HMODULE, ctypes.wintypes.LPCSTR]
         function.restype = ctypes.c_void_p
@@ -1314,7 +1743,14 @@ def _native_callable_state(
         )
     if isinstance(value, FunctionType):
         return _NativeCallableState(
-            value, type(value), _function_state(value), None, None, None, None, None
+            value,
+            type(value),
+            _function_state(value, capture_globals=True),
+            None,
+            None,
+            None,
+            None,
+            None,
         )
     if _is_ctypes_callable(value):
         (
@@ -1370,6 +1806,7 @@ class _LiveState:
     globals: dict[str, _GlobalState]
     module_dispatch: _AttributeDispatchState
     library_dispatch: _AttributeDispatchState
+    library_instance_bindings: dict[str, _InstanceBindingState]
     library_namespace_owner: type
     library_namespace_descriptor: object
     library_namespace: dict[str, object]
@@ -1390,6 +1827,7 @@ def _capture_live_state(
     source: bytes,
     native_handle: int,
 ) -> _LiveState:
+    _validate_ctypes_dependencies()
     native_symbols = _native_symbol_names(source)
     library_namespace_owner, library_namespace_descriptor = _raw_type_descriptor(
         type(library), "__dict__"
@@ -1398,14 +1836,13 @@ def _capture_live_state(
         library,
         expected=(library_namespace_owner, library_namespace_descriptor),
     )
+    library_instance_bindings = _capture_instance_bindings(namespace, "Gmsh native library")
     library_handle_owner, library_handle_descriptor = _library_handle_descriptor(library)
     library_funcptr_owner, library_funcptr_descriptor = _raw_type_descriptor(
         type(library), "_FuncPtr"
     )
     library_funcptr = _factory_state(namespace.get("_FuncPtr", _MISSING))
-    module_dispatch = _attribute_dispatch_state(
-        module, ("__getattribute__", "__getattr__")
-    )
+    module_dispatch = _attribute_dispatch_state(module, ("__getattribute__", "__getattr__"))
     library_dispatch = _attribute_dispatch_state(
         library,
         (
@@ -1423,7 +1860,7 @@ def _capture_live_state(
     functions: list[_FunctionState] = []
     for name, value in tuple(module_namespace.items()):
         if isinstance(value, FunctionType) and value.__module__ == module_name:
-            module_functions[name] = _function_state(value)
+            module_functions[name] = _function_state(value, capture_globals=True)
             functions.append(module_functions[name])
         elif isinstance(value, type):
             _capture_class_state((name,), value, module_name, classes, functions)
@@ -1436,11 +1873,21 @@ def _capture_live_state(
     for name in global_names:
         if name in module_namespace:
             value = module_namespace[name]
+            function_state = (
+                _function_dependency_state(
+                    value,
+                    dependency_depth=0,
+                    dependency_seen=frozenset(),
+                )
+                if isinstance(value, FunctionType)
+                else None
+            )
             global_states[name] = _GlobalState(
                 value,
                 _stable_global_signature(value),
                 _MISSING,
                 None,
+                function_state,
             )
         else:
             builtin = _builtin_binding(module, name)
@@ -1449,6 +1896,15 @@ def _capture_live_state(
                 None,
                 builtin,
                 _stable_global_signature(builtin),
+                (
+                    _function_dependency_state(
+                        builtin,
+                        dependency_depth=0,
+                        dependency_seen=frozenset(),
+                    )
+                    if isinstance(builtin, FunctionType)
+                    else None
+                ),
             )
         if len(global_states) > _MAX_LIVE_GLOBALS:
             raise _error("Gmsh live globals exceed the finite verification limit")
@@ -1459,6 +1915,7 @@ def _capture_live_state(
         globals=global_states,
         module_dispatch=module_dispatch,
         library_dispatch=library_dispatch,
+        library_instance_bindings=library_instance_bindings,
         library_namespace_owner=library_namespace_owner,
         library_namespace_descriptor=library_namespace_descriptor,
         library_namespace=namespace,
@@ -1523,9 +1980,7 @@ def _validate_native_callable_state(
         _validate_ctypes_call_signature(current, name, signature_policy)
 
 
-def _validate_attribute_dispatch(
-    state: _AttributeDispatchState, value: object, label: str
-) -> None:
+def _validate_attribute_dispatch(state: _AttributeDispatchState, value: object, label: str) -> None:
     current = _attribute_dispatch_state(value, tuple(state.descriptors))
     if current.value_type is not state.value_type:
         raise _error(f"live Gmsh {label} attribute dispatch changed")
@@ -1591,6 +2046,11 @@ def _validate_live_state(state: _LiveState, module: ModuleType, library: object)
     )
     if current_library_namespace is not state.library_namespace:
         raise _error("live Gmsh native library namespace changed")
+    _validate_instance_bindings(
+        state.library_instance_bindings,
+        current_library_namespace,
+        "native library",
+    )
     current_handle_owner, current_handle_descriptor = _library_handle_descriptor(library)
     if (
         current_handle_owner is not state.library_handle_owner
@@ -1638,22 +2098,27 @@ def _validate_live_state(state: _LiveState, module: ModuleType, library: object)
             builtin = _builtin_binding(module, name)
             if builtin is not global_state.builtin_value:
                 raise _error(f"live Gmsh builtin {name} was replaced")
-            if global_state.builtin_signature is not None and _stable_global_signature(
-                builtin
-            ) != global_state.builtin_signature:
+            if (
+                global_state.builtin_signature is not None
+                and _stable_global_signature(builtin) != global_state.builtin_signature
+            ):
                 raise _error(f"live Gmsh builtin {name} changed")
         else:
             if current is not global_state.value:
                 raise _error(f"live Gmsh global {name} was replaced")
-            if global_state.stable_signature is not None and _stable_global_signature(
-                current
-            ) != global_state.stable_signature:
+            if (
+                global_state.stable_signature is not None
+                and _stable_global_signature(current) != global_state.stable_signature
+            ):
                 raise _error(f"live Gmsh global {name} changed")
 
-    if _library_handle(
-        library,
-        expected=(state.library_handle_owner, state.library_handle_descriptor),
-    ) != state.native_handle:
+    if (
+        _library_handle(
+            library,
+            expected=(state.library_handle_owner, state.library_handle_descriptor),
+        )
+        != state.native_handle
+    ):
         raise _error("live Gmsh native library handle changed")
     for name, callable_state in state.native_callables.items():
         current = current_library_namespace.get(name, _MISSING)
@@ -1669,7 +2134,11 @@ def _validate_live_state(state: _LiveState, module: ModuleType, library: object)
         )
     additions: dict[str, _NativeCallableState] = {}
     for name, current in current_library_namespace.items():
-        if not isinstance(name, str) or name not in state.native_symbols or name in state.native_callables:
+        if (
+            not isinstance(name, str)
+            or name not in state.native_symbols
+            or name in state.native_callables
+        ):
             continue
         if not callable(current):
             raise _error(f"live Gmsh native member {name} is not callable")
@@ -1700,9 +2169,7 @@ def _validate_loaded_module(
         loaded_spec is None
         or getattr(loaded_spec, "name", None) != "gmsh"
         or getattr(loaded_spec, "submodule_search_locations", None) is not None
-        or not _same_path(
-            str(getattr(spec, "origin", "")), str(getattr(loaded_spec, "origin", ""))
-        )
+        or not _same_path(str(getattr(spec, "origin", "")), str(getattr(loaded_spec, "origin", "")))
     ):
         raise _error("executing Gmsh module import spec changed")
     loader = getattr(module, "__loader__", None)
@@ -1755,9 +2222,7 @@ def _cached_session(
                 _pinned_file(admission, library_path, "Gmsh native library")
                 spec = _find_gmsh_spec(module_path)
                 snapshot = _source_snapshot(module_record, admission)
-                cache_path, cache_identity = _validate_cache(
-                    module_path, spec, snapshot, admission
-                )
+                cache_path, cache_identity = _validate_cache(module_path, spec, snapshot, admission)
                 if snapshot.code_digest != session.code_digest:
                     raise _error("verified Gmsh module code identity changed")
                 _validate_loaded_module(
@@ -1786,9 +2251,7 @@ def _cached_session(
 
 def _import_verified_source(module_path: Path, spec: Any, code: CodeType) -> ModuleType:
     loader = _SourceOnlyLoader("gmsh", str(module_path), code)
-    verified_spec = importlib.util.spec_from_file_location(
-        "gmsh", str(module_path), loader=loader
-    )
+    verified_spec = importlib.util.spec_from_file_location("gmsh", str(module_path), loader=loader)
     if verified_spec is None or not _same_path(str(module_path), str(verified_spec.origin)):
         raise _error("Gmsh source import spec is not the resolved module")
     if not _same_path(str(getattr(spec, "origin", "")), str(verified_spec.origin)):
@@ -1814,6 +2277,7 @@ def load_verified_gmsh(binding: dict[str, object]) -> tuple[Any, dict[str, objec
     """Load Gmsh only after verifying the exact isolated runtime binding."""
 
     _require_isolated_interpreter()
+    _validate_ctypes_dependencies()
     expected = _normalise_binding(binding, "expected runtime")
     with _CACHE_LOCK:
         preloaded = sys.modules.get("gmsh")

@@ -272,11 +272,14 @@ def test_measured_backend_native_dispatch_allows_curved_faces(
     report = backend.inspect_rigid_primitive(primitive, geometry_digest=digest)
     assert report.frame == TOOL_LOCAL
     assert report.bodies[0].body_id == TOOL_BODY.value
-    assert backend.mesh_rigid_primitive(
-        primitive,
-        geometry_digest=digest,
-        global_size_si=0.001,
-    ) == "native-mesh"
+    assert (
+        backend.mesh_rigid_primitive(
+            primitive,
+            geometry_digest=digest,
+            global_size_si=0.001,
+        )
+        == "native-mesh"
+    )
 
 
 def test_measured_backend_allows_verified_load_per_producer_operation(
@@ -320,7 +323,8 @@ def test_measured_backend_keeps_planar_guard_for_imported_step_faces() -> None:
 
 
 def test_measured_backend_restores_planar_guard_after_native_success_and_error(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     from febio_cae.adapters.geometry import gmsh_occ
 
@@ -343,3 +347,21 @@ def test_measured_backend_restores_planar_guard_after_native_success_and_error(
         backend._primitive_context(module, 1, primitive)
     with pytest.raises(ValueError, match="planar STEP faces"):
         backend._inspect_faces(module, "body-1", 1, 1.0)
+
+
+def test_preparation_rejects_nested_backend_alias_with_different_consumed_backend() -> None:
+    from febio_cae.adapters.geometry.preparation import _verify_preparation_output
+
+    raw = {
+        "producer": {"backend": {"runtime_identity": "nested"}},
+        "backend": {"runtime_identity": "outer"},
+        "carrier": {},
+        "mesh": {},
+        "inspection": {},
+        "backend_id": "gmsh-occ",
+        "backend_version": "4.15.2",
+        "mesh_generations": 1,
+    }
+
+    with pytest.raises(ValueError, match="raw|response|backend"):
+        _verify_preparation_output(raw, {})

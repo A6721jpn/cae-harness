@@ -256,7 +256,10 @@ class CurrentInspection:
     ) -> None:
         if primitive.kind not in {"sphere", "cylinder"}:
             raise ValueError("current native tool record requires a curved primitive")
-        if expected_geometry_digest is not None and report.geometry_digest != expected_geometry_digest:
+        if (
+            expected_geometry_digest is not None
+            and report.geometry_digest != expected_geometry_digest
+        ):
             raise ValueError("current native tool geometry identity differs")
         if report.source_digest != primitive_source_digest(
             primitive,
@@ -337,9 +340,7 @@ class CurrentInspection:
         )
 
 
-def _criteria_from_limits(
-    limits: dict[str, Any], profile: NumericalProfileRef, kind: str
-) -> Any:
+def _criteria_from_limits(limits: dict[str, Any], profile: NumericalProfileRef, kind: str) -> Any:
     raw = limits.get("_generation_criteria")
     if kind == "box":
         if raw is not None:
@@ -435,9 +436,7 @@ def produce(
         raise ValueError("preparation STEP source digest mismatch")
     _require_ap214_header(source.content)
     primitive_kind = spec.rigid_tool.primitive.kind
-    criteria = _criteria_from_limits(
-        limits, spec.mesh_policy.quality_profile, primitive_kind
-    )
+    criteria = _criteria_from_limits(limits, spec.mesh_policy.quality_profile, primitive_kind)
     backend = (
         _make_backend(limits["cpu_workers"], runtime_binding)
         if runtime_binding is not None
@@ -564,14 +563,41 @@ def run_preparation(
     if result_file.stat().st_size > limits["memory_bytes"]:
         raise ValueError("preparation output exceeds memory budget")
     result = json.loads(result_file.read_bytes())
-    if not isinstance(result, dict):
-        raise TypeError("invalid producer output")
-    producer = result.get("producer", result)
-    if not isinstance(producer, dict) or not isinstance(producer.get("backend"), dict):
-        raise ValueError("preparation producer runtime evidence is missing")
-    verify_runtime_identity(runtime_binding, producer["backend"].get("runtime_identity"))
+    _verify_preparation_output(result, runtime_binding)
     result["runtime_binding"] = runtime_binding
     result["process"] = {**process, "argv": list(argv)}
+    return result
+
+
+def _verify_preparation_output(result: object, runtime_binding: object) -> dict[str, Any]:
+    """Verify the exact raw child response consumed by the application."""
+
+    required = {
+        "carrier",
+        "mesh",
+        "inspection",
+        "backend",
+        "backend_id",
+        "backend_version",
+        "mesh_generations",
+    }
+    optional = {
+        "generation_criteria",
+        "native_tool_inspection",
+        "native_tool_primitive",
+    }
+    if not isinstance(result, dict):
+        raise TypeError("invalid raw preparation response")
+    if (
+        "producer" in result
+        or not required <= set(result)
+        or not set(result) <= required | optional
+    ):
+        raise ValueError("preparation response is not the raw producer shape")
+    backend = result.get("backend")
+    if not isinstance(backend, dict):
+        raise ValueError("preparation response backend is missing")
+    verify_runtime_identity(runtime_binding, backend.get("runtime_identity"))
     return result
 
 

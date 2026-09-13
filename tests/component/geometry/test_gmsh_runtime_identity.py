@@ -93,9 +93,7 @@ def _isolated(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_capture_runtime_binding_uses_distribution_metadata_without_importing_gmsh(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    module, library, launcher, image, python_library = _files(
-        tmp_path, "__version__ = '4.15.2'\n"
-    )
+    module, library, launcher, image, python_library = _files(tmp_path, "__version__ = '4.15.2'\n")
     cfg = tmp_path / "pyvenv.cfg"
     cfg.write_text("version = 3.12.10\n", encoding="utf-8")
     entries = [SimpleNamespace(name="gmsh.py"), SimpleNamespace(name="../gmsh-4.15.dll")]
@@ -149,9 +147,7 @@ def test_load_verified_gmsh_rejects_process_or_environment_mismatch_before_impor
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, field: str
 ) -> None:
     _isolated(monkeypatch)
-    module, library, launcher, image, python_library = _files(
-        tmp_path, "__version__ = '4.15.2'\n"
-    )
+    module, library, launcher, image, python_library = _files(tmp_path, "__version__ = '4.15.2'\n")
     cfg = tmp_path / "pyvenv.cfg"
     cfg.write_text("version = 3.12.10\n", encoding="utf-8")
     expected = _binding(tmp_path, module=module, library=library, pyvenv_cfg=cfg)
@@ -197,12 +193,16 @@ def test_load_verified_gmsh_rejects_changed_module_and_dll_before_api(
         "    return False\n",
     )
     expected = _binding(tmp_path, module=module, library=library)
-    monkeypatch.setattr(runtime, "_current_process_binding", lambda: {
-        "python": _identity(launcher),
-        "python_image": _identity(image),
-        "python_library": _identity(python_library),
-        "pyvenv_cfg": None,
-    })
+    monkeypatch.setattr(
+        runtime,
+        "_current_process_binding",
+        lambda: {
+            "python": _identity(launcher),
+            "python_image": _identity(image),
+            "python_library": _identity(python_library),
+            "pyvenv_cfg": None,
+        },
+    )
     monkeypatch.setattr(runtime, "_mapped_module_path", lambda handle: library)
     monkeypatch.syspath_prepend(str(module.parent))
     sys.modules.pop("gmsh", None)
@@ -264,12 +264,16 @@ def test_load_verified_gmsh_refuses_stale_cache_and_unverified_preload(
     cache = Path(importlib.util.cache_from_source(str(module)))
     cache.write_bytes(cache.read_bytes()[:-1] + b"x")
     expected = _binding(tmp_path, module=module, library=library)
-    monkeypatch.setattr(runtime, "_current_process_binding", lambda: {
-        "python": _identity(launcher),
-        "python_image": _identity(image),
-        "python_library": _identity(python_library),
-        "pyvenv_cfg": None,
-    })
+    monkeypatch.setattr(
+        runtime,
+        "_current_process_binding",
+        lambda: {
+            "python": _identity(launcher),
+            "python_image": _identity(image),
+            "python_library": _identity(python_library),
+            "pyvenv_cfg": None,
+        },
+    )
     monkeypatch.setattr(runtime, "_mapped_module_path", lambda handle: library)
     monkeypatch.syspath_prepend(str(module.parent))
     sys.modules["gmsh"] = SimpleNamespace(__file__=str(module), __version__="4.15.2")
@@ -283,9 +287,7 @@ def test_load_verified_gmsh_refuses_stale_cache_and_unverified_preload(
 def test_load_verified_gmsh_refuses_nonisolated_calls_before_import_or_reuse(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    module, library, launcher, image, python_library = _files(
-        tmp_path, "__version__ = '4.15.2'\n"
-    )
+    module, library, launcher, image, python_library = _files(tmp_path, "__version__ = '4.15.2'\n")
     expected = _binding(tmp_path, module=module, library=library)
     monkeypatch.setattr(
         runtime,
@@ -306,12 +308,7 @@ def test_load_verified_gmsh_executes_only_the_authenticated_source_snapshot(
 ) -> None:
     _isolated(monkeypatch)
     marker = tmp_path / "changed-source-side-effect.txt"
-    source = (
-        "__version__ = '4.15.2'\n"
-        "class Lib:\n"
-        "    _handle = 99\n"
-        "lib = Lib()\n"
-    )
+    source = "__version__ = '4.15.2'\nclass Lib:\n    _handle = 99\nlib = Lib()\n"
     module, library, launcher, image, python_library = _files(tmp_path, source)
     expected = _binding(tmp_path, module=module, library=library)
     monkeypatch.setattr(
@@ -339,8 +336,7 @@ def test_load_verified_gmsh_executes_only_the_authenticated_source_snapshot(
     def mutate_before_exec(loader: Any, loaded: Any) -> None:
         module.write_text(
             "from pathlib import Path\n"
-            f"Path({str(marker)!r}).write_text('changed', encoding='utf-8')\n"
-            + source,
+            f"Path({str(marker)!r}).write_text('changed', encoding='utf-8')\n" + source,
             encoding="utf-8",
         )
         original_exec(loader, loaded)
@@ -357,13 +353,7 @@ def test_verified_session_revalidates_exact_reuse_state(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, mutation: str
 ) -> None:
     _isolated(monkeypatch)
-    source = (
-        "events = []\n"
-        "__version__ = '4.15.2'\n"
-        "class Lib:\n"
-        "    _handle = 99\n"
-        "lib = Lib()\n"
-    )
+    source = "events = []\n__version__ = '4.15.2'\nclass Lib:\n    _handle = 99\nlib = Lib()\n"
     module, library, launcher, image, python_library = _files(tmp_path, source)
     cfg = tmp_path / "pyvenv.cfg"
     expected = _binding(tmp_path, module=module, library=library)
@@ -511,9 +501,91 @@ def _install_synthetic_native_export(
     pointer = ctypes.cast(value, ctypes.c_void_p).value
     assert isinstance(pointer, int) and pointer > 0
     setattr(loaded.lib, name, value)
-    monkeypatch.setattr(
-        runtime, "_native_export_address", lambda library, symbol: pointer
+    monkeypatch.setattr(runtime, "_native_export_address", lambda library, symbol: pointer)
+
+
+def _synthetic_cdll_setup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> tuple[dict[str, object], Path]:
+    _isolated(monkeypatch)
+    source = (
+        "import ctypes\n"
+        "__version__ = '4.15.2'\n"
+        "def isInitialized():\n"
+        "    return lib.gmshIsInitialized()\n"
+        "lib = object.__new__(ctypes.CDLL)\n"
+        "lib._handle = 99\n"
+        "lib._FuncPtr = object\n"
     )
+    module, library, launcher, image, python_library = _files(tmp_path, source)
+    expected = _binding(tmp_path, module=module, library=library)
+    monkeypatch.setattr(
+        runtime,
+        "_current_process_binding",
+        lambda: {
+            "python": _identity(launcher),
+            "python_image": _identity(image),
+            "python_library": _identity(python_library),
+            "pyvenv_cfg": None,
+        },
+    )
+    monkeypatch.setattr(runtime, "_mapped_module_path", lambda handle: library)
+    monkeypatch.syspath_prepend(str(module.parent))
+    sys.modules.pop("gmsh", None)
+    return expected, library
+
+
+def test_verified_session_rejects_instance_level_lazy_dispatch_override(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    expected, _library = _synthetic_cdll_setup(monkeypatch, tmp_path)
+    loaded, _ = runtime.load_verified_gmsh(expected)
+
+    loaded.lib.__getitem__ = lambda name: None
+
+    with pytest.raises((OSError, ValueError), match="instance|dispatch|library"):
+        runtime.load_verified_gmsh(expected)
+
+
+def test_verified_load_rejects_pre_admission_ctypes_resolver_tampering(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    expected, _library = _synthetic_cdll_setup(monkeypatch, tmp_path)
+    resolver = ctypes.CDLL.__getattr__
+
+    def replacement(self: Any, name: str) -> Any:
+        del self, name
+        return None
+
+    monkeypatch.setattr(resolver, "__code__", replacement.__code__)
+
+    with pytest.raises((OSError, ValueError), match="ctypes|resolver|dispatch|code"):
+        runtime.load_verified_gmsh(expected)
+
+
+def test_verified_load_rejects_tampered_imported_cast_before_pointer_use(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    expected, _library = _synthetic_cdll_setup(monkeypatch, tmp_path)
+    loaded, _ = runtime.load_verified_gmsh(expected)
+    native = _synthetic_native_callable()
+    _install_synthetic_native_export(monkeypatch, loaded, "gmshIsInitialized", native)
+    runtime.load_verified_gmsh(expected)
+
+    marker = tmp_path / "unsafe-cast-called"
+    monkeypatch.setitem(runtime.ctypes.cast.__globals__, "_marker_path", str(marker))
+
+    def replacement(value: Any, target: Any) -> Any:
+        del value, target
+        with open(_marker_path, "w", encoding="ascii") as stream:
+            stream.write("called")
+        return None
+
+    monkeypatch.setattr(runtime.ctypes.cast, "__code__", replacement.__code__)
+
+    with pytest.raises((OSError, ValueError), match="ctypes|cast|dependency|code"):
+        runtime.load_verified_gmsh(expected)
+    assert not marker.exists()
 
 
 def test_verified_session_rejects_preverification_ctypes_metadata_tampering(
@@ -840,9 +912,7 @@ def test_verified_session_rejects_library_handle_descriptor_tampering(
     sys.modules.pop("gmsh", None)
     loaded, _ = runtime.load_verified_gmsh(expected)
 
-    monkeypatch.setattr(
-        type(loaded.lib), "_handle", property(lambda self: 99), raising=False
-    )
+    monkeypatch.setattr(type(loaded.lib), "_handle", property(lambda self: 99), raising=False)
     with pytest.raises((OSError, ValueError), match="handle|descriptor|library|dispatch"):
         runtime.load_verified_gmsh(expected)
 
@@ -1238,9 +1308,7 @@ def test_verified_session_rejects_lazy_factory_descriptor_tampering(
     sys.modules.pop("gmsh", None)
     loaded, _ = runtime.load_verified_gmsh(expected)
 
-    monkeypatch.setattr(
-        type(loaded.lib), "_FuncPtr", property(lambda self: object), raising=False
-    )
+    monkeypatch.setattr(type(loaded.lib), "_FuncPtr", property(lambda self: object), raising=False)
     with pytest.raises((OSError, ValueError), match="factory|descriptor|dispatch|library"):
         runtime.load_verified_gmsh(expected)
 
@@ -1398,9 +1466,7 @@ def test_verified_session_accepts_authenticated_source_restype_transition(
     loaded, _ = runtime.load_verified_gmsh(expected)
 
     native = _synthetic_native_callable()
-    _install_synthetic_native_export(
-        monkeypatch, loaded, "gmshLoggerGetWallTime", native
-    )
+    _install_synthetic_native_export(monkeypatch, loaded, "gmshLoggerGetWallTime", native)
     runtime.load_verified_gmsh(expected)
     native.restype = ctypes.c_double
 
@@ -1446,12 +1512,7 @@ def test_cached_session_resolves_current_import_precedence_independently(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     _isolated(monkeypatch)
-    source = (
-        "__version__ = '4.15.2'\n"
-        "class Lib:\n"
-        "    _handle = 99\n"
-        "lib = Lib()\n"
-    )
+    source = "__version__ = '4.15.2'\nclass Lib:\n    _handle = 99\nlib = Lib()\n"
     module, library, launcher, image, python_library = _files(tmp_path, source)
     expected = _binding(tmp_path, module=module, library=library)
     earlier = tmp_path / "earlier" / "gmsh.py"
