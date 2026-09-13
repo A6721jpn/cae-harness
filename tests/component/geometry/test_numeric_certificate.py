@@ -123,67 +123,28 @@ def test_near_degenerate_but_exact_affine_neighbor() -> None:
     assert len(_backend_consume(points)) == 1
 
 
-def _rational_certificate(points: Any) -> bool:
-    """Independent Fraction/Gauss-Jordan oracle using full shape derivatives."""
-    p: list[list[Fraction]] = [[Fraction(v) for v in row] for row in points]
-    if _determinant(points) <= 0:
-        return False
-    matrix: list[list[Fraction]] = [
-        [p[j + 1][i] - p[0][i] for j in range(3)] + [Fraction(i == j) for j in range(3)]
-        for i in range(3)
-    ]
-    for j in range(3):
-        pivot = next(i for i in range(j, 3) if matrix[i][j])
-        matrix[j], matrix[pivot] = matrix[pivot], matrix[j]
-        divisor = matrix[j][j]
-        matrix[j] = [v / divisor for v in matrix[j]]
-        for i in range(3):
-            if i != j:
-                factor = matrix[i][j]
-                matrix[i] = [a - factor * b for a, b in zip(matrix[i], matrix[j], strict=True)]
-    inverse = [row[3:] for row in matrix]
-    gradients = ((-1, -1, -1), (1, 0, 0), (0, 1, 0), (0, 0, 1))
-    for vertex in range(4):
-        derivatives = [[(4 * int(vertex == i) - 1) * v for v in gradients[i]] for i in range(4)]
-        derivatives += [
-            [
-                4 * (int(vertex == u) * gradients[v][j] + int(vertex == v) * gradients[u][j])
-                for j in range(3)
-            ]
-            for u, v in EDGES
-        ]
-        jacobian = [
-            [sum((p[n][i] * derivatives[n][j] for n in range(10)), Fraction(0)) for j in range(3)]
-            for i in range(3)
-        ]
-        relative = [
-            [
-                sum((inverse[i][k] * jacobian[k][j] for k in range(3)), Fraction(0)) - int(i == j)
-                for j in range(3)
-            ]
-            for i in range(3)
-        ]
-        if max(sum((abs(v) for v in row), Fraction(0)) for row in relative) >= Fraction(
-            9999999999, 10000000000
-        ):
-            return False
-    return True
-
-
-@pytest.mark.parametrize(
-    "delta", [0.0, 1 / 64, 1 / 16, (1 - 2e-10) / 12, (1 - 0.5e-10) / 12, 1 / 8]
-)
-def test_exact_relative_norm_matches_independent_shape_derivative_oracle(delta: float) -> None:
+def test_quadratic_shear_with_identically_positive_jacobian_is_certified() -> None:
     reference = _midpoints([(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)])
-    reference[4] = (0.5 + delta, 0.0, 0.0)
-    # Sheared, ill-conditioned but nonsingular affine change of coordinates.
-    points = [(p[0] + p[1] + p[2], p[1] + p[2], math.ldexp(p[2], -42)) for p in reference]
-    if _rational_certificate(points):
-        volume = require_positive_quadratic_mapping(points)
-        assert volume == float(_determinant(points) / 6)
-    else:
-        with pytest.raises(ValueError, match="cannot be certified"):
-            require_positive_quadratic_mapping(points)
+    points = [(x + 2 * y * y, y, z) for x, y, z in reference]
+    assert _determinant(points) == 1
+    assert require_positive_quadratic_mapping(points) == 1 / 6
+
+
+def test_positive_vertex_jacobians_with_negative_interior_are_rejected() -> None:
+    reference = _midpoints([(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)])
+    points = [
+        (x * x - y * y - 1.25 * x, 2 * x * y - 1.75 * y, z)
+        for x, y, z in reference
+    ]
+
+    def jacobian_determinant(x: float, y: float) -> float:
+        return (2 * x - 1.25) * (2 * x - 1.75) + 4 * y * y
+
+    assert _determinant(points) > 0
+    assert all(jacobian_determinant(x, y) > 0 for x, y, _ in reference[:4])
+    assert jacobian_determinant(0.75, 0.05) < 0
+    with pytest.raises(ValueError, match="cannot be certified"):
+        require_positive_quadratic_mapping(points)
 
 
 @pytest.mark.parametrize("exponent", [-400, 400])
