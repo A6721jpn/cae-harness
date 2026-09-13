@@ -928,3 +928,40 @@ criteria as a curved-Tet10 certificate. Placement remains downstream and is
 applied exactly once. New algorithm criteria, native source identity and profile
 approval require their own evidence; an API smoke does not qualify a public
 sphere, cylinder, friction or Hertz profile.
+
+### Declared source-local refinement lifecycle
+
+The existing `mesh_dependence` metric retains its three-global-size contract.
+The distinct `source_local_mesh_dependence` metric declares the same length
+parameters `coarse_size`, `refined_size`, `fine_size`, relative force-change
+limit and absolute force floor, but applies the three sizes to explicit local
+balls while keeping the global size fixed. Every participating local refinement
+must have a `SourceLocalRefinementBall`; all declared balls use the same staged
+target size. Mixed global/local studies and implicit region selection are refused.
+
+Each child must use the next declared size. Refinement IDs, selections, bodies,
+source frames, centers, radii, generation profile, refinement ceiling and every
+physical condition remain fixed. Existing case-wide reservations and current-parent
+checks still apply; changing a size is not permission for another unbounded attempt.
+
+Numerical local-mesh evidence requires a declared deformable-part ball. It checks
+registered meshes in the unchanged physical frames: each declared ball must
+contain at least three distinct corner-node edges by edge-midpoint membership.
+Both refinements must increase that local edge count, decrease its observed
+maximum edge length, and increase element counts for each refined body.
+Unchanged far-field maxima do not invalidate a local study. Both successive
+registered force-history changes still require the predeclared tolerance.
+Missing samples, unqualified contact evidence or incomplete state coverage remain
+UNVERIFIED. This adds no sphere, cylinder, friction or material qualification.
+
+### Native CPU allocation enforcement
+
+On the supported Windows native path, declared CPU allocations are enforced by
+a Job Object affinity mask before assigning and resuming the child. The mask
+uses no more than the requested number of CPUs and is contained in the launching
+process's actual allowed affinity. Empty/unavailable affinity or failed limit
+configuration refuses launch without an uncontained fallback. Memory limits,
+kill-on-close, retained-handle cleanup and zero-active-process drain remain intact.
+Runner allocation follows the bundle thread count already checked against the
+case budget; preparation follows its resolved CPU allocation. Library thread
+environment variables remain controls, not proof of the operating-system bound.

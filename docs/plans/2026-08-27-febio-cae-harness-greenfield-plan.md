@@ -782,3 +782,21 @@ remain unchanged. Refinement centers, radii, sizes, transition policy, solver/ou
 settings, expected observations and finite operation/resource limits are fixed
 before each native study. This work does not waive mandatory E2Es, live LLM
 evidence or authorized real-model/BottomFrame acceptance.
+
+### Bounded local lifecycle and native CPU checks
+
+- Preserve existing global mesh studies. Add the distinct predeclared
+  source-local metric and exact adjacent-stage admission without changing
+  physical declarations, local balls, global size or case-wide reservations.
+- Require actual in-ball corner-edge refinement and refined-body element
+  growth across both steps, plus both qualified registered force-history
+  comparisons. Missing evidence remains UNVERIFIED, not a geometry-only PASS.
+- Exercise source-local admission, rejection of shifted/implicit/mixed scopes
+  and a registered local study whose far-field edge maximum stays unchanged.
+- Enforce resolved Windows CPU allocations before native resume using a
+  subset of allowed process affinity, while preserving memory and kill-on-close.
+  Verify a real harmless child and its descendant remain bounded and drain;
+  an environment-only thread request is insufficient evidence.
+- Independently review exact source commits, then run the final local gates
+  and fresh installed native acceptance. None of these source changes waive
+  native geometry, physics, live-LLM or authorized real-model qualification.
