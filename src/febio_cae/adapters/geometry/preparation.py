@@ -92,6 +92,7 @@ def _run_owned(
     argv: tuple[str, ...],
     directory: Path,
     *,
+    cpu_workers: int,
     timeout_seconds: float,
     memory_bytes: int,
 ) -> dict[str, int]:
@@ -106,7 +107,12 @@ def _run_owned(
     ):
         try:
             process = WindowsJobProcess(
-                argv, directory, stdout, stderr, memory_limit_bytes=memory_bytes
+                argv,
+                directory,
+                stdout,
+                stderr,
+                memory_limit_bytes=memory_bytes,
+                cpu_workers=cpu_workers,
             )
         except LaunchCleanupPending as error:
             _pending.append(error.process)
@@ -511,7 +517,11 @@ def run_preparation(
     bootstrap = f"import sys; sys.path.insert(0, {str(package_root)!r}); from febio_cae.adapters.geometry.preparation import _main; _main()"
     argv = (sys.executable, "-I", "-c", bootstrap)
     process = _run_owned(
-        argv, directory, timeout_seconds=limits["wall_seconds"], memory_bytes=limits["memory_bytes"]
+        argv,
+        directory,
+        cpu_workers=limits["cpu_workers"],
+        timeout_seconds=limits["wall_seconds"],
+        memory_bytes=limits["memory_bytes"],
     )
     result_file = directory / "output.json"
     if result_file.stat().st_size > limits["memory_bytes"]:

@@ -188,7 +188,11 @@ def run_inspection(
     argv = (sys.executable, "-I", "-c", bootstrap)
     before_launch()
     process = _run_owned(
-        argv, directory, timeout_seconds=remaining(deadline), memory_bytes=limits["memory_bytes"]
+        argv,
+        directory,
+        cpu_workers=limits["cpu_workers"],
+        timeout_seconds=remaining(deadline),
+        memory_bytes=limits["memory_bytes"],
     )
     remaining(deadline)
     cap = limits["max_response_bytes"]

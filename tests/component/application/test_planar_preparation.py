@@ -224,6 +224,7 @@ def test_preparation_uses_finite_owned_process_deadline(tmp_path: Path) -> None:
         module._run_owned(
             (sys.executable, "-I", "-c", "import time; time.sleep(60)"),
             tmp_path,
+            cpu_workers=1,
             timeout_seconds=0.15,
             memory_bytes=128 * 1024 * 1024,
         )
