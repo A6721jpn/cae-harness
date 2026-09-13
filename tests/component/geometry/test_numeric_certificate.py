@@ -83,8 +83,8 @@ def test_exactly_coplanar_connected_consumer_rejected(
     points = _coplanar()
     original = synthetic_backend.mesh
 
-    def coplanar_mesh(*args: Any) -> Any:
-        mesh = original(*args)
+    def coplanar_mesh(*args: Any, **kwargs: Any) -> Any:
+        mesh = original(*args, **kwargs)
         return replace(
             mesh,
             nodes=tuple(

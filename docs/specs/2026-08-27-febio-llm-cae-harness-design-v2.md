@@ -160,6 +160,22 @@ CAD・メッシュの第一候補はGmshのPython APIとOpenCASCADEである。[
 
 2026-09-09 fixed-pair correction: active public inspection/preparation requires Gmsh 4.15.2, owned linked OCCT 7.8.1 and AP214, superseding the earlier 8.0.1 expectation. A separately bounded identity-only session measured `General.BuildInfo` with exactly `OCC version: 7.8.1` in the pinned official Windows wheel (SHA256 `7b36083bb410fa27c5d0e052929d1a9844a5b09169d66017b72b41aabd49d711`). No OCCT-8-only feature basis was identified in the V2 compatibility evidence. The earlier producer failed before geometry; that failure and historical synthetic evidence remain unchanged. This correction establishes a reproducible candidate identity, not geometric/scientific qualification or SUPPORTED status. Exact owned-session equality, missing/ambiguous/mismatch refusal, generic optional-version behavior, AP214/unit/analytic tolerances and all actual E2E requirements remain unchanged; no arbitrary caller version, fallback or separate OCCT substitution is allowed.
 
+Public native inspection/preparation must bind the actual isolated Gmsh runtime
+before any Gmsh session, query, model or mesh API is called. The parent captures
+an internal `gmsh-runtime-identity-v1` binding without importing Gmsh: interpreter,
+installed distribution module and native library, and `pyvenv.cfg` when present.
+File identities include resolved path, size and SHA256; missing or ambiguous
+distribution/layout data fails closed rather than guessing a loaded library.
+The owned child verifies its interpreter/import resolution and executable module
+source or valid bytecode, then resolves the library actually mapped by its native
+handle and compares identities before using Gmsh. A module filename or version
+string alone is not loaded-code evidence. Repeated sessions may reuse the same
+verified module, but an unverified preloaded module or mismatched binding cannot
+bypass admission. Parent consumers verify the returned observed identity against
+their frozen binding before accepting inspection/preparation output. This internal
+producer metadata is not a caller-supplied success flag or physical qualification;
+generic optional backend configuration and existing owned-process bounds remain.
+
 STEP調査はボディ数、閉じたソリッドか、単位、体積、境界面、幾何学的欠陥を報告する。体積・面積・距離・向きは選択を解決するための幾何情報であり、材料や支持の意味を付与しない。
 
 領域はCAD属性名、明示したボディと座標条件、またはユーザーが選択した面の集合で定義する。CLIは番号付きの調査図と領域一覧を出力できる。これは静的成果物であり、製品GUIを追加しない。曖昧な「上側」等は座標系と対象を確定させる。

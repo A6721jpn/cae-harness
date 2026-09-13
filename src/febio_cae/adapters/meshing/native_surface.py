@@ -1,15 +1,19 @@
 """Whole-face Bernstein certificates for local native primitive surfaces.
 
-The public function in this module is deliberately a small numerical leaf.  It
-certifies the represented quadratic face and returns a one-sided upper bound on
-its distance to a finite analytic primitive boundary.  It does not classify
-physical regions, apply placement, or establish a two-sided Hausdorff bound.
+The unsigned public function in this module certifies a represented quadratic
+face and returns a one-sided upper bound on its maximum distance to a finite
+analytic primitive boundary.  The signed public function instead encloses the
+minimum signed distance and has a finite subdivision budget; an interval that
+has not reached the requested tolerance remains conservative but may be
+ambiguous.  Neither API classifies physical regions, applies placement, or
+establishes a two-sided Hausdorff bound.
 
 All input binary numbers are first represented as exact integers over one common
 scale.  The fixed-degree Bernstein operations below retain a common exact
-integer denominator; subdivision uses the four dyadic child triangles.  Float
-conversion is used only for square roots and is checked against the exact
-rational value before a result is returned.
+integer denominator; subdivision uses the four dyadic child triangles.  The
+unsigned path converts square-root bounds to floats only after exact checks;
+the signed path retains rational square-root enclosures through signed-feature
+subtractions and checks float conversion only at the final interval endpoints.
 """
 
 from __future__ import annotations
@@ -699,4 +703,471 @@ def primitive_face_distance_upper_bound(
     return _cylinder_bound(position, radius, _rational(exact_height, scale))
 
 
-__all__ = ["ALGORITHM", "primitive_face_distance_upper_bound"]
+_SIGNED_MAX_DEPTH = 24
+_SIGNED_MAX_WORK = 4096
+_SIGNED_SQRT_SCALE = 1 << 64
+
+
+@dataclass(frozen=True, slots=True)
+class _SignedInput:
+    points: tuple[_Point, ...]
+    position_denominator: int
+    kind: str
+    radius: _Rational | None
+    half_height: _Rational | None
+    half_dimensions: tuple[_Rational, ...] | None
+    tolerance: _Rational
+    work_limit: int
+
+
+@dataclass(slots=True)
+class _SignedCell:
+    position: tuple[_Bernstein, _Bernstein, _Bernstein]
+    lower: _Rational
+    depth: int
+
+
+def _signed_binary_ratio(value: object, label: str) -> tuple[int, int]:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"{label} must be a finite binary number")
+    try:
+        ratio = _binary_ratio(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{label} must be a finite binary number") from error
+    denominator = ratio[1]
+    if denominator & (denominator - 1):
+        raise ValueError(f"{label} must be a finite binary number")
+    return ratio
+
+
+def _signed_positive_ratio(value: object, label: str) -> tuple[int, int]:
+    ratio = _signed_binary_ratio(value, label)
+    if ratio[0] <= 0:
+        raise ValueError(f"{label} must be positive")
+    return ratio
+
+
+def _signed_read_input(
+    kind: str,
+    coordinates_si: Sequence[Sequence[float]],
+    *,
+    radius_si: float | None,
+    height_si: float | None,
+    dimensions_si: Sequence[float] | None,
+    tolerance_si: float,
+    max_subdivisions: int,
+) -> _SignedInput:
+    if not isinstance(kind, str) or kind not in {"sphere", "cylinder", "box"}:
+        raise ValueError("signed primitive kind must be sphere, cylinder, or box")
+    if isinstance(max_subdivisions, bool) or not isinstance(max_subdivisions, int):
+        raise TypeError("max_subdivisions must be a positive integer")
+    if max_subdivisions <= 0:
+        raise ValueError("max_subdivisions must be a positive integer")
+
+    try:
+        if len(coordinates_si) != 6:
+            raise ValueError("signed primitive requires six Tri6 points")
+    except TypeError as error:
+        raise ValueError("signed primitive requires six Tri6 points") from error
+
+    coordinate_ratios: list[tuple[tuple[int, int], ...]] = []
+    for point in coordinates_si:
+        try:
+            if len(point) != 3:
+                raise ValueError("signed primitive requires three-component points")
+        except TypeError as error:
+            raise ValueError("signed primitive requires three-component points") from error
+        coordinate_ratios.append(
+            tuple(_signed_binary_ratio(value, "point coordinate") for value in point)
+        )
+
+    radius_ratio: tuple[int, int] | None = None
+    height_ratio: tuple[int, int] | None = None
+    dimension_ratios: tuple[tuple[int, int], ...] | None = None
+    if kind == "sphere":
+        if radius_si is None:
+            raise ValueError("sphere radius is required")
+        if height_si is not None or dimensions_si is not None:
+            raise ValueError("sphere accepts only radius_si")
+        radius_ratio = _signed_positive_ratio(radius_si, "sphere radius")
+    elif kind == "cylinder":
+        if radius_si is None or height_si is None:
+            raise ValueError("cylinder radius and height are required")
+        if dimensions_si is not None:
+            raise ValueError("cylinder accepts radius_si and height_si only")
+        radius_ratio = _signed_positive_ratio(radius_si, "cylinder radius")
+        height_ratio = _signed_positive_ratio(height_si, "cylinder height")
+    else:
+        if radius_si is not None or height_si is not None:
+            raise ValueError("box accepts dimensions_si only")
+        if dimensions_si is None:
+            raise ValueError("box dimensions are required")
+        try:
+            if len(dimensions_si) != 3:
+                raise ValueError("box requires three dimensions")
+        except TypeError as error:
+            raise ValueError("box requires three dimensions") from error
+        dimension_ratios = tuple(
+            _signed_positive_ratio(value, "box dimension") for value in dimensions_si
+        )
+
+    tolerance_ratio = _signed_positive_ratio(tolerance_si, "tolerance_si")
+    denominators = [
+        denominator
+        for point in coordinate_ratios
+        for _, denominator in point
+    ]
+    if radius_ratio is not None:
+        denominators.append(radius_ratio[1])
+    if height_ratio is not None:
+        denominators.append(height_ratio[1])
+    if dimension_ratios is not None:
+        denominators.extend(denominator for _, denominator in dimension_ratios)
+    scale = 1
+    for denominator in denominators:
+        scale = math.lcm(scale, denominator)
+
+    exact_points: tuple[_Point, ...] = tuple(
+        (
+            point[0][0] * (scale // point[0][1]),
+            point[1][0] * (scale // point[1][1]),
+            point[2][0] * (scale // point[2][1]),
+        )
+        for point in coordinate_ratios
+    )
+
+    def exact_ratio(ratio: tuple[int, int]) -> _Rational:
+        return _rational(ratio[0] * (scale // ratio[1]), scale)
+
+    radius = exact_ratio(radius_ratio) if radius_ratio is not None else None
+    half_height = (
+        _q_mul(exact_ratio(height_ratio), _q_rational_half())
+        if height_ratio is not None
+        else None
+    )
+    half_dimensions = (
+        tuple(
+            _q_mul(exact_ratio(ratio), _q_rational_half())
+            for ratio in dimension_ratios
+        )
+        if dimension_ratios is not None
+        else None
+    )
+    return _SignedInput(
+        points=exact_points,
+        position_denominator=2 * scale,
+        kind=kind,
+        radius=radius,
+        half_height=half_height,
+        half_dimensions=half_dimensions,
+        tolerance=_rational(*tolerance_ratio),
+        work_limit=min(max_subdivisions, _SIGNED_MAX_WORK),
+    )
+
+
+def _signed_ratio_approximation(numerator: int, denominator: int) -> float:
+    numerator_bits = numerator.bit_length()
+    denominator_bits = denominator.bit_length()
+    numerator_take = min(numerator_bits, 53)
+    denominator_take = min(denominator_bits, 53)
+    numerator_top = numerator >> (numerator_bits - numerator_take)
+    denominator_top = denominator >> (denominator_bits - denominator_take)
+    numerator_mantissa = math.ldexp(float(numerator_top), -numerator_take)
+    denominator_mantissa = math.ldexp(float(denominator_top), -denominator_take)
+    try:
+        return math.ldexp(
+            numerator_mantissa / denominator_mantissa,
+            numerator_bits - denominator_bits,
+        )
+    except OverflowError:
+        return math.inf
+
+
+def _signed_positive_float_ratio(numerator: int, denominator: int, *, upward: bool) -> float:
+    if numerator <= 0 or denominator <= 0:
+        raise ValueError("internal positive float ratio must be positive")
+    candidate = _signed_ratio_approximation(numerator, denominator)
+    if not math.isfinite(candidate):
+        candidate = sys.float_info.max
+    if candidate == 0.0 and upward:
+        candidate = math.nextafter(0.0, math.inf)
+    for _ in range(64):
+        candidate_numerator, candidate_denominator = candidate.as_integer_ratio()
+        at_least = candidate_numerator * denominator >= numerator * candidate_denominator
+        at_most = candidate_numerator * denominator <= numerator * candidate_denominator
+        if upward and at_least:
+            return candidate
+        if not upward and at_most:
+            return candidate
+        next_candidate = math.nextafter(candidate, math.inf if upward else 0.0)
+        if not math.isfinite(next_candidate) and upward:
+            raise ValueError("signed primitive result is not representable")
+        candidate = next_candidate
+    raise ValueError("signed primitive result is not representable")
+
+
+def _signed_float_down(value: _Rational) -> float:
+    if value.numerator == 0:
+        return 0.0
+    if value.numerator > 0:
+        return _signed_positive_float_ratio(value.numerator, value.denominator, upward=False)
+    positive = _signed_positive_float_ratio(-value.numerator, value.denominator, upward=True)
+    return -positive
+
+
+def _signed_float_up(value: _Rational) -> float:
+    if value.numerator == 0:
+        return 0.0
+    if value.numerator > 0:
+        return _signed_positive_float_ratio(value.numerator, value.denominator, upward=True)
+    positive = _signed_positive_float_ratio(-value.numerator, value.denominator, upward=False)
+    return -positive
+
+
+def _signed_sqrt_bound(value: _Rational, *, upward: bool) -> _Rational:
+    if value.numerator < 0:
+        raise ValueError("internal signed square-root ratio must be nonnegative")
+    if value.numerator == 0:
+        return _q_zero()
+
+    # Keep the root exact as a rational enclosure until any primitive radius or
+    # half-dimension has been subtracted.  Converting sqrt(value) to a float
+    # first can overflow even when the final signed distance is representable.
+    scale = _SIGNED_SQRT_SCALE
+    scaled = value.numerator * value.denominator * scale * scale
+    root = math.isqrt(scaled)
+    if upward and root * root < scaled:
+        root += 1
+    return _rational(root, value.denominator * scale)
+
+
+def _signed_abs(value: _Rational) -> _Rational:
+    return value if value.numerator >= 0 else _q_neg(value)
+
+
+def _signed_abs_interval(
+    minimum: _Rational, maximum: _Rational
+) -> tuple[_Rational, _Rational]:
+    if _q_less(maximum, _q_zero()):
+        return _q_neg(maximum), _q_neg(minimum)
+    if _q_less(_q_zero(), minimum):
+        return minimum, maximum
+    return _q_zero(), _q_max(_signed_abs(minimum), _signed_abs(maximum))
+
+
+def _signed_feature_sdf_bound(
+    values: tuple[_Rational, ...], *, upward: bool
+) -> _Rational:
+    positives = tuple(_nonnegative(value) for value in values)
+    squared = _q_zero()
+    for value in positives:
+        squared = _q_add(squared, _q_square(value))
+    outside = _signed_sqrt_bound(squared, upward=upward)
+    largest = values[0]
+    for value in values[1:]:
+        largest = _q_max(largest, value)
+    inside = _q_min(largest, _q_zero())
+    return _q_add(outside, inside)
+
+
+def _signed_polynomial_value(value: _Bernstein, barycentric: tuple[_Rational, ...]) -> _Rational:
+    result = _q_zero()
+    for index, numerator in zip(_INDICES[value.degree], value.numerators, strict=True):
+        term = _rational(numerator, value.denominator)
+        for coordinate, exponent in zip(barycentric, index, strict=True):
+            for _ in range(exponent):
+                term = _q_mul(term, coordinate)
+        term = _q_mul(term, _q_from_int(_MULTINOMIAL_BY_INDEX[value.degree][index]))
+        result = _q_add(result, term)
+    return result
+
+
+_SIGNED_WITNESSES: tuple[tuple[_Rational, _Rational, _Rational], ...] = (
+    (_Rational(1, 1), _Rational(0, 1), _Rational(0, 1)),
+    (_Rational(0, 1), _Rational(1, 1), _Rational(0, 1)),
+    (_Rational(0, 1), _Rational(0, 1), _Rational(1, 1)),
+    (_Rational(1, 2), _Rational(1, 2), _Rational(0, 1)),
+    (_Rational(0, 1), _Rational(1, 2), _Rational(1, 2)),
+    (_Rational(1, 2), _Rational(0, 1), _Rational(1, 2)),
+    (_Rational(1, 3), _Rational(1, 3), _Rational(1, 3)),
+)
+
+
+def _signed_cell_lower(
+    position: tuple[_Bernstein, _Bernstein, _Bernstein], spec: _SignedInput
+) -> _Rational:
+    if spec.kind == "sphere":
+        if spec.radius is None:
+            raise ValueError("internal sphere radius is missing")
+        minimum, _ = _enclosure(_squared_norm(position, include_z=True))
+        return _q_sub(
+            _signed_sqrt_bound(_nonnegative(minimum), upward=False),
+            spec.radius,
+        )
+    if spec.kind == "cylinder":
+        if spec.radius is None or spec.half_height is None:
+            raise ValueError("internal cylinder dimensions are missing")
+        radial_minimum, _ = _enclosure(_squared_norm(position, include_z=False))
+        z_minimum, z_maximum = _enclosure(position[2])
+        absolute_z_minimum, _ = _signed_abs_interval(z_minimum, z_maximum)
+        radial_lower = _signed_sqrt_bound(_nonnegative(radial_minimum), upward=False)
+        radial_difference = _q_sub(radial_lower, spec.radius)
+        axial_difference = _q_sub(absolute_z_minimum, spec.half_height)
+        return _signed_feature_sdf_bound((radial_difference, axial_difference), upward=False)
+    if spec.half_dimensions is None:
+        raise ValueError("internal box dimensions are missing")
+    differences: list[_Rational] = []
+    for coordinate, half_dimension in zip(position, spec.half_dimensions, strict=True):
+        minimum, maximum = _enclosure(coordinate)
+        absolute_minimum, _ = _signed_abs_interval(minimum, maximum)
+        differences.append(_q_sub(absolute_minimum, half_dimension))
+    return _signed_feature_sdf_bound(tuple(differences), upward=False)
+
+
+def _signed_point_upper(
+    position: tuple[_Bernstein, _Bernstein, _Bernstein],
+    barycentric: tuple[_Rational, _Rational, _Rational],
+    spec: _SignedInput,
+) -> _Rational:
+    point = tuple(_signed_polynomial_value(axis, barycentric) for axis in position)
+    if spec.kind == "sphere":
+        if spec.radius is None:
+            raise ValueError("internal sphere radius is missing")
+        squared = _q_zero()
+        for coordinate in point:
+            squared = _q_add(squared, _q_square(coordinate))
+        return _q_sub(
+            _signed_sqrt_bound(squared, upward=True),
+            spec.radius,
+        )
+    if spec.kind == "cylinder":
+        if spec.radius is None or spec.half_height is None:
+            raise ValueError("internal cylinder dimensions are missing")
+        radial_squared = _q_add(_q_square(point[0]), _q_square(point[1]))
+        radial_upper = _signed_sqrt_bound(radial_squared, upward=True)
+        radial_difference = _q_sub(radial_upper, spec.radius)
+        axial_difference = _q_sub(_signed_abs(point[2]), spec.half_height)
+        return _signed_feature_sdf_bound((radial_difference, axial_difference), upward=True)
+    if spec.half_dimensions is None:
+        raise ValueError("internal box dimensions are missing")
+    differences = tuple(
+        _q_sub(_signed_abs(coordinate), half_dimension)
+        for coordinate, half_dimension in zip(point, spec.half_dimensions, strict=True)
+    )
+    return _signed_feature_sdf_bound(differences, upward=True)
+
+
+def _signed_child_positions(
+    position: tuple[_Bernstein, _Bernstein, _Bernstein]
+) -> tuple[tuple[_Bernstein, _Bernstein, _Bernstein], ...]:
+    children = tuple(_subdivide(axis) for axis in position)
+    return tuple(
+        (children[0][index], children[1][index], children[2][index])
+        for index in range(len(children[0]))
+    )
+
+
+def _signed_rational_min(values: Sequence[_Rational]) -> _Rational:
+    if not values:
+        raise ValueError("internal rational minimum requires a value")
+    result = values[0]
+    for value in values[1:]:
+        result = _q_min(result, value)
+    return result
+
+
+def primitive_face_minimum_signed_distance_interval(
+    kind: str,
+    points: Sequence[Sequence[float]],
+    *,
+    radius_si: float | None = None,
+    height_si: float | None = None,
+    dimensions_si: Sequence[float] | None = None,
+    tolerance_si: float,
+    max_subdivisions: int = 4096,
+) -> tuple[float, float]:
+    """Enclose the minimum signed distance of a complete canonical Tri6 patch.
+
+    The lower endpoint is obtained from exact Bernstein enclosures and the
+    monotone signed distance of the closed primitive.  The upper endpoint is
+    the upward-rounded signed distance of an actual point on the patch.  The
+    subdivision budget is finite; if the requested precision is not reached,
+    the returned interval remains conservative and may be ambiguous.
+    """
+    spec = _signed_read_input(
+        kind,
+        points,
+        radius_si=radius_si,
+        height_si=height_si,
+        dimensions_si=dimensions_si,
+        tolerance_si=tolerance_si,
+        max_subdivisions=max_subdivisions,
+    )
+    position = _position_polynomials(spec.points, spec.position_denominator)
+    leaves = [_SignedCell(position, _signed_cell_lower(position, spec), 0)]
+    upper: _Rational | None = None
+    for barycentric in _SIGNED_WITNESSES:
+        candidate = _signed_point_upper(position, barycentric, spec)
+        upper = candidate if upper is None else _q_min(upper, candidate)
+    if upper is None:
+        raise ValueError("signed primitive has no finite point witness")
+
+    work = 0
+    while True:
+        lower = _signed_rational_min(tuple(cell.lower for cell in leaves))
+        width = _q_sub(upper, lower)
+        if _q_less(width, spec.tolerance) or _q_equal(width, spec.tolerance):
+            break
+        if work >= spec.work_limit:
+            break
+        splittable = [
+            index for index, cell in enumerate(leaves) if cell.depth < _SIGNED_MAX_DEPTH
+        ]
+        if not splittable:
+            break
+        selected = splittable[0]
+        for index in splittable[1:]:
+            if _q_less(leaves[index].lower, leaves[selected].lower):
+                selected = index
+        cell = leaves.pop(selected)
+        for child_position in _signed_child_positions(cell.position):
+            child = _SignedCell(
+                child_position,
+                _signed_cell_lower(child_position, spec),
+                cell.depth + 1,
+            )
+            leaves.append(child)
+            for barycentric in _SIGNED_WITNESSES:
+                candidate = _signed_point_upper(child_position, barycentric, spec)
+                upper = _q_min(upper, candidate)
+        work += 1
+
+    lower = _signed_rational_min(tuple(cell.lower for cell in leaves))
+    if spec.kind == "sphere":
+        if spec.radius is None:
+            raise ValueError("internal sphere radius is missing")
+        safe_lower = _q_neg(spec.radius)
+    elif spec.kind == "cylinder":
+        if spec.radius is None or spec.half_height is None:
+            raise ValueError("internal cylinder dimensions are missing")
+        safe_lower = _q_neg(_q_min(spec.radius, spec.half_height))
+    else:
+        if spec.half_dimensions is None:
+            raise ValueError("internal box dimensions are missing")
+        safe_lower = _q_neg(_signed_rational_min(spec.half_dimensions))
+    if _q_less(upper, lower):
+        lower = safe_lower
+    if _q_less(upper, lower):
+        raise ValueError("signed primitive distance bounds are not representable")
+    lower_float = _signed_float_down(lower)
+    upper_float = _signed_float_up(upper)
+    if not math.isfinite(lower_float) or not math.isfinite(upper_float):
+        raise ValueError("signed primitive distance bounds are not representable")
+    return lower_float, upper_float
+
+
+__all__ = [
+    "ALGORITHM",
+    "primitive_face_distance_upper_bound",
+    "primitive_face_minimum_signed_distance_interval",
+]

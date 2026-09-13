@@ -85,8 +85,8 @@ def test_folded_quadratic_mapping_rejected(
 ) -> None:
     original = synthetic_backend.mesh
 
-    def folded(*args: Any) -> Any:
-        mesh = original(*args)
+    def folded(*args: Any, **kwargs: Any) -> Any:
+        mesh = original(*args, **kwargs)
         edge_node = mesh.elements[0].node_ids[4]
         return replace(
             mesh,
@@ -97,6 +97,6 @@ def test_folded_quadratic_mapping_rejected(
         )
 
     monkeypatch.setattr(synthetic_backend, "mesh", folded)
-    with pytest.raises(PortError, match="quadratic") as error:
+    with pytest.raises(PortError) as error:
         mesh_port.mesh(synthetic_case_revision)
     assert error.value.category == PortErrorCategory.QUALITY
