@@ -456,8 +456,9 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
             spec.rigid_tool.contact_surface.geometry_digest,
         )
         placed_inspection = _placed_inspection(inspection, primitive.placement)
-        for refinement in spec.mesh_policy.local_refinements:
-            self._resolve_selection_from_report(refinement.selection, placed_inspection)
+        for selection in _spec_selections(spec):
+            if selection.body_id == primitive.body_id:
+                self._resolve_selection_from_report(selection, placed_inspection)
         check_deadline(deadline)
         backend = cast(NativeCurvedGeometryBackend, self._backend)
         try:
@@ -841,6 +842,36 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
                     PortErrorCategory.UNSUPPORTED_CAPABILITY,
                     "backend local-refinement mapping is not qualified for this adapter",
                 )
+        selections = _spec_selections(spec)
+        selection_resolutions = {
+            _selection_digest(selection): self._resolve_selection_from_report(selection, report)
+            for selection in selections
+            if selection.body_id.value == part_body_id
+        }
+        generated = self._generate_tool(spec, deadline)
+        applied = self._initial_placement(spec, report, generated)
+        placed_tool = replace(spec.rigid_tool.primitive, placement=applied.placement)
+        tool_report = self._tool_inspection(
+            generated,
+            placed_tool,
+            spec.rigid_tool.contact_surface.geometry_digest,
+        )
+        for selection in selections:
+            selection_digest = _selection_digest(selection)
+            if selection_digest in selection_resolutions:
+                continue
+            selected_report = report if selection.body_id.value == part_body_id else tool_report
+            if selection.body_id.value not in {
+                part_body_id,
+                spec.rigid_tool.primitive.body_id.value,
+            }:
+                self._raise(
+                    PortErrorCategory.INVALID_INPUT,
+                    f"selection {selection.name!r} identifies an unknown mesh body",
+                )
+            selection_resolutions[selection_digest] = self._resolve_selection_from_report(
+                selection, selected_report
+            )
         try:
             part_mesh = self._backend.mesh(
                 source.content,
@@ -861,9 +892,6 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
             )
         if part_mesh.geometry_digest != spec.geometry.geometry_digest:
             self._raise(PortErrorCategory.INTEGRITY, "backend mesh geometry digest is stale")
-        generated = self._generate_tool(spec, deadline)
-        applied = self._initial_placement(spec, report, generated)
-        placed_tool = replace(spec.rigid_tool.primitive, placement=applied.placement)
         tool_mesh = generated.mesh
         part_mapped = self._map_backend_mesh(
             part_mesh,
@@ -892,29 +920,6 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
             self._raise(PortErrorCategory.INTEGRITY, "part and rigid-tool mesh face IDs overlap")
         all_nodes = part_mapped.nodes + tool_mapped.nodes
         all_elements = part_mapped.elements + tool_mapped.elements
-        tool_report = self._tool_inspection(
-            generated,
-            placed_tool,
-            spec.rigid_tool.contact_surface.geometry_digest,
-        )
-        selections = _spec_selections(spec)
-        selection_resolutions: dict[str, ResolutionSnapshot] = {}
-        for selection in selections:
-            selection_digest = _selection_digest(selection)
-            if selection_digest in selection_resolutions:
-                continue
-            selected_report = report if selection.body_id.value == part_body_id else tool_report
-            if selection.body_id.value not in {
-                part_body_id,
-                spec.rigid_tool.primitive.body_id.value,
-            }:
-                self._raise(
-                    PortErrorCategory.INVALID_INPUT,
-                    f"selection {selection.name!r} identifies an unknown mesh body",
-                )
-            selection_resolutions[selection_digest] = self._resolve_selection_from_report(
-                selection, selected_report
-            )
         coverage: dict[tuple[str, str], list[str]] = {}
         for backend_mesh in (part_mesh, tool_mesh):
             for face in backend_mesh.faces:
