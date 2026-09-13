@@ -7,6 +7,14 @@ I+tD is nonsingular for 0<=t<=1 (Neumann criterion), hence det J stays positive.
 All orientation and relative-norm operations use exact integers representing the
 supplied binary coordinates. No rounded determinant, inverse or norm establishes
 the hypotheses. The conservative norm threshold is exactly 1 - 1/10**10.
+If the Neumann criterion is inconclusive, the exact four vertex Jacobians are
+used to expand ``det(J)`` as a cubic in the barycentric coordinates. The 64
+ordered choices of a vertex for each Jacobian column are grouped into the 20
+degree-three monomials. Each grouped integer coefficient has the same sign as
+the corresponding Bernstein coefficient because their ratio is a positive
+multinomial factor. Strictly positive coefficients therefore prove positivity
+over the whole closed tetrahedron; this is another sufficient proof and may
+still conservatively refuse a positive mapping.
 This is sufficient, not necessary: valid strongly curved elements can be refused.
 It certifies the represented element, not intended geometry or native qualification.
 """
@@ -52,10 +60,13 @@ def require_positive_quadratic_mapping(points: Sequence[Sequence[float]]) -> flo
         raise ValueError("quadratic mapping has degenerate or inverted corners")
     gradients = ((-1, -1, -1), (1, 0, 0), (0, 1, 0), (0, 0, 1))
     edges = ((0, 1), (1, 2), (2, 0), (0, 3), (1, 3), (2, 3))
+    affine = [[columns[j][i] for j in range(3)] for i in range(3)]
     deviations = [
         [2 * exact[4 + k][j] - exact[u][j] - exact[v][j] for j in range(3)]
         for k, (u, v) in enumerate(edges)
     ]
+    vertex_jacobians: list[tuple[tuple[int, int, int], ...]] = []
+    neumann_certified = True
     for vertex in range(4):
         # Non-affine displacement is sum 2*L_u*L_v*twice_edge_deviation.
         perturbation = [
@@ -70,13 +81,27 @@ def require_positive_quadratic_mapping(points: Sequence[Sequence[float]]) -> flo
             ]
             for i in range(3)
         ]
-        relative = [
-            [sum(cofactors[i][k] * perturbation[k][j] for k in range(3)) for j in range(3)]
-            for i in range(3)
-        ]
-        bound = max(sum(abs(v) for v in row) for row in relative)
-        if bound * 10**10 >= determinant * (10**10 - 1):
-            raise ValueError("quadratic mapping positivity cannot be certified over the element")
+        vertex_jacobians.append(
+            tuple(
+                tuple(affine[i][j] + perturbation[i][j] for j in range(3))
+                for i in range(3)
+            )
+        )
+        if neumann_certified:
+            relative = [
+                [
+                    sum(cofactors[i][k] * perturbation[k][j] for k in range(3))
+                    for j in range(3)
+                ]
+                for i in range(3)
+            ]
+            bound = max(sum(abs(v) for v in row) for row in relative)
+            if bound * 10**10 >= determinant * (10**10 - 1):
+                neumann_certified = False
+    if not neumann_certified and not _strictly_positive_cubic_bernstein_determinant(
+        vertex_jacobians
+    ):
+        raise ValueError("quadratic mapping positivity cannot be certified over the element")
     # This conversion is only for the public scalar quality measurement; it
     # does not participate in the exact positivity/norm decision above.
     try:
@@ -86,3 +111,46 @@ def require_positive_quadratic_mapping(points: Sequence[Sequence[float]]) -> flo
     if not math.isfinite(volume) or volume <= 0:
         raise ValueError("positive corner volume is not representable")
     return volume
+
+
+def _determinant_from_columns(
+    first: Sequence[int], second: Sequence[int], third: Sequence[int]
+) -> int:
+    return (
+        first[0] * (second[1] * third[2] - second[2] * third[1])
+        - first[1] * (second[0] * third[2] - second[2] * third[0])
+        + first[2] * (second[0] * third[1] - second[1] * third[0])
+    )
+
+
+def _strictly_positive_cubic_bernstein_determinant(
+    vertex_jacobians: Sequence[Sequence[Sequence[int]]],
+) -> bool:
+    coefficients: dict[tuple[int, int, int, int], int] = {
+        (first, second, third, 3 - first - second - third): 0
+        for first in range(4)
+        for second in range(4 - first)
+        for third in range(4 - first - second)
+    }
+    for first_vertex in range(4):
+        for second_vertex in range(4):
+            for third_vertex in range(4):
+                exponent = tuple(
+                    int(first_vertex == vertex)
+                    + int(second_vertex == vertex)
+                    + int(third_vertex == vertex)
+                    for vertex in range(4)
+                )
+                first_column = tuple(
+                    vertex_jacobians[first_vertex][row][0] for row in range(3)
+                )
+                second_column = tuple(
+                    vertex_jacobians[second_vertex][row][1] for row in range(3)
+                )
+                third_column = tuple(
+                    vertex_jacobians[third_vertex][row][2] for row in range(3)
+                )
+                coefficients[exponent] += _determinant_from_columns(
+                    first_column, second_column, third_column
+                )
+    return all(coefficient > 0 for coefficient in coefficients.values())
