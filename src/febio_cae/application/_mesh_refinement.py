@@ -16,11 +16,13 @@ from febio_cae.domain import (
     AssessmentStatus,
     CaseRevision,
     CriterionAssessment,
+    FrameId,
     IsotropicLinearElastic,
     LocalRefinement,
     MeasuredValue,
     MeshArtifact,
     MeshPolicy,
+    NumericalProfileRef,
     Quantity,
     QualityCriterion,
     ResultManifest,
@@ -32,6 +34,11 @@ from febio_cae.domain import (
 from febio_cae.domain.canonical import canonical_bytes
 from febio_cae.domain.results import numeric_state_indices
 from febio_cae.storage.comparison import ComparisonTarget, successful_targets
+from febio_cae.storage.mesh_quality import (
+    CurrentPreparationRegistration,
+    MeshQualityRegistration,
+)
+from febio_cae.storage.preparation import PreparationStore
 from febio_cae.storage.registry import CaseStorage
 
 from ._comparison import _curve
@@ -63,6 +70,19 @@ class _LocalBallMeasurement:
 @dataclass(frozen=True, slots=True)
 class _LocalMeshMeasurement:
     balls: dict[str, _LocalBallMeasurement]
+    body_element_counts: dict[str, int]
+
+
+@dataclass(frozen=True, slots=True)
+class _LocalCornerEdge:
+    midpoint: tuple[float, float, float]
+    length_m: float
+
+
+@dataclass(frozen=True, slots=True)
+class _LocalMeshIndex:
+    frame: FrameId
+    edges_by_body: dict[str, tuple[_LocalCornerEdge, ...]]
     body_element_counts: dict[str, int]
 
 
@@ -228,8 +248,56 @@ def _normalised_local_policy(policy: MeshPolicy) -> MeshPolicy:
     )
 
 
+def _normalised_admission_revision(
+    revision: CaseRevision, registration: CurrentPreparationRegistration
+) -> CaseRevision:
+    """Project a verified preparation admission back to its shared generator."""
+
+    return replace(
+        revision,
+        spec=replace(
+            revision.spec,
+            mesh_policy=replace(
+                revision.spec.mesh_policy,
+                quality_profile=registration.generation_profile,
+            ),
+        ),
+    )
+
+
+def _authenticated_prepared_revision(
+    storage: CaseStorage,
+    revision: CaseRevision,
+    mesh: MeshArtifact | None = None,
+    *,
+    common_generation_profile: NumericalProfileRef | None = None,
+) -> tuple[CaseRevision, CurrentPreparationRegistration]:
+    """Authenticate current-preparation mesh provenance before comparing physics."""
+
+    registration = storage.resolve_revision_mesh_quality(revision)
+    if not isinstance(registration, CurrentPreparationRegistration):
+        raise ValueError("refinement requires a current preparation admission")
+    if registration.reference != revision.spec.mesh_policy.quality_profile:
+        raise ValueError("revision mesh quality admission reference is not registered")
+    registration.check_spec(revision.spec)
+    generation = storage.resolve_mesh_quality(registration.generation_profile)
+    if not isinstance(generation, MeshQualityRegistration):
+        raise ValueError("preparation admission does not preserve a generation profile")
+    if revision.spec.rigid_tool.primitive.kind not in generation.primitive_kinds:
+        raise ValueError("preparation generation profile does not cover the declared primitive")
+    expected = PreparationStore(storage).mesh(registration, revision)
+    if mesh is not None and expected.to_bytes() != mesh.to_bytes():
+        raise ValueError("registered preparation mesh differs from the comparison mesh")
+    if (
+        common_generation_profile is not None
+        and registration.generation_profile != common_generation_profile
+    ):
+        raise ValueError("refinement stages do not share one generation profile")
+    return _normalised_admission_revision(revision, registration), registration
+
+
 def _same_local_physics(candidate: CaseRevision, current: CaseRevision) -> bool:
-    """Compare local-study candidates while normalising only local target sizes."""
+    """Compare local candidates after verified admission projection and size normalisation."""
 
     if (
         candidate.case_id != current.case_id
@@ -389,27 +457,21 @@ def _local_transform(candidate: CaseRevision, body_id: str) -> RigidTransform:
     raise ValueError("source-local refinement identifies an undeclared body")
 
 
-def _local_mesh_measurement(
-    revision: CaseRevision, mesh: MeshArtifact, refinement: LocalRefinement
-) -> _LocalBallMeasurement:
-    region = refinement.region
-    if not isinstance(region, SourceLocalRefinementBall):
-        raise ValueError("source-local refinement evidence requires an explicit ball")
-    body_id = refinement.selection.body_id.value
-    transform = _local_transform(revision, body_id)
-    if mesh.frame != transform.target_frame or region.center.frame != transform.source_frame:
-        raise ValueError("source-local ball and mesh are not in compatible physical frames")
-    center = _transform_point(_point_values(region.center), transform)
-    radius = float(region.radius.to_si().value)
-    if not math.isfinite(radius) or radius <= 0:
-        raise ValueError("source-local ball radius is invalid")
+def _local_mesh_index(mesh: MeshArtifact, bodies: set[str]) -> _LocalMeshIndex:
+    """Build one reusable coordinate, body-count and corner-edge index per mesh."""
 
     coordinates = {node.node_id: tuple(node.coordinates_si) for node in mesh.nodes}
-    edges: dict[tuple[int, int], float] = {}
+    body_element_counts = {body: 0 for body in bodies}
+    edges_by_body: dict[str, dict[tuple[int, int], _LocalCornerEdge]] = {
+        body: {} for body in bodies
+    }
     for element in mesh.elements:
-        if element.body_id != body_id:
+        body_id = element.body_id
+        if body_id not in bodies:
             continue
+        body_element_counts[body_id] += 1
         corners = tuple(element.node_ids[index] for index in TET10_CORNER_NODE_POSITIONS)
+        edges = edges_by_body[body_id]
         for left_index, right_index in TET10_EDGE_NODE_POSITIONS:
             edge = (
                 min(corners[left_index], corners[right_index]),
@@ -423,16 +485,61 @@ def _local_mesh_measurement(
             except KeyError as error:
                 raise ValueError("source-local mesh edge references an unknown node") from error
             midpoint = tuple((left[index] + right[index]) / 2 for index in range(3))
-            if math.dist(midpoint, center) <= radius:
-                length = math.dist(left, right)
-                if not math.isfinite(length) or length <= 0:
-                    raise ValueError("source-local mesh contains an invalid corner edge")
-                edges[edge] = length
-    if len(edges) < 3:
+            length = math.dist(left, right)
+            if not math.isfinite(length) or length <= 0:
+                raise ValueError("source-local mesh contains an invalid corner edge")
+            edges[edge] = _LocalCornerEdge(midpoint, length)
+    if any(count <= 0 for count in body_element_counts.values()):
+        raise ValueError("source-local mesh evidence lacks a refined body")
+    return _LocalMeshIndex(
+        mesh.frame,
+        {
+            body: tuple(record for _, record in sorted(edges.items()))
+            for body, edges in edges_by_body.items()
+        },
+        body_element_counts,
+    )
+
+
+def _local_ball_measurement(
+    revision: CaseRevision,
+    refinement: LocalRefinement,
+    index: _LocalMeshIndex,
+) -> _LocalBallMeasurement:
+    region = refinement.region
+    if not isinstance(region, SourceLocalRefinementBall):
+        raise ValueError("source-local refinement evidence requires an explicit ball")
+    body_id = refinement.selection.body_id.value
+    transform = _local_transform(revision, body_id)
+    if index.frame != transform.target_frame or region.center.frame != transform.source_frame:
+        raise ValueError("source-local ball and mesh are not in compatible physical frames")
+    center = _transform_point(_point_values(region.center), transform)
+    radius = float(region.radius.to_si().value)
+    if not math.isfinite(radius) or radius <= 0:
+        raise ValueError("source-local ball radius is invalid")
+
+    in_ball = tuple(
+        edge
+        for edge in index.edges_by_body.get(body_id, ())
+        if math.dist(edge.midpoint, center) <= radius
+    )
+    if len(in_ball) < 3:
         raise ValueError(
             f"source-local ball {refinement.refinement_id!r} has fewer than three in-ball edges"
         )
-    return _LocalBallMeasurement(len(edges), max(edges.values()))
+    return _LocalBallMeasurement(len(in_ball), max(edge.length_m for edge in in_ball))
+
+
+def _local_mesh_measurement(
+    revision: CaseRevision, mesh: MeshArtifact, refinement: LocalRefinement
+) -> _LocalBallMeasurement:
+    """Measure one ball while retaining the historical private helper boundary."""
+
+    return _local_ball_measurement(
+        revision,
+        refinement,
+        _local_mesh_index(mesh, {refinement.selection.body_id.value}),
+    )
 
 
 def _local_mesh_measurements(
@@ -443,16 +550,13 @@ def _local_mesh_measurements(
         item.selection.body_id == revision.spec.geometry.body_id for item in refinements
     ):
         raise ValueError("source-local mesh evidence requires a deformable-part ball")
-    balls = {
-        item.refinement_id: _local_mesh_measurement(revision, mesh, item) for item in refinements
-    }
     bodies = {item.selection.body_id.value for item in refinements}
-    body_element_counts = {
-        body: sum(element.body_id == body for element in mesh.elements) for body in bodies
+    index = _local_mesh_index(mesh, bodies)
+    balls = {
+        item.refinement_id: _local_ball_measurement(revision, item, index)
+        for item in refinements
     }
-    if any(count <= 0 for count in body_element_counts.values()):
-        raise ValueError("source-local mesh evidence lacks a refined body")
-    return _LocalMeshMeasurement(balls, body_element_counts)
+    return _LocalMeshMeasurement(balls, index.body_element_counts)
 
 
 def _assess_source_local_mesh_refinement(
@@ -470,14 +574,41 @@ def _assess_source_local_mesh_refinement(
     groups: dict[float, tuple[ComparisonTarget, tuple[float, ...], _LocalMeshMeasurement]] = {}
     current: ComparisonTarget | None = None
     current_curve: tuple[float, ...] | None = None
-    for candidate in successful_targets(storage):
+    targets = successful_targets(storage)
+    current_targets = tuple(
+        candidate
+        for candidate in targets
+        if candidate.manifest.manifest_id == manifest.manifest_id
+    )
+    if (
+        len(current_targets) != 1
+        or current_targets[0].revision.to_bytes() != revision.to_bytes()
+    ):
+        raise ValueError("current manifest is not an eligible registered local study result")
+    current_target = current_targets[0]
+    current_revision, current_registration = _authenticated_prepared_revision(
+        storage, current_target.revision, current_target.mesh
+    )
+    for candidate in targets:
         try:
             stage_size = _local_stage_size(candidate.revision.spec.mesh_policy, declaration)
+            comparable_revision = (
+                current_revision
+                if candidate.manifest.manifest_id == current_target.manifest.manifest_id
+                else _authenticated_prepared_revision(
+                    storage,
+                    candidate.revision,
+                    candidate.mesh,
+                    common_generation_profile=current_registration.generation_profile,
+                )[0]
+            )
         except (AttributeError, TypeError, ValueError, OverflowError):
+            if candidate.manifest.manifest_id == current_target.manifest.manifest_id:
+                raise
             continue
-        if not _same_local_physics(candidate.revision, revision) or not has_qualified_runtime(
-            candidate.bundle
-        ):
+        if not _same_local_physics(
+            comparable_revision, current_revision
+        ) or not has_qualified_runtime(candidate.bundle):
             continue
         curve = _qualified_force_curve(storage, candidate, times)
         measurements = _local_mesh_measurements(candidate.revision, candidate.mesh)
@@ -645,10 +776,40 @@ def assess_mesh_refinement(
         groups: dict[float, dict[float, tuple[ComparisonTarget, tuple[float, ...]]]] = {}
         current: ComparisonTarget | None = None
         current_curve: tuple[float, ...] | None = None
-        for candidate in successful_targets(storage):
-            if not _same_physics(candidate.revision, revision) or not has_qualified_runtime(
-                candidate.bundle
-            ):
+        targets = successful_targets(storage)
+        current_targets = tuple(
+            candidate
+            for candidate in targets
+            if candidate.manifest.manifest_id == manifest.manifest_id
+        )
+        if (
+            len(current_targets) != 1
+            or current_targets[0].revision.to_bytes() != revision.to_bytes()
+        ):
+            raise ValueError("current manifest is not an eligible registered study result")
+        current_target = current_targets[0]
+        current_revision, current_registration = _authenticated_prepared_revision(
+            storage, current_target.revision, current_target.mesh
+        )
+        for candidate in targets:
+            try:
+                comparable_revision = (
+                    current_revision
+                    if candidate.manifest.manifest_id == current_target.manifest.manifest_id
+                    else _authenticated_prepared_revision(
+                        storage,
+                        candidate.revision,
+                        candidate.mesh,
+                        common_generation_profile=current_registration.generation_profile,
+                    )[0]
+                )
+            except (AttributeError, TypeError, ValueError, OverflowError):
+                if candidate.manifest.manifest_id == current_target.manifest.manifest_id:
+                    raise
+                continue
+            if not _same_physics(
+                comparable_revision, current_revision
+            ) or not has_qualified_runtime(candidate.bundle):
                 continue
             size = float(candidate.revision.spec.mesh_policy.global_size.to_si().value)
             if size not in sizes:
@@ -676,9 +837,17 @@ def assess_mesh_refinement(
         ancestor_id = revision.parent_revision_id
         while baseline_modulus is None and ancestor_id is not None:
             ancestor = storage.get_revision(revision.case_id, ancestor_id)
+            try:
+                comparable_ancestor, _ = _authenticated_prepared_revision(
+                    storage,
+                    ancestor,
+                    common_generation_profile=current_registration.generation_profile,
+                )
+            except (AttributeError, TypeError, ValueError, OverflowError):
+                break
             if (
-                not _same_physics(ancestor, revision)
-                or ancestor.spec.mesh_policy.global_size.to_si().value != sizes[2]
+                not _same_physics(comparable_ancestor, current_revision)
+                or comparable_ancestor.spec.mesh_policy.global_size.to_si().value != sizes[2]
             ):
                 break
             ancestor_material = ancestor.spec.material

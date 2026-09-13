@@ -238,6 +238,26 @@ def _execution_result_completeness(
     )
 
 
+def _unverified_mesh_refinement(
+    revision: CaseRevision, error: Exception
+) -> CriterionAssessment:
+    criterion_id = next(
+        (
+            item.criterion_id
+            for item in revision.spec.quality_policy.criteria
+            if item.metric_id in {"mesh_dependence", "source_local_mesh_dependence"}
+        ),
+        "mesh_dependence",
+    )
+    return CriterionAssessment(
+        criterion_id,
+        "numeric",
+        AssessmentStatus.UNVERIFIED,
+        (),
+        f"registered refinement-study evidence is unavailable: {error}",
+    )
+
+
 def required_quality_summary(
     manifest: ResultManifest,
     revision: CaseRevision,
@@ -272,7 +292,11 @@ def required_quality_summary(
     if qualified and execution_row.status is AssessmentStatus.PASS:
         planar = assess_planar_requirements(manifest, revision, mesh, profile, storage)
         residual = assess_reported_residual(report, revision.spec.solver_policy)
-        refinement, refinement_evidence = assess_mesh_refinement(manifest, revision, storage)
+        try:
+            refinement, refinement_evidence = assess_mesh_refinement(manifest, revision, storage)
+        except (KeyError, TypeError, ValueError, OverflowError, PortError) as error:
+            refinement = _unverified_mesh_refinement(revision, error)
+            refinement_evidence = {"status": "UNVERIFIED", "reason": str(error)}
         numerical = (execution_row, *planar, residual, refinement)
     physical = CriterionAssessment(
         "physical_applicability_validation",

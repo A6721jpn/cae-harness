@@ -345,3 +345,19 @@ def test_local_measurement_missing_in_ball_edges_is_unverified_input() -> None:
     far_mesh = replace(mesh, nodes=far_nodes)
     with pytest.raises(ValueError, match="fewer than three"):
         _local_mesh_measurements(revision, far_mesh)
+
+
+def test_local_mesh_index_deduplicates_edges_before_ball_membership() -> None:
+    from dataclasses import replace
+
+    from febio_cae.application._mesh_refinement import _local_mesh_index
+
+    revision = _local_revision(1)
+    mesh = _local_mesh(revision, 1, 0.001)
+    duplicate = replace(mesh.elements[-1], element_id=mesh.elements[-1].element_id + 1)
+    shared_mesh = replace(mesh, elements=(*mesh.elements, duplicate))
+
+    index = _local_mesh_index(shared_mesh, {"part-body"})
+
+    assert index.body_element_counts == {"part-body": 3}
+    assert len(index.edges_by_body["part-body"]) == 12
