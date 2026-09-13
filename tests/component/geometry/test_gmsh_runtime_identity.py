@@ -689,6 +689,103 @@ def test_verified_session_rejects_ctypes_metadata_access_tampering(
         runtime.load_verified_gmsh(expected)
 
 
+def test_verified_session_rejects_library_attribute_dispatch_tampering(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A synthetic CDLL-like library cannot redirect source attribute lookup."""
+
+    _isolated(monkeypatch)
+    source = (
+        "__version__ = '4.15.2'\n"
+        "def isInitialized():\n"
+        "    return lib.gmshIsInitialized()\n"
+        "class Lib:\n"
+        "    _handle = 99\n"
+        "lib = Lib()\n"
+    )
+    module, library, launcher, image, python_library = _files(tmp_path, source)
+    expected = _binding(tmp_path, module=module, library=library)
+    monkeypatch.setattr(
+        runtime,
+        "_current_process_binding",
+        lambda: {
+            "python": _identity(launcher),
+            "python_image": _identity(image),
+            "python_library": _identity(python_library),
+            "pyvenv_cfg": None,
+        },
+    )
+    monkeypatch.setattr(runtime, "_mapped_module_path", lambda handle: library)
+    monkeypatch.syspath_prepend(str(module.parent))
+    sys.modules.pop("gmsh", None)
+    loaded, _ = runtime.load_verified_gmsh(expected)
+
+    class RedirectingLib(type(loaded.lib)):
+        def __getattribute__(self, attribute: str) -> Any:
+            if attribute == "gmshIsInitialized":
+                return lambda: True
+            return super().__getattribute__(attribute)
+
+    monkeypatch.setattr(loaded.lib, "__class__", RedirectingLib)
+    with pytest.raises((OSError, ValueError), match="library|dispatch|attribute|type"):
+        runtime.load_verified_gmsh(expected)
+
+
+def test_verified_session_rejects_ctypes_metaclass_mro_spoof(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A synthetic CFuncPtr metaclass cannot hide an overridden dispatch MRO."""
+
+    _isolated(monkeypatch)
+    source = (
+        "__version__ = '4.15.2'\n"
+        "def isInitialized():\n"
+        "    return lib.gmshIsInitialized()\n"
+        "class Lib:\n"
+        "    _handle = 99\n"
+        "lib = Lib()\n"
+    )
+    module, library, launcher, image, python_library = _files(tmp_path, source)
+    expected = _binding(tmp_path, module=module, library=library)
+    monkeypatch.setattr(
+        runtime,
+        "_current_process_binding",
+        lambda: {
+            "python": _identity(launcher),
+            "python_image": _identity(image),
+            "python_library": _identity(python_library),
+            "pyvenv_cfg": None,
+        },
+    )
+    monkeypatch.setattr(runtime, "_mapped_module_path", lambda handle: library)
+    monkeypatch.syspath_prepend(str(module.parent))
+    sys.modules.pop("gmsh", None)
+    loaded, _ = runtime.load_verified_gmsh(expected)
+
+    native = _synthetic_native_callable()
+    native_type = type(native)
+
+    class LyingMeta(type(native_type)):
+        def __getattribute__(cls, attribute: str) -> Any:
+            if attribute == "__mro__":
+                return native_type.__mro__
+            return super().__getattribute__(attribute)
+
+    class RedirectedCFunc(native_type, metaclass=LyingMeta):
+        _argtypes_ = native_type._argtypes_
+        _restype_ = native_type._restype_
+        _flags_ = native_type._flags_
+
+        def __call__(self, *args: Any, **kwargs: Any) -> Any:
+            del args, kwargs
+            return None
+
+    native.__class__ = RedirectedCFunc
+    _install_synthetic_native_export(monkeypatch, loaded, "gmshIsInitialized", native)
+    with pytest.raises((OSError, ValueError), match="dispatch|metaclass|type|native"):
+        runtime.load_verified_gmsh(expected)
+
+
 def test_verified_session_accepts_authenticated_source_restype_transition(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
