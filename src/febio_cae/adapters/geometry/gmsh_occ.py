@@ -136,6 +136,22 @@ class _ElementContext:
     canonical_node_ids: tuple[int, ...]
 
 
+_EdgeMidpointSignature = tuple[tuple[tuple[int, int], int], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _TetFaceContext:
+    element_id: int
+    local_face_id: int
+    edge_midpoints: _EdgeMidpointSignature
+
+
+@dataclass(frozen=True, slots=True)
+class _SurfaceFacet:
+    corner_key: tuple[int, int, int]
+    edge_midpoints: _EdgeMidpointSignature
+
+
 class GmshOCCBackend:
     """Concrete, optional Gmsh 4.x/OpenCASCADE backend.
 
@@ -727,37 +743,80 @@ class GmshOCCBackend:
         elements: Sequence[_ElementContext],
         node_coordinates: dict[int, tuple[float, float, float]],
     ) -> tuple[BackendMeshFace, ...]:
-        by_key: dict[tuple[int, int, int], list[tuple[int, int]]] = {}
+        by_key: dict[tuple[int, int, int], list[_TetFaceContext]] = {}
         for element in elements:
             for local_face_id, positions in enumerate(_tet10_face_positions()):
-                key = _sorted_triple(
-                    tuple(element.canonical_node_ids[position] for position in positions[:3])
+                face_nodes = tuple(
+                    element.canonical_node_ids[position] for position in positions
                 )
-                by_key.setdefault(key, []).append((element.element_id, local_face_id))
+                key = _sorted_triple(face_nodes[:3])
+                by_key.setdefault(key, []).append(
+                    _TetFaceContext(
+                        element.element_id,
+                        local_face_id,
+                        _edge_midpoint_signature(face_nodes[:3], face_nodes[3:]),
+                    )
+                )
 
-        result: list[BackendMeshFace] = []
+        cad_facets: list[tuple[BackendFace, tuple[_SurfaceFacet, ...]]] = []
+        seen_surface_keys: set[tuple[int, int, int]] = set()
         for cad_face in context.faces:
             surface_tag = _surface_tag(cad_face.face_id)
-            surface_keys = _surface_mesh_keys(gmsh, surface_tag)
-            if not surface_keys:
+            surface_facets = _surface_mesh_keys(gmsh, surface_tag)
+            if not surface_facets:
                 raise BackendError(
                     BackendErrorCategory.INTEGRITY,
                     f"Gmsh produced no surface facets for CAD face {cad_face.face_id!r}",
                 )
-            for facet_index, key in enumerate(sorted(surface_keys)):
-                adjacency = tuple(sorted(by_key.get(key, ())))
-                if not adjacency or len(adjacency) > 2:
+            for facet in surface_facets:
+                if facet.corner_key in seen_surface_keys:
+                    raise BackendError(
+                        BackendErrorCategory.INTEGRITY,
+                        f"CAD face {cad_face.face_id!r} contains a duplicate surface facet",
+                    )
+                seen_surface_keys.add(facet.corner_key)
+            cad_facets.append((cad_face, surface_facets))
+
+        exterior_keys = {
+            key for key, adjacency in by_key.items() if len(adjacency) == 1
+        }
+        if seen_surface_keys != exterior_keys:
+            raise BackendError(
+                BackendErrorCategory.INTEGRITY,
+                "CAD boundary facets do not cover every exterior Tet10 face exactly once",
+            )
+
+        result: list[BackendMeshFace] = []
+        for cad_face, surface_facets in cad_facets:
+            for facet_index, facet in enumerate(
+                sorted(surface_facets, key=lambda item: item.corner_key)
+            ):
+                adjacency = tuple(
+                    sorted(
+                        by_key.get(facet.corner_key, ()),
+                        key=lambda item: (item.element_id, item.local_face_id),
+                    )
+                )
+                if len(adjacency) != 1:
                     raise BackendError(
                         BackendErrorCategory.INTEGRITY,
                         f"CAD face {cad_face.face_id!r} has an invalid Tet10 boundary adjacency",
                     )
-                corner_points = tuple(node_coordinates[node_id] for node_id in key)
+                face_context = adjacency[0]
+                if facet.edge_midpoints != face_context.edge_midpoints:
+                    raise BackendError(
+                        BackendErrorCategory.INTEGRITY,
+                        f"CAD face {cad_face.face_id!r} has mismatched Tet10 midside connectivity",
+                    )
+                corner_points = tuple(
+                    node_coordinates[node_id] for node_id in facet.corner_key
+                )
                 area, centroid = _triangle_measure(corner_points)
                 result.append(
                     BackendMeshFace(
                         face_id=f"{cad_face.face_id}:facet-{facet_index}",
-                        adjacent_element_ids=tuple(item[0] for item in adjacency),
-                        local_face_ids=tuple(item[1] for item in adjacency),
+                        adjacent_element_ids=(face_context.element_id,),
+                        local_face_ids=(face_context.local_face_id,),
                         area_si=area,
                         centroid_si=centroid,
                         boundary_points_si=corner_points,
@@ -1290,17 +1349,33 @@ def _tet10_face_positions() -> tuple[tuple[int, ...], ...]:
     )
 
 
-def _surface_mesh_keys(gmsh: Any, surface_tag: int) -> set[tuple[int, int, int]]:
+def _surface_mesh_keys(gmsh: Any, surface_tag: int) -> tuple[_SurfaceFacet, ...]:
     try:
-        element_types, _, node_tags = gmsh.model.mesh.getElements(2, surface_tag)
+        element_types, element_tags, node_tags = gmsh.model.mesh.getElements(2, surface_tag)
     except (AttributeError, RuntimeError, TypeError, ValueError) as error:
         raise BackendError(
             BackendErrorCategory.ENVIRONMENT,
             f"Gmsh surface mesh read failed for {surface_tag}: {error}",
         ) from error
-    keys: set[tuple[int, int, int]] = set()
-    for type_id_raw, flat_raw in zip(element_types, node_tags, strict=True):
-        type_id = int(type_id_raw)
+    try:
+        types = _as_ints(element_types)
+        tags_by_type = [_as_ints(item) for item in element_tags]
+        nodes_by_type = [_as_ints(item) for item in node_tags]
+    except (BackendError, TypeError, ValueError) as error:
+        if isinstance(error, BackendError):
+            raise
+        raise BackendError(
+            BackendErrorCategory.INTEGRITY,
+            "Gmsh surface element arrays are not valid sequences",
+        ) from error
+    if len(types) != len(tags_by_type) or len(types) != len(nodes_by_type):
+        raise BackendError(
+            BackendErrorCategory.INTEGRITY, "Gmsh surface element arrays are inconsistent"
+        )
+    facets: list[_SurfaceFacet] = []
+    seen_corner_keys: set[tuple[int, int, int]] = set()
+    seen_element_tags: set[int] = set()
+    for type_id, tags, flat in zip(types, tags_by_type, nodes_by_type, strict=True):
         try:
             properties = gmsh.model.mesh.getElementProperties(type_id)
         except (AttributeError, RuntimeError, TypeError, ValueError) as error:
@@ -1312,22 +1387,58 @@ def _surface_mesh_keys(gmsh: Any, surface_tag: int) -> set[tuple[int, int, int]]
             raise BackendError(
                 BackendErrorCategory.INTEGRITY, "Gmsh surface element properties are incomplete"
             )
-        node_count = int(properties[3])
-        primary_count = int(properties[5])
-        if primary_count != 3 or node_count < 3:
+        try:
+            dimension = int(properties[1])
+            order = int(properties[2])
+            node_count = int(properties[3])
+            primary_count = int(properties[5])
+        except (TypeError, ValueError, OverflowError) as error:
+            raise BackendError(
+                BackendErrorCategory.INTEGRITY,
+                f"Gmsh surface element properties are invalid for type {type_id}",
+            ) from error
+        if dimension != 2 or order != 2 or primary_count != 3 or node_count != 6:
             raise BackendError(
                 BackendErrorCategory.UNSUPPORTED_CAPABILITY,
-                f"Gmsh surface element type {type_id} is not triangular",
+                f"Gmsh surface element type {type_id} is not a complete quadratic triangle",
             )
-        flat = _as_ints(flat_raw)
-        tags = flat
-        if len(tags) % node_count:
+        if any(tag <= 0 for tag in tags) or len(set(tags)) != len(tags):
+            raise BackendError(
+                BackendErrorCategory.INTEGRITY,
+                f"Gmsh surface element tags are invalid for type {type_id}",
+            )
+        if seen_element_tags.intersection(tags):
+            raise BackendError(
+                BackendErrorCategory.INTEGRITY,
+                f"Gmsh surface element tags are duplicated for surface {surface_tag}",
+            )
+        seen_element_tags.update(tags)
+        if len(flat) != len(tags) * node_count:
             raise BackendError(
                 BackendErrorCategory.INTEGRITY, "Gmsh surface connectivity length is inconsistent"
             )
-        for index in range(0, len(tags), node_count):
-            keys.add(_sorted_triple(tuple(tags[index + offset] for offset in range(3))))
-    return keys
+        for index, element_tag in enumerate(tags):
+            del element_tag
+            node_ids = tuple(flat[index * node_count : (index + 1) * node_count])
+            if len(set(node_ids)) != 6 or any(node_id <= 0 for node_id in node_ids):
+                raise BackendError(
+                    BackendErrorCategory.INTEGRITY,
+                    "Gmsh quadratic surface facet must contain six distinct positive nodes",
+                )
+            corner_key = _sorted_triple(node_ids[:3])
+            if corner_key in seen_corner_keys:
+                raise BackendError(
+                    BackendErrorCategory.INTEGRITY,
+                    f"Gmsh surface {surface_tag} contains a duplicate facet",
+                )
+            seen_corner_keys.add(corner_key)
+            facets.append(
+                _SurfaceFacet(
+                    corner_key=corner_key,
+                    edge_midpoints=_edge_midpoint_signature(node_ids[:3], node_ids[3:]),
+                )
+            )
+    return tuple(facets)
 
 
 def _surface_tag(face_id: str) -> int:
@@ -1344,6 +1455,26 @@ def _sorted_triple(values: Sequence[int]) -> tuple[int, int, int]:
         raise BackendError(BackendErrorCategory.INTEGRITY, "a surface key must contain three nodes")
     first, second, third = sorted(values)
     return first, second, third
+
+
+def _edge_midpoint_signature(
+    corner_nodes: Sequence[int], midpoint_nodes: Sequence[int]
+) -> _EdgeMidpointSignature:
+    if len(corner_nodes) != 3 or len(midpoint_nodes) != 3:
+        raise BackendError(
+            BackendErrorCategory.INTEGRITY,
+            "a quadratic triangle must contain three corners and three midsides",
+        )
+    edges: list[tuple[tuple[int, int], int]] = []
+    for first, second, midpoint in zip(
+        corner_nodes,
+        (*corner_nodes[1:], corner_nodes[0]),
+        midpoint_nodes,
+        strict=True,
+    ):
+        edge = tuple(sorted((first, second)))
+        edges.append((edge, midpoint))
+    return tuple(sorted(edges))
 
 
 def _triangle_measure(
