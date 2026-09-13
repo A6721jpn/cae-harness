@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import importlib
 import sqlite3
 from dataclasses import replace
 from pathlib import Path
@@ -16,6 +15,7 @@ from test_planar_edit_validation import prepared
 from febio_cae.adapters.febio import QualityAdapter
 from febio_cae.domain import (
     AttemptRecord,
+    CaseRevision,
     ComparisonAxis,
     ComparisonInterval,
     ComparisonSpec,
@@ -480,9 +480,7 @@ def test_comparison_refuses_incompatible_or_ineligible_results(tmp_path: Path, d
 def test_current_prepared_box_is_an_explicit_comparison_origin(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
-    from types import SimpleNamespace
-
-    from test_planar_preparation import _isolate, prepared_input
+    from test_planar_preparation import _build_prepared_input, _isolate
 
     from febio_cae.application import _comparison
     from febio_cae.application._preparation_request import normalize_request
@@ -491,7 +489,7 @@ def test_current_prepared_box_is_an_explicit_comparison_origin(
     from febio_cae.storage.mesh_quality import PlanarPreparationRegistration
     from febio_cae.storage.preparation import PreparationStore
 
-    service, created, request, backend, _ = prepared_input.__wrapped__(tmp_path, monkeypatch)
+    service, created, request, backend, _ = _build_prepared_input(tmp_path, monkeypatch)
     _isolate(monkeypatch, backend)
     storage = service._storage(created.case_id)
     source_digest = storage.source_asset("cad").content_digest
@@ -507,9 +505,11 @@ def test_current_prepared_box_is_an_explicit_comparison_origin(
             if {"reference", "target_field", "content_digest"} <= value.keys():
                 value["reference"] = "cad"
                 value["content_digest"] = source_digest
-            if value.get("body_id") == request["values"]["geometry"]["body_id"]:
-                if "geometry_digest" in value:
-                    value["geometry_digest"] = None
+            if (
+                value.get("body_id") == request["values"]["geometry"]["body_id"]
+                and "geometry_digest" in value
+            ):
+                value["geometry_digest"] = None
             if "inspection_digest" in value:
                 value["inspection_digest"] = None
             for child in value.values():
@@ -587,17 +587,34 @@ def test_current_prepared_box_is_an_explicit_comparison_origin(
     )
 
     baseline_target = target(storage, baseline.manifest_id, "run-baseline")
-    curved_item = replace(
-        baseline_target,
-        revision=SimpleNamespace(
-            case_id=baseline_target.revision.case_id,
-            revision_id=baseline_target.revision.revision_id,
-            to_bytes=baseline_target.revision.to_bytes,
-            spec=SimpleNamespace(
-                rigid_tool=SimpleNamespace(primitive=SimpleNamespace(kind="sphere")),
-                mesh_policy=baseline_target.revision.spec.mesh_policy,
+    box_primitive = baseline_target.revision.spec.rigid_tool.primitive
+    radius_evidence = next(iter(box_primitive.dimension_evidence.values()))
+    curved_revision = CaseRevision(
+        case_id=baseline_target.revision.case_id,
+        revision_id="comparison-curved",
+        parent_revision_id=None,
+        parent_spec_digest=None,
+        spec=replace(
+            baseline_target.revision.spec,
+            rigid_tool=replace(
+                baseline_target.revision.spec.rigid_tool,
+                primitive=replace(
+                    box_primitive,
+                    kind="sphere",
+                    dimensions={"radius": next(iter(box_primitive.dimensions.values()))},
+                    dimension_evidence={
+                        "radius": replace(radius_evidence, target_field="rigid_tool.radius")
+                    },
+                ),
             ),
         ),
+        evidence=baseline_target.revision.evidence,
     )
+    storage.register_revision_if_current(
+        curved_revision,
+        expected_generation=service.current_draft(created.case_id).generation,
+        mesh_quality_required=True,
+    )
+    curved_item = replace(baseline_target, revision=curved_revision)
     with pytest.raises(PortError, match="explicit planar box"):
         _comparison._eligible(service, storage, curved_item)

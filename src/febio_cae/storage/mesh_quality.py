@@ -286,7 +286,7 @@ MeshQualityRecord = (
 def decode_mesh_quality(payload: bytes) -> MeshQualityRecord:
     data = json.loads(payload)
     if not isinstance(data, dict):
-        raise ValueError("invalid mesh quality payload")
+        raise TypeError("invalid mesh quality payload")
     if "admission_kind" not in data:
         return MeshQualityRegistration.from_bytes(payload)
     kind = data["admission_kind"]
@@ -316,7 +316,7 @@ def decode_mesh_quality(payload: bytes) -> MeshQualityRecord:
         raise ValueError("invalid mesh quality admission header")
     profile = data["generation_profile"]
     if not isinstance(profile, dict):
-        raise ValueError("invalid mesh quality generation profile")
+        raise TypeError("invalid mesh quality generation profile")
     try:
         values = (
             data["profile_id"],

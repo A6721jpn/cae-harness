@@ -25,8 +25,8 @@ from febio_cae.adapters.geometry import (
 )
 from febio_cae.domain import (
     TET10_FACE_NODE_POSITIONS,
-    CaseRevision,
     BodyId,
+    CaseRevision,
     FaceId,
     FaceSetRule,
     FrameId,

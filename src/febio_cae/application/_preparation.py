@@ -15,16 +15,8 @@ from febio_cae.adapters.geometry.preparation import (
     resource_snapshot,
     run_preparation,
 )
-from febio_cae.adapters.meshing.approximation import (
-    NATIVE_ALGORITHM,
-    ApproximationCriteria,
-)
-from febio_cae.domain import (
-    CaseRevision,
-    EvidenceRef,
-    MeshArtifact,
-    RigidPrimitive,
-)
+from febio_cae.adapters.meshing.approximation import NATIVE_ALGORITHM, ApproximationCriteria
+from febio_cae.domain import CaseRevision, EvidenceRef, MeshArtifact, RigidPrimitive
 from febio_cae.domain.canonical import canonical_bytes
 from febio_cae.domain.codec import decode_record
 from febio_cae.domain.compatibility import CapabilityStatus
@@ -41,6 +33,10 @@ from ._preparation_request import normalize_request, request_parts
 
 if TYPE_CHECKING:
     from .service import RegisteredCaseService
+
+
+class _MalformedProducerObjectError(TypeError, ValueError):
+    """Type mismatch that remains on the service's persisted-integrity path."""
 
 
 def _bound_generation_criteria(
@@ -82,7 +78,7 @@ def geometry_from_output(
 ) -> StepGeometryMeshAdapter:
     producer = output.get("producer", output)
     if not isinstance(producer, dict):
-        raise ValueError("preparation producer output is not an object")
+        raise _MalformedProducerObjectError("preparation producer output is not an object")
     required = {
         "carrier",
         "inspection",

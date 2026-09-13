@@ -6,18 +6,27 @@ import hashlib
 import importlib
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import pytest
 
+from febio_cae.application.service import CreatedCase, RegisteredCaseService
 from febio_cae.cli.main import main
 
 
-@pytest.fixture
-def prepared_input(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Any, ...]:
+class PreparedInput(NamedTuple):
+    service: RegisteredCaseService
+    created: CreatedCase
+    request: dict[str, Any]
+    backend: Any
+    step: bytes
+
+
+def _build_prepared_input(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> PreparedInput:
     from test_persistence_authority import _profile
 
-    from febio_cae.application.service import RegisteredCaseService
     from febio_cae.domain import EvidenceRef, Quantity
     from febio_cae.storage.mesh_quality import MeshQualityRegistration
 
@@ -67,7 +76,12 @@ def prepared_input(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Any
         created.case_id, quality
     ).to_dict()
     request = {"schema_version": "1", "values": raw, "evidence": [], "source_declarations": []}
-    return service, created, request, fixtures.SyntheticBackend(), step
+    return PreparedInput(service, created, request, fixtures.SyntheticBackend(), step)
+
+
+@pytest.fixture
+def prepared_input(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> PreparedInput:
+    return _build_prepared_input(tmp_path, monkeypatch)
 
 
 def _isolate(monkeypatch: pytest.MonkeyPatch, backend: Any) -> None:
@@ -89,7 +103,7 @@ def _isolate(monkeypatch: pytest.MonkeyPatch, backend: Any) -> None:
 
 
 def test_current_operation_publishes_bound_preparation(
-    prepared_input: tuple[Any, ...],
+    prepared_input: PreparedInput,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -139,7 +153,7 @@ def test_current_operation_publishes_bound_preparation(
 
 @pytest.mark.parametrize("bad", ["source", "geometry", "version"])
 def test_preparation_refuses_source_or_backend_mismatch(
-    prepared_input: tuple[Any, ...], monkeypatch: pytest.MonkeyPatch, bad: str
+    prepared_input: PreparedInput, monkeypatch: pytest.MonkeyPatch, bad: str
 ) -> None:
     service, created, request, backend, _ = prepared_input
     _isolate(monkeypatch, backend)
@@ -163,7 +177,7 @@ def test_preparation_refuses_source_or_backend_mismatch(
 
 
 def test_freeze_without_publication_cannot_supply_execution_mesh(
-    prepared_input: tuple[Any, ...], monkeypatch: pytest.MonkeyPatch
+    prepared_input: PreparedInput, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     service, created, request, backend, _ = prepared_input
     _isolate(monkeypatch, backend)
@@ -232,7 +246,6 @@ def test_preparation_uses_finite_owned_process_deadline(tmp_path: Path) -> None:
 
 
 def test_stale_prepared_generation_is_rejected_before_compilation(
-    request: pytest.FixtureRequest,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -262,7 +275,7 @@ def test_stale_prepared_generation_is_rejected_before_compilation(
         )
 
     monkeypatch.setattr(profiles, "_profile", profile)
-    service, created, payload, backend, _ = request.getfixturevalue("prepared_input")
+    service, created, payload, backend, _ = _build_prepared_input(tmp_path, monkeypatch)
     _isolate(monkeypatch, backend)
     prepared = service.prepare_planar(created.case_id, payload, expected_generation=0)
     draft = service.current_draft(created.case_id)
@@ -313,7 +326,6 @@ def test_stale_prepared_generation_is_rejected_before_compilation(
 @pytest.mark.parametrize("route", ["typed", "natural"])
 def test_prepared_material_child(
     route: str,
-    request: pytest.FixtureRequest,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -344,7 +356,7 @@ def test_prepared_material_child(
         )
 
     monkeypatch.setattr(profiles, "_profile", profile)
-    service, created, payload, backend, _ = request.getfixturevalue("prepared_input")
+    service, created, payload, backend, _ = _build_prepared_input(tmp_path, monkeypatch)
     _isolate(monkeypatch, backend)
     if route == "natural":
         payload["values"]["budget"].update(max_llm_calls=2, max_llm_tokens=2200)
@@ -525,7 +537,7 @@ def _mesh_study_request(request: dict[str, Any]) -> dict[str, Any]:
 
 
 def test_explicit_refinement_preserves_parent_mesh_and_publishes_new_origins(
-    prepared_input: tuple[Any, ...], monkeypatch: pytest.MonkeyPatch
+    prepared_input: PreparedInput, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import copy
 
@@ -567,7 +579,7 @@ def test_explicit_refinement_preserves_parent_mesh_and_publishes_new_origins(
 
 
 def test_prepared_case_reservations_are_finite_and_not_reset_by_reopening(
-    prepared_input: tuple[Any, ...], monkeypatch: pytest.MonkeyPatch
+    prepared_input: PreparedInput, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from febio_cae.storage import CaseStorage, StorageConflictError
     from febio_cae.storage.demo_budget import (
@@ -597,7 +609,7 @@ def test_prepared_case_reservations_are_finite_and_not_reset_by_reopening(
 
 @pytest.mark.parametrize("change", ["skipped_size", "budget", "material"])
 def test_refinement_rejects_changed_physics_or_skipped_size(
-    prepared_input: tuple[Any, ...], monkeypatch: pytest.MonkeyPatch, change: str
+    prepared_input: PreparedInput, monkeypatch: pytest.MonkeyPatch, change: str
 ) -> None:
     service, created, request, backend, _ = prepared_input
     _isolate(monkeypatch, backend)
@@ -626,7 +638,7 @@ def test_refinement_rejects_changed_physics_or_skipped_size(
 
 
 def test_failed_refinement_cannot_restart_as_changed_initial_preparation(
-    prepared_input: tuple[Any, ...], monkeypatch: pytest.MonkeyPatch
+    prepared_input: PreparedInput, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from febio_cae.storage.preparation import PreparationStore
 
@@ -699,7 +711,7 @@ def test_native_preparation_replays_nonidentity_placement_without_regeneration(
     )
     from febio_cae.storage.mesh_quality import MeshQualityRegistration
 
-    service, created, request, backend, _ = prepared_input.__wrapped__(tmp_path, monkeypatch)
+    service, created, request, backend, _ = _build_prepared_input(tmp_path, monkeypatch)
     _isolate(monkeypatch, backend)
     fixtures = importlib.import_module("geometry.conftest")
     primitive = fixtures.make_case_spec("0" * 64).rigid_tool.primitive
@@ -945,7 +957,6 @@ def test_box_preparation_preserves_core_record_and_producer_contract(
     from febio_cae.application.service import RegisteredCaseService
     from febio_cae.domain import (
         CaseRevision,
-        EvidenceRef,
         GeometryInspectionRequest,
         MeshArtifact,
         Quantity,
