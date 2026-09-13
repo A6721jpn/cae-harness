@@ -186,6 +186,20 @@ def _owned_path(root: Path, relative: str) -> Path:
     return candidate
 
 
+def _temporary_io_path(path: Path) -> Path:
+    """Extend temporary I/O only after resolving its already-pinned parent."""
+    if os.name != "nt":
+        return path
+    canonical = path.parent.resolve(strict=True) / path.name
+    absolute = str(canonical)
+    prefix = "\\\\?\\"
+    if absolute.startswith(prefix):
+        return canonical
+    if absolute.startswith("\\\\"):
+        return Path(prefix + "UNC\\" + absolute[2:])
+    return Path(prefix + absolute)
+
+
 def _write_atomic(root: Path, relative: str, content: bytes, *, token: str | None = None) -> Path:
     with pin_directories(root):
         target = _owned_path(root, relative)
@@ -199,7 +213,7 @@ def _write_pinned(root: Path, relative: str, content: bytes, *, token: str | Non
     _assert_no_links(target.parent, root)
     suffix = token or uuid.uuid4().hex[:12]
     target_key = hashlib.sha256(target.name.encode("utf-8")).hexdigest()[:12]
-    temporary = target.with_name(f".{target_key}.{suffix}.tmp")
+    temporary = _temporary_io_path(target.with_name(f".{target_key}.{suffix}.tmp"))
     created = False
     try:
         with temporary.open("xb") as handle:
@@ -534,7 +548,7 @@ class CaseStorage:
                     f"publication target does not match prepared bytes: {relative}"
                 )
             target.unlink()
-        temporary = target.with_name(f".{target.name}.{transaction_id}.tmp")
+        temporary = _temporary_io_path(target.with_name(f".{target.name}.{transaction_id}.tmp"))
         if temporary.exists():
             temporary.unlink()
         with _connect(self.registry_path) as connection:
@@ -598,8 +612,8 @@ class CaseStorage:
                                         f"publication target does not match prepared bytes: {relative}"
                                     )
                                 final.unlink()
-                            temporary = final.with_name(
-                                f".{final.name}.{row['transaction_id']}.tmp"
+                            temporary = _temporary_io_path(
+                                final.with_name(f".{final.name}.{row['transaction_id']}.tmp")
                             )
                             if temporary.exists():
                                 temporary.unlink()
@@ -663,7 +677,9 @@ class CaseStorage:
                                     row["expected_draft_id"],
                                 ),
                             )
-                    temporary = final.with_name(f".{final.name}.{row['transaction_id']}.tmp")
+                    temporary = _temporary_io_path(
+                        final.with_name(f".{final.name}.{row['transaction_id']}.tmp")
+                    )
                     if not final.exists():
                         connection.execute(
                             "DELETE FROM revision_mesh_quality WHERE revision_id=? AND revision_id NOT IN (SELECT revision_id FROM revisions)",
@@ -1052,7 +1068,7 @@ class CaseStorage:
         self._fault("after_prepare")
         target = _owned_path(self.root, relative)
         target.parent.mkdir(parents=True, exist_ok=True)
-        temporary = target.with_name(f".{target.name}.{transaction_id}.tmp")
+        temporary = _temporary_io_path(target.with_name(f".{target.name}.{transaction_id}.tmp"))
         temporary.parent.mkdir(parents=True, exist_ok=True)
         _assert_no_links(target.parent, self.root)
         with temporary.open("xb") as handle:
