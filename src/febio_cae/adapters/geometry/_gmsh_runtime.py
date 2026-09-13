@@ -725,6 +725,8 @@ class _FunctionState:
     function: FunctionType
     code: CodeType
     globals_dict: dict[str, object]
+    builtins_value: object
+    builtins_signature: object
     defaults: object
     defaults_signature: object
     kwdefaults: object
@@ -761,6 +763,8 @@ def _function_state(
         function=function,
         code=selected_code,
         globals_dict=function.__globals__,
+        builtins_value=function.__builtins__,
+        builtins_signature=_value_signature(function.__builtins__),
         defaults=function.__defaults__,
         defaults_signature=_value_signature(function.__defaults__),
         kwdefaults=function.__kwdefaults__,
@@ -797,6 +801,11 @@ def _validate_function_state(state: _FunctionState, label: str) -> None:
         raise _error(f"live Gmsh executable function {label} code changed")
     if function.__globals__ is not state.globals_dict:
         raise _error(f"live Gmsh executable function {label} globals changed")
+    if (
+        function.__builtins__ is not state.builtins_value
+        or _value_signature(function.__builtins__) != state.builtins_signature
+    ):
+        raise _error(f"live Gmsh executable function {label} builtins changed")
     if (
         function.__defaults__ is not state.defaults
         or _value_signature(function.__defaults__) != state.defaults_signature
@@ -858,6 +867,210 @@ def _code_global_names(code: CodeType) -> frozenset[str]:
     return frozenset(names)
 
 
+@dataclass(slots=True)
+class _SourceImportBinding:
+    module_name: str
+    load_name: str
+    path: tuple[str, ...]
+
+
+@dataclass(slots=True)
+class _ExecutableAttributeState:
+    root_name: str
+    path: tuple[str, ...]
+    values: tuple[object, ...]
+    function_state: _FunctionState | None = None
+
+
+def _attribute_chain(node: ast.AST) -> tuple[str, tuple[str, ...]] | None:
+    attributes: list[str] = []
+    current: ast.AST = node
+    while isinstance(current, ast.Attribute):
+        attributes.append(current.attr)
+        current = current.value
+    if not isinstance(current, ast.Name):
+        return None
+    attributes.reverse()
+    return current.id, tuple(attributes)
+
+
+def _source_import_bindings(
+    tree: ast.AST, used_names: frozenset[str]
+) -> dict[str, _SourceImportBinding]:
+    result: dict[str, _SourceImportBinding] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                root_name = alias.asname or alias.name.partition(".")[0]
+                if root_name not in used_names:
+                    continue
+                module_name = alias.name if alias.asname else alias.name.partition(".")[0]
+                result[root_name] = _SourceImportBinding(module_name, alias.name, ())
+        elif isinstance(node, ast.ImportFrom):
+            if node.level != 0 or not isinstance(node.module, str) or not node.module:
+                continue
+            for alias in node.names:
+                if alias.name == "*":
+                    continue
+                root_name = alias.asname or alias.name
+                if root_name not in used_names:
+                    continue
+                path = tuple(part for part in alias.name.split(".") if part)
+                result[root_name] = _SourceImportBinding(
+                    node.module,
+                    node.module,
+                    path,
+                )
+    return result
+
+
+def _raw_dependency_attribute(value: object, name: str) -> object:
+    if isinstance(value, ModuleType):
+        try:
+            return vars(value).get(name, _MISSING)
+        except TypeError:
+            return _MISSING
+    if isinstance(value, type):
+        return _raw_type_descriptor(value, name)[1]
+    try:
+        namespace = object.__getattribute__(value, "__dict__")
+    except (AttributeError, TypeError, ValueError):
+        return _MISSING
+    return namespace.get(name, _MISSING) if isinstance(namespace, dict) else _MISSING
+
+
+def _load_source_import_binding(
+    binding: _SourceImportBinding, label: str
+) -> tuple[object, ModuleType]:
+    try:
+        module = importlib.import_module(binding.module_name)
+        if binding.load_name != binding.module_name:
+            importlib.import_module(binding.load_name)
+    except (ImportError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise _error(f"Gmsh executable dependency {label} cannot be imported") from exc
+    if not isinstance(module, ModuleType):
+        raise _error(f"Gmsh executable dependency {label} is not a module")
+    current: object = module
+    for index, name in enumerate(binding.path):
+        candidate = _raw_dependency_attribute(current, name)
+        if candidate is _MISSING:
+            submodule_name = f"{binding.module_name}.{'.'.join(binding.path[: index + 1])}"
+            try:
+                candidate = importlib.import_module(submodule_name)
+            except (ImportError, OSError, RuntimeError, TypeError, ValueError) as exc:
+                raise _error(f"Gmsh executable dependency {label} is unavailable") from exc
+        current = candidate
+    return current, module
+
+
+def _dependency_parent_module(value: object) -> ModuleType | type | None:
+    if isinstance(value, (ModuleType, type)):
+        return value
+    return None
+
+
+def _authenticate_dependency_function(
+    function: FunctionType, parent: object, label: str
+) -> _FunctionState:
+    module_name: object
+    source_name: object
+    if isinstance(parent, ModuleType):
+        parent_namespace = vars(parent)
+        module_name = parent_namespace.get("__name__", _MISSING)
+        source_name = parent_namespace.get("__file__", _MISSING)
+    elif isinstance(parent, type):
+        class_namespace = vars(parent)
+        module_name = class_namespace.get("__module__", _MISSING)
+        module = sys.modules.get(module_name) if isinstance(module_name, str) else None
+        source_name = (
+            vars(module).get("__file__", _MISSING) if isinstance(module, ModuleType) else _MISSING
+        )
+    else:
+        raise _error(f"Gmsh executable dependency {label} has no module owner")
+    if (
+        not isinstance(module_name, str)
+        or function.__module__ != module_name
+        or not isinstance(source_name, str)
+        or not _same_path(function.__code__.co_filename, source_name)
+    ):
+        raise _error(f"Gmsh executable dependency {label} has an unexpected source owner")
+    state = _function_dependency_state(
+        function,
+        dependency_depth=0,
+        dependency_seen=frozenset(),
+    )
+    if state is None:
+        raise _error(f"Gmsh executable dependency {label} is not independently authenticated")
+    return state
+
+
+def _capture_source_dependencies(
+    source: bytes, code: CodeType
+) -> tuple[_ExecutableAttributeState, ...]:
+    try:
+        tree = ast.parse(source.decode("utf-8"))
+    except (SyntaxError, UnicodeDecodeError, TypeError, ValueError) as exc:
+        raise _error("Gmsh executable dependencies cannot be inspected") from exc
+    used_names = _code_global_names(code)
+    bindings = _source_import_bindings(tree, used_names)
+    chains: set[tuple[str, tuple[str, ...]]] = set()
+    for node in ast.walk(tree):
+        chain = _attribute_chain(node)
+        if chain is not None and chain[0] in bindings and chain[1]:
+            chains.add(chain)
+    for root_name in bindings:
+        if root_name in used_names:
+            chains.add((root_name, ()))
+    if len(chains) > _MAX_LIVE_MEMBERS:
+        raise _error("Gmsh executable dependencies exceed the finite verification limit")
+
+    result: list[_ExecutableAttributeState] = []
+    for root_name, path in sorted(chains):
+        root, module = _load_source_import_binding(bindings[root_name], root_name)
+        values: list[object] = [root]
+        current = root
+        for name in path:
+            current = _raw_dependency_attribute(current, name)
+            if current is _MISSING:
+                raise _error(
+                    f"Gmsh executable dependency {root_name}.{'.'.join(path)} is unavailable"
+                )
+            values.append(current)
+        if not callable(current):
+            continue
+        function_state = None
+        if isinstance(current, FunctionType):
+            parent = values[-2] if len(values) > 1 else module
+            function_state = _authenticate_dependency_function(
+                current,
+                parent,
+                f"{root_name}.{'.'.join(path)}",
+            )
+        result.append(_ExecutableAttributeState(root_name, path, tuple(values), function_state))
+    return tuple(result)
+
+
+def _validate_source_dependencies(
+    module: ModuleType, states: tuple[_ExecutableAttributeState, ...]
+) -> None:
+    namespace = vars(module)
+    for state in states:
+        current = namespace.get(state.root_name, _MISSING)
+        if current is _MISSING or current is not state.values[0]:
+            raise _error(f"live Gmsh executable dependency {state.root_name} was replaced")
+        for index, name in enumerate(state.path, start=1):
+            current = _raw_dependency_attribute(current, name)
+            if current is _MISSING or current is not state.values[index]:
+                raise _error(
+                    f"live Gmsh executable dependency {state.root_name}.{'.'.join(state.path)} was replaced"
+                )
+        if state.function_state is not None:
+            _validate_function_state(
+                state.function_state,
+                f"{state.root_name}.{'.'.join(state.path)}",
+            )
+
+
 def _native_symbol_names(source: bytes) -> frozenset[str]:
     try:
         tree = ast.parse(source.decode("utf-8"))
@@ -903,6 +1116,20 @@ def _dispatch_descriptor_state(value_type: type, name: str) -> _DispatchDescript
             raise _error(f"ctypes {name} descriptor changed before admission")
         _validate_function_state(function_state, f"ctypes {name}")
         return _DispatchDescriptorState(owner, descriptor, (function_state,))
+    permitted = _CTYPES_PERMITTED_DESCRIPTORS.get((owner, name))
+    if permitted is not None and descriptor is not permitted:
+        raise _error(f"ctypes {name} descriptor changed before admission")
+    if descriptor is _MISSING:
+        return _DispatchDescriptorState(owner, descriptor, ())
+    if permitted is None:
+        raise _error(f"ctypes {name} descriptor is not statically authenticated")
+    return _DispatchDescriptorState(owner, descriptor, ())
+
+
+def _generic_dispatch_descriptor_state(
+    value_type: type, name: str
+) -> _DispatchDescriptorState:
+    owner, descriptor = _raw_type_descriptor(value_type, name)
     return _DispatchDescriptorState(
         owner,
         descriptor,
@@ -911,6 +1138,36 @@ def _dispatch_descriptor_state(value_type: type, name: str) -> _DispatchDescript
             for function in _descriptor_functions(descriptor)
         ),
     )
+
+
+def _factory_descriptor_state(value_type: type, name: str) -> _DispatchDescriptorState:
+    owner, descriptor = _raw_type_descriptor(value_type, name)
+    trusted = _CTYPES_TRUSTED_DESCRIPTORS.get((owner, name))
+    if trusted is not None:
+        trusted_descriptor, function_state = trusted
+        if descriptor is not trusted_descriptor:
+            raise _error(f"ctypes {name} descriptor changed before admission")
+        _validate_function_state(function_state, f"ctypes {name}")
+        return _DispatchDescriptorState(owner, descriptor, (function_state,))
+    permitted = _CTYPES_PERMITTED_DESCRIPTORS.get((owner, name))
+    if permitted is not None:
+        if descriptor is not permitted:
+            raise _error(f"ctypes {name} descriptor changed before admission")
+        return _DispatchDescriptorState(owner, descriptor, ())
+    if descriptor is _MISSING:
+        return _DispatchDescriptorState(owner, descriptor, ())
+    if name not in {"__new__", "__init__"}:
+        raise _error(f"ctypes {name} descriptor is not statically authenticated")
+    if owner is not value_type or not isinstance(descriptor, FunctionType):
+        raise _error(f"ctypes {name} descriptor is not statically authenticated")
+    function_state = _function_dependency_state(
+        descriptor,
+        dependency_depth=0,
+        dependency_seen=frozenset(),
+    )
+    if function_state is None:
+        raise _error(f"ctypes {name} descriptor is not statically authenticated")
+    return _DispatchDescriptorState(owner, descriptor, (function_state,))
 
 
 @dataclass(slots=True)
@@ -946,8 +1203,8 @@ def _factory_state(value: object) -> _FactoryState | None:
         metaclass,
         _dispatch_descriptor_state(metaclass, "__call__"),
         _dispatch_descriptor_state(metaclass, "__getattribute__"),
-        _dispatch_descriptor_state(value, "__new__"),
-        _dispatch_descriptor_state(value, "__init__"),
+        _factory_descriptor_state(value, "__new__"),
+        _factory_descriptor_state(value, "__init__"),
         instance_descriptors,
     )
 
@@ -964,7 +1221,7 @@ def _attribute_dispatch_state(value: object, names: tuple[str, ...]) -> _Attribu
         raise _error("Gmsh attribute dispatch uses an unsupported metaclass")
     return _AttributeDispatchState(
         value_type,
-        {name: _dispatch_descriptor_state(value_type, name) for name in names},
+        {name: _generic_dispatch_descriptor_state(value_type, name) for name in names},
     )
 
 
@@ -1095,6 +1352,15 @@ def _builtin_binding_from_globals(globals_dict: dict[str, object], name: str) ->
     return _MISSING
 
 
+def _builtin_binding_from_function(function: FunctionType, name: str) -> object:
+    builtins_value = function.__builtins__
+    if isinstance(builtins_value, dict):
+        return builtins_value.get(name, _MISSING)
+    if isinstance(builtins_value, ModuleType):
+        return vars(builtins_value).get(name, _MISSING)
+    return _MISSING
+
+
 def _builtin_binding(module: ModuleType, name: str) -> object:
     return _builtin_binding_from_globals(vars(module), name)
 
@@ -1169,6 +1435,10 @@ def _capture_function_globals(
     dependency_seen: frozenset[int] = frozenset(),
 ) -> dict[str, _GlobalState]:
     globals_dict = function.__globals__
+    builtins_value = function.__builtins__
+    global_builtins = globals_dict.get("__builtins__", _MISSING)
+    if global_builtins is not _MISSING and global_builtins is not builtins_value:
+        raise _error("Gmsh executable function builtins mapping differs from its globals")
     names = set(_code_global_names(function.__code__ if code is None else code))
     names.add("__builtins__")
     result: dict[str, _GlobalState] = {}
@@ -1192,7 +1462,7 @@ def _capture_function_globals(
                 function_state,
             )
         else:
-            builtin = _builtin_binding_from_globals(globals_dict, name)
+            builtin = _builtin_binding_from_function(function, name)
             if (
                 builtin is not _MISSING
                 and name in vars(builtins)
@@ -1229,7 +1499,7 @@ def _validate_function_globals(state: _FunctionState, label: str) -> None:
         if global_state.value is _MISSING:
             if current is not _MISSING:
                 raise _error(f"live Gmsh dispatch global {label}.{name} was added")
-            builtin = _builtin_binding_from_globals(globals_dict, name)
+            builtin = _builtin_binding_from_function(state.function, name)
             if builtin is not global_state.builtin_value:
                 raise _error(f"live Gmsh dispatch builtin {label}.{name} was replaced")
             if (
@@ -1250,7 +1520,7 @@ def _validate_function_globals(state: _FunctionState, label: str) -> None:
             resolved = (
                 current
                 if global_state.value is not _MISSING
-                else _builtin_binding_from_globals(globals_dict, name)
+                else _builtin_binding_from_function(state.function, name)
             )
             if resolved is not dependency.function:
                 raise _error(f"live Gmsh executable dependency {label}.{name} was replaced")
@@ -1260,8 +1530,11 @@ def _validate_function_globals(state: _FunctionState, label: str) -> None:
 _CTYPES_TRUSTED_FUNCTIONS: dict[int, _FunctionState] = {}
 _CTYPES_TRUSTED_FUNCTIONS_BY_NAME: dict[str, _FunctionState] = {}
 _CTYPES_TRUSTED_DESCRIPTORS: dict[tuple[type, str], tuple[object, _FunctionState]] = {}
+_CTYPES_PERMITTED_DESCRIPTORS: dict[tuple[type, str], object] = {}
+_CTYPES_DISPATCH_EXPECTATIONS: dict[tuple[type, str], tuple[type, object]] = {}
 _CTYPES_BINDINGS: dict[str, object] = {}
 _CTYPES_INTERNAL_DISPATCH: tuple[type, object, type, object, type, object] | None = None
+_CTYPES_INTERNAL_SIGNATURE: tuple[object, ...] | None = None
 _CTYPES_NAMESPACE: dict[str, object] | None = None
 _CTYPES_SOURCE_PATH: Path | None = None
 _CTYPES_SOURCE_IDENTITY: dict[str, object] | None = None
@@ -1272,6 +1545,7 @@ def _build_ctypes_trust() -> None:
     global _CTYPES_SOURCE_IDENTITY
     global _CTYPES_SOURCE_PATH
     global _CTYPES_INTERNAL_DISPATCH
+    global _CTYPES_INTERNAL_SIGNATURE
 
     namespace = vars(ctypes)
     source_value = namespace.get("__file__", _MISSING)
@@ -1319,6 +1593,9 @@ def _build_ctypes_trust() -> None:
     _CTYPES_TRUSTED_FUNCTIONS.clear()
     _CTYPES_TRUSTED_FUNCTIONS_BY_NAME.clear()
     _CTYPES_TRUSTED_DESCRIPTORS.clear()
+    _CTYPES_PERMITTED_DESCRIPTORS.clear()
+    _CTYPES_DISPATCH_EXPECTATIONS.clear()
+    _CTYPES_BINDINGS.clear()
     for name, (function, expected) in definitions.items():
         state = _function_state(
             function,
@@ -1352,6 +1629,7 @@ def _build_ctypes_trust() -> None:
         "create_unicode_buffer",
         "sizeof",
         "POINTER",
+        "CDLL",
         "WinDLL",
         "c_void_p",
         "c_int",
@@ -1364,6 +1642,66 @@ def _build_ctypes_trust() -> None:
         raise _error("ctypes internal cast implementation is unavailable")
     _CTYPES_INTERNAL_DISPATCH = _ctypes_dispatch_descriptor(internal_cast, "ctypes._cast")
 
+    descriptor_names = (
+        "__call__",
+        "__getattribute__",
+        "__setattr__",
+        "__new__",
+        "__init__",
+        "__getattr__",
+        "__getitem__",
+        "_name",
+        *(_NATIVE_CALL_ATTRIBUTES),
+    )
+    known_types = [object, type, cdll]
+    if isinstance(_CFUNC_PTR_TYPE, type):
+        known_types.append(_CFUNC_PTR_TYPE)
+    win_dll = namespace.get("WinDLL", _MISSING)
+    if isinstance(win_dll, type):
+        known_types.append(win_dll)
+    for known_type in known_types:
+        for name in descriptor_names:
+            owner, descriptor = _raw_type_descriptor(known_type, name)
+            if descriptor is _MISSING:
+                continue
+            existing = _CTYPES_PERMITTED_DESCRIPTORS.get((owner, name))
+            if existing is not None and existing is not descriptor:
+                raise _error(f"ctypes {name} has conflicting descriptors")
+            _CTYPES_PERMITTED_DESCRIPTORS[(owner, name)] = descriptor
+
+    for known_type, names in (
+        (
+            cdll,
+            (
+                "__getattribute__",
+                "__setattr__",
+                "__getattr__",
+                "__getitem__",
+                "__init__",
+            ),
+        ),
+        (
+            win_dll,
+            (
+                "__getattribute__",
+                "__setattr__",
+                "__getattr__",
+                "__getitem__",
+                "__init__",
+            ),
+        ),
+    ):
+        if not isinstance(known_type, type):
+            continue
+        for name in names:
+            _CTYPES_DISPATCH_EXPECTATIONS[(known_type, name)] = _raw_type_descriptor(
+                known_type, name
+            )
+
+    _CTYPES_INTERNAL_SIGNATURE = _ctypes_call_signature(internal_cast, "ctypes._cast")
+    if _CTYPES_INTERNAL_SIGNATURE[2] != _value_signature(None):
+        raise _error("ctypes internal cast errcheck is not absent")
+
 
 def _validate_ctypes_source() -> None:
     if _CTYPES_NAMESPACE is None or _CTYPES_SOURCE_PATH is None or _CTYPES_SOURCE_IDENTITY is None:
@@ -1375,6 +1713,23 @@ def _validate_ctypes_source() -> None:
         raise _error("ctypes source path changed")
     current_identity = _file_identity(_CTYPES_SOURCE_PATH, "ctypes source")
     _compare_file_records(_CTYPES_SOURCE_IDENTITY, current_identity, "ctypes source")
+
+
+def _validate_ctypes_dispatch_expectations() -> None:
+    for (value_type, name), (expected_owner, expected_descriptor) in (
+        _CTYPES_DISPATCH_EXPECTATIONS.items()
+    ):
+        owner, descriptor = _raw_type_descriptor(value_type, name)
+        if owner is not expected_owner or descriptor is not expected_descriptor:
+            raise _error(f"ctypes {value_type.__name__} {name} dispatch changed")
+        trusted = _CTYPES_TRUSTED_DESCRIPTORS.get((owner, name))
+        if trusted is not None:
+            trusted_descriptor, function_state = trusted
+            if trusted_descriptor is not descriptor:
+                raise _error(f"ctypes {value_type.__name__} {name} descriptor changed")
+            _validate_function_state(function_state, f"ctypes {value_type.__name__}.{name}")
+        elif _descriptor_functions(descriptor):
+            raise _error(f"ctypes {value_type.__name__} {name} function is not trusted")
 
 
 def _validate_ctypes_function(name: str) -> None:
@@ -1410,6 +1765,7 @@ def _validate_ctypes_function(name: str) -> None:
 
 def _validate_ctypes_dependencies() -> None:
     _validate_ctypes_source()
+    _validate_ctypes_dispatch_expectations()
     for name in (
         "CDLL.__getattr__",
         "CDLL.__getitem__",
@@ -1428,8 +1784,12 @@ def _validate_ctypes_dependencies() -> None:
         not _is_ctypes_callable(internal_cast)
         or _CTYPES_INTERNAL_DISPATCH is None
         or _ctypes_dispatch_descriptor(internal_cast, "ctypes._cast") != _CTYPES_INTERNAL_DISPATCH
+        or _CTYPES_INTERNAL_SIGNATURE is None
+        or _ctypes_call_signature(internal_cast, "ctypes._cast")
+        != _CTYPES_INTERNAL_SIGNATURE
+        or _CTYPES_INTERNAL_SIGNATURE[2] != _value_signature(None)
     ):
-        raise _error("ctypes internal cast dispatch changed")
+        raise _error("ctypes internal cast dispatch or metadata changed")
 
 
 def _is_ctypes_callable(value: object) -> bool:
@@ -1472,9 +1832,6 @@ def _ctypes_dispatch_descriptor(
         setattr_owner,
         setattr_descriptor,
     )
-
-
-_build_ctypes_trust()
 
 
 def _ctypes_pointer(value: object, name: str) -> int:
@@ -1620,6 +1977,9 @@ def _validate_ctypes_call_signature(
     permitted = signature_policy.get(name)
     if permitted is None or signature not in permitted:
         raise _error(f"cached native callable {name} has unauthorized call metadata")
+
+
+_build_ctypes_trust()
 
 
 def _library_namespace(
@@ -1819,6 +2179,7 @@ class _LiveState:
     native_signature_policy: dict[str, frozenset[tuple[object, ...]]]
     native_callables: dict[str, _NativeCallableState]
     native_handle: int
+    source_dependencies: tuple[_ExecutableAttributeState, ...]
 
 
 def _capture_live_state(
@@ -1826,8 +2187,10 @@ def _capture_live_state(
     library: object,
     source: bytes,
     native_handle: int,
+    source_dependencies: tuple[_ExecutableAttributeState, ...],
 ) -> _LiveState:
     _validate_ctypes_dependencies()
+    _validate_source_dependencies(module, source_dependencies)
     native_symbols = _native_symbol_names(source)
     library_namespace_owner, library_namespace_descriptor = _raw_type_descriptor(
         type(library), "__dict__"
@@ -1930,6 +2293,7 @@ def _capture_live_state(
             library, native_symbols, native_signature_policy
         ),
         native_handle=native_handle,
+        source_dependencies=source_dependencies,
     )
 
 
@@ -1998,7 +2362,10 @@ def _validate_attribute_dispatch(state: _AttributeDispatchState, value: object, 
 def _validate_dispatch_descriptor(
     state: _DispatchDescriptorState, value_type: type, name: str, label: str
 ) -> None:
-    current = _dispatch_descriptor_state(value_type, name)
+    if name in {"__new__", "__init__"} and state.functions:
+        current = _generic_dispatch_descriptor_state(value_type, name)
+    else:
+        current = _dispatch_descriptor_state(value_type, name)
     if current.owner is not state.owner or current.descriptor is not state.descriptor:
         raise _error(f"live Gmsh {label} descriptor changed")
     for function_state in state.functions:
@@ -2038,6 +2405,7 @@ def _validate_factory_state(state: _FactoryState, value: object) -> None:
 
 
 def _validate_live_state(state: _LiveState, module: ModuleType, library: object) -> None:
+    _validate_source_dependencies(module, state.source_dependencies)
     _validate_attribute_dispatch(state.module_dispatch, module, "module")
     _validate_attribute_dispatch(state.library_dispatch, library, "native library")
     current_library_namespace = _library_namespace(
@@ -2304,6 +2672,7 @@ def load_verified_gmsh(binding: dict[str, object]) -> tuple[Any, dict[str, objec
             cache_path, cache_identity = _validate_cache(
                 module_path, actual_module, snapshot, admission
             )
+            source_dependencies = _capture_source_dependencies(snapshot.content, snapshot.code)
             module = _import_verified_source(module_path, actual_module, snapshot.code)
             code_digest = snapshot.code_digest
             try:
@@ -2311,12 +2680,14 @@ def load_verified_gmsh(binding: dict[str, object]) -> tuple[Any, dict[str, objec
                     module, module_path, actual_module, code_digest, snapshot.code
                 )
                 _verify_source_snapshot_current(snapshot)
+                _validate_source_dependencies(module, source_dependencies)
                 library_object, handle = _module_handle(module)
                 live_state = _capture_live_state(
                     module,
                     library_object,
                     snapshot.content,
                     handle,
+                    source_dependencies,
                 )
                 mapped_path = _mapped_module_path(handle)
                 if not _same_path(str(mapped_path), str(library_path)):

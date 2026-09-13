@@ -594,6 +594,8 @@ def _verify_preparation_output(result: object, runtime_binding: object) -> dict[
         or not set(result) <= required | optional
     ):
         raise ValueError("preparation response is not the raw producer shape")
+    if result.get("backend_id") != "gmsh-occ" or result.get("backend_version") != "4.15.2":
+        raise ValueError("preparation response consumed backend differs from current backend")
     backend = result.get("backend")
     if not isinstance(backend, dict):
         raise ValueError("preparation response backend is missing")

@@ -1,5 +1,7 @@
 """Synthetic admission evidence only; no native modules or mesh quality claims."""
 
+import hashlib
+import json
 from pathlib import Path
 from typing import Any
 
@@ -12,7 +14,8 @@ from febio_cae.adapters.geometry import (
     GmshOCCConfig,
 )
 from febio_cae.adapters.geometry.preparation import _MeasuredGmsh
-from febio_cae.domain import Quantity, RigidPrimitive
+from febio_cae.domain import Quantity, RigidPrimitive, SourceAssetContent, SourceAssetRef
+from febio_cae.domain.canonical import canonical_bytes
 
 from .test_gmsh_units import _FakeGmsh
 from .conftest import TOOL_BODY, TOOL_LOCAL, _evidence, _identity_transform
@@ -349,19 +352,71 @@ def test_measured_backend_restores_planar_guard_after_native_success_and_error(
         backend._inspect_faces(module, "body-1", 1, 1.0)
 
 
-def test_preparation_rejects_nested_backend_alias_with_different_consumed_backend() -> None:
-    from febio_cae.adapters.geometry.preparation import _verify_preparation_output
+@pytest.mark.parametrize("backend_id, accepted", [("gmsh-occ", True), ("spoofed", False)])
+def test_run_preparation_consumes_only_the_current_top_level_backend(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    backend_id: str,
+    accepted: bool,
+) -> None:
+    from febio_cae.adapters.geometry import preparation
 
-    raw = {
-        "producer": {"backend": {"runtime_identity": "nested"}},
-        "backend": {"runtime_identity": "outer"},
-        "carrier": {},
-        "mesh": {},
-        "inspection": {},
-        "backend_id": "gmsh-occ",
+    step = b"synthetic-step"
+    source = SourceAssetContent(
+        SourceAssetRef("synthetic-step", hashlib.sha256(step).hexdigest(), "model/step"),
+        step,
+    )
+    runtime_binding = {
+        "schema_version": "gmsh-runtime-identity-v1",
+        "python": {"path": "synthetic/python.exe", "size": 1, "sha256": "0" * 64},
+        "python_image": {
+            "path": "synthetic/python-image.exe",
+            "size": 2,
+            "sha256": "1" * 64,
+        },
+        "python_library": {
+            "path": "synthetic/python312.dll",
+            "size": 3,
+            "sha256": "2" * 64,
+        },
+        "module": {"path": "synthetic/gmsh.py", "size": 4, "sha256": "3" * 64},
+        "library": {"path": "synthetic/gmsh-4.15.dll", "size": 5, "sha256": "4" * 64},
+        "pyvenv_cfg": None,
+    }
+    child_output = {
+        "carrier": {"synthetic": "carrier"},
+        "mesh": {"synthetic": "mesh"},
+        "inspection": {"synthetic": "inspection"},
+        "backend": {"runtime_identity": runtime_binding},
+        "backend_id": backend_id,
         "backend_version": "4.15.2",
         "mesh_generations": 1,
     }
 
-    with pytest.raises(ValueError, match="raw|response|backend"):
-        _verify_preparation_output(raw, {})
+    def launch(argv: tuple[str, ...], directory: Path, **budget: Any) -> dict[str, int]:
+        del argv, budget
+        json.loads((directory / "input.json").read_bytes())
+        (directory / "output.json").write_bytes(canonical_bytes(child_output))
+        return {"pid": 123, "creation_time": 456, "exit_code": 0}
+
+    monkeypatch.setattr(preparation, "capture_runtime_binding", lambda: runtime_binding)
+    monkeypatch.setattr(preparation, "_run_owned", launch)
+
+    if accepted:
+        result = preparation.run_preparation(
+            source,
+            {},
+            {"cpu_workers": 1, "wall_seconds": 1.0, "memory_bytes": 1024},
+            tmp_path / "work",
+        )
+        assert result["backend_id"] == "gmsh-occ"
+        assert result["runtime_binding"] == runtime_binding
+        assert result["process"]["exit_code"] == 0
+    else:
+        with pytest.raises(ValueError):
+            preparation.run_preparation(
+                source,
+                {},
+                {"cpu_workers": 1, "wall_seconds": 1.0, "memory_bytes": 1024},
+                tmp_path / "work",
+            )

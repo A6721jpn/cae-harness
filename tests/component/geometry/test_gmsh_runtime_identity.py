@@ -6,7 +6,9 @@ import hashlib
 import importlib
 import importlib.util
 import os
+import platform
 import py_compile
+import signal
 import sys
 import ctypes
 from pathlib import Path
@@ -563,7 +565,7 @@ def test_verified_load_rejects_pre_admission_ctypes_resolver_tampering(
         runtime.load_verified_gmsh(expected)
 
 
-def test_verified_load_rejects_tampered_imported_cast_before_pointer_use(
+def test_verified_load_rejects_cast_errcheck_before_pointer_use(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     expected, _library = _synthetic_cdll_setup(monkeypatch, tmp_path)
@@ -573,17 +575,95 @@ def test_verified_load_rejects_tampered_imported_cast_before_pointer_use(
     runtime.load_verified_gmsh(expected)
 
     marker = tmp_path / "unsafe-cast-called"
-    monkeypatch.setitem(runtime.ctypes.cast.__globals__, "_marker_path", str(marker))
+    def errcheck(result: Any, function: Any, arguments: Any) -> Any:
+        del function, arguments
+        marker.write_text("called", encoding="ascii")
+        return result
 
-    def replacement(value: Any, target: Any) -> Any:
-        del value, target
-        with open(_marker_path, "w", encoding="ascii") as stream:
-            stream.write("called")
+    native.errcheck = errcheck
+
+    with pytest.raises((OSError, ValueError)):
+        runtime.load_verified_gmsh(expected)
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("target", ["cdll_getattribute", "windll_init"])
+def test_verified_load_rejects_pre_admission_ctypes_mro_tampering(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, target: str
+) -> None:
+    expected, _library = _synthetic_cdll_setup(monkeypatch, tmp_path)
+
+    def replacement(*args: Any, **kwargs: Any) -> Any:
+        del args, kwargs
         return None
 
-    monkeypatch.setattr(runtime.ctypes.cast, "__code__", replacement.__code__)
+    if target == "cdll_getattribute":
+        monkeypatch.setattr(ctypes.CDLL, "__getattribute__", replacement)
+    else:
+        monkeypatch.setattr(ctypes.WinDLL, "__init__", replacement)
 
-    with pytest.raises((OSError, ValueError), match="ctypes|cast|dependency|code"):
+    with pytest.raises((OSError, ValueError)):
+        runtime.load_verified_gmsh(expected)
+
+
+@pytest.mark.parametrize("dependency", ["signal", "platform", "numpy"])
+def test_verified_load_rejects_tampered_import_attribute_before_gmsh_import(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, dependency: str
+) -> None:
+    marker = tmp_path / f"unsafe-{dependency}-called"
+    if dependency == "signal":
+        source = (
+            "import signal\n"
+            "signal.signal(signal.SIGINT, None)\n"
+        )
+
+        def poisoned(*args: Any, **kwargs: Any) -> Any:
+            del args, kwargs
+            marker.write_text("called", encoding="ascii")
+            return None
+
+        monkeypatch.setattr(signal, "signal", poisoned)
+    elif dependency == "platform":
+        source = "import platform\nplatform.system()\n"
+
+        def poisoned() -> str:
+            marker.write_text("called", encoding="ascii")
+            return "Windows"
+
+        monkeypatch.setattr(platform, "system", poisoned)
+    else:
+        source = "import numpy\nnumpy.ctypeslib.as_array(())\n"
+        numpy = ModuleType("numpy")
+        ctypeslib = ModuleType("numpy.ctypeslib")
+
+        def poisoned(*args: Any, **kwargs: Any) -> Any:
+            del args, kwargs
+            marker.write_text("called", encoding="ascii")
+            return ()
+
+        ctypeslib.as_array = poisoned
+        numpy.ctypeslib = ctypeslib
+        monkeypatch.setitem(sys.modules, "numpy", numpy)
+        monkeypatch.setitem(sys.modules, "numpy.ctypeslib", ctypeslib)
+
+    source += (
+        "__version__ = '4.15.2'\n"
+        "class Lib:\n"
+        "    _handle = 99\n"
+        "lib = Lib()\n"
+    )
+    expected, _library = _synthetic_cdll_setup(monkeypatch, tmp_path)
+    module = expected["module"]
+    assert isinstance(module, dict)
+    module_path = Path(module["path"])
+    module_path.write_text(source, encoding="utf-8")
+    expected["module"] = {
+        "path": str(module_path.resolve()),
+        "size": module_path.stat().st_size,
+        "sha256": hashlib.sha256(module_path.read_bytes()).hexdigest(),
+    }
+
+    with pytest.raises((OSError, ValueError)):
         runtime.load_verified_gmsh(expected)
     assert not marker.exists()
 
@@ -1506,6 +1586,47 @@ def test_verified_session_rejects_module_builtin_shadowing(
 
     with pytest.raises((OSError, ValueError), match="global|builtin"):
         runtime.load_verified_gmsh(expected)
+
+
+def test_verified_load_rejects_function_builtins_mapping_mismatch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    marker = tmp_path / "unsafe-builtin-called"
+    source = (
+        "__version__ = '4.15.2'\n"
+        "def poisoned(value):\n"
+        "    with open(_marker, 'w', encoding='ascii') as stream:\n"
+        "        stream.write('called')\n"
+        "    return False\n"
+        "def uses_bool(value):\n"
+        "    return bool(value)\n"
+        "class Lib:\n"
+        "    _handle = 99\n"
+        "lib = Lib()\n"
+        "_marker = "
+        + repr(str(marker))
+        + "\n"
+        "__builtins__ = {'bool': poisoned}\n"
+    )
+    module, _library, launcher, image, python_library = _files(tmp_path, source)
+    expected = _binding(tmp_path, module=module, library=_library)
+    monkeypatch.setattr(
+        runtime,
+        "_current_process_binding",
+        lambda: {
+            "python": _identity(launcher),
+            "python_image": _identity(image),
+            "python_library": _identity(python_library),
+            "pyvenv_cfg": None,
+        },
+    )
+    monkeypatch.setattr(runtime, "_mapped_module_path", lambda handle: _library)
+    monkeypatch.syspath_prepend(str(module.parent))
+    sys.modules.pop("gmsh", None)
+
+    with pytest.raises((OSError, ValueError)):
+        runtime.load_verified_gmsh(expected)
+    assert not marker.exists()
 
 
 def test_cached_session_resolves_current_import_precedence_independently(
