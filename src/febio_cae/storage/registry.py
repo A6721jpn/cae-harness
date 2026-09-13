@@ -187,13 +187,14 @@ def _owned_path(root: Path, relative: str) -> Path:
 
 
 def _temporary_io_path(path: Path) -> Path:
-    """Keep temporary I/O usable when its valid destination is near MAX_PATH."""
+    """Extend temporary I/O only after resolving its already-pinned parent."""
     if os.name != "nt":
         return path
-    absolute = str(path.absolute())
+    canonical = path.parent.resolve(strict=True) / path.name
+    absolute = str(canonical)
     prefix = "\\\\?\\"
     if absolute.startswith(prefix):
-        return path
+        return canonical
     if absolute.startswith("\\\\"):
         return Path(prefix + "UNC\\" + absolute[2:])
     return Path(prefix + absolute)
