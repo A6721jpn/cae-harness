@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Sequence
 from typing import Any
 
 import pytest
@@ -148,7 +149,7 @@ class SyntheticBackend:
     def inspect(
         self,
         content: bytes,
-        requested_body_ids: tuple[str, ...],
+        requested_body_ids: Sequence[str],
     ) -> BackendInspection:
         centroid_z = 0.011 if self.changed_measurement else 0.01
         faces = (

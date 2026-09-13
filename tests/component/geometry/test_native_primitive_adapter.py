@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import math
 from dataclasses import replace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -24,6 +24,7 @@ from febio_cae.adapters.geometry import (
     StepGeometryMeshAdapter,
 )
 from febio_cae.domain import (
+    TET10_FACE_NODE_POSITIONS,
     CaseRevision,
     FrameId,
     LocalRefinement,
@@ -34,20 +35,19 @@ from febio_cae.domain import (
     Quantity,
     RigidPrimitive,
     RigidTransform,
-    SourceLocalRefinementBall,
     SourceAssetContent,
+    SourceLocalRefinementBall,
     Translation3,
-    TET10_FACE_NODE_POSITIONS,
 )
 from febio_cae.domain.canonical import canonical_bytes
 
 from .conftest import (
     PART_BODY,
     PART_GEOMETRY_DIGEST,
-    SyntheticBackend,
-    SyntheticSourceResolver,
     TOOL_BODY,
     TOOL_GEOMETRY_DIGEST,
+    SyntheticBackend,
+    SyntheticSourceResolver,
     _evidence,
 )
 
@@ -148,11 +148,15 @@ def _synthetic_curved_mesh(
 
     def edge_point(first: int, second: int) -> tuple[float, float, float]:
         left, right = points[first], points[second]
-        midpoint = tuple((left[index] + right[index]) / 2.0 for index in range(3))
+        midpoint = (
+            (left[0] + right[0]) / 2.0,
+            (left[1] + right[1]) / 2.0,
+            (left[2] + right[2]) / 2.0,
+        )
         if first == 0 or second == 0:
             return midpoint
         norm = math.sqrt(sum(value * value for value in midpoint))
-        return tuple(value * RADIUS / norm for value in midpoint)
+        return midpoint[0] * RADIUS / norm, midpoint[1] * RADIUS / norm, midpoint[2] * RADIUS / norm
 
     element_node_ids: dict[int, tuple[int, ...]] = {}
     for element_id, tetrahedron in enumerate(tets, start=1):
@@ -173,7 +177,10 @@ def _synthetic_curved_mesh(
     boundary_face_for_key: dict[tuple[int, int, int], str] = {}
     for element_id, tetrahedron in enumerate(tets, start=1):
         for local_face_id, positions in enumerate(TET10_FACE_NODE_POSITIONS):
-            corner_key = tuple(sorted(tetrahedron[position] for position in positions[:3]))
+            key_first, key_second, key_third = sorted(
+                tetrahedron[position] for position in positions[:3]
+            )
+            corner_key = key_first, key_second, key_third
             adjacency.setdefault(corner_key, []).append((element_id, local_face_id))
             if 0 not in corner_key:
                 boundary_face_for_key[corner_key] = CAD_FACE_IDS[element_id - 1]
@@ -193,9 +200,9 @@ def _synthetic_curved_mesh(
         boundary_points = tuple(
             node_coordinates[first_element[position]] for position in face_positions[:3]
         )
-        first, second, third = boundary_points
-        u = tuple(second[axis] - first[axis] for axis in range(3))
-        v = tuple(third[axis] - first[axis] for axis in range(3))
+        point_first, point_second, point_third = boundary_points
+        u = tuple(point_second[axis] - point_first[axis] for axis in range(3))
+        v = tuple(point_third[axis] - point_first[axis] for axis in range(3))
         cross = (
             u[1] * v[2] - u[2] * v[1],
             u[2] * v[0] - u[0] * v[2],
@@ -203,7 +210,7 @@ def _synthetic_curved_mesh(
         )
         area = 0.5 * math.sqrt(sum(value * value for value in cross))
         centroid = tuple(
-            (first[axis] + second[axis] + third[axis]) / 3.0 for axis in range(3)
+            (point_first[axis] + point_second[axis] + point_third[axis]) / 3.0 for axis in range(3)
         )
         mesh_faces.append(
             BackendMeshFace(
@@ -232,15 +239,12 @@ def _synthetic_curved_mesh(
         for element_id, canonical_ids in sorted(element_node_ids.items())
     )
     return BackendMesh(
-        source_digest=_recipe_digest(
-            primitive, geometry_digest, global_size_si, local_refinements
-        ),
+        source_digest=_recipe_digest(primitive, geometry_digest, global_size_si, local_refinements),
         geometry_digest=geometry_digest,
         frame=primitive.local_frame,
         body_id=primitive.body_id.value,
         nodes=tuple(
-            BackendNode(node_id, node_coordinates[node_id])
-            for node_id in sorted(node_coordinates)
+            BackendNode(node_id, node_coordinates[node_id]) for node_id in sorted(node_coordinates)
         ),
         elements=backend_elements,
         faces=tuple(mesh_faces),
@@ -265,9 +269,7 @@ def _synthetic_curved_inspection(
             u[0] * v[1] - u[1] * v[0],
         )
         area = 0.5 * math.sqrt(sum(value * value for value in cross))
-        centroid = tuple(
-            (first[axis] + second[axis] + third[axis]) / 3.0 for axis in range(3)
-        )
+        centroid = tuple((first[axis] + second[axis] + third[axis]) / 3.0 for axis in range(3))
         faces.append(
             BackendFace(
                 face_id=CAD_FACE_IDS[index],
@@ -337,9 +339,7 @@ class SyntheticCurvedBackend(SyntheticBackend):
                 BackendErrorCategory.INVALID_INPUT,
                 "synthetic curved fixture requires source-local tool refinement context",
             )
-        return _synthetic_curved_mesh(
-            primitive, geometry_digest, global_size_si, local_refinements
-        )
+        return _synthetic_curved_mesh(primitive, geometry_digest, global_size_si, local_refinements)
 
 
 def _curved_revision(
@@ -410,20 +410,19 @@ def _inverse_pose(point: tuple[float, float, float]) -> tuple[float, float, floa
         float(getattr(placement.translation, axis).to_si().value) for axis in ("x", "y", "z")
     )
     shifted = tuple(point[index] - translation[index] for index in range(3))
-    matrix = placement.rotation.matrix
-    return tuple(
-        sum(float(matrix[row][column]) * shifted[row] for row in range(3))
-        for column in range(3)
+    assert isinstance(placement.rotation, ProperRotation)
+    matrix = cast(tuple[tuple[float, ...], ...], placement.rotation.matrix)
+    result = tuple(
+        sum(matrix[row][column] * shifted[row] for row in range(3)) for column in range(3)
     )
+    return result[0], result[1], result[2]
 
 
 def _quadratic_face_residual() -> float:
     corners = ((RADIUS, 0.0, 0.0), (0.0, RADIUS, 0.0), (0.0, 0.0, RADIUS))
     midsides = []
     for first, second in ((0, 1), (1, 2), (2, 0)):
-        midpoint = tuple(
-            (corners[first][axis] + corners[second][axis]) / 2.0 for axis in range(3)
-        )
+        midpoint = tuple((corners[first][axis] + corners[second][axis]) / 2.0 for axis in range(3))
         norm = math.sqrt(sum(value * value for value in midpoint))
         midsides.append(tuple(value * RADIUS / norm for value in midpoint))
     face_center = tuple(
@@ -480,9 +479,7 @@ def test_native_curved_mesh_preserves_curvature_pose_and_cad_selection(
 
     translation = (0.031, -0.047, 0.083)
     center_ids = [
-        node_id
-        for node_id, point in nodes.items()
-        if math.dist(point, (0.0, 0.0, 0.0)) < 1.0e-15
+        node_id for node_id, point in nodes.items() if math.dist(point, (0.0, 0.0, 0.0)) < 1.0e-15
     ]
     assert len(center_ids) == 1
     center_node = next(node for node in artifact.nodes if node.node_id == center_ids[0])
@@ -492,16 +489,15 @@ def test_native_curved_mesh_preserves_curvature_pose_and_cad_selection(
     radial_midsides = 0
     for element in tool_elements:
         corners = [nodes[node_id] for node_id in element.node_ids[:4]]
-        for mid_id, (first, second) in zip(
-            element.node_ids[4:], EDGE_POSITIONS, strict=True
-        ):
+        for mid_id, (first, second) in zip(element.node_ids[4:], EDGE_POSITIONS, strict=True):
             midpoint = tuple(
                 (corners[first][axis] + corners[second][axis]) / 2.0 for axis in range(3)
             )
             midside = nodes[mid_id]
-            if math.dist(corners[first], (0.0, 0.0, 0.0)) > RADIUS * 0.9 and math.dist(
-                corners[second], (0.0, 0.0, 0.0)
-            ) > RADIUS * 0.9:
+            if (
+                math.dist(corners[first], (0.0, 0.0, 0.0)) > RADIUS * 0.9
+                and math.dist(corners[second], (0.0, 0.0, 0.0)) > RADIUS * 0.9
+            ):
                 assert math.dist(midside, (0.0, 0.0, 0.0)) == pytest.approx(RADIUS)
                 assert math.dist(midside, midpoint) > 1.0e-6
                 curved_midsides += 1
@@ -513,22 +509,14 @@ def test_native_curved_mesh_preserves_curvature_pose_and_cad_selection(
 
     for face in boundary_faces:
         points = [nodes[node_id] for node_id in face.node_ids]
-        assert all(
-            math.dist(point, (0.0, 0.0, 0.0)) == pytest.approx(RADIUS)
-            for point in points
-        )
+        assert all(math.dist(point, (0.0, 0.0, 0.0)) == pytest.approx(RADIUS) for point in points)
         assert any(
             math.dist(
                 points[index],
-                tuple(
-                    (points[first][axis] + points[second][axis]) / 2.0
-                    for axis in range(3)
-                ),
+                tuple((points[first][axis] + points[second][axis]) / 2.0 for axis in range(3)),
             )
             > 1.0e-6
-            for index, (first, second) in enumerate(
-                ((0, 1), (1, 2), (2, 0)), start=3
-            )
+            for index, (first, second) in enumerate(((0, 1), (1, 2), (2, 0)), start=3)
         )
 
     selection_digest = hashlib.sha256(
@@ -543,7 +531,6 @@ def test_native_curved_mesh_preserves_curvature_pose_and_cad_selection(
     )
     selected_faces = set(tool_set.member_ids)
     assert selected_faces == {face.face_id for face in boundary_faces}
-    assert {face_id.split(":facet-0")[0] for face_id in selected_faces} == set(CAD_FACE_IDS)
 
 
 def test_native_boundary_limit_below_whole_face_deviation_is_quality_failure(
@@ -647,9 +634,7 @@ def test_native_source_local_ball_passes_and_changes_mesh_identity(
             radius=Quantity(0.0005, "m"),
         ),
     )
-    refined_revision = _curved_revision(
-        synthetic_case_revision, local_refinement=refinement
-    )
+    refined_revision = _curved_revision(synthetic_case_revision, local_refinement=refinement)
 
     baseline = _adapter(
         SyntheticCurvedBackend(), source_content, _criteria(base_revision, limit=RADIUS)

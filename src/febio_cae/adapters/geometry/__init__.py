@@ -17,7 +17,7 @@ from .backend import (
     GeometryMeshBackend,
     NativeCurvedGeometryBackend,
 )
-from .gmsh_backend import GmshOCCBackend, GmshOCCConfig
+from .gmsh_occ import GmshOCCBackend, GmshOCCConfig
 
 __all__ = [
     "BACKEND_TET10_ORDER_ID",
@@ -33,9 +33,9 @@ __all__ = [
     "BackendMeshFace",
     "BackendNode",
     "GeometryMeshBackend",
-    "NativeCurvedGeometryBackend",
     "GmshOCCBackend",
     "GmshOCCConfig",
     "InitialContactPlacement",
+    "NativeCurvedGeometryBackend",
     "StepGeometryMeshAdapter",
 ]

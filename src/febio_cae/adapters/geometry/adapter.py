@@ -253,9 +253,7 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
     ) -> BackendInspection:
         backend = cast(NativeCurvedGeometryBackend, self._backend)
         try:
-            report = backend.inspect_rigid_primitive(
-                primitive, geometry_digest=geometry_digest
-            )
+            report = backend.inspect_rigid_primitive(primitive, geometry_digest=geometry_digest)
         except PortError:
             raise
         except BackendError as error:
@@ -439,13 +437,13 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
             ) from error
 
     def _generate_native_tool(
-        self, spec: CaseSpec, criteria: "ApproximationCriteria | None", deadline: float
+        self, spec: CaseSpec, criteria: ApproximationCriteria | None, deadline: float
     ) -> GeneratedPrimitiveMesh:
-        from febio_cae.adapters.meshing.approximation import check_deadline
-        from febio_cae.adapters.meshing.primitives import GeneratedPrimitiveMesh
         from febio_cae.adapters.meshing.approximation import (
             ApproximationCriteria as RuntimeApproximationCriteria,
         )
+        from febio_cae.adapters.meshing.approximation import check_deadline
+        from febio_cae.adapters.meshing.primitives import GeneratedPrimitiveMesh
 
         check_deadline(deadline)
         primitive = spec.rigid_tool.primitive
@@ -582,7 +580,9 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
             ApproximationCriteria,
             check_deadline,
         )
-        from febio_cae.adapters.meshing.native_surface import primitive_face_distance_upper_bound
+        from febio_cae.adapters.meshing.native_surface import (
+            primitive_face_distance_upper_bound,
+        )
 
         if (
             not isinstance(criteria, ApproximationCriteria)
@@ -654,8 +654,7 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
             try:
                 element = elements[face.adjacent_element_ids[0]]
                 canonical_node_ids = tuple(
-                    element.node_ids[position]
-                    for position in BACKEND_TET10_TO_CANONICAL_POSITIONS
+                    element.node_ids[position] for position in BACKEND_TET10_TO_CANONICAL_POSITIONS
                 )
                 positions = TET10_FACE_NODE_POSITIONS[face.local_face_ids[0]]
                 points = tuple(nodes[canonical_node_ids[position]] for position in positions)
@@ -696,9 +695,7 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
                 PortErrorCategory.INTEGRITY,
                 "native CAD boundary faces are not completely covered: " + ", ".join(missing),
             )
-        deviation = max(
-            cast(float, item["deviation_upper_bound_si"]) for item in records
-        )
+        deviation = max(cast(float, item["deviation_upper_bound_si"]) for item in records)
         limit = float(criteria.max_boundary_deviation.to_si().value)
         if deviation > limit:
             self._raise(
@@ -831,10 +828,14 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
                 "declared geometry body is not a closed solid",
             )
         if spec.mesh_policy.local_refinements:
-            native_tool = spec.rigid_tool.primitive.kind in {
-                "sphere",
-                "cylinder",
-            } and self._native_curved_capability()
+            native_tool = (
+                spec.rigid_tool.primitive.kind
+                in {
+                    "sphere",
+                    "cylinder",
+                }
+                and self._native_curved_capability()
+            )
             if not native_tool:
                 self._raise(
                     PortErrorCategory.UNSUPPORTED_CAPABILITY,
@@ -950,9 +951,7 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
             )
         signed_volumes = part_mapped.signed_volumes + tool_mapped.signed_volumes
         minimum_volume = min(signed_volumes)
-        corner_minimum_volume = min(
-            part_mapped.corner_volumes + tool_mapped.corner_volumes
-        )
+        corner_minimum_volume = min(part_mapped.corner_volumes + tool_mapped.corner_volumes)
         native_volume = generated.native_inspection is not None
         selection_digests = tuple(sorted(selection_resolutions))
         recipe_digest = _mesh_recipe_digest(
@@ -1625,28 +1624,25 @@ def _quadratic_tet10_volume(points: Sequence[Sequence[float]]) -> float:
         gradients: list[tuple[float, float, float]] = []
         for index in range(4):
             coefficient = 4.0 * barycentric[index] - 1.0
+            gradient = barycentric_gradients[index]
             gradients.append(
-                tuple(
-                    coefficient * barycentric_gradients[index][direction]
-                    for direction in range(3)
-                )
+                (coefficient * gradient[0], coefficient * gradient[1], coefficient * gradient[2])
             )
-        for first, second in edges:
+        for first_node, second_node in edges:
+            first_value, second_value = barycentric[first_node], barycentric[second_node]
+            first_gradient = barycentric_gradients[first_node]
+            second_gradient = barycentric_gradients[second_node]
             gradients.append(
-                tuple(
-                    4.0
-                    * (
-                        barycentric_gradients[first][direction] * barycentric[second]
-                        + barycentric[first] * barycentric_gradients[second][direction]
-                    )
-                    for direction in range(3)
+                (
+                    4.0 * (first_gradient[0] * second_value + first_value * second_gradient[0]),
+                    4.0 * (first_gradient[1] * second_value + first_value * second_gradient[1]),
+                    4.0 * (first_gradient[2] * second_value + first_value * second_gradient[2]),
                 )
             )
         jacobian = tuple(
             tuple(
                 math.fsum(
-                    float(points[node][axis]) * gradients[node][direction]
-                    for node in range(10)
+                    float(points[node][axis]) * gradients[node][direction] for node in range(10)
                 )
                 for axis in range(3)
             )
@@ -1665,12 +1661,10 @@ def _quadratic_tet10_volume(points: Sequence[Sequence[float]]) -> float:
 
     center = (0.25, 0.25, 0.25, 0.25)
     vertex_points = tuple(
-        tuple(0.5 if index == vertex else 1.0 / 6.0 for index in range(4))
-        for vertex in range(4)
+        tuple(0.5 if index == vertex else 1.0 / 6.0 for index in range(4)) for vertex in range(4)
     )
     value = (
-        -0.8 * determinant(center)
-        + 0.45 * math.fsum(determinant(point) for point in vertex_points)
+        -0.8 * determinant(center) + 0.45 * math.fsum(determinant(point) for point in vertex_points)
     ) / 6.0
     if not math.isfinite(value) or value <= 0.0:
         raise ValueError("quadratic mapping volume is not positive or representable")
