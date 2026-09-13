@@ -66,6 +66,7 @@ def _read_native_result(
     tool = revision.spec.rigid_tool.primitive.body_id.value
     face_by_id = {face.face_id: face for face in mesh.faces}
     contact_entities: dict[str, tuple[str, ...]] = {}
+    active_contact_surfaces: tuple[str, ...] = ()
     contact_selections = (
         revision.spec.contact.part_surface,
         revision.spec.contact.tool_surface,
@@ -113,6 +114,7 @@ def _read_native_result(
                 "surface_node": contact_surface_node_ids,
             }
         )
+        active_contact_surfaces = tuple(face_set.set_id for face_set in contact_face_sets)
     entities = {
         "node": tuple(str(node.node_id) for node in mesh.nodes),
         "element": tuple(
@@ -131,6 +133,7 @@ def _read_native_result(
         entity_ids={
             mapping.canonical_id: entities[mapping.location] for mapping in profile.output_mappings
         },
+        active_contact_surfaces=active_contact_surfaces,
     )
     manifest = XpltReaderAdapter(profile=profile, data_store=data).read(attempt, bundle)
     for observation in manifest.read_result.observations:

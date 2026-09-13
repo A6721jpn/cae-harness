@@ -86,6 +86,16 @@ _LAYOUTS = {
     "contact status": (_CONTACT_DICTIONARY, 0, 1, "face", "FLOAT", "1", ("value",)),
     "contact traction": (_CONTACT_DICTIONARY, 1, 1, "face", "VEC3F", "Pa", _VECTOR),
 }
+_NATIVE_CONTACT_ANCILLARY_UNITS: dict[str, str | None] = {
+    "nodal contact gap": "L",
+    "nodal contact pressure": "P",
+    "nodal contact traction": "P",
+    "contact area": "L^2",
+    "contact force": "F",
+    "contact pressure": "P",
+    "contact status": None,
+    "contact traction": "P",
+}
 _OBJECT_NAMES = (
     "Position",
     "Velocity",
@@ -117,6 +127,7 @@ class _Source:
     state_times: tuple[float, ...]
     part_bodies: tuple[tuple[int, str], ...]
     entity_ids: tuple[tuple[str, tuple[str, ...]], ...]
+    active_contact_surfaces: tuple[str, ...]
 
 
 def _scope(attempt: AttemptRecord) -> tuple[str, str, str, int]:
@@ -187,6 +198,7 @@ class LocalResultDataStore(ResultDataPort):
         state_times: Sequence[float],
         part_bodies: Mapping[int, str],
         entity_ids: Mapping[str, Sequence[str]],
+        active_contact_surfaces: Sequence[str] = (),
     ) -> None:
         if attempt.state not in {RunState.VALIDATING, RunState.SUCCEEDED}:
             raise PortError(
@@ -233,6 +245,26 @@ class LocalResultDataStore(ResultDataPort):
             raise PortError(
                 PortErrorCategory.INVALID_INPUT, "registered part/body mapping is incomplete"
             )
+        if isinstance(active_contact_surfaces, (str, bytes, bytearray)):
+            raise PortError(
+                PortErrorCategory.INVALID_INPUT,
+                "active contact surfaces must be a sequence of mesh-set IDs",
+            )
+        active_surfaces = tuple(active_contact_surfaces)
+        if any(
+            not isinstance(item, str) or not item or item != item.strip()
+            for item in active_surfaces
+        ) or len(set(active_surfaces)) != len(active_surfaces):
+            raise PortError(
+                PortErrorCategory.INVALID_INPUT,
+                "registered active contact surfaces are invalid or duplicated",
+            )
+        face_sets = {item.set_id for item in mesh.sets if item.kind == "face"}
+        if not set(active_surfaces) <= face_sets:
+            raise PortError(
+                PortErrorCategory.INVALID_INPUT,
+                "registered active contact surfaces are not trusted face sets",
+            )
         entities = tuple(sorted((name, tuple(ids)) for name, ids in entity_ids.items()))
         if not entities or any(
             not ids
@@ -243,7 +275,7 @@ class LocalResultDataStore(ResultDataPort):
             raise PortError(
                 PortErrorCategory.INVALID_INPUT, "registered output entities are invalid"
             )
-        source = _Source(attempt, bundle, raw, mesh, times, bodies, entities)
+        source = _Source(attempt, bundle, raw, mesh, times, bodies, entities, active_surfaces)
         previous = self._sources.get(_scope(attempt))
         if previous is not None and previous != source:
             raise PortError(PortErrorCategory.CONFLICT, "registered source is immutable")
@@ -441,11 +473,14 @@ class _NativeParser:
                     raise _ParseError("unsupported array dictionary layout")
                 if 0x01020007 in fields and len(fields[0x01020007]) != 64:
                     raise _ParseError("invalid observed dictionary ancillary width")
-                if group == _CONTACT_DICTIONARY and (
-                    0x01020007 not in fields
-                    or _text(fields[0x01020007], "contact dictionary unit", fixed=True) != layout[5]
-                ):
-                    raise _ParseError("contact dictionary unit differs from native layout")
+                if group == _CONTACT_DICTIONARY:
+                    observed_unit = (
+                        None
+                        if 0x01020007 not in fields
+                        else _text(fields[0x01020007], "contact dictionary unit", fixed=True)
+                    )
+                    if observed_unit != _NATIVE_CONTACT_ANCILLARY_UNITS[name]:
+                        raise _ParseError("contact dictionary ancillary differs from native layout")
                 if (mapping.location, mapping.value_type, mapping.unit) != layout[
                     3:6
                 ] or mapping.frame != self.source.mesh.frame:
@@ -688,22 +723,18 @@ class _NativeParser:
             for face in face_by_id.values()
             for node_id in face.node_ids
         }
+        active_surface_names = set(self.source.active_contact_surfaces)
+        if not active_surface_names:
+            raise _ParseError("contact output requires explicit active surface registration")
         registered_entities = dict(self.source.entity_ids)
-        active_surface_names: set[str] = set()
-        registered_face_ids: set[str] = set()
-        registered_surface_node_ids: set[str] = set()
         for variable in contact_variables:
             registered = set(registered_entities[variable.mapping.canonical_id])
-            if variable.mapping.location == "surface":
-                active_surface_names.update(registered)
-            elif variable.mapping.location == "face":
+            if variable.mapping.location == "face":
                 if not registered <= set(face_by_id):
                     raise _ParseError("registered contact faces are foreign")
-                registered_face_ids.update(registered)
             elif variable.mapping.location == "surface_node":
                 if not registered <= trusted_surface_node_ids:
                     raise _ParseError("registered contact surface nodes are foreign")
-                registered_surface_node_ids.update(registered)
 
         if not active_surface_names.issubset(native_surfaces):
             raise _ParseError("registered contact surfaces are foreign")
@@ -712,21 +743,16 @@ class _NativeParser:
             for surface_name in active_surface_names
             for face_id in native_surfaces[surface_name].face_ids
         }
-        expected_face_ids = active_faces if active_surface_names else registered_face_ids
+        expected_face_ids = active_faces
         active_nodes = {
             surface_node_entity_id(face_id, node_id)
             for face_id in expected_face_ids
             for node_id in face_by_id[face_id].node_ids
         }
-        expected_surface_node_ids = (
-            active_nodes
-            if active_surface_names or registered_face_ids
-            else registered_surface_node_ids
-        )
         expected_by_location = {
             "surface": active_surface_names,
             "face": expected_face_ids,
-            "surface_node": expected_surface_node_ids,
+            "surface_node": active_nodes,
         }
         for variable in contact_variables:
             registered = set(registered_entities[variable.mapping.canonical_id])
@@ -814,6 +840,11 @@ class _NativeParser:
         result: dict[str, tuple[float, ...]] = {}
         expected_entities = dict(self.source.entity_ids)
         contact_surfaces = {surface.native_id: surface for surface in mesh.surfaces}
+        active_native_ids = {
+            surface.native_id
+            for surface in mesh.surfaces
+            if surface.name in self.source.active_contact_surfaces
+        }
         contact_faces = {face.face_id: face for face in self.source.mesh.faces}
         contact_entities = {
             surface.native_id: {
@@ -878,6 +909,10 @@ class _NativeParser:
                         if entity in entities:
                             raise _ParseError("duplicate result entity across regions")
                         entities[entity] = values_raw[offset * width : (offset + 1) * width]
+                if variable.group == _CONTACT_DICTIONARY and regions != active_native_ids:
+                    raise _ParseError(
+                        "contact state regions do not match registered active surfaces"
+                    )
                 output_id = variable.mapping.canonical_id
                 expected = expected_entities[output_id]
                 if set(entities) != set(expected):
@@ -947,6 +982,7 @@ class XpltReaderAdapter:
                         "bundle": bundle.bundle_digest,
                         "file": resolved.entry.to_dict(),
                         "entities": {key: list(ids) for key, ids in source.entity_ids},
+                        "active_contact_surfaces": list(source.active_contact_surfaces),
                         "states": list(source.state_times),
                         "parts": {str(key): body for key, body in source.part_bodies},
                     }

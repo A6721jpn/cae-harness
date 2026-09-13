@@ -241,7 +241,7 @@ _CONTACT_RAW_VALUES: dict[str, tuple[tuple[float, ...], tuple[float, ...]]] = {
     ),
 }
 
-_OBSERVED_CONTACT_ANCILLARY_UNITS: dict[str, str | None] = {
+_NATIVE_CONTACT_ANCILLARY_UNITS: dict[str, str | None] = {
     "contact_nodal_gap": "L",
     "contact_nodal_pressure": "P",
     "contact_nodal_traction": "P",
@@ -290,20 +290,30 @@ def _surface_node_id(face_id: str, node_id: int) -> str:
     return canonical_bytes([face_id, node_id]).decode("utf-8")
 
 
-def _contact_entities(revision: Any, mesh: Any) -> dict[str, tuple[str, ...]]:
-    selections = {
-        "part": revision.spec.contact.part_surface,
-        "tool": revision.spec.contact.tool_surface,
-    }
-    faces = {face.face_id: face for face in mesh.faces}
-    face_sets = {
-        side: next(
-            item for item in mesh.sets if item.set_id == selection.name and item.kind == "face"
+def _contact_face_sets(revision: Any, mesh: Any) -> tuple[MeshSet, ...]:
+    result: list[MeshSet] = []
+    for selection in (revision.spec.contact.part_surface, revision.spec.contact.tool_surface):
+        digest = hashlib.sha256(selection.to_bytes()).hexdigest()
+        matches = tuple(
+            item
+            for item in mesh.sets
+            if item.kind == "face"
+            and item.body_id == selection.body_id.value
+            and item.source_selection_digest == digest
         )
-        for side, selection in selections.items()
-    }
+        if len(matches) != 1:
+            raise AssertionError(
+                f"contact selection does not resolve to one face set: {selection.name}"
+            )
+        result.append(matches[0])
+    return tuple(result)
+
+
+def _contact_entities(revision: Any, mesh: Any) -> dict[str, tuple[str, ...]]:
+    faces = {face.face_id: face for face in mesh.faces}
+    face_sets = _contact_face_sets(revision, mesh)
     result: dict[str, tuple[str, ...]] = {}
-    face_ids = tuple(str(face_sets[item].member_ids[0]) for item in ("part", "tool"))
+    face_ids = tuple(str(face_set.member_ids[0]) for face_set in face_sets)
     for spec in _CONTACT_SPECS:
         canonical_id, _, location = spec[:3]
         if location == "surface_node":
@@ -314,17 +324,15 @@ def _contact_entities(revision: Any, mesh: Any) -> dict[str, tuple[str, ...]]:
                 for node_id in face.node_ids
             )
         elif location == "surface":
-            result[canonical_id] = tuple(face_sets[item].set_id for item in ("part", "tool"))
+            result[canonical_id] = tuple(face_set.set_id for face_set in face_sets)
         else:
             result[canonical_id] = tuple(
-                str(face_sets[item].member_ids[0]) for item in ("part", "tool")
+                str(face_set.member_ids[0]) for face_set in face_sets
             )
     return result
 
 
-def native_bytes(
-    mesh: Any, *, defect: str = "", observed_metadata: bool = False
-) -> bytes:
+def native_bytes(mesh: Any, *, defect: str = "") -> bytes:
     header = (
         uint(0x01010001, 0x35)
         + uint(0x01010004, 0)
@@ -341,14 +349,9 @@ def native_bytes(
                 spec[9],
                 spec[10],
                 (
-                    _OBSERVED_CONTACT_ANCILLARY_UNITS[spec[0]]
-                    if observed_metadata
-                    else (
-                        "P"
-                        if defect == "wrong-contact-unit"
-                        and spec[0] == "contact_nodal_gap"
-                        else spec[4]
-                    )
+                    "P"
+                    if defect == "wrong-contact-unit" and spec[0] == "contact_nodal_gap"
+                    else _NATIVE_CONTACT_ANCILLARY_UNITS[spec[0]]
                 ),
             ),
         )
@@ -500,7 +503,6 @@ def _surface_case(
     *,
     quality: bool = False,
     defect: str = "",
-    observed_metadata: bool = False,
 ) -> tuple[
     Any,
     Any,
@@ -639,7 +641,7 @@ def _surface_case(
         revision, mesh, profile
     )
     attempt_root = tmp_path / "attempt"
-    payload = native_bytes(mesh, defect=defect, observed_metadata=observed_metadata)
+    payload = native_bytes(mesh, defect=defect)
     output_path = attempt_root / "output/results.xplt"
     output_path.parent.mkdir(parents=True)
     output_path.write_bytes(payload)
@@ -683,6 +685,9 @@ def _surface_case(
         state_times=(0.0, 1.0),
         part_bodies={1: mesh.elements[0].body_id, 2: mesh.elements[1].body_id},
         entity_ids=entity_ids,
+        active_contact_surfaces=tuple(
+            item.set_id for item in _contact_face_sets(revision, mesh)
+        ),
     )
     reader = XpltReaderAdapter(profile=profile, data_store=data_store)
     return revision, reader, attempt, bundle, mesh, profile, data_store, store
@@ -711,6 +716,10 @@ def test_native_contact_outputs_compile_and_project_exact_entities(tmp_path: Pat
     assert {
         item.attrib["type"] for item in input_root.findall("Output/plotfile/var")
     } == expected_native_names
+    assert data_store.source_for(attempt, bundle).active_contact_surfaces == (
+        "part-contact",
+        "tool-contact",
+    )
 
     manifest = reader.read(attempt, bundle)
     assert manifest.read_result.status.value == "VALIDATED"
@@ -763,12 +772,22 @@ def test_native_contact_outputs_compile_and_project_exact_entities(tmp_path: Pat
     assert surface_force.values[-1] == (-3.0, -4.0, -5.0, -4.0, -5.0, -6.0)
 
 
-def test_native_contact_dictionary_accepts_observed_ancillary_metadata(tmp_path: Path) -> None:
-    _, reader, attempt, bundle, *_ = _surface_case(tmp_path, observed_metadata=True)
+def test_contact_outputs_require_explicit_active_surface_registration(tmp_path: Path) -> None:
+    _, _, attempt, bundle, mesh, profile, data_store, _ = _surface_case(tmp_path)
+    source = data_store.source_for(attempt, bundle)
+    unbound_store = LocalResultDataStore()
+    unbound_store.register_source(
+        attempt,
+        bundle,
+        source.raw,
+        mesh=mesh,
+        state_times=source.state_times,
+        part_bodies=dict(source.part_bodies),
+        entity_ids=dict(source.entity_ids),
+    )
 
-    manifest = reader.read(attempt, bundle)
-
-    assert manifest.read_result.status.value == "VALIDATED"
+    with pytest.raises(PortError):
+        XpltReaderAdapter(profile=profile, data_store=unbound_store).read(attempt, bundle)
 
 
 def test_quality_evaluates_contact_surface_node_surface_and_face_scopes(tmp_path: Path) -> None:
