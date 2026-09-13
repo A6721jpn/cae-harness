@@ -22,10 +22,11 @@ import os
 import stat
 import sys
 import threading
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 from types import CodeType, ModuleType
-from typing import Any
+from typing import Any, BinaryIO
 
 _SCHEMA_VERSION = "gmsh-runtime-identity-v1"
 _GMSH_DISTRIBUTION = "gmsh"
@@ -89,15 +90,47 @@ def _resolve_regular_file(value: object, label: str) -> Path:
     return resolved
 
 
-def _read_bounded(path: Path, limit: int, label: str) -> bytes:
+def _read_stream_bounded(
+    stream: BinaryIO, limit: int, label: str
+) -> tuple[bytes, int, str, int]:
     try:
-        with path.open("rb") as stream:
-            content = stream.read(limit + 1)
-    except OSError as exc:
+        before = os.fstat(stream.fileno())
+        digest = hashlib.sha256()
+        chunks: list[bytes] = []
+        size = 0
+        while chunk := stream.read(_HASH_CHUNK):
+            if not isinstance(chunk, bytes):
+                raise _error(f"{label} file returned non-binary content")
+            size += len(chunk)
+            if size > limit:
+                raise _error(f"{label} file exceeds the finite verification limit")
+            digest.update(chunk)
+            chunks.append(chunk)
+        after = os.fstat(stream.fileno())
+    except _RuntimeBindingError:
+        raise
+    except (AttributeError, OSError, TypeError, ValueError) as exc:
         raise _error(f"{label} file cannot be read") from exc
-    if len(content) > limit:
-        raise _error(f"{label} file exceeds the finite verification limit")
-    return content
+    if (
+        size != before.st_size
+        or after.st_size != before.st_size
+        or getattr(after, "st_mtime_ns", None) != getattr(before, "st_mtime_ns", None)
+    ):
+        raise _error(f"{label} file changed while it was being verified")
+    return b"".join(chunks), size, digest.hexdigest(), getattr(after, "st_mtime_ns", 0)
+
+
+def _pinned_file(admission: ExitStack, path: Path, label: str) -> BinaryIO:
+    """Retain the existing Windows directory/file identity guard through admission."""
+
+    try:
+        if os.name == "nt":
+            from febio_cae.storage._ownership import pinned_read
+
+            return admission.enter_context(pinned_read(path))
+        return admission.enter_context(path.open("rb"))
+    except (ImportError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise _error(f"{label} file cannot be pinned for admission") from exc
 
 
 def _file_identity(value: object, label: str = "runtime") -> dict[str, object]:
@@ -335,59 +368,97 @@ def _cache_path(module_path: Path, spec: Any) -> Path:
     return expected
 
 
-def _cache_signature(path: Path) -> tuple[bool, int, int] | None:
-    try:
-        info = path.stat()
-    except FileNotFoundError:
-        return None
-    except OSError as exc:
-        raise _error("Gmsh module cache cannot be inspected") from exc
-    if not stat.S_ISREG(info.st_mode):
-        raise _error("Gmsh module cache is not regular")
-    if getattr(info, "st_file_attributes", 0) & getattr(
-        ctypes.wintypes, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400
-    ):
-        raise _error("Gmsh module cache is a reparse point")
-    return True, info.st_size, getattr(info, "st_mtime_ns", 0)
-
-
-def _compile_source(module_path: Path) -> CodeType:
-    source = _read_bounded(module_path, _MAX_SOURCE_BYTES, "Gmsh Python module")
+def _compile_source_bytes(source: bytes, module_path: Path) -> CodeType:
     try:
         return compile(source, str(module_path), "exec", dont_inherit=True, optimize=-1)
     except (SyntaxError, TypeError, ValueError) as exc:
         raise _error("Gmsh Python module source cannot be compiled") from exc
 
 
-def _validate_cache(module_path: Path, spec: Any) -> tuple[Path, tuple[bool, int, int] | None]:
+@dataclass(slots=True)
+class _SourceSnapshot:
+    path: Path
+    stream: BinaryIO
+    content: bytes
+    identity: dict[str, object]
+    mtime_ns: int
+    code: CodeType
+    code_digest: str
+
+
+def _source_snapshot(
+    module_record: dict[str, object], admission: ExitStack
+) -> _SourceSnapshot:
+    module_path = _resolve_regular_file(module_record.get("path"), "Gmsh Python module")
+    stream = _pinned_file(admission, module_path, "Gmsh Python module")
+    content, size, digest, mtime_ns = _read_stream_bounded(
+        stream, _MAX_SOURCE_BYTES, "Gmsh Python module"
+    )
+    identity = {"path": str(module_path), "size": size, "sha256": digest}
+    _compare_file_records(module_record, identity, "module")
+    code = _compile_source_bytes(content, module_path)
+    return _SourceSnapshot(
+        module_path,
+        stream,
+        content,
+        identity,
+        mtime_ns,
+        code,
+        _code_digest(code),
+    )
+
+
+def _verify_source_snapshot_current(snapshot: _SourceSnapshot) -> None:
+    try:
+        snapshot.stream.seek(0)
+    except (AttributeError, OSError, ValueError) as exc:
+        raise _error("Gmsh Python module admission guard cannot be rewound") from exc
+    content, size, digest, _mtime_ns = _read_stream_bounded(
+        snapshot.stream, _MAX_SOURCE_BYTES, "Gmsh Python module"
+    )
+    current = {"path": str(snapshot.path), "size": size, "sha256": digest}
+    if content != snapshot.content or current != snapshot.identity:
+        raise _error("Gmsh Python module changed during admission")
+
+
+_CacheIdentity = tuple[str, int, str]
+
+
+def _validate_cache(
+    module_path: Path,
+    spec: Any,
+    snapshot: _SourceSnapshot,
+    admission: ExitStack,
+) -> tuple[Path, _CacheIdentity | None]:
     cache = _cache_path(module_path, spec)
-    signature = _cache_signature(cache)
-    if signature is None:
+    try:
+        cache.stat()
+    except FileNotFoundError:
         return cache, None
-    if signature[1] > _MAX_CACHE_BYTES:
-        raise _error("Gmsh module cache exceeds the finite verification limit")
-    content = _read_bounded(cache, _MAX_CACHE_BYTES, "Gmsh module cache")
+    except OSError as exc:
+        raise _error("Gmsh module cache cannot be inspected") from exc
+    stream = _pinned_file(admission, cache, "Gmsh module cache")
+    content, size, digest, _mtime_ns = _read_stream_bounded(
+        stream, _MAX_CACHE_BYTES, "Gmsh module cache"
+    )
+    cache_identity = (str(cache), size, digest)
     if len(content) < 16 or content[:4] != importlib.util.MAGIC_NUMBER:
         raise _error("Gmsh module cache has an invalid header")
     flags = int.from_bytes(content[4:8], "little")
     if flags & ~0x03:
         raise _error("Gmsh module cache has unsupported flags")
-    source = _read_bounded(module_path, _MAX_SOURCE_BYTES, "Gmsh Python module")
     if flags & 1:
         try:
-            source_hash = importlib.util.source_hash(source)
+            source_hash = importlib.util.source_hash(snapshot.content)
         except (AttributeError, TypeError, ValueError) as exc:
             raise _error("Gmsh module source hash cannot be calculated") from exc
         if content[8:16] != source_hash:
             raise _error("Gmsh module cache is stale")
     else:
-        try:
-            info = module_path.stat()
-        except OSError as exc:
-            raise _error("Gmsh Python module cannot be inspected") from exc
-        if content[8:12] != (int(info.st_mtime) & 0xFFFFFFFF).to_bytes(4, "little"):
+        source_mtime_seconds = (snapshot.mtime_ns // 1_000_000_000) & 0xFFFFFFFF
+        if content[8:12] != source_mtime_seconds.to_bytes(4, "little"):
             raise _error("Gmsh module cache is stale")
-        if content[12:16] != (info.st_size & 0xFFFFFFFF).to_bytes(4, "little"):
+        if content[12:16] != (len(snapshot.content) & 0xFFFFFFFF).to_bytes(4, "little"):
             raise _error("Gmsh module cache is stale")
     try:
         cached_code = marshal.loads(content[16:])
@@ -395,25 +466,27 @@ def _validate_cache(module_path: Path, spec: Any) -> tuple[Path, tuple[bool, int
         raise _error("Gmsh module cache code is malformed") from exc
     if not isinstance(cached_code, CodeType):
         raise _error("Gmsh module cache does not contain module code")
-    source_code = _compile_source(module_path)
     try:
-        same_code = (
-            marshal.dumps(cached_code) == content[16:]
-            and marshal.dumps(source_code) == marshal.dumps(cached_code)
-        )
+        cached_marshaled = marshal.dumps(cached_code)
+        source_marshaled = marshal.dumps(snapshot.code)
     except (ValueError, TypeError) as exc:
         raise _error("Gmsh module cache code cannot be compared") from exc
-    if not same_code:
+    if cached_marshaled != content[16:] or source_marshaled != cached_marshaled:
         raise _error("Gmsh module cache code differs from the verified source")
-    return cache, signature
+    return cache, cache_identity
 
 
 class _SourceOnlyLoader(importlib.machinery.SourceFileLoader):
-    """Use normal import machinery while never executing a cached code object."""
+    """Execute the authenticated source snapshot, never a loader reread."""
+
+    def __init__(self, fullname: str, path: str, code: CodeType) -> None:
+        super().__init__(fullname, path)
+        self._verified_code = code
+        self._verified_code_digest = _code_digest(code)
 
     def get_code(self, fullname: str) -> CodeType:
         del fullname
-        return _compile_source(Path(self.get_filename("gmsh")))
+        return self._verified_code
 
 
 def _find_gmsh_spec(module_path: Path) -> Any:
@@ -442,44 +515,67 @@ def _module_handle(module: ModuleType) -> tuple[Any, int]:
     return library, handle
 
 
-def _stat_signature(record: dict[str, object], label: str) -> tuple[str, int, int]:
-    path = record.get("path")
-    if not isinstance(path, str):
-        raise _RuntimeBindingError(f"{label} identity path is malformed")
-    resolved = _resolve_regular_file(path, label)
+def _require_isolated_interpreter() -> None:
+    if getattr(getattr(sys, "flags", None), "isolated", 0) != 1:
+        raise _error("verified Gmsh loading requires an isolated interpreter")
+
+
+def _verify_process_binding(
+    expected: dict[str, object], observed: dict[str, object]
+) -> None:
+    for field in _PROCESS_FIELDS:
+        expected_value = expected[field]
+        observed_value = observed[field]
+        if expected_value is None or observed_value is None:
+            if expected_value is not observed_value:
+                raise _error(f"runtime identity mismatch for {field}")
+        else:
+            _compare_file_records(
+                expected_value,  # type: ignore[arg-type]
+                observed_value,  # type: ignore[arg-type]
+                field,
+            )
+
+
+def _code_digest(code: CodeType) -> str:
     try:
-        info = resolved.stat()
-    except OSError as exc:
-        raise _error(f"{label} identity file cannot be inspected") from exc
-    return str(resolved), info.st_size, getattr(info, "st_mtime_ns", 0)
+        content = marshal.dumps(code)
+    except (TypeError, ValueError) as exc:
+        raise _error("Gmsh module code cannot be attested") from exc
+    return hashlib.sha256(content).hexdigest()
 
 
-def _binding_signatures(binding: dict[str, object]) -> tuple[tuple[str, str, int, int], ...]:
-    result: list[tuple[str, str, int, int]] = []
-    for field in ("python", "python_image", "python_library", "module", "library"):
-        record = binding[field]
-        if not isinstance(record, dict):
-            raise ValueError(f"runtime identity {field} record is malformed")
-        path, size, mtime = _stat_signature(record, field)
-        result.append((field, path, size, mtime))
-    cfg = binding["pyvenv_cfg"]
-    if cfg is not None:
-        if not isinstance(cfg, dict):
-            raise ValueError("runtime identity pyvenv_cfg record is malformed")
-        path, size, mtime = _stat_signature(cfg, "pyvenv.cfg")
-        result.append(("pyvenv_cfg", path, size, mtime))
-    return tuple(result)
-
-
-def _signatures_unchanged(signatures: tuple[tuple[str, str, int, int], ...]) -> bool:
-    for _field, path, size, mtime in signatures:
-        try:
-            info = Path(path).stat()
-        except OSError:
-            return False
-        if info.st_size != size or getattr(info, "st_mtime_ns", 0) != mtime:
-            return False
-    return True
+def _validate_loaded_module(
+    module: ModuleType,
+    module_path: Path,
+    spec: Any,
+    expected_code_digest: str,
+    expected_code: CodeType | None = None,
+) -> None:
+    if not _same_path(str(module_path), str(getattr(module, "__file__", ""))):
+        raise _error("executing Gmsh module has a different source path")
+    if getattr(module, "__version__", None) != _GMSH_VERSION:
+        raise _error("executing Gmsh module has an unexpected version")
+    loaded_spec = getattr(module, "__spec__", None)
+    if (
+        loaded_spec is None
+        or getattr(loaded_spec, "name", None) != "gmsh"
+        or getattr(loaded_spec, "submodule_search_locations", None) is not None
+        or not _same_path(
+            str(getattr(spec, "origin", "")), str(getattr(loaded_spec, "origin", ""))
+        )
+    ):
+        raise _error("executing Gmsh module import spec changed")
+    loader = getattr(module, "__loader__", None)
+    if (
+        not isinstance(loader, _SourceOnlyLoader)
+        or getattr(loaded_spec, "loader", None) is not loader
+        or loader._verified_code_digest != expected_code_digest
+        or (expected_code is not None and loader._verified_code is not expected_code)
+    ):
+        raise _error("executing Gmsh module code identity changed")
+    if sys.modules.get("gmsh") is not module:
+        raise _error("executing Gmsh module import state changed")
 
 
 @dataclass(slots=True)
@@ -488,9 +584,10 @@ class _VerifiedSession:
     library: Any
     binding: dict[str, object]
     observed: dict[str, object]
-    signatures: tuple[tuple[str, str, int, int], ...]
+    code_digest: str
+    code_object: CodeType
     cache_path: Path
-    cache_signature: tuple[bool, int, int] | None
+    cache_identity: _CacheIdentity | None
 
 
 _CACHE_LOCK = threading.RLock()
@@ -504,31 +601,46 @@ def _cached_session(
         return None
     for session in _VERIFIED_SESSIONS:
         if session.module is module and session.binding == binding:
-            if not _signatures_unchanged(session.signatures):
-                raise _error(
-                    "verified Gmsh runtime identity files changed (module/library/process)"
+            verify_runtime_identity(binding, session.observed)
+            process = _current_process_binding()
+            _verify_process_binding(binding, process)
+            module_record = binding["module"]
+            library_record = binding["library"]
+            if not isinstance(module_record, dict) or not isinstance(library_record, dict):
+                raise ValueError("runtime identity module/library records are malformed")
+            module_path = _resolve_regular_file(module_record["path"], "Gmsh Python module")
+            library_path = _resolve_regular_file(library_record["path"], "Gmsh native library")
+            with ExitStack() as admission:
+                _pinned_file(admission, library_path, "Gmsh native library")
+                spec = _find_gmsh_spec(module_path)
+                snapshot = _source_snapshot(module_record, admission)
+                cache_path, cache_identity = _validate_cache(
+                    module_path, spec, snapshot, admission
                 )
-            current_cache = _cache_signature(session.cache_path)
-            if current_cache != session.cache_signature:
-                raise _error("Gmsh module cache changed after verification")
-            try:
-                _library, handle = _module_handle(module)
-                mapped = _mapped_module_path(handle)
-            except (OSError, TypeError, ValueError) as exc:
-                if isinstance(exc, _RuntimeBindingError):
-                    raise
-                raise _error("verified Gmsh native handle cannot be resolved") from exc
-            library_record = session.observed.get("library")
-            if not isinstance(library_record, dict) or not _same_path(
-                str(mapped), str(library_record.get("path", ""))
-            ):
-                raise _error("verified Gmsh native library mapping changed")
+                if snapshot.code_digest != session.code_digest:
+                    raise _error("verified Gmsh module code identity changed")
+                _validate_loaded_module(
+                    module, module_path, spec, session.code_digest, session.code_object
+                )
+                library_object, handle = _module_handle(module)
+                if library_object is not session.library:
+                    raise _error("verified Gmsh native library object changed")
+                mapped_path = _mapped_module_path(handle)
+                if not _same_path(str(mapped_path), str(library_path)):
+                    raise _error("verified Gmsh native library mapping changed")
+                actual_library_record = _file_identity(mapped_path, "mapped Gmsh native library")
+                _compare_file_records(library_record, actual_library_record, "library")
+                if cache_identity != session.cache_identity or not _same_path(
+                    str(cache_path), str(session.cache_path)
+                ):
+                    raise _error("Gmsh module cache changed after verification")
+                _verify_source_snapshot_current(snapshot)
             return session
     return None
 
 
-def _import_verified_source(module_path: Path, spec: Any) -> ModuleType:
-    loader = _SourceOnlyLoader("gmsh", str(module_path))
+def _import_verified_source(module_path: Path, spec: Any, code: CodeType) -> ModuleType:
+    loader = _SourceOnlyLoader("gmsh", str(module_path), code)
     verified_spec = importlib.util.spec_from_file_location(
         "gmsh", str(module_path), loader=loader
     )
@@ -556,6 +668,7 @@ def _import_verified_source(module_path: Path, spec: Any) -> ModuleType:
 def load_verified_gmsh(binding: dict[str, object]) -> tuple[Any, dict[str, object]]:
     """Load Gmsh only after verifying the exact isolated runtime binding."""
 
+    _require_isolated_interpreter()
     expected = _normalise_binding(binding, "expected runtime")
     with _CACHE_LOCK:
         preloaded = sys.modules.get("gmsh")
@@ -568,59 +681,54 @@ def load_verified_gmsh(binding: dict[str, object]) -> tuple[Any, dict[str, objec
             raise _error("unverified preloaded Gmsh module is refused")
 
         process = _current_process_binding()
-        for field in _PROCESS_FIELDS:
-            expected_value = expected[field]
-            observed_value = process[field]
-            if expected_value is None or observed_value is None:
-                if expected_value is not observed_value:
-                    raise _error(f"runtime identity mismatch for {field}")
-            else:
-                _compare_file_records(
-                    expected_value,  # type: ignore[arg-type]
-                    observed_value,  # type: ignore[arg-type]
-                    field,
-                )
+        _verify_process_binding(expected, process)
         module_record = expected["module"]
-        if not isinstance(module_record, dict):
-            raise ValueError("runtime identity module record is malformed")
+        library_record = expected["library"]
+        if not isinstance(module_record, dict) or not isinstance(library_record, dict):
+            raise ValueError("runtime identity module/library records are malformed")
         module_path = _resolve_regular_file(module_record["path"], "Gmsh Python module")
-        actual_module = _find_gmsh_spec(module_path)
-        cache_path, cache_signature = _validate_cache(module_path, actual_module)
-        module = _import_verified_source(module_path, actual_module)
-        try:
-            if not _same_path(str(module_path), str(getattr(module, "__file__", ""))):
-                raise _error("executing Gmsh module has a different source path")
-            if getattr(module, "__version__", None) != _GMSH_VERSION:
-                raise _error("executing Gmsh module has an unexpected version")
-            library_object, handle = _module_handle(module)
-            mapped_path = _mapped_module_path(handle)
-            actual_module_record = _file_identity(module_path, "executing Gmsh Python module")
-            actual_library_record = _file_identity(mapped_path, "mapped Gmsh native library")
-            _compare_file_records(module_record, actual_module_record, "module")
-            expected_library = expected["library"]
-            if not isinstance(expected_library, dict):
-                raise ValueError("runtime identity library record is malformed")
-            _compare_file_records(expected_library, actual_library_record, "library")
-            observed: dict[str, object] = {
-                "schema_version": _SCHEMA_VERSION,
-                **process,
-                "module": actual_module_record,
-                "library": actual_library_record,
-            }
-            verify_runtime_identity(expected, observed)
-            signatures = _binding_signatures(expected)
-        except BaseException:
-            if sys.modules.get("gmsh") is module:
-                sys.modules.pop("gmsh", None)
-            raise
+        library_path = _resolve_regular_file(library_record["path"], "Gmsh native library")
+        with ExitStack() as admission:
+            _pinned_file(admission, library_path, "Gmsh native library")
+            actual_module = _find_gmsh_spec(module_path)
+            snapshot = _source_snapshot(module_record, admission)
+            cache_path, cache_identity = _validate_cache(
+                module_path, actual_module, snapshot, admission
+            )
+            module = _import_verified_source(module_path, actual_module, snapshot.code)
+            code_digest = snapshot.code_digest
+            try:
+                _validate_loaded_module(
+                    module, module_path, actual_module, code_digest, snapshot.code
+                )
+                _verify_source_snapshot_current(snapshot)
+                library_object, handle = _module_handle(module)
+                mapped_path = _mapped_module_path(handle)
+                if not _same_path(str(mapped_path), str(library_path)):
+                    raise _error("verified Gmsh native library mapping differs from binding")
+                actual_library_record = _file_identity(mapped_path, "mapped Gmsh native library")
+                _compare_file_records(library_record, actual_library_record, "library")
+                actual_module_record = snapshot.identity
+                observed: dict[str, object] = {
+                    "schema_version": _SCHEMA_VERSION,
+                    **process,
+                    "module": actual_module_record,
+                    "library": actual_library_record,
+                }
+                verify_runtime_identity(expected, observed)
+            except BaseException:
+                if sys.modules.get("gmsh") is module:
+                    sys.modules.pop("gmsh", None)
+                raise
         session = _VerifiedSession(
             module,
             library_object,
             expected,
             observed,
-            signatures,
+            code_digest,
+            snapshot.code,
             cache_path,
-            cache_signature,
+            cache_identity,
         )
         _VERIFIED_SESSIONS.append(session)
         return module, dict(observed)
