@@ -257,6 +257,30 @@ def _geometry(
     )
 
 
+def _nonidentity_geometry() -> GeometryIntent:
+    geometry = _geometry()
+    return replace(
+        geometry,
+        placement=RigidTransform(
+            source_frame=geometry.placement.source_frame,
+            target_frame=geometry.placement.target_frame,
+            translation=Translation3(
+                WORLD,
+                Quantity(31, "mm"),
+                Quantity(-47, "mm"),
+                Quantity(83, "mm"),
+            ),
+            rotation=ProperRotation(
+                (
+                    (0.0, -1.0, 0.0),
+                    (1.0, 0.0, 0.0),
+                    (0.0, 0.0, 1.0),
+                )
+            ),
+        ),
+    )
+
+
 def _material(material_type: type[Any] = IsotropicLinearElastic) -> Any:
     applicability = MaterialApplicability(
         strain_statement="The supplied strain range is applicable.",
@@ -580,6 +604,78 @@ def test_case_spec_is_frozen_and_projection_is_detached() -> None:
     projected["outputs"]["requests"][0]["selection"]["name"] = "mutated"  # type: ignore[index]
     assert case.geometry.body_id == PART_BODY
     assert case.to_dict()["geometry"]["body_id"] == PART_BODY.value
+
+
+def test_case_spec_round_trips_source_local_ball_before_body_placement() -> None:
+    domain = importlib.import_module("febio_cae.domain")
+    ball_type = getattr(domain, "SourceLocalRefinementBall", None)
+    assert ball_type is not None, "SourceLocalRefinementBall is not available"
+    geometry = _nonidentity_geometry()
+    source_frame = geometry.placement.source_frame
+    ball = ball_type(
+        center=Point3(
+            source_frame,
+            Quantity(1, "mm"),
+            Quantity(2, "mm"),
+            Quantity(3, "mm"),
+        ),
+        radius=Quantity(4, "mm"),
+    )
+    refinement = LocalRefinement(
+        refinement_id="source-ball",
+        selection=_part_selection(rule=WholeBodyRule(PART_BODY)),
+        size=Quantity(1, "mm"),
+        region=ball,
+    )
+    case = _case_value(
+        geometry=geometry,
+        mesh_policy=_mesh(local_refinements=[refinement]),
+    )
+
+    region = case.to_dict()["mesh_policy"]["local_refinements"][0]["region"]
+    assert region["kind"] == "source_local_ball"
+    assert region["center"]["frame"] == source_frame.value
+    assert source_frame != geometry.placement.target_frame
+    from febio_cae.domain.codec import decode_record, encode_record
+
+    restored = decode_record(encode_record(case), type(case))
+    assert restored.to_bytes() == case.to_bytes()
+    assert restored.mesh_policy.local_refinements[0].region == ball
+
+
+@pytest.mark.parametrize(
+    "frame",
+    (WORLD, FrameId("ForeignLocal")),
+    ids=("placed-world", "foreign-local"),
+)
+def test_case_spec_rejects_source_local_ball_in_placed_or_foreign_frame(
+    frame: FrameId,
+) -> None:
+    domain = importlib.import_module("febio_cae.domain")
+    ball_type = getattr(domain, "SourceLocalRefinementBall", None)
+    assert ball_type is not None, "SourceLocalRefinementBall is not available"
+    geometry = _nonidentity_geometry()
+    ball = ball_type(
+        center=Point3(
+            frame,
+            Quantity(1, "mm"),
+            Quantity(2, "mm"),
+            Quantity(3, "mm"),
+        ),
+        radius=Quantity(4, "mm"),
+    )
+    refinement = LocalRefinement(
+        refinement_id="source-ball",
+        selection=_part_selection(rule=WholeBodyRule(PART_BODY)),
+        size=Quantity(1, "mm"),
+        region=ball,
+    )
+
+    with pytest.raises(_case().CaseSpecValidationError, match="frame"):
+        _case_value(
+            geometry=geometry,
+            mesh_policy=_mesh(local_refinements=[refinement]),
+        )
 
 
 def test_case_spec_preserves_nontrivial_unicode_positive() -> None:

@@ -28,6 +28,7 @@ import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from statistics import median
 from typing import Any, cast
 
 import pytest
@@ -354,6 +355,33 @@ def _max_chord_deviation(
     return deviation
 
 
+def _corner_edge_records(mesh: BackendMesh) -> tuple[tuple[float, float], ...]:
+    nodes = {node.node_id: tuple(node.coordinates_si) for node in mesh.nodes}
+    records: list[tuple[float, float]] = []
+    seen: set[tuple[int, int]] = set()
+    for element in mesh.elements:
+        corners = element.node_ids[:4]
+        for first, second in (
+            (0, 1),
+            (0, 2),
+            (0, 3),
+            (1, 2),
+            (1, 3),
+            (2, 3),
+        ):
+            edge = tuple(sorted((corners[first], corners[second])))
+            if edge in seen:
+                continue
+            seen.add(edge)
+            first_point = nodes[edge[0]]
+            second_point = nodes[edge[1]]
+            midpoint = tuple(
+                (first_point[axis] + second_point[axis]) / 2.0 for axis in range(3)
+            )
+            records.append((math.dist(midpoint, (0.0, 0.0, 0.0)), math.dist(first_point, second_point)))
+    return tuple(records)
+
+
 @pytest.mark.native
 @pytest.mark.parametrize("case", CASES, ids=lambda value: value.kind)
 def test_native_curved_primitive_inspection_and_tet10_mesh(case: _PrimitiveCase) -> None:
@@ -415,3 +443,52 @@ def test_native_curved_primitive_inspection_and_tet10_mesh(case: _PrimitiveCase)
     assert changed_size_mesh.geometry_digest == case.geometry_digest
     assert changed_primitive_mesh.source_digest != mesh.source_digest
     assert changed_size_mesh.source_digest != mesh.source_digest
+
+
+@pytest.mark.native
+def test_native_source_local_ball_refines_only_bounded_sphere_region() -> None:
+    """Predeclared native gate: exactly two mesh calls and no inspection call.
+
+    The sphere uses the existing 10 mm measured fixture dimensions.  Unique
+    Tet10 corner-edge midpoints inside the explicit 6 mm source-local ball are
+    compared with the coarse baseline; a far shell must retain an edge larger
+    than the 1 mm local request, so the local field is not uniform globally.
+    """
+
+    case = next(item for item in CASES if item.kind == "sphere")
+    backend = _backend()
+    primitive = _primitive(case)
+    from febio_cae.adapters.geometry import BackendLocalRefinement
+
+    local_size_si = 0.001
+    local_refinement = BackendLocalRefinement(
+        body_id=primitive.body_id.value,
+        frame=primitive.local_frame,
+        center_si=(0.0, 0.0, 0.0),
+        radius_si=0.006,
+        size_si=local_size_si,
+    )
+    coarse = backend.mesh_rigid_primitive(
+        primitive,
+        geometry_digest=case.geometry_digest,
+        global_size_si=case.global_size_si,
+    )
+    refined = backend.mesh_rigid_primitive(
+        primitive,
+        geometry_digest=case.geometry_digest,
+        global_size_si=case.global_size_si,
+        local_refinements=(local_refinement,),
+    )
+
+    coarse_records = _corner_edge_records(coarse)
+    refined_records = _corner_edge_records(refined)
+    coarse_inside = [length for distance, length in coarse_records if distance <= 0.006]
+    refined_inside = [length for distance, length in refined_records if distance <= 0.006]
+    refined_far = [length for distance, length in refined_records if distance >= 0.009]
+
+    assert coarse_inside
+    assert refined_inside
+    assert median(refined_inside) < median(coarse_inside) * 0.75
+    assert len(refined_inside) > len(coarse_inside)
+    assert refined_far
+    assert max(refined_far) > local_size_si * 1.5

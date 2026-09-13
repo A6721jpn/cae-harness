@@ -15,6 +15,7 @@ from febio_cae.domain import (
     FaceId,
     FaceSetRule,
     FrameId,
+    Point3,
     Quantity,
     SelectionRef,
     UnitDirection,
@@ -126,11 +127,31 @@ def _local(
     refinement_id: object = "local-A",
     selection: object = _MISSING,
     size: object = _MISSING,
+    region: object = _MISSING,
 ) -> Any:
+    values: dict[str, object] = {
+        "refinement_id": refinement_id,
+        "selection": _selection() if selection is _MISSING else selection,
+        "size": Quantity(5, "mm") if size is _MISSING else size,
+    }
+    if region is not _MISSING:
+        values["region"] = region
     return mesh.LocalRefinement(
-        refinement_id=refinement_id,
-        selection=_selection() if selection is _MISSING else selection,
-        size=Quantity(5, "mm") if size is _MISSING else size,
+        **values,
+    )
+
+
+def _source_local_ball(mesh: ModuleType, *, frame: FrameId = FrameId("PartLocal")) -> Any:
+    ball_type = getattr(mesh, "SourceLocalRefinementBall", None)
+    assert ball_type is not None, "SourceLocalRefinementBall is not available"
+    return ball_type(
+        center=Point3(
+            frame,
+            Quantity(1, "mm"),
+            Quantity(-2, "mm"),
+            Quantity(3, "mm"),
+        ),
+        radius=Quantity(4, "mm"),
     )
 
 
@@ -157,6 +178,7 @@ def test_mesh_policy_api_is_available() -> None:
     for name in (
         "SCHEMA_VERSION",
         "NumericalProfileRef",
+        "SourceLocalRefinementBall",
         "LocalRefinement",
         "MeshPolicy",
         "MeshPolicyValidationError",
@@ -254,7 +276,35 @@ def test_local_refinement_preserves_selection_and_size_projection() -> None:
     assert payload["selection"]["name"] == "part-selection"
     assert payload["selection"]["geometry_digest"] == "d" * 64
     assert payload["size"] == {"value": 0.005, "unit": "m"}
+    assert "region" not in payload
     assert local.to_bytes() == canonical_bytes(payload)
+
+
+def test_source_local_ball_is_typed_and_round_trips_canonically() -> None:
+    mesh = _mesh()
+    ball = _source_local_ball(mesh)
+    local = _local(mesh, region=ball)
+    policy = _policy(mesh, local_refinements=[local])
+    payload = policy.to_dict()
+    region = payload["local_refinements"][0]["region"]
+
+    assert region["kind"] == "source_local_ball"
+    assert region["center"]["frame"] == "PartLocal"
+    from febio_cae.domain.codec import decode_record
+
+    restored = decode_record(policy.to_bytes(), type(policy))
+    assert restored.to_bytes() == policy.to_bytes()
+    assert restored.local_refinements[0].region == ball
+
+
+def test_source_local_ball_requires_typed_values_and_whole_body_selection() -> None:
+    mesh = _mesh()
+    ball = _source_local_ball(mesh)
+
+    with pytest.raises(ValueError):
+        _local(mesh, region={"kind": "source_local_ball"})
+    with pytest.raises(ValueError, match="whole|WholeBody|region"):
+        _local(mesh, selection=_selection(face_ids=("face-A",)), region=ball)
 
 
 def test_local_refinement_requires_all_fields_and_rejects_unknown_fields() -> None:
