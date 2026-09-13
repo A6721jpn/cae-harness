@@ -8,6 +8,7 @@ import importlib.util
 import os
 import py_compile
 import sys
+import ctypes
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -425,7 +426,7 @@ def test_verified_session_rejects_live_executable_tampering(
         "class Lib:\n"
         "    _handle = 99\n"
         "lib = Lib()\n"
-        "lib.gmsh_isInitialized = isInitialized\n"
+        "lib.gmshIsInitialized = isInitialized\n"
     )
     module, library, launcher, image, python_library = _files(tmp_path, source)
     expected = _binding(tmp_path, module=module, library=library)
@@ -451,7 +452,7 @@ def test_verified_session_rejects_live_executable_tampering(
     elif mutation == "class_method":
         loaded.model.getEntities = loaded.replacement
     else:
-        loaded.lib.gmsh_isInitialized = loaded.replacement
+        loaded.lib.gmshIsInitialized = loaded.replacement
 
     with pytest.raises((OSError, ValueError), match="live|executable|function|class|native"):
         runtime.load_verified_gmsh(expected)
@@ -494,6 +495,179 @@ def test_verified_session_preserves_legitimate_module_state(
 
     assert reused is loaded
     assert loaded.events == ["legitimate API state"]
+
+
+def _synthetic_native_callable() -> Any:
+    """Create a harmless CFuncPtr for the synthetic native-symbol tests."""
+
+    native = ctypes.CFUNCTYPE(ctypes.c_int)(lambda: 0)
+    native.argtypes = None
+    return native
+
+
+def _install_synthetic_native_export(
+    monkeypatch: pytest.MonkeyPatch, loaded: Any, name: str, value: Any
+) -> None:
+    pointer = ctypes.cast(value, ctypes.c_void_p).value
+    assert isinstance(pointer, int) and pointer > 0
+    setattr(loaded.lib, name, value)
+    monkeypatch.setattr(
+        runtime, "_native_export_address", lambda library, symbol: pointer
+    )
+
+
+def test_verified_session_rejects_preverification_ctypes_metadata_tampering(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The native-symbol premise is synthetic; metadata is poisoned before reuse."""
+
+    _isolated(monkeypatch)
+    source = (
+        "__version__ = '4.15.2'\n"
+        "def isInitialized():\n"
+        "    return lib.gmshIsInitialized()\n"
+        "class Lib:\n"
+        "    _handle = 99\n"
+        "lib = Lib()\n"
+    )
+    module, library, launcher, image, python_library = _files(tmp_path, source)
+    expected = _binding(tmp_path, module=module, library=library)
+    monkeypatch.setattr(
+        runtime,
+        "_current_process_binding",
+        lambda: {
+            "python": _identity(launcher),
+            "python_image": _identity(image),
+            "python_library": _identity(python_library),
+            "pyvenv_cfg": None,
+        },
+    )
+    monkeypatch.setattr(runtime, "_mapped_module_path", lambda handle: library)
+    monkeypatch.syspath_prepend(str(module.parent))
+    sys.modules.pop("gmsh", None)
+    loaded, _ = runtime.load_verified_gmsh(expected)
+
+    native = _synthetic_native_callable()
+    native.errcheck = lambda result, function, arguments: result
+    _install_synthetic_native_export(monkeypatch, loaded, "gmshIsInitialized", native)
+
+    with pytest.raises((OSError, ValueError), match="metadata|signature|call"):
+        runtime.load_verified_gmsh(expected)
+
+
+def test_verified_session_accepts_legitimate_lazy_native_cache(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A source-referenced symbol may be materialized between verified operations."""
+
+    _isolated(monkeypatch)
+    source = (
+        "__version__ = '4.15.2'\n"
+        "def isInitialized():\n"
+        "    return lib.gmshIsInitialized()\n"
+        "class Lib:\n"
+        "    _handle = 99\n"
+        "lib = Lib()\n"
+    )
+    module, library, launcher, image, python_library = _files(tmp_path, source)
+    expected = _binding(tmp_path, module=module, library=library)
+    monkeypatch.setattr(
+        runtime,
+        "_current_process_binding",
+        lambda: {
+            "python": _identity(launcher),
+            "python_image": _identity(image),
+            "python_library": _identity(python_library),
+            "pyvenv_cfg": None,
+        },
+    )
+    monkeypatch.setattr(runtime, "_mapped_module_path", lambda handle: library)
+    monkeypatch.syspath_prepend(str(module.parent))
+    sys.modules.pop("gmsh", None)
+    loaded, _ = runtime.load_verified_gmsh(expected)
+
+    native = _synthetic_native_callable()
+    _install_synthetic_native_export(monkeypatch, loaded, "gmshIsInitialized", native)
+
+    reused, _ = runtime.load_verified_gmsh(expected)
+    assert reused is loaded
+
+
+def test_verified_session_accepts_authenticated_source_restype_transition(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A source-declared restype transition remains allowed for lazy caching."""
+
+    _isolated(monkeypatch)
+    source = (
+        "from ctypes import c_double\n"
+        "__version__ = '4.15.2'\n"
+        "def wall_time():\n"
+        "    lib.gmshLoggerGetWallTime.restype = c_double\n"
+        "    return lib.gmshLoggerGetWallTime()\n"
+        "class Lib:\n"
+        "    _handle = 99\n"
+        "lib = Lib()\n"
+    )
+    module, library, launcher, image, python_library = _files(tmp_path, source)
+    expected = _binding(tmp_path, module=module, library=library)
+    monkeypatch.setattr(
+        runtime,
+        "_current_process_binding",
+        lambda: {
+            "python": _identity(launcher),
+            "python_image": _identity(image),
+            "python_library": _identity(python_library),
+            "pyvenv_cfg": None,
+        },
+    )
+    monkeypatch.setattr(runtime, "_mapped_module_path", lambda handle: library)
+    monkeypatch.syspath_prepend(str(module.parent))
+    sys.modules.pop("gmsh", None)
+    loaded, _ = runtime.load_verified_gmsh(expected)
+
+    native = _synthetic_native_callable()
+    native.restype = ctypes.c_double
+    _install_synthetic_native_export(
+        monkeypatch, loaded, "gmshLoggerGetWallTime", native
+    )
+
+    reused, _ = runtime.load_verified_gmsh(expected)
+    assert reused is loaded
+
+
+def test_verified_session_rejects_module_builtin_shadowing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _isolated(monkeypatch)
+    source = (
+        "__version__ = '4.15.2'\n"
+        "def uses_bool(value):\n"
+        "    return bool(value)\n"
+        "class Lib:\n"
+        "    _handle = 99\n"
+        "lib = Lib()\n"
+    )
+    module, library, launcher, image, python_library = _files(tmp_path, source)
+    expected = _binding(tmp_path, module=module, library=library)
+    monkeypatch.setattr(
+        runtime,
+        "_current_process_binding",
+        lambda: {
+            "python": _identity(launcher),
+            "python_image": _identity(image),
+            "python_library": _identity(python_library),
+            "pyvenv_cfg": None,
+        },
+    )
+    monkeypatch.setattr(runtime, "_mapped_module_path", lambda handle: library)
+    monkeypatch.syspath_prepend(str(module.parent))
+    sys.modules.pop("gmsh", None)
+    loaded, _ = runtime.load_verified_gmsh(expected)
+    loaded.bool = lambda value: False
+
+    with pytest.raises((OSError, ValueError), match="global|builtin"):
+        runtime.load_verified_gmsh(expected)
 
 
 def test_cached_session_resolves_current_import_precedence_independently(

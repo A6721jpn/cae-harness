@@ -10,8 +10,10 @@ is actually mapped by Windows.
 
 from __future__ import annotations
 
+import ast
 import ctypes
 import ctypes.wintypes
+import dis
 import hashlib
 import importlib
 import importlib.machinery
@@ -55,6 +57,8 @@ _MAX_LIVE_MEMBERS = 8192
 _MAX_LIVE_GLOBALS = 16384
 _MAX_VALUE_ITEMS = 128
 _MAX_VALUE_DEPTH = 4
+_NATIVE_SYMBOL_PREFIX = "gmsh"
+_NATIVE_CALL_ATTRIBUTES = ("argtypes", "restype", "errcheck")
 
 
 class _RuntimeBindingError(OSError):
@@ -707,7 +711,7 @@ def _validate_function_state(state: _FunctionState, label: str) -> None:
         raise _error(f"live Gmsh executable function {label} metadata changed")
 
 
-def _code_names(code: CodeType) -> frozenset[str]:
+def _code_global_names(code: CodeType) -> frozenset[str]:
     names: set[str] = set()
     pending = [code]
     seen: set[int] = set()
@@ -716,9 +720,29 @@ def _code_names(code: CodeType) -> frozenset[str]:
         if id(current) in seen:
             continue
         seen.add(id(current))
-        names.update(name for name in current.co_names if isinstance(name, str))
+        for instruction in dis.get_instructions(current):
+            if instruction.opname in {"LOAD_GLOBAL", "LOAD_NAME"} and isinstance(
+                instruction.argval, str
+            ):
+                names.add(instruction.argval)
         pending.extend(constant for constant in current.co_consts if isinstance(constant, CodeType))
     return frozenset(names)
+
+
+def _native_symbol_names(source: bytes) -> frozenset[str]:
+    try:
+        tree = ast.parse(source.decode("utf-8"))
+    except (SyntaxError, UnicodeDecodeError, TypeError, ValueError) as exc:
+        raise _error("Gmsh source native symbols cannot be inspected") from exc
+    return frozenset(
+        node.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "lib"
+        and node.attr.startswith(_NATIVE_SYMBOL_PREFIX)
+        and len(node.attr) > len(_NATIVE_SYMBOL_PREFIX)
+    )
 
 
 def _descriptor_functions(member: object) -> tuple[FunctionType, ...]:
@@ -781,6 +805,17 @@ def _capture_class_state(
 class _GlobalState:
     value: object
     stable_signature: object | None
+    builtin_value: object
+    builtin_signature: object | None
+
+
+def _builtin_binding(module: ModuleType, name: str) -> object:
+    builtins_value = vars(module).get("__builtins__", _MISSING)
+    if isinstance(builtins_value, dict):
+        return builtins_value.get(name, _MISSING)
+    if isinstance(builtins_value, ModuleType):
+        return vars(builtins_value).get(name, _MISSING)
+    return _MISSING
 
 
 def _is_ctypes_callable(value: object) -> bool:
@@ -800,13 +835,120 @@ def _ctypes_pointer(value: object, name: str) -> int:
 
 def _ctypes_call_signature(value: object, name: str) -> tuple[object, ...]:
     try:
+        argtypes = getattr(value, "argtypes")
+        if isinstance(argtypes, (list, tuple)) and not argtypes:
+            argtypes = None
         return (
-            _value_signature(getattr(value, "argtypes")),
+            _value_signature(argtypes),
             _value_signature(getattr(value, "restype")),
             _value_signature(getattr(value, "errcheck")),
         )
     except (AttributeError, TypeError, ValueError) as exc:
         raise _error(f"cached native callable {name} has malformed call metadata") from exc
+
+
+def _static_ctypes_value(node: ast.AST) -> object:
+    if isinstance(node, ast.Constant) and isinstance(
+        node.value, (type(None), bool, int, float, str, bytes)
+    ):
+        return node.value
+    if isinstance(node, ast.Name):
+        candidate = getattr(ctypes, node.id, _MISSING)
+        return candidate if isinstance(candidate, type) else _MISSING
+    if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+        if node.value.id != "ctypes":
+            return _MISSING
+        candidate = getattr(ctypes, node.attr, _MISSING)
+        return candidate if isinstance(candidate, type) else _MISSING
+    if isinstance(node, (ast.List, ast.Tuple)):
+        values = [_static_ctypes_value(item) for item in node.elts]
+        if any(value is _MISSING for value in values):
+            return _MISSING
+        return values if isinstance(node, ast.List) else tuple(values)
+    if isinstance(node, ast.Call) and not node.keywords and len(node.args) == 1:
+        function = node.func
+        function_name: str | None = None
+        if isinstance(function, ast.Name):
+            function_name = function.id
+        elif isinstance(function, ast.Attribute) and isinstance(function.value, ast.Name):
+            if function.value.id == "ctypes":
+                function_name = function.attr
+        if function_name == "POINTER":
+            pointed_type = _static_ctypes_value(node.args[0])
+            if isinstance(pointed_type, type):
+                try:
+                    return ctypes.POINTER(pointed_type)
+                except (AttributeError, TypeError, ValueError):
+                    return _MISSING
+    return _MISSING
+
+
+def _native_signature_policy(
+    source: bytes, native_symbols: frozenset[str]
+) -> dict[str, frozenset[tuple[object, ...]]]:
+    default = (
+        _value_signature(None),
+        _value_signature(ctypes.c_int),
+        _value_signature(None),
+    )
+    permitted = {name: {default} for name in native_symbols}
+    if not native_symbols:
+        return {}
+    try:
+        tree = ast.parse(source.decode("utf-8"))
+    except (SyntaxError, UnicodeDecodeError, TypeError, ValueError) as exc:
+        raise _error("Gmsh source native metadata cannot be inspected") from exc
+
+    assignments: list[tuple[int, int, str, str, ast.AST]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+            value = node.value
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+            value = node.value
+            if value is None:
+                continue
+        else:
+            continue
+        for target in targets:
+            if not isinstance(target, ast.Attribute) or target.attr not in _NATIVE_CALL_ATTRIBUTES:
+                continue
+            owner = target.value
+            if not isinstance(owner, ast.Attribute) or owner.attr not in native_symbols:
+                continue
+            if not isinstance(owner.value, ast.Name) or owner.value.id != "lib":
+                continue
+            assignments.append(
+                (target.lineno, target.col_offset, owner.attr, target.attr, value)
+            )
+    if len(assignments) > _MAX_LIVE_MEMBERS:
+        raise _error("Gmsh native metadata exceeds the finite verification limit")
+    assignments.sort(key=lambda item: (item[0], item[1]))
+    current = {name: list(default) for name in native_symbols}
+    for _line, _column, name, attribute, expression in assignments:
+        value = _static_ctypes_value(expression)
+        if value is _MISSING:
+            raise _error(f"Gmsh native metadata for {name} is not independently supported")
+        index = _NATIVE_CALL_ATTRIBUTES.index(attribute)
+        signature = _value_signature(value)
+        candidate = list(default)
+        candidate[index] = signature
+        permitted[name].add(tuple(candidate))
+        current[name][index] = signature
+        permitted[name].add(tuple(current[name]))
+    return {name: frozenset(signatures) for name, signatures in permitted.items()}
+
+
+def _validate_ctypes_call_signature(
+    value: object,
+    name: str,
+    signature_policy: dict[str, frozenset[tuple[object, ...]]],
+) -> None:
+    signature = _ctypes_call_signature(value, name)
+    permitted = signature_policy.get(name)
+    if permitted is None or signature not in permitted:
+        raise _error(f"cached native callable {name} has unauthorized call metadata")
 
 
 def _library_namespace(library: object) -> dict[str, object]:
@@ -877,7 +1019,6 @@ class _NativeCallableState:
     value_type: type
     function: _FunctionState | None
     pointer: int | None
-    call_signature: tuple[object, ...] | None
 
 
 def _native_callable_state(
@@ -885,34 +1026,42 @@ def _native_callable_state(
     name: str,
     value: object,
     native_symbols: frozenset[str],
+    signature_policy: dict[str, frozenset[tuple[object, ...]]],
     *,
     allow_new: bool,
 ) -> _NativeCallableState:
     if allow_new:
         pointer = _validate_ctypes_callable(library, name, value, native_symbols)
+        _validate_ctypes_call_signature(value, name, signature_policy)
         return _NativeCallableState(
-            value, type(value), None, pointer, _ctypes_call_signature(value, name)
+            value, type(value), None, pointer
         )
     if isinstance(value, FunctionType):
-        return _NativeCallableState(value, type(value), _function_state(value), None, None)
+        return _NativeCallableState(value, type(value), _function_state(value), None)
     if _is_ctypes_callable(value):
         pointer = _validate_ctypes_callable(library, name, value, native_symbols)
-        return _NativeCallableState(
-            value, type(value), None, pointer, _ctypes_call_signature(value, name)
-        )
+        _validate_ctypes_call_signature(value, name, signature_policy)
+        return _NativeCallableState(value, type(value), None, pointer)
     if not callable(value):
         raise _error(f"cached native callable {name} is not callable")
-    return _NativeCallableState(value, type(value), None, None, None)
+    return _NativeCallableState(value, type(value), None, None)
 
 
 def _capture_native_callables(
-    library: object, native_symbols: frozenset[str]
+    library: object,
+    native_symbols: frozenset[str],
+    signature_policy: dict[str, frozenset[tuple[object, ...]]],
 ) -> dict[str, _NativeCallableState]:
     result: dict[str, _NativeCallableState] = {}
     for name, value in _library_namespace(library).items():
-        if isinstance(name, str) and name.startswith("gmsh_") and callable(value):
+        if isinstance(name, str) and name in native_symbols and callable(value):
             result[name] = _native_callable_state(
-                library, name, value, native_symbols, allow_new=False
+                library,
+                name,
+                value,
+                native_symbols,
+                signature_policy,
+                allow_new=False,
             )
     return result
 
@@ -923,12 +1072,17 @@ class _LiveState:
     classes: dict[tuple[str, ...], _ClassState]
     globals: dict[str, _GlobalState]
     native_symbols: frozenset[str]
+    native_signature_policy: dict[str, frozenset[tuple[object, ...]]]
     native_callables: dict[str, _NativeCallableState]
     native_handle: int
 
 
 def _capture_live_state(
-    module: ModuleType, library: object, source_code: CodeType, native_handle: int
+    module: ModuleType,
+    library: object,
+    source_code: CodeType,
+    source: bytes,
+    native_handle: int,
 ) -> _LiveState:
     namespace = vars(module)
     module_name = module.__name__
@@ -946,22 +1100,37 @@ def _capture_live_state(
     global_states: dict[str, _GlobalState] = {}
     global_names = {"__builtins__", "__name__", "__package__"}
     for function in functions:
-        global_names.update(_code_names(function.code))
+        global_names.update(_code_global_names(function.code))
     for name in global_names:
         if name in namespace:
             value = namespace[name]
-            global_states[name] = _GlobalState(value, _stable_global_signature(value))
-            if len(global_states) > _MAX_LIVE_GLOBALS:
-                raise _error("Gmsh live globals exceed the finite verification limit")
-    native_symbols = frozenset(
-        name for name in _code_names(source_code) if name.startswith("gmsh_")
-    )
+            global_states[name] = _GlobalState(
+                value,
+                _stable_global_signature(value),
+                _MISSING,
+                None,
+            )
+        else:
+            builtin = _builtin_binding(module, name)
+            global_states[name] = _GlobalState(
+                _MISSING,
+                None,
+                builtin,
+                _stable_global_signature(builtin),
+            )
+        if len(global_states) > _MAX_LIVE_GLOBALS:
+            raise _error("Gmsh live globals exceed the finite verification limit")
+    native_symbols = _native_symbol_names(source)
+    native_signature_policy = _native_signature_policy(source, native_symbols)
     return _LiveState(
         module_functions,
         classes,
         global_states,
         native_symbols,
-        _capture_native_callables(library, native_symbols),
+        native_signature_policy,
+        _capture_native_callables(
+            library, native_symbols, native_signature_policy
+        ),
         native_handle,
     )
 
@@ -981,6 +1150,7 @@ def _validate_native_callable_state(
     state: _NativeCallableState,
     current: object,
     native_symbols: frozenset[str],
+    signature_policy: dict[str, frozenset[tuple[object, ...]]],
 ) -> None:
     if current is not state.value or type(current) is not state.value_type:
         raise _error(f"live Gmsh native callable {name} was replaced")
@@ -992,8 +1162,7 @@ def _validate_native_callable_state(
         pointer = _validate_ctypes_callable(library, name, current, native_symbols)
         if pointer != state.pointer:
             raise _error(f"live Gmsh native callable {name} address changed")
-        if _ctypes_call_signature(current, name) != state.call_signature:
-            raise _error(f"live Gmsh native callable {name} call metadata changed")
+        _validate_ctypes_call_signature(current, name, signature_policy)
 
 
 def _validate_live_state(state: _LiveState, module: ModuleType, library: object) -> None:
@@ -1018,12 +1187,23 @@ def _validate_live_state(state: _LiveState, module: ModuleType, library: object)
                 _validate_function_state(function_state, ".".join(path + (name,)))
     for name, global_state in state.globals.items():
         current = namespace.get(name, _MISSING)
-        if current is not global_state.value:
-            raise _error(f"live Gmsh global {name} was replaced")
-        if global_state.stable_signature is not None and _stable_global_signature(
-            current
-        ) != global_state.stable_signature:
-            raise _error(f"live Gmsh global {name} changed")
+        if global_state.value is _MISSING:
+            if current is not _MISSING:
+                raise _error(f"live Gmsh global {name} was added")
+            builtin = _builtin_binding(module, name)
+            if builtin is not global_state.builtin_value:
+                raise _error(f"live Gmsh builtin {name} was replaced")
+            if global_state.builtin_signature is not None and _stable_global_signature(
+                builtin
+            ) != global_state.builtin_signature:
+                raise _error(f"live Gmsh builtin {name} changed")
+        else:
+            if current is not global_state.value:
+                raise _error(f"live Gmsh global {name} was replaced")
+            if global_state.stable_signature is not None and _stable_global_signature(
+                current
+            ) != global_state.stable_signature:
+                raise _error(f"live Gmsh global {name} changed")
 
     current_library_namespace = _library_namespace(library)
     if _library_handle(library) != state.native_handle:
@@ -1033,16 +1213,26 @@ def _validate_live_state(state: _LiveState, module: ModuleType, library: object)
         if current is _MISSING:
             raise _error(f"live Gmsh native callable {name} was removed")
         _validate_native_callable_state(
-            library, name, callable_state, current, state.native_symbols
+            library,
+            name,
+            callable_state,
+            current,
+            state.native_symbols,
+            state.native_signature_policy,
         )
     additions: dict[str, _NativeCallableState] = {}
     for name, current in current_library_namespace.items():
-        if not isinstance(name, str) or not name.startswith("gmsh_") or name in state.native_callables:
+        if not isinstance(name, str) or name not in state.native_symbols or name in state.native_callables:
             continue
         if not callable(current):
             raise _error(f"live Gmsh native member {name} is not callable")
         additions[name] = _native_callable_state(
-            library, name, current, state.native_symbols, allow_new=True
+            library,
+            name,
+            current,
+            state.native_symbols,
+            state.native_signature_policy,
+            allow_new=True,
         )
     state.native_callables.update(additions)
 
@@ -1208,7 +1398,11 @@ def load_verified_gmsh(binding: dict[str, object]) -> tuple[Any, dict[str, objec
                 _verify_source_snapshot_current(snapshot)
                 library_object, handle = _module_handle(module)
                 live_state = _capture_live_state(
-                    module, library_object, snapshot.code, handle
+                    module,
+                    library_object,
+                    snapshot.code,
+                    snapshot.content,
+                    handle,
                 )
                 mapped_path = _mapped_module_path(handle)
                 if not _same_path(str(mapped_path), str(library_path)):
