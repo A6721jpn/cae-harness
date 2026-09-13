@@ -675,7 +675,7 @@ class RegisteredCaseService:
                             expected_tool_geometry_digest=origin.spec.rigid_tool.contact_surface.geometry_digest,
                         )
                         placed_selection = geometry_port.resolve_placed_selection
-                    except (StorageIntegrityError, ValueError, OSError) as error:
+                    except (StorageIntegrityError, TypeError, ValueError, OSError) as error:
                         diagnostics.append(
                             _diagnostic(ServiceErrorCategory.INTEGRITY, str(error), "geometry")
                         )

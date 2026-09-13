@@ -480,7 +480,7 @@ def test_comparison_refuses_incompatible_or_ineligible_results(tmp_path: Path, d
 def test_current_prepared_box_is_an_explicit_comparison_origin(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
-    from test_planar_preparation import _build_prepared_input, _isolate
+    from test_planar_preparation import _build_prepared_input, _isolate, _response_text
 
     from febio_cae.application import _comparison
     from febio_cae.application._preparation_request import normalize_request
@@ -521,7 +521,9 @@ def test_current_prepared_box_is_an_explicit_comparison_origin(
     bind_evidence(request["values"])
 
     prepared = service.prepare_planar(created.case_id, request, expected_generation=0)
-    parent = service.get_revision(created.case_id, prepared["revision_id"])
+    parent = service.get_revision(
+        created.case_id, _response_text(prepared, "revision_id")
+    )
     registration = storage.resolve_revision_mesh_quality(parent)
     assert isinstance(registration, PlanarPreparationRegistration)
     origin_store = PreparationStore(storage)
@@ -582,9 +584,15 @@ def test_current_prepared_box_is_an_explicit_comparison_origin(
         candidate_run_id="run-candidate",
     )
     assert result["status"] == "COMPARED"
-    assert result["comparison"]["sources"][0]["root_mesh_digest"] == (
-        registration.original_mesh_digest
-    )
+    comparison = result.get("comparison")
+    assert isinstance(comparison, dict)
+    sources = comparison.get("sources")
+    assert isinstance(sources, list) and sources
+    first_source = sources[0]
+    assert isinstance(first_source, dict)
+    root_mesh_digest = first_source.get("root_mesh_digest")
+    assert isinstance(root_mesh_digest, str)
+    assert root_mesh_digest == registration.original_mesh_digest
 
     baseline_target = target(storage, baseline.manifest_id, "run-baseline")
     box_primitive = baseline_target.revision.spec.rigid_tool.primitive

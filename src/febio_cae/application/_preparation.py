@@ -35,10 +35,6 @@ if TYPE_CHECKING:
     from .service import RegisteredCaseService
 
 
-class _MalformedProducerObjectError(TypeError, ValueError):
-    """Type mismatch that remains on the service's persisted-integrity path."""
-
-
 def _bound_generation_criteria(
     registration: MeshQualityRegistration, primitive_kind: str, max_elements: int
 ) -> dict[str, object] | None:
@@ -78,7 +74,7 @@ def geometry_from_output(
 ) -> StepGeometryMeshAdapter:
     producer = output.get("producer", output)
     if not isinstance(producer, dict):
-        raise _MalformedProducerObjectError("preparation producer output is not an object")
+        raise TypeError("preparation producer output is not an object")
     required = {
         "carrier",
         "inspection",

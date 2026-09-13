@@ -12,6 +12,7 @@ import pytest
 
 from febio_cae.application.service import CreatedCase, RegisteredCaseService
 from febio_cae.cli.main import main
+from febio_cae.storage.mesh_quality import CurrentPreparationRegistration
 
 
 class PreparedInput(NamedTuple):
@@ -79,6 +80,18 @@ def _build_prepared_input(
     return PreparedInput(service, created, request, fixtures.SyntheticBackend(), step)
 
 
+def _response_text(response: dict[str, object], key: str) -> str:
+    value = response.get(key)
+    assert isinstance(value, str), f"response[{key!r}] must be a string"
+    return value
+
+
+def _response_int(response: dict[str, object], key: str) -> int:
+    value = response.get(key)
+    assert isinstance(value, int), f"response[{key!r}] must be an integer"
+    return value
+
+
 @pytest.fixture
 def prepared_input(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> PreparedInput:
     return _build_prepared_input(tmp_path, monkeypatch)
@@ -141,6 +154,7 @@ def test_current_operation_publishes_bound_preparation(
     revision = service.get_revision(created.case_id, result["revision_id"])
     storage = service._storage(created.case_id)
     registration = storage.resolve_revision_mesh_quality(revision)
+    assert isinstance(registration, CurrentPreparationRegistration)
     mesh = service._planar_execution_mesh(storage, registration, revision)
     assert mesh.nodes and mesh.elements
     assert any(
@@ -149,6 +163,28 @@ def test_current_operation_publishes_bound_preparation(
     )
     assert revision.spec.geometry.geometry_digest == backend.geometry_digest
     assert service.validate_case(created.case_id).status == "VALIDATED"
+
+
+def test_malformed_prepared_geometry_is_a_structured_integrity_diagnostic(
+    prepared_input: PreparedInput, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from febio_cae.domain.lifecycle import ServiceErrorCategory
+    from febio_cae.storage.preparation import PreparationStore
+
+    service, created, request, backend, _ = prepared_input
+    _isolate(monkeypatch, backend)
+    service.prepare_planar(created.case_id, request, expected_generation=0)
+
+    def malformed_output(*args: Any, **kwargs: Any) -> dict[str, object]:
+        return {"producer": []}
+
+    monkeypatch.setattr(PreparationStore, "origin_output", malformed_output)
+    result = service.validate_case(created.case_id)
+    assert any(
+        diagnostic.code is ServiceErrorCategory.INTEGRITY
+        and diagnostic.field == "geometry"
+        for diagnostic in result.diagnostics
+    )
 
 
 @pytest.mark.parametrize("bad", ["source", "geometry", "version"])
@@ -194,6 +230,7 @@ def test_freeze_without_publication_cannot_supply_execution_mesh(
     revision = service.get_revision(created.case_id, record["revision_id"])
     storage = service._storage(created.case_id)
     registration = storage.resolve_revision_mesh_quality(revision)
+    assert isinstance(registration, CurrentPreparationRegistration)
     with pytest.raises((ValueError, RuntimeError), match="PREPARED"):
         service._planar_execution_mesh(storage, registration, revision)
     with pytest.raises((ValueError, RuntimeError), match="PREPARED"):
@@ -298,9 +335,10 @@ def test_stale_prepared_generation_is_rejected_before_compilation(
             return SimpleNamespace(files=(), to_dict=lambda: {"synthetic_compiler": True})
 
     monkeypatch.setattr(_demo, "CompilerAdapter", Compiler)
+    prepared_revision_id = _response_text(prepared, "revision_id")
     with pytest.raises(PortError) as error:
         service.run_demo(
-            created.case_id, prepared["revision_id"], executable=str(solver), preflight=True
+            created.case_id, prepared_revision_id, executable=str(solver), preflight=True
         )
     assert error.value.category is PortErrorCategory.CONFLICT
     code = main(
@@ -311,7 +349,7 @@ def test_stale_prepared_generation_is_rejected_before_compilation(
             "run-demo",
             created.case_id,
             "--revision-id",
-            prepared["revision_id"],
+            prepared_revision_id,
             "--solver",
             str(solver),
             "--preflight",
@@ -361,7 +399,9 @@ def test_prepared_material_child(
     if route == "natural":
         payload["values"]["budget"].update(max_llm_calls=2, max_llm_tokens=2200)
     prepared = service.prepare_planar(created.case_id, payload, expected_generation=0)
-    parent = service.get_revision(created.case_id, prepared["revision_id"])
+    parent = service.get_revision(
+        created.case_id, _response_text(prepared, "revision_id")
+    )
     storage = service._storage(created.case_id)
     originals = {p: p.read_bytes() for p in (storage.root / "preparation").rglob("*.json")}
     root_bytes = parent.to_bytes()
@@ -546,12 +586,16 @@ def test_explicit_refinement_preserves_parent_mesh_and_publishes_new_origins(
     payload = _mesh_study_request(request)
     prepared = service.prepare_planar(created.case_id, payload, expected_generation=0)
     storage = service._storage(created.case_id)
-    parent = service.get_revision(created.case_id, prepared["revision_id"])
+    parent = service.get_revision(
+        created.case_id, _response_text(prepared, "revision_id")
+    )
     parent_registration = storage.resolve_revision_mesh_quality(parent)
+    assert isinstance(parent_registration, CurrentPreparationRegistration)
     parent_mesh = service._planar_execution_mesh(storage, parent_registration, parent)
+    preparation_id = _response_text(prepared, "preparation_id")
     immutable = {
         path: path.read_bytes()
-        for path in (storage.root / "preparation" / prepared["preparation_id"]).glob("*.json")
+        for path in (storage.root / "preparation" / preparation_id).glob("*.json")
     }
     original_parent = parent
     for size in (1.0, 0.5):
@@ -560,13 +604,16 @@ def test_explicit_refinement_preserves_parent_mesh_and_publishes_new_origins(
         prepared = service.prepare_planar(
             created.case_id,
             child_request,
-            expected_generation=prepared["generation"],
+            expected_generation=_response_int(prepared, "generation"),
             parent_revision_id=parent.revision_id,
         )
-        child = service.get_revision(created.case_id, prepared["revision_id"])
+        child = service.get_revision(
+            created.case_id, _response_text(prepared, "revision_id")
+        )
         assert child.parent_revision_id == parent.revision_id
         assert child.parent_spec_digest == parent.spec_digest
         child_registration = storage.resolve_revision_mesh_quality(child)
+        assert isinstance(child_registration, CurrentPreparationRegistration)
         assert child_registration.preparation_id != parent_registration.preparation_id
         assert service.validate_case(created.case_id).status == "VALIDATED"
         assert storage.get_revision(created.case_id, original_parent.revision_id) == original_parent
@@ -593,7 +640,9 @@ def test_prepared_case_reservations_are_finite_and_not_reset_by_reopening(
         created.case_id, _mesh_study_request(request), expected_generation=0
     )
     storage = service._storage(created.case_id)
-    revision = service.get_revision(created.case_id, prepared["revision_id"])
+    revision = service.get_revision(
+        created.case_id, _response_text(prepared, "revision_id")
+    )
     for number in range(4):
         assert reserve_prepared_solver_attempt(
             CaseStorage(storage.root), revision, f"solver-{number}"
@@ -629,11 +678,13 @@ def test_refinement_rejects_changed_physics_or_skipped_size(
         service.prepare_planar(
             created.case_id,
             payload,
-            expected_generation=prepared["generation"],
-            parent_revision_id=prepared["revision_id"],
+            expected_generation=_response_int(prepared, "generation"),
+            parent_revision_id=_response_text(prepared, "revision_id"),
         )
     assert storage.current_draft(created.case_id) == before
-    assert storage.current_frozen_revision(created.case_id) == prepared["revision_id"]
+    assert storage.current_frozen_revision(created.case_id) == _response_text(
+        prepared, "revision_id"
+    )
     assert len(backend.mesh_requests) == 1
 
 
@@ -648,7 +699,9 @@ def test_failed_refinement_cannot_restart_as_changed_initial_preparation(
     payload["values"]["budget"]["max_attempts"] = 2
     prepared = service.prepare_planar(created.case_id, payload, expected_generation=0)
     storage = service._storage(created.case_id)
-    parent = storage.get_revision(created.case_id, prepared["revision_id"])
+    parent = storage.get_revision(
+        created.case_id, _response_text(prepared, "revision_id")
+    )
     payload["values"]["mesh_policy"]["global_size"] = {"value": 1.0, "unit": "mm"}
 
     def fail_publication(*args: Any, **kwargs: Any) -> None:
@@ -660,7 +713,7 @@ def test_failed_refinement_cannot_restart_as_changed_initial_preparation(
             service.prepare_planar(
                 created.case_id,
                 payload,
-                expected_generation=prepared["generation"],
+                expected_generation=_response_int(prepared, "generation"),
                 parent_revision_id=parent.revision_id,
             )
     failed = PreparationStore(storage).latest(created.case_id)
