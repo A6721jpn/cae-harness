@@ -197,9 +197,12 @@ def _write_pinned(root: Path, relative: str, content: bytes, *, token: str | Non
     target.parent.mkdir(parents=True, exist_ok=True)
     _assert_no_links(target.parent, root)
     suffix = token or uuid.uuid4().hex[:12]
-    temporary = target.with_name(f".{target.name}.{suffix}.tmp")
+    target_key = hashlib.sha256(target.name.encode("utf-8")).hexdigest()[:12]
+    temporary = target.with_name(f".{target_key}.{suffix}.tmp")
+    created = False
     try:
         with temporary.open("xb") as handle:
+            created = True
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
@@ -214,7 +217,7 @@ def _write_pinned(root: Path, relative: str, content: bytes, *, token: str | Non
             finally:
                 os.close(directory_handle)
     finally:
-        if temporary.exists():
+        if created and temporary.exists():
             temporary.unlink()
     return target
 
