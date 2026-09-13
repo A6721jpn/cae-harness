@@ -19,7 +19,6 @@ import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-
 ALGORITHM = "native-quadratic-primitive-bernstein-v1"
 
 type _Index = tuple[int, int, int]
@@ -115,12 +114,10 @@ def _multinomial(index: _Index) -> int:
 
 
 _MULTINOMIALS = {
-    degree: tuple(_multinomial(index) for index in indices)
-    for degree, indices in _INDICES.items()
+    degree: tuple(_multinomial(index) for index in indices) for degree, indices in _INDICES.items()
 }
 _MULTINOMIAL_BY_INDEX = {
-    degree: dict(zip(_INDICES[degree], _MULTINOMIALS[degree], strict=True))
-    for degree in range(5)
+    degree: dict(zip(_INDICES[degree], _MULTINOMIALS[degree], strict=True)) for degree in range(5)
 }
 
 
@@ -131,9 +128,7 @@ class _Bernstein:
     denominator: int
 
 
-def _make_polynomial(
-    degree: int, numerators: Sequence[int], denominator: int
-) -> _Bernstein:
+def _make_polynomial(degree: int, numerators: Sequence[int], denominator: int) -> _Bernstein:
     if denominator <= 0:
         raise ValueError("internal Bernstein denominator must be positive")
     expected = len(_INDICES[degree])
@@ -240,9 +235,9 @@ def _compose_child(value: _Bernstein, child_vertices: Sequence[_Index]) -> _Bern
             for exponent_split in _COMPOSITIONS[exponent]:
                 coefficient = _multinomial(exponent_split)
                 for child_axis in range(3):
-                    coefficient *= child_vertices[child_axis][parent_axis] ** exponent_split[
-                        child_axis
-                    ]
+                    coefficient *= (
+                        child_vertices[child_axis][parent_axis] ** exponent_split[child_axis]
+                    )
                 row_terms[exponent_split] = coefficient
             expanded: dict[_Index, int] = {}
             for existing_index, existing_coefficient in terms.items():
@@ -276,12 +271,12 @@ def _subdivide(value: _Bernstein) -> tuple[_Bernstein, ...]:
     return tuple(_compose_child(value, vertices) for vertices in _CHILD_VERTICES)
 
 
-def _enclosure(value: _Bernstein, depth: int = 4) -> tuple[_Rational, _Rational]:
-    leaves = [value]
-    for _ in range(depth):
-        leaves = [child for leaf in leaves for child in _subdivide(leaf)]
-    minimum, maximum = _polynomial_minmax(leaves[0])
-    for leaf in leaves[1:]:
+def _enclosure(value: _Bernstein) -> tuple[_Rational, _Rational]:
+    # One exact split tightens the enclosure while retaining complete coverage.
+    # Orientation uses its separate adaptive proof, not this distance bound.
+    leaves = iter(_subdivide(value))
+    minimum, maximum = _polynomial_minmax(next(leaves))
+    for leaf in leaves:
         leaf_minimum, leaf_maximum = _polynomial_minmax(leaf)
         minimum = _q_min(minimum, leaf_minimum)
         maximum = _q_max(maximum, leaf_maximum)
@@ -322,10 +317,7 @@ def _derivative(value: _Bernstein, direction: int) -> _Bernstein:
         )
         minus: _Index = (index[0] + 1, index[1], index[2])
         numerators.append(
-            degree
-            * (
-                value.numerators[positions[plus]] - value.numerators[positions[minus]]
-            )
+            degree * (value.numerators[positions[plus]] - value.numerators[positions[minus]])
         )
     return _make_polynomial(degree - 1, numerators, value.denominator)
 
@@ -359,9 +351,9 @@ def _dot(
     return _polynomial_add(result, _polynomial_product(left[2], right[2]))
 
 
-def _binary_ratio(value: int | float) -> tuple[int, int]:
+def _binary_ratio(value: float) -> tuple[int, int]:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError("native surface inputs must be finite binary numbers")
+        raise TypeError("native surface inputs must be finite binary numbers")
     if isinstance(value, float) and not math.isfinite(value):
         raise ValueError("native surface inputs must be finite binary numbers")
     try:
@@ -434,16 +426,17 @@ def _position_polynomials(
         (0, 1, 1),
         (1, 0, 1),
     )
-    controls: list[tuple[int, int, int]] = [
-        (2 * points[0][axis], 2 * points[1][axis], 2 * points[2][axis])
-        for axis in range(3)
-    ]
-    for axis in range(3):
-        controls[axis] += (
+    controls = [
+        (
+            2 * points[0][axis],
+            2 * points[1][axis],
+            2 * points[2][axis],
             4 * points[3][axis] - points[0][axis] - points[1][axis],
             4 * points[4][axis] - points[1][axis] - points[2][axis],
             4 * points[5][axis] - points[2][axis] - points[0][axis],
         )
+        for axis in range(3)
+    ]
     result: list[_Bernstein] = []
     for axis_controls in controls:
         by_index = dict(zip(control_indices, axis_controls, strict=True))
@@ -568,13 +561,9 @@ def _radial_error_squared_upper(
     return _q_max(endpoint_bound(minimum_squared), endpoint_bound(maximum_squared))
 
 
-def _radial_overshoot_squared_upper(
-    maximum_squared: _Rational, radius: _Rational
-) -> _Rational:
+def _radial_overshoot_squared_upper(maximum_squared: _Rational, radius: _Rational) -> _Rational:
     maximum_squared = _nonnegative(maximum_squared)
-    if _q_less(maximum_squared, _q_square(radius)) or _q_equal(
-        maximum_squared, _q_square(radius)
-    ):
+    if _q_less(maximum_squared, _q_square(radius)) or _q_equal(maximum_squared, _q_square(radius)):
         return _q_zero()
     lower_root = _float_as_rational(_sqrt_down(maximum_squared))
     return _nonnegative(
@@ -591,9 +580,7 @@ def _interval_distance_squared_upper(
     return _q_max(_q_square(_q_sub(minimum, target)), _q_square(_q_sub(maximum, target)))
 
 
-def _sphere_bound(
-    position: tuple[_Bernstein, _Bernstein, _Bernstein], radius: _Rational
-) -> float:
+def _sphere_bound(position: tuple[_Bernstein, _Bernstein, _Bernstein], radius: _Rational) -> float:
     first_derivative = (
         _derivative(position[0], 1),
         _derivative(position[1], 1),
@@ -641,9 +628,7 @@ def _cylinder_bound(
     radial_squared = _enclosure(_squared_norm(position, include_z=False))
     z_minimum, z_maximum = _enclosure(position[2])
     half_height = _q_mul(height, _q_rational_half())
-    radius_squared = _radial_error_squared_upper(
-        radial_squared[0], radial_squared[1], radius
-    )
+    radius_squared = _radial_error_squared_upper(radial_squared[0], radial_squared[1], radius)
     outside_top = _nonnegative(_q_sub(z_maximum, half_height))
     outside_bottom = _nonnegative(_q_sub(_q_neg(half_height), z_minimum))
     axial_outside = _q_max(outside_top, outside_bottom)
@@ -666,8 +651,7 @@ def _cylinder_bound(
     for candidate, _ in candidates[1:]:
         minimum_squared = _q_min(minimum_squared, candidate)
     if not any(
-        certified and _q_equal(candidate, minimum_squared)
-        for candidate, certified in candidates
+        certified and _q_equal(candidate, minimum_squared) for candidate, certified in candidates
     ):
         raise ValueError("cylinder face outward orientation cannot be certified")
     result = _sqrt_up(minimum_squared)
