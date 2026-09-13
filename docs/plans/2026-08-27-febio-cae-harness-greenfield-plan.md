@@ -814,3 +814,19 @@ evidence or authorized real-model/BottomFrame acceptance.
 - Independently review its exact artifacts, then release at most one new bounded
   native attempt. Recorded-output diagnostics are not that new execution and
   cannot establish public physical/profile or full-E2E qualification.
+
+### Remaining curved-contact evidence prerequisites
+
+- Implement the bounded signed Tri6-to-primitive minimum-distance leaf separately
+  from public physical quality. Defend interior penetration, finite-cylinder
+  caps/side transitions, box corners, outward rounding and exhausted-work
+  ambiguity with exact or independently bounded synthetic cases.
+- Exercise fresh installed public preparation for sphere, cylinder and an
+  explicitly source-local STEP ball. Bind approved generation profiles, actual
+  source bytes, current measured selections, installed wheel and native tools.
+  Prepare and independently review a finite, geometry-only execution protocol
+  before any native call; preserve non-PASS physical status.
+- Native gap/pressure/traction storage and canonical signs do not establish
+  curved normals, averaging or Coulomb stick/slip semantics. Record those missing
+  facts explicitly; qualify the separate physical studies before broadening
+  mandatory numerical producers or publishing a curved/friction profile.
