@@ -762,6 +762,52 @@ def test_verified_session_rejects_ctypes_symbol_name_descriptor_tampering(
         runtime.load_verified_gmsh(expected)
 
 
+def test_verified_session_does_not_execute_ctypes_symbol_name_fallback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Native symbol validation does not call a mutable CFuncPtr __getattr__."""
+
+    _isolated(monkeypatch)
+    source = (
+        "__version__ = '4.15.2'\n"
+        "def isInitialized():\n"
+        "    return lib.gmshIsInitialized()\n"
+        "class Lib:\n"
+        "    _handle = 99\n"
+        "lib = Lib()\n"
+    )
+    module, library, launcher, image, python_library = _files(tmp_path, source)
+    expected = _binding(tmp_path, module=module, library=library)
+    monkeypatch.setattr(
+        runtime,
+        "_current_process_binding",
+        lambda: {
+            "python": _identity(launcher),
+            "python_image": _identity(image),
+            "python_library": _identity(python_library),
+            "pyvenv_cfg": None,
+        },
+    )
+    monkeypatch.setattr(runtime, "_mapped_module_path", lambda handle: library)
+    monkeypatch.syspath_prepend(str(module.parent))
+    sys.modules.pop("gmsh", None)
+    loaded, _ = runtime.load_verified_gmsh(expected)
+
+    native = _synthetic_native_callable()
+    _install_synthetic_native_export(monkeypatch, loaded, "gmshIsInitialized", native)
+    runtime.load_verified_gmsh(expected)
+    calls: list[str] = []
+
+    def replacement(self: Any, name: str) -> None:
+        del self
+        calls.append(name)
+        return None
+
+    monkeypatch.setattr(type(native), "__getattr__", replacement, raising=False)
+    runtime.load_verified_gmsh(expected)
+    assert calls == []
+
+
 def test_verified_session_rejects_ctypes_metadata_access_tampering(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

@@ -1250,14 +1250,6 @@ def _validate_ctypes_callable(
         raise _error(f"cached native callable {name} is not in the authenticated source")
     if not _is_ctypes_callable(value):
         raise _error(f"cached native callable {name} is not a ctypes function")
-    symbol = getattr(value, "_name", None)
-    if isinstance(symbol, bytes):
-        try:
-            symbol = symbol.decode("ascii")
-        except UnicodeError as exc:
-            raise _error(f"cached native callable {name} has a malformed symbol") from exc
-    if isinstance(symbol, str) and symbol != name:
-        raise _error(f"cached native callable {name} has a different symbol")
     pointer = _ctypes_pointer(value, name)
     exported = _native_export_address(library, name)
     if exported is not None and pointer != exported:
