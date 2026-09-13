@@ -952,6 +952,92 @@ def test_verified_session_rejects_lazy_factory_tampering(
         runtime.load_verified_gmsh(expected)
 
 
+def test_verified_session_rejects_lazy_factory_constructor_tampering(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A retained lazy factory cannot change its constructor before resolution."""
+
+    _isolated(monkeypatch)
+    source = (
+        "import ctypes\n"
+        "__version__ = '4.15.2'\n"
+        "def isInitialized():\n"
+        "    return lib.gmshIsInitialized()\n"
+        "class FuncFactory:\n"
+        "    def __init__(self, *args):\n"
+        "        del args\n"
+        "FuncFactory.__module__ = 'ctypes'\n"
+        "lib = object.__new__(ctypes.CDLL)\n"
+        "lib._handle = 99\n"
+        "lib._FuncPtr = FuncFactory\n"
+    )
+    module, library, launcher, image, python_library = _files(tmp_path, source)
+    expected = _binding(tmp_path, module=module, library=library)
+    monkeypatch.setattr(
+        runtime,
+        "_current_process_binding",
+        lambda: {
+            "python": _identity(launcher),
+            "python_image": _identity(image),
+            "python_library": _identity(python_library),
+            "pyvenv_cfg": None,
+        },
+    )
+    monkeypatch.setattr(runtime, "_mapped_module_path", lambda handle: library)
+    monkeypatch.syspath_prepend(str(module.parent))
+    sys.modules.pop("gmsh", None)
+    loaded, _ = runtime.load_verified_gmsh(expected)
+
+    constructor = loaded.lib._FuncPtr.__dict__["__init__"]
+
+    def replacement(self: Any, *args: Any) -> None:
+        del self, args
+
+    monkeypatch.setattr(constructor, "__code__", replacement.__code__)
+    with pytest.raises((OSError, ValueError), match="factory|constructor|dispatch|native"):
+        runtime.load_verified_gmsh(expected)
+
+
+def test_verified_session_rejects_library_setattr_dispatch_tampering(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A lazy CDLL cache cannot use a replacement library setter."""
+
+    _isolated(monkeypatch)
+    source = (
+        "import ctypes\n"
+        "__version__ = '4.15.2'\n"
+        "def isInitialized():\n"
+        "    return lib.gmshIsInitialized()\n"
+        "lib = object.__new__(ctypes.CDLL)\n"
+        "lib._handle = 99\n"
+        "lib._FuncPtr = object\n"
+    )
+    module, library, launcher, image, python_library = _files(tmp_path, source)
+    expected = _binding(tmp_path, module=module, library=library)
+    monkeypatch.setattr(
+        runtime,
+        "_current_process_binding",
+        lambda: {
+            "python": _identity(launcher),
+            "python_image": _identity(image),
+            "python_library": _identity(python_library),
+            "pyvenv_cfg": None,
+        },
+    )
+    monkeypatch.setattr(runtime, "_mapped_module_path", lambda handle: library)
+    monkeypatch.syspath_prepend(str(module.parent))
+    sys.modules.pop("gmsh", None)
+    loaded, _ = runtime.load_verified_gmsh(expected)
+
+    def replacement(self: Any, name: str, value: Any) -> None:
+        object.__setattr__(self, name, value)
+
+    monkeypatch.setattr(type(loaded.lib), "__setattr__", replacement)
+    with pytest.raises((OSError, ValueError), match="setattr|dispatch|library|native"):
+        runtime.load_verified_gmsh(expected)
+
+
 def test_verified_session_rejects_spoofed_library_namespace(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

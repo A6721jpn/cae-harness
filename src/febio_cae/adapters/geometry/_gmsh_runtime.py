@@ -823,6 +823,32 @@ def _dispatch_descriptor_state(value_type: type, name: str) -> _DispatchDescript
 
 
 @dataclass(slots=True)
+class _FactoryState:
+    value: type
+    metaclass: type
+    metaclass_call: _DispatchDescriptorState
+    metaclass_getattribute: _DispatchDescriptorState
+    new: _DispatchDescriptorState
+    init: _DispatchDescriptorState
+
+
+def _factory_state(value: object) -> _FactoryState | None:
+    if value is _MISSING:
+        return None
+    if not isinstance(value, type):
+        raise _error("Gmsh native library factory is not a type")
+    metaclass = type(value)
+    return _FactoryState(
+        value,
+        metaclass,
+        _dispatch_descriptor_state(metaclass, "__call__"),
+        _dispatch_descriptor_state(metaclass, "__getattribute__"),
+        _dispatch_descriptor_state(value, "__new__"),
+        _dispatch_descriptor_state(value, "__init__"),
+    )
+
+
+@dataclass(slots=True)
 class _AttributeDispatchState:
     value_type: type
     descriptors: dict[str, _DispatchDescriptorState]
@@ -1305,9 +1331,7 @@ class _LiveState:
     library_namespace_owner: type
     library_namespace_descriptor: object
     library_namespace: dict[str, object]
-    library_funcptr_owner: type
-    library_funcptr_descriptor: object
-    library_funcptr: object
+    library_funcptr: _FactoryState | None
     native_symbols: frozenset[str]
     native_signature_policy: dict[str, frozenset[tuple[object, ...]]]
     native_callables: dict[str, _NativeCallableState]
@@ -1328,16 +1352,19 @@ def _capture_live_state(
         library,
         expected=(library_namespace_owner, library_namespace_descriptor),
     )
-    library_funcptr_owner, library_funcptr_descriptor = _raw_type_descriptor(
-        type(library), "_FuncPtr"
-    )
-    library_funcptr = namespace.get("_FuncPtr", _MISSING)
+    library_funcptr = _factory_state(namespace.get("_FuncPtr", _MISSING))
     module_dispatch = _attribute_dispatch_state(
         module, ("__getattribute__", "__getattr__")
     )
     library_dispatch = _attribute_dispatch_state(
         library,
-        ("__getattribute__", "__getattr__", "__getitem__", *sorted(native_symbols)),
+        (
+            "__getattribute__",
+            "__getattr__",
+            "__getitem__",
+            "__setattr__",
+            *sorted(native_symbols),
+        ),
     )
     module_namespace = vars(module)
     module_name = module.__name__
@@ -1385,8 +1412,6 @@ def _capture_live_state(
         library_namespace_owner=library_namespace_owner,
         library_namespace_descriptor=library_namespace_descriptor,
         library_namespace=namespace,
-        library_funcptr_owner=library_funcptr_owner,
-        library_funcptr_descriptor=library_funcptr_descriptor,
         library_funcptr=library_funcptr,
         native_symbols=native_symbols,
         native_signature_policy=native_signature_policy,
@@ -1457,6 +1482,41 @@ def _validate_attribute_dispatch(
             _validate_function_state(function_state, f"{label} {name} dispatch")
 
 
+def _validate_dispatch_descriptor(
+    state: _DispatchDescriptorState, value_type: type, name: str, label: str
+) -> None:
+    current = _dispatch_descriptor_state(value_type, name)
+    if current.owner is not state.owner or current.descriptor is not state.descriptor:
+        raise _error(f"live Gmsh {label} descriptor changed")
+    for function_state in state.functions:
+        _validate_function_state(function_state, f"{label} {name}")
+
+
+def _validate_factory_state(state: _FactoryState, value: object) -> None:
+    if value is not state.value:
+        raise _error("live Gmsh native library factory changed")
+    if type(value) is not state.metaclass:
+        raise _error("live Gmsh native library factory metaclass changed")
+    _validate_dispatch_descriptor(
+        state.metaclass_call,
+        state.metaclass,
+        "__call__",
+        "native library factory call",
+    )
+    _validate_dispatch_descriptor(
+        state.metaclass_getattribute,
+        state.metaclass,
+        "__getattribute__",
+        "native library factory attribute",
+    )
+    _validate_dispatch_descriptor(
+        state.new, state.value, "__new__", "native library factory constructor"
+    )
+    _validate_dispatch_descriptor(
+        state.init, state.value, "__init__", "native library factory constructor"
+    )
+
+
 def _validate_live_state(state: _LiveState, module: ModuleType, library: object) -> None:
     _validate_attribute_dispatch(state.module_dispatch, module, "module")
     _validate_attribute_dispatch(state.library_dispatch, library, "native library")
@@ -1466,16 +1526,12 @@ def _validate_live_state(state: _LiveState, module: ModuleType, library: object)
     )
     if current_library_namespace is not state.library_namespace:
         raise _error("live Gmsh native library namespace changed")
-    current_funcptr_owner, current_funcptr_descriptor = _raw_type_descriptor(
-        type(library), "_FuncPtr"
-    )
-    if (
-        current_funcptr_owner is not state.library_funcptr_owner
-        or current_funcptr_descriptor is not state.library_funcptr_descriptor
-    ):
-        raise _error("live Gmsh native library factory descriptor changed")
-    if current_library_namespace.get("_FuncPtr", _MISSING) is not state.library_funcptr:
-        raise _error("live Gmsh native library factory changed")
+    current_funcptr = current_library_namespace.get("_FuncPtr", _MISSING)
+    if state.library_funcptr is None:
+        if current_funcptr is not _MISSING:
+            raise _error("live Gmsh native library factory was added")
+    else:
+        _validate_factory_state(state.library_funcptr, current_funcptr)
     namespace = vars(module)
     for name, function_state in state.module_functions.items():
         if namespace.get(name, _MISSING) is not function_state.function:
