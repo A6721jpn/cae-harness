@@ -746,9 +746,7 @@ class GmshOCCBackend:
         by_key: dict[tuple[int, int, int], list[_TetFaceContext]] = {}
         for element in elements:
             for local_face_id, positions in enumerate(_tet10_face_positions()):
-                face_nodes = tuple(
-                    element.canonical_node_ids[position] for position in positions
-                )
+                face_nodes = tuple(element.canonical_node_ids[position] for position in positions)
                 key = _sorted_triple(face_nodes[:3])
                 by_key.setdefault(key, []).append(
                     _TetFaceContext(
@@ -777,9 +775,7 @@ class GmshOCCBackend:
                 seen_surface_keys.add(facet.corner_key)
             cad_facets.append((cad_face, surface_facets))
 
-        exterior_keys = {
-            key for key, adjacency in by_key.items() if len(adjacency) == 1
-        }
+        exterior_keys = {key for key, adjacency in by_key.items() if len(adjacency) == 1}
         if seen_surface_keys != exterior_keys:
             raise BackendError(
                 BackendErrorCategory.INTEGRITY,
@@ -808,9 +804,7 @@ class GmshOCCBackend:
                         BackendErrorCategory.INTEGRITY,
                         f"CAD face {cad_face.face_id!r} has mismatched Tet10 midside connectivity",
                     )
-                corner_points = tuple(
-                    node_coordinates[node_id] for node_id in facet.corner_key
-                )
+                corner_points = tuple(node_coordinates[node_id] for node_id in facet.corner_key)
                 area, centroid = _triangle_measure(corner_points)
                 result.append(
                     BackendMeshFace(
@@ -1472,7 +1466,7 @@ def _edge_midpoint_signature(
         midpoint_nodes,
         strict=True,
     ):
-        edge = tuple(sorted((first, second)))
+        edge = (first, second) if first < second else (second, first)
         edges.append((edge, midpoint))
     return tuple(sorted(edges))
 

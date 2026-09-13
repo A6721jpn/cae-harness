@@ -13,6 +13,7 @@ from febio_cae.adapters.geometry import (
     GmshOCCConfig,
 )
 from febio_cae.domain import (
+    TET10_FACE_NODE_POSITIONS,
     BodyId,
     EvidenceRef,
     FrameId,
@@ -20,7 +21,6 @@ from febio_cae.domain import (
     Quantity,
     RigidPrimitive,
     RigidTransform,
-    TET10_FACE_NODE_POSITIONS,
     Translation3,
 )
 
@@ -186,13 +186,17 @@ class _SyntheticModelMesh:
         self, dimension: int, tag: int
     ) -> tuple[list[int], list[list[int]], list[list[int]]]:
         if dimension == 3 and tag == 1:
-            return [11], [list(range(1, len(self.owner.layout.volume_elements) + 1))], [
-                [node for element in self.owner.layout.volume_elements for node in element]
-            ]
+            return (
+                [11],
+                [list(range(1, len(self.owner.layout.volume_elements) + 1))],
+                [[node for element in self.owner.layout.volume_elements for node in element]],
+            )
         if dimension == 2 and tag == 1:
-            return [self.owner.layout.surface_element_type], [
-                list(range(1, len(self.owner.layout.surface_elements) + 1))
-            ], [[node for facet in self.owner.layout.surface_elements for node in facet]]
+            return (
+                [self.owner.layout.surface_element_type],
+                [list(range(1, len(self.owner.layout.surface_elements) + 1))],
+                [[node for facet in self.owner.layout.surface_elements for node in facet]],
+            )
         raise RuntimeError("unexpected element query")
 
     def getElementProperties(self, type_id: int) -> tuple[Any, ...]:
