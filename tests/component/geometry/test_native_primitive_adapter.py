@@ -26,6 +26,7 @@ from febio_cae.adapters.geometry import (
 from febio_cae.domain import (
     TET10_FACE_NODE_POSITIONS,
     CaseRevision,
+    BodyId,
     FaceId,
     FaceSetRule,
     FrameId,
@@ -40,6 +41,7 @@ from febio_cae.domain import (
     SourceAssetContent,
     SourceLocalRefinementBall,
     Translation3,
+    WholeBodyRule,
 )
 from febio_cae.domain.canonical import canonical_bytes
 
@@ -344,6 +346,61 @@ class SyntheticCurvedBackend(SyntheticBackend):
         return _synthetic_curved_mesh(primitive, geometry_digest, global_size_si, local_refinements)
 
 
+class RefinementRecordingCurvedBackend(SyntheticCurvedBackend):
+    """Synthetic native backend that records both owner-specific requests."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.step_refinements: tuple[BackendLocalRefinement, ...] = ()
+        self.tool_refinements: tuple[BackendLocalRefinement, ...] = ()
+
+    def mesh(
+        self,
+        content: bytes,
+        body_id: str,
+        global_size_si: float,
+        *,
+        local_refinements: tuple[BackendLocalRefinement, ...] = (),
+    ) -> BackendMesh:
+        self.step_refinements = tuple(local_refinements)
+        return SyntheticBackend.mesh(self, content, body_id, global_size_si)
+
+    def mesh_rigid_primitive(
+        self,
+        primitive: RigidPrimitive,
+        *,
+        geometry_digest: str,
+        global_size_si: float,
+        local_refinements: tuple[BackendLocalRefinement, ...] = (),
+    ) -> BackendMesh:
+        self.tool_refinements = tuple(local_refinements)
+        return super().mesh_rigid_primitive(
+            primitive,
+            geometry_digest=geometry_digest,
+            global_size_si=global_size_si,
+            local_refinements=local_refinements,
+        )
+
+
+class RefinementRecordingStepBackend(SyntheticBackend):
+    """Synthetic STEP backend that accepts and records local refinements."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.step_refinements: tuple[BackendLocalRefinement, ...] = ()
+
+    def mesh(
+        self,
+        content: bytes,
+        body_id: str,
+        global_size_si: float,
+        *,
+        local_refinements: tuple[BackendLocalRefinement, ...] = (),
+    ) -> BackendMesh:
+        self.step_refinements = tuple(local_refinements)
+        return super().mesh(content, body_id, global_size_si)
+
+
 def _curved_revision(
     revision: CaseRevision,
     *,
@@ -406,6 +463,33 @@ def _adapter(
     )
 
 
+def _whole_body_refinement(
+    selection: Any,
+    refinement_id: str,
+    center_frame: FrameId,
+) -> LocalRefinement:
+    selected = replace(
+        selection,
+        name=refinement_id,
+        role="mesh_refinement",
+        role_evidence=_evidence("selection.role", refinement_id),
+    )
+    return LocalRefinement(
+        refinement_id=refinement_id,
+        selection=selected,
+        size=Quantity(0.001, "m"),
+        region=SourceLocalRefinementBall(
+            center=Point3(
+                center_frame,
+                Quantity(0, "m"),
+                Quantity(0, "m"),
+                Quantity(0, "m"),
+            ),
+            radius=Quantity(0.0005, "m"),
+        ),
+    )
+
+
 def _inverse_pose(point: tuple[float, float, float]) -> tuple[float, float, float]:
     placement = _nonidentity_placement()
     translation = tuple(
@@ -464,10 +548,14 @@ def test_native_curved_mesh_preserves_curvature_pose_and_cad_selection(
         revision.spec.rigid_tool.primitive,
         TOOL_GEOMETRY_DIGEST,
     )
-    assert inspection.frame == TOOL_LOCAL
+    assert inspection.frame == WORLD
     assert len(inspection.bodies) == 1
     assert inspection.bodies[0].volume_si == pytest.approx(4.0 * math.pi * RADIUS**3 / 3.0)
     assert {face.face_id for face in inspection.bodies[0].faces} == set(CAD_FACE_IDS)
+    first_face = inspection.bodies[0].faces[0]
+    assert first_face.centroid_si == pytest.approx(
+        (0.031 + RADIUS / 3.0, -0.047 - RADIUS / 3.0, 0.083 + RADIUS / 3.0)
+    )
 
     artifact = adapter.mesh(revision)
 
@@ -689,3 +777,129 @@ def test_native_source_local_ball_passes_and_changes_mesh_identity(
     assert set(baseline.provenance.source_selection_digests) < set(
         refined.provenance.source_selection_digests
     )
+
+
+def test_native_placed_selection_uses_local_inspection_without_mesh_generation(
+    source_content: SourceAssetContent,
+    synthetic_case_revision: CaseRevision,
+) -> None:
+    revision = _curved_revision(synthetic_case_revision)
+    backend = SyntheticCurvedBackend()
+    adapter = _adapter(backend, source_content, _criteria(revision, limit=RADIUS))
+
+    result = adapter.resolve_placed_selection(
+        source_content,
+        revision.spec.geometry,
+        revision.spec.rigid_tool,
+        revision.spec.rigid_tool.contact_surface,
+    )
+
+    assert result.frame == WORLD
+    assert backend.curved_inspection_calls == 1
+    assert backend.curved_mesh_calls == 0
+    first_face = next(face for face in result.faces if face.face_id.value == CAD_FACE_IDS[0])
+    assert first_face.centroid == pytest.approx(
+        Point3(
+            WORLD,
+            Quantity(0.031 + RADIUS / 3.0, "m"),
+            Quantity(-0.047 - RADIUS / 3.0, "m"),
+            Quantity(0.083 + RADIUS / 3.0, "m"),
+        )
+    )
+
+
+def test_local_refinements_are_partitioned_by_owner_and_change_recipe(
+    source_content: SourceAssetContent,
+    synthetic_case_revision: CaseRevision,
+) -> None:
+    base = _curved_revision(synthetic_case_revision)
+    part_refinement = _whole_body_refinement(
+        base.spec.contact.part_surface,
+        "part-local-ball",
+        base.spec.geometry.placement.source_frame,
+    )
+    tool_refinement = _whole_body_refinement(
+        base.spec.rigid_tool.contact_surface,
+        "tool-local-ball",
+        base.spec.rigid_tool.primitive.local_frame,
+    )
+    policy = replace(base.spec.mesh_policy, local_refinements=(part_refinement, tool_refinement))
+    refined_revision = replace(base, spec=replace(base.spec, mesh_policy=policy))
+
+    baseline = _adapter(
+        RefinementRecordingCurvedBackend(), source_content, _criteria(base, limit=RADIUS)
+    ).mesh(base)
+    backend = RefinementRecordingCurvedBackend()
+    refined = _adapter(
+        backend, source_content, _criteria(refined_revision, limit=RADIUS)
+    ).mesh(refined_revision)
+
+    assert len(backend.step_refinements) == 1
+    assert backend.step_refinements[0].body_id == PART_BODY.value
+    assert backend.step_refinements[0].frame == base.spec.geometry.placement.source_frame
+    assert backend.step_refinements[0].center_si == (0.0, 0.0, 0.0)
+    assert len(backend.tool_refinements) == 1
+    assert backend.tool_refinements[0].body_id == TOOL_BODY.value
+    assert backend.tool_refinements[0].frame == base.spec.rigid_tool.primitive.local_frame
+    assert backend.tool_refinements[0].center_si == (0.0, 0.0, 0.0)
+    assert refined.provenance.mesh_recipe_digest != baseline.provenance.mesh_recipe_digest
+    assert refined.artifact_id != baseline.artifact_id
+    assert refined.provenance.source_geometry_digest == baseline.provenance.source_geometry_digest
+    assert refined.provenance.source_body_ids == baseline.provenance.source_body_ids
+
+
+def test_step_local_refinement_is_supported_with_box_tool(
+    source_content: SourceAssetContent,
+    synthetic_case_revision: CaseRevision,
+) -> None:
+    base = synthetic_case_revision
+    refinement = _whole_body_refinement(
+        base.spec.contact.part_surface,
+        "part-local-box-ball",
+        base.spec.geometry.placement.source_frame,
+    )
+    policy = replace(base.spec.mesh_policy, local_refinements=(refinement,))
+    revision = replace(base, spec=replace(base.spec, mesh_policy=policy))
+    backend = RefinementRecordingStepBackend()
+    adapter = StepGeometryMeshAdapter(
+        backend,
+        source_resolver=SyntheticSourceResolver(source_content),
+        source_asset=source_content.source_asset,
+    )
+
+    artifact = adapter.mesh(revision)
+
+    assert artifact.nodes and artifact.elements
+    assert len(backend.step_refinements) == 1
+    assert backend.step_refinements[0].body_id == PART_BODY.value
+    assert backend.step_refinements[0].frame == base.spec.geometry.placement.source_frame
+
+
+@pytest.mark.parametrize("corruption", ("body", "source", "frame"))
+def test_invalid_refinement_identity_is_rejected_before_any_mesh_generation(
+    source_content: SourceAssetContent,
+    synthetic_case_revision: CaseRevision,
+    corruption: str,
+) -> None:
+    base = _curved_revision(synthetic_case_revision)
+    selection = base.spec.rigid_tool.contact_surface
+    if corruption == "body":
+        foreign_body = BodyId("foreign-refinement-body")
+        selection = replace(selection, body_id=foreign_body, rule=WholeBodyRule(foreign_body))
+    elif corruption == "source":
+        selection = replace(selection, geometry_digest="9" * 64)
+    else:
+        selection = replace(selection, frame=FrameId("WrongPlacedFrame"))
+    refinement = _whole_body_refinement(selection, f"invalid-{corruption}-ball", TOOL_LOCAL)
+    policy = replace(base.spec.mesh_policy, local_refinements=(refinement,))
+    invalid_spec = replace(base.spec)
+    object.__setattr__(invalid_spec, "mesh_policy", policy)
+    revision = replace(base, spec=invalid_spec)
+    backend = SyntheticCurvedBackend()
+
+    with pytest.raises(PortError):
+        _adapter(backend, source_content, _criteria(base, limit=RADIUS)).mesh(revision)
+
+    assert backend.curved_inspection_calls == 0
+    assert backend.curved_mesh_calls == 0
+    assert backend.mesh_requests == []

@@ -234,7 +234,10 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
         if not isinstance(primitive, RigidPrimitive):
             raise TypeError("primitive must be a RigidPrimitive")
         if primitive.kind in {"sphere", "cylinder"} and self._native_curved_capability():
-            return self._inspect_native_primitive(primitive, geometry_digest)
+            return _placed_inspection(
+                self._inspect_native_primitive(primitive, geometry_digest),
+                primitive.placement,
+            )
         generated = generate_primitive_mesh(primitive, geometry_digest=geometry_digest)
         return self._tool_inspection(generated, primitive, geometry_digest)
 
@@ -321,7 +324,7 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
         rigid_tool: RigidToolIntent,
         selection: SelectionRef,
     ) -> ResolutionSnapshot:
-        """Concrete draft-scoped bridge for explicit part and flat-tool poses.
+        """Concrete draft-scoped bridge for explicit part and rigid-tool poses.
 
         This does not replace the source-only GeometryPort contract or apply
         contact gap adjustments. The supplied intents must already state poses.
@@ -350,11 +353,6 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
         if selection.body_id == geometry.body_id:
             selected_report = _placed_inspection(report, geometry.placement)
         elif selection.body_id == rigid_tool.primitive.body_id:
-            if rigid_tool.primitive.kind != "box":
-                self._raise(
-                    PortErrorCategory.UNSUPPORTED_CAPABILITY,
-                    "placed bridge supports flat box tools only",
-                )
             selected_report = self.inspect_rigid_tool(
                 rigid_tool.primitive, rigid_tool.contact_surface.geometry_digest
             )
@@ -383,10 +381,17 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
                 PortErrorCategory.INTEGRITY, "case STEP unit conflicts with source inspection"
             )
         report = _placed_inspection(self.inspection_details(inspection), spec.geometry.placement)
-        generated = self._generate_tool(spec, deadline)
+        _, tool_refinements = self._partition_local_refinements(spec)
+        generated = self._generate_tool(spec, deadline, tool_refinements=tool_refinements)
         return self._initial_placement(spec, report, generated)
 
-    def _generate_tool(self, spec: CaseSpec, deadline: float) -> GeneratedPrimitiveMesh:
+    def _generate_tool(
+        self,
+        spec: CaseSpec,
+        deadline: float,
+        *,
+        tool_refinements: tuple[BackendLocalRefinement, ...] | None = None,
+    ) -> GeneratedPrimitiveMesh:
         from febio_cae.adapters.meshing.approximation import (
             ALGORITHM,
             NATIVE_ALGORITHM,
@@ -399,6 +404,11 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
         primitive = spec.rigid_tool.primitive
         is_curved = primitive.kind in {"sphere", "cylinder"}
         native = is_curved and self._native_curved_capability()
+        if is_curved and not native and spec.mesh_policy.local_refinements:
+            self._raise(
+                PortErrorCategory.UNSUPPORTED_CAPABILITY,
+                "local refinement mapping is not qualified without a native curved tool backend",
+            )
         criteria = None
         if is_curved:
             criteria = resolve_criteria(
@@ -413,15 +423,18 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
                     PortErrorCategory.UNSUPPORTED_CAPABILITY,
                     "native curved contact placement requires an explicit AsPlaced arrangement",
                 )
+            if tool_refinements is None:
+                _, tool_refinements = self._partition_local_refinements(spec)
             return self._generate_native_tool(
                 spec,
                 criteria,
                 deadline,
+                tool_refinements=tool_refinements,
             )
-        if spec.mesh_policy.local_refinements:
+        if tool_refinements:
             self._raise(
                 PortErrorCategory.UNSUPPORTED_CAPABILITY,
-                "backend local-refinement mapping is not qualified for this adapter",
+                "box rigid-tool local refinement is not supported by the primitive backend",
             )
         try:
             return generate_primitive_mesh(
@@ -437,7 +450,12 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
             ) from error
 
     def _generate_native_tool(
-        self, spec: CaseSpec, criteria: ApproximationCriteria | None, deadline: float
+        self,
+        spec: CaseSpec,
+        criteria: ApproximationCriteria | None,
+        deadline: float,
+        *,
+        tool_refinements: tuple[BackendLocalRefinement, ...],
     ) -> GeneratedPrimitiveMesh:
         from febio_cae.adapters.meshing.approximation import (
             ApproximationCriteria as RuntimeApproximationCriteria,
@@ -450,7 +468,6 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
 
         if not isinstance(criteria, RuntimeApproximationCriteria):
             self._raise(PortErrorCategory.INTEGRITY, "native criteria are unavailable")
-        local_refinements = self._native_local_refinements(spec)
         inspection = self._inspect_native_primitive(
             primitive,
             spec.rigid_tool.contact_surface.geometry_digest,
@@ -466,7 +483,7 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
                 primitive,
                 geometry_digest=spec.rigid_tool.contact_surface.geometry_digest,
                 global_size_si=float(spec.mesh_policy.global_size.to_si().value),
-                local_refinements=local_refinements,
+                local_refinements=tool_refinements,
             )
         except PortError:
             raise
@@ -501,72 +518,115 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
             native_inspection=inspection,
         )
 
-    def _native_local_refinements(self, spec: CaseSpec) -> tuple[BackendLocalRefinement, ...]:
+    def _partition_local_refinements(
+        self, spec: CaseSpec
+    ) -> tuple[tuple[BackendLocalRefinement, ...], tuple[BackendLocalRefinement, ...]]:
+        """Validate source-local refinement intent and partition it by owning body."""
+
+        geometry = spec.geometry
         primitive = spec.rigid_tool.primitive
-        geometry_digest = spec.rigid_tool.contact_surface.geometry_digest
-        result: list[BackendLocalRefinement] = []
-        for refinement in spec.mesh_policy.local_refinements:
+        global_size = float(spec.mesh_policy.global_size.to_si().value)
+        part_refinements: list[BackendLocalRefinement] = []
+        tool_refinements: list[BackendLocalRefinement] = []
+        for index, refinement in enumerate(spec.mesh_policy.local_refinements):
+            field = f"mesh policy local refinement {index}"
             if not isinstance(refinement, LocalRefinement):
-                self._raise(
-                    PortErrorCategory.INVALID_INPUT,
-                    "mesh policy contains an invalid local refinement",
-                )
+                self._raise(PortErrorCategory.INVALID_INPUT, f"{field} is invalid")
             region = refinement.region
-            selection = refinement.selection
             if not isinstance(region, SourceLocalRefinementBall):
                 self._raise(
                     PortErrorCategory.UNSUPPORTED_CAPABILITY,
-                    "native curved meshing requires a source-local refinement ball",
+                    f"{field} requires a source-local refinement ball",
                 )
-            if selection.body_id != primitive.body_id:
-                self._raise(
-                    PortErrorCategory.INVALID_INPUT,
-                    "native local refinement selection must identify the tool body",
-                )
-            if selection.geometry_digest != geometry_digest:
-                self._raise(
-                    PortErrorCategory.INTEGRITY,
-                    "native local refinement selection references stale tool geometry",
-                )
-            if selection.frame != primitive.placement.target_frame:
-                self._raise(
-                    PortErrorCategory.INVALID_INPUT,
-                    "native local refinement selection must use the placed tool frame",
-                )
+
+            selection = refinement.selection
             if selection.stated_role != "mesh_refinement":
                 self._raise(
                     PortErrorCategory.INVALID_INPUT,
-                    "native local refinement selection role must be mesh_refinement",
+                    f"{field} selection role must be mesh_refinement",
                 )
             if not isinstance(selection.rule, WholeBodyRule):
                 self._raise(
                     PortErrorCategory.UNSUPPORTED_CAPABILITY,
-                    "native local refinement selection must resolve the whole tool body",
+                    f"{field} selection must resolve the whole body",
                 )
-            if region.center.frame != primitive.local_frame:
+            if selection.rule.body_id != selection.body_id:
                 self._raise(
                     PortErrorCategory.INVALID_INPUT,
-                    "native local refinement center must use the primitive local frame",
+                    f"{field} whole-body rule identifies a different body",
+                )
+
+            if selection.body_id == geometry.body_id:
+                owner = part_refinements
+                expected_digest = geometry.geometry_digest
+                expected_target_frame = geometry.placement.target_frame
+                expected_source_frame = geometry.placement.source_frame
+                owner_body_id = geometry.body_id.value
+            elif selection.body_id == primitive.body_id:
+                owner = tool_refinements
+                expected_digest = spec.rigid_tool.contact_surface.geometry_digest
+                expected_target_frame = primitive.placement.target_frame
+                expected_source_frame = primitive.local_frame
+                owner_body_id = primitive.body_id.value
+            else:
+                self._raise(
+                    PortErrorCategory.INVALID_INPUT,
+                    f"{field} selection identifies a foreign body",
+                )
+
+            if selection.geometry_digest != expected_digest:
+                self._raise(
+                    PortErrorCategory.INTEGRITY,
+                    f"{field} selection references stale geometry",
+                )
+            if selection.frame != expected_target_frame:
+                self._raise(
+                    PortErrorCategory.INVALID_INPUT,
+                    f"{field} selection must use the placed target frame",
+                )
+            if region.center.frame != expected_source_frame:
+                self._raise(
+                    PortErrorCategory.INVALID_INPUT,
+                    f"{field} center must use the owning body's source-local frame",
                 )
             try:
                 center = _point_values(region.center)
                 radius = float(region.radius.to_si().value)
                 size = float(refinement.size.to_si().value)
+            except (AttributeError, TypeError, ValueError, OverflowError) as error:
+                self._raise(
+                    PortErrorCategory.INVALID_INPUT,
+                    f"{field} dimensions are invalid: {error}",
+                )
+            if (
+                any(not math.isfinite(value) for value in center)
+                or not math.isfinite(radius)
+                or radius <= 0.0
+                or not math.isfinite(size)
+                or size <= 0.0
+                or not math.isfinite(global_size)
+                or size > global_size
+            ):
+                self._raise(
+                    PortErrorCategory.INVALID_INPUT,
+                    f"{field} dimensions are invalid or exceed global size",
+                )
+            try:
+                owner.append(
+                    BackendLocalRefinement(
+                        body_id=owner_body_id,
+                        frame=expected_source_frame,
+                        center_si=center,
+                        radius_si=radius,
+                        size_si=size,
+                    )
+                )
             except (TypeError, ValueError, OverflowError) as error:
                 self._raise(
                     PortErrorCategory.INVALID_INPUT,
-                    f"native local refinement dimensions are invalid: {error}",
+                    f"{field} backend refinement record is invalid: {error}",
                 )
-            result.append(
-                BackendLocalRefinement(
-                    body_id=primitive.body_id.value,
-                    frame=primitive.local_frame,
-                    center_si=center,
-                    radius_si=radius,
-                    size_si=size,
-                )
-            )
-        return tuple(result)
+        return tuple(part_refinements), tuple(tool_refinements)
 
     def _native_approximation(
         self,
@@ -828,27 +888,18 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
                 PortErrorCategory.UNSUPPORTED_CAPABILITY,
                 "declared geometry body is not a closed solid",
             )
-        if spec.mesh_policy.local_refinements:
-            native_tool = (
-                spec.rigid_tool.primitive.kind
-                in {
-                    "sphere",
-                    "cylinder",
-                }
-                and self._native_curved_capability()
-            )
-            if not native_tool:
-                self._raise(
-                    PortErrorCategory.UNSUPPORTED_CAPABILITY,
-                    "backend local-refinement mapping is not qualified for this adapter",
-                )
+        part_refinements, tool_refinements = self._partition_local_refinements(spec)
         selections = _spec_selections(spec)
         selection_resolutions = {
             _selection_digest(selection): self._resolve_selection_from_report(selection, report)
             for selection in selections
             if selection.body_id.value == part_body_id
         }
-        generated = self._generate_tool(spec, deadline)
+        generated = self._generate_tool(
+            spec,
+            deadline,
+            tool_refinements=tool_refinements,
+        )
         applied = self._initial_placement(spec, report, generated)
         placed_tool = replace(spec.rigid_tool.primitive, placement=applied.placement)
         tool_report = self._tool_inspection(
@@ -877,6 +928,7 @@ class StepGeometryMeshAdapter(GeometryPort, MeshingPort):
                 source.content,
                 part_body_id,
                 float(spec.mesh_policy.global_size.to_si().value),
+                local_refinements=part_refinements,
             )
         except BackendError as error:
             self._raise_backend(error)
