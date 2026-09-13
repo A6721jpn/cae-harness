@@ -1,8 +1,10 @@
-"""Private trusted-composition criteria and bounded affine primitive generation.
+"""Private trusted-composition criteria and bounded primitive generation.
 
 No record lookup or qualification authority is established here. A registered
 provider must be supplied by composition; test providers are only synthetic.
-The algorithm represents inscribed radial polyhedra, not curved Tet10 faces.
+The legacy algorithm represents inscribed radial polyhedra. Native curved
+generation uses the same criteria validation path with a different algorithm
+identity and is assembled by the geometry adapter.
 """
 
 from __future__ import annotations
@@ -23,9 +25,21 @@ from febio_cae.domain import (
 )
 from febio_cae.domain.units import Dimension
 
+from .native_surface import ALGORITHM as NATIVE_ALGORITHM
+
 type Point = tuple[float, float, float]
 type Tet = tuple[int, int, int, int]
 ALGORITHM = "radial-polyhedron-affine-tet10-v1"
+
+__all__ = [
+    "ALGORITHM",
+    "NATIVE_ALGORITHM",
+    "ApproximationCriteria",
+    "CriteriaProvider",
+    "check_deadline",
+    "controlled_decomposition",
+    "resolve_criteria",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,7 +95,10 @@ type CriteriaProvider = Callable[[NumericalProfileRef], ApproximationCriteria | 
 
 
 def resolve_criteria(
-    provider: CriteriaProvider | None, policy: MeshPolicy, kind: str
+    provider: CriteriaProvider | None,
+    policy: MeshPolicy,
+    kind: str,
+    algorithm_id: str = ALGORITHM,
 ) -> ApproximationCriteria:
     if provider is None:
         raise PortError(
@@ -100,10 +117,10 @@ def resolve_criteria(
         )
     if criteria.profile != policy.quality_profile:
         raise PortError(PortErrorCategory.INTEGRITY, "approximation criteria foreign or stale")
-    if criteria.algorithm_id != ALGORITHM or kind not in criteria.supported_kinds:
+    if criteria.algorithm_id != algorithm_id or kind not in criteria.supported_kinds:
         raise PortError(
             PortErrorCategory.UNSUPPORTED_CAPABILITY,
-            "approximation criteria do not qualify this algorithm/kind",
+            f"approximation criteria do not qualify {algorithm_id!r}/{kind!r}",
         )
     return criteria
 

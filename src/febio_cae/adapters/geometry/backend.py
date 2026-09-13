@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Protocol, runtime_checkable
 
-from febio_cae.domain import FrameId
+from febio_cae.domain import FrameId, RigidPrimitive
 
 BACKEND_TET10_ORDER_ID = "tet10-backend-v1"
 # Position in a backend Tet10 connectivity tuple for each canonical position.
@@ -512,6 +512,31 @@ class GeometryMeshBackend(Protocol):
         """Generate a Tet10 mesh for one body, with SI coordinates."""
 
 
+@runtime_checkable
+class NativeCurvedGeometryBackend(Protocol):
+    """Optional native capability for analytic curved rigid primitives.
+
+    The capability is intentionally separate from :class:`GeometryMeshBackend`:
+    existing STEP backends may continue to provide the explicit affine curved
+    approximation path without claiming native curved-surface support.
+    """
+
+    def inspect_rigid_primitive(
+        self, primitive: RigidPrimitive, *, geometry_digest: str
+    ) -> BackendInspection:
+        """Inspect one analytic primitive in its declared local frame."""
+
+    def mesh_rigid_primitive(
+        self,
+        primitive: RigidPrimitive,
+        *,
+        geometry_digest: str,
+        global_size_si: float,
+        local_refinements: tuple[BackendLocalRefinement, ...] = (),
+    ) -> BackendMesh:
+        """Generate one native curved Tet10 mesh in the primitive local frame."""
+
+
 __all__ = [
     "BACKEND_TET10_ORDER_ID",
     "BACKEND_TET10_TO_CANONICAL_POSITIONS",
@@ -526,4 +551,5 @@ __all__ = [
     "BackendMeshFace",
     "BackendNode",
     "GeometryMeshBackend",
+    "NativeCurvedGeometryBackend",
 ]
