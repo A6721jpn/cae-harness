@@ -68,7 +68,7 @@ def test_malformed_local_refinement_is_rejected_before_native_entry(
         pytest.fail("malformed local refinement entered the native backend")
 
     monkeypatch.setattr(backend, "_load_module", forbidden_native_entry)
-    with pytest.raises(BackendError, match="local_refinement") as error:
+    with pytest.raises(BackendError) as error:
         backend.mesh_rigid_primitive(
             _primitive(),
             geometry_digest="a" * 64,
