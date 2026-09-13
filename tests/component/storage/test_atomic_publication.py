@@ -26,6 +26,20 @@ def test_atomic_publication_keeps_long_valid_target_component(tmp_path: Path) ->
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires Windows path semantics")
+def test_atomic_publication_replaces_valid_target_near_path_limit(tmp_path: Path) -> None:
+    root = tmp_path / ("p" * (239 - len(str(tmp_path))))
+    assert len(str(root)) == 240
+    root.mkdir()
+    target = root / "state.json"
+    target.write_bytes(b"original")
+
+    published = _write_atomic(root, target.name, b"replacement", token="boundary01")
+
+    assert published == target
+    assert target.read_bytes() == b"replacement"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows path semantics")
 def test_atomic_publication_collision_preserves_foreign_temporary(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
