@@ -513,7 +513,11 @@ def _local_mesh_index(mesh: MeshArtifact, bodies: set[str]) -> _LocalMeshIndex:
                 right = coordinates[edge[1]]
             except KeyError as error:
                 raise ValueError("source-local mesh edge references an unknown node") from error
-            midpoint = tuple((left[index] + right[index]) / 2 for index in range(3))
+            midpoint = (
+                (left[0] + right[0]) / 2,
+                (left[1] + right[1]) / 2,
+                (left[2] + right[2]) / 2,
+            )
             length = math.dist(left, right)
             if not math.isfinite(length) or length <= 0:
                 raise ValueError("source-local mesh contains an invalid corner edge")
