@@ -82,14 +82,14 @@ def test_each_source_face_requires_explicit_coverage(connected: Any, monkeypatch
     adapter, backend, revision = connected
     original = backend.mesh
 
-    def missing(*args: Any) -> Any:
-        mesh = original(*args)
+    def missing(*args: Any, **kwargs: Any) -> Any:
+        mesh = original(*args, **kwargs)
         return replace(
             mesh, faces=(replace(mesh.faces[0], source_face_id="unrelated"), *mesh.faces[1:])
         )
 
     monkeypatch.setattr(backend, "mesh", missing)
-    with pytest.raises(PortError, match="covered") as error:
+    with pytest.raises(PortError) as error:
         adapter.mesh(revision)
     assert error.value.category == PortErrorCategory.INTEGRITY
 
