@@ -320,7 +320,12 @@ def test_registered_missing_output_or_endpoint_is_rejected_before_summary(
 
 
 def _scaled_mesh_backend(fixtures: Any) -> Any:
-    from febio_cae.adapters.geometry import BackendElement, BackendMesh, BackendMeshFace, BackendNode
+    from febio_cae.adapters.geometry import (
+        BackendElement,
+        BackendMesh,
+        BackendMeshFace,
+        BackendNode,
+    )
 
     class MeshStudyBackend(fixtures.SyntheticBackend):
         def mesh(
@@ -373,7 +378,10 @@ def _scaled_mesh_backend(fixtures: Any) -> Any:
                     faces.append(
                         BackendMeshFace(
                             f"{face.face_id}-copy-{copy_index}",
-                            tuple(element_id + element_offset for element_id in face.adjacent_element_ids),
+                            tuple(
+                                element_id + element_offset
+                                for element_id in face.adjacent_element_ids
+                            ),
                             face.local_face_ids,
                             face.area_si,
                             face.centroid_si,
@@ -393,6 +401,97 @@ def _scaled_mesh_backend(fixtures: Any) -> Any:
             )
 
     return MeshStudyBackend(geometry_digest="0" * 64)
+
+
+def _source_local_mesh_backend(fixtures: Any) -> Any:
+    from febio_cae.adapters.geometry import (
+        BackendElement,
+        BackendMesh,
+        BackendMeshFace,
+        BackendNode,
+    )
+
+    class SourceLocalStudyBackend(fixtures.SyntheticBackend):
+        def mesh(
+            self,
+            content: bytes,
+            body_id: str,
+            global_size_si: float,
+            *,
+            local_refinements: tuple[Any, ...] = (),
+        ) -> BackendMesh:
+            if len(local_refinements) != 1:
+                raise ValueError("source-local synthetic study requires one ball")
+            base = super().mesh(
+                content,
+                body_id,
+                global_size_si,
+                local_refinements=(),
+            )
+            target = round(float(local_refinements[0].size_si), 10)
+            stage_copies = {0.002: 1, 0.001: 2, 0.0005: 3}.get(target)
+            if stage_copies is None:
+                raise ValueError(f"unexpected synthetic local study size: {target}")
+            nodes: list[BackendNode] = []
+            elements: list[BackendElement] = []
+            faces: list[BackendMeshFace] = []
+
+            def add_copy(copy_index: int, scale: float, x_offset: float) -> None:
+                node_offset = copy_index * len(base.nodes)
+                element_offset = copy_index * len(base.elements)
+                for node in base.nodes:
+                    nodes.append(
+                        BackendNode(
+                            node.node_id + node_offset,
+                            (
+                                node.coordinates_si[0] * scale + x_offset,
+                                node.coordinates_si[1] * scale,
+                                node.coordinates_si[2] * scale,
+                            ),
+                        )
+                    )
+                for element in base.elements:
+                    elements.append(
+                        BackendElement(
+                            element.element_id + element_offset,
+                            element.element_type,
+                            tuple(node_id + node_offset for node_id in element.node_ids),
+                            element.body_id,
+                            element.ordering_id,
+                        )
+                    )
+                for face in base.faces:
+                    faces.append(
+                        BackendMeshFace(
+                            f"{face.face_id}-copy-{copy_index}",
+                            tuple(
+                                element_id + element_offset
+                                for element_id in face.adjacent_element_ids
+                            ),
+                            face.local_face_ids,
+                            face.area_si,
+                            face.centroid_si,
+                            face.boundary_points_si,
+                            face.source_face_id if copy_index == 0 else None,
+                        )
+                    )
+
+            for copy_index in range(stage_copies):
+                add_copy(copy_index, target / 0.002, 0.0)
+            # A fixed, separated copy supplies the far-field control measurement.
+            add_copy(stage_copies, 0.8, 0.02)
+            return BackendMesh(
+                base.source_digest,
+                base.geometry_digest,
+                base.frame,
+                base.body_id,
+                nodes,
+                elements,
+                faces,
+                base.ordering_id,
+            )
+
+    return SourceLocalStudyBackend(geometry_digest="0" * 64)
 
 
 def _mesh_study_payload(service: Any, request: dict[str, Any]) -> dict[str, Any]:
@@ -458,9 +557,7 @@ def _mesh_study_payload(service: Any, request: dict[str, Any]) -> dict[str, Any]
             for name in ("solver_policy", "outputs", "quality_policy")
         },
     )
-    controls = {
-        control.name: control.value for control in configured.solver_policy.controls
-    } | {
+    controls = {control.name: control.value for control in configured.solver_policy.controls} | {
         "dtol": Quantity(0.001, "1"),
         "etol": Quantity(0.01, "1"),
         "rtol": Quantity(0.001, "1"),
@@ -529,9 +626,7 @@ def _mesh_study_payload(service: Any, request: dict[str, Any]) -> dict[str, Any]
             "geometry_digest": surface["geometry_digest"],
             "body_id": surface["body_id"],
             "frame": surface["frame"],
-            "face_ids": [
-                {"schema_version": "1", "value": face_id} for face_id in face_ids
-            ],
+            "face_ids": [{"schema_version": "1", "value": face_id} for face_id in face_ids],
             "provenance": copy.deepcopy(evidence),
         }
         surface["resolution"] = None
@@ -651,7 +746,9 @@ def _mesh_study_payload(service: Any, request: dict[str, Any]) -> dict[str, Any]
     ]
 
     criterion_main = next(
-        item for item in values["quality_policy"]["criteria"] if item["metric_id"] == "peak_abs_value"
+        item
+        for item in values["quality_policy"]["criteria"]
+        if item["metric_id"] == "peak_abs_value"
     )
     criterion_main["criterion_id"] = "part_displacement_limit"
     criterion_main["evaluation_ids"] = ["ev_part_displacement"]
@@ -722,6 +819,54 @@ def _mesh_study_payload(service: Any, request: dict[str, Any]) -> dict[str, Any]
     return payload
 
 
+def _source_local_study_payload(service: Any, request: dict[str, Any]) -> dict[str, Any]:
+    import copy
+
+    payload = _mesh_study_payload(service, request)
+    values = payload["values"]
+    assert isinstance(values, dict)
+    values["mesh_policy"]["global_size"] = {"value": 5.0, "unit": "mm"}
+    part_selection = copy.deepcopy(values["contact"]["part_surface"])
+    part_selection["name"] = "source-local-body"
+    part_selection["stated_role"] = "mesh_refinement"
+    part_selection["rule"] = {
+        "schema_version": "1",
+        "kind": "whole_body",
+        "body_id": values["geometry"]["body_id"],
+    }
+    part_selection["resolution"] = None
+    source_frame = values["geometry"]["placement"]["source_frame"]
+    values["mesh_policy"]["local_refinements"] = [
+        {
+            "schema_version": "1",
+            "refinement_id": "part-ball",
+            "selection": part_selection,
+            "size": {"value": 2.0, "unit": "mm"},
+            "region": {
+                "schema_version": "1",
+                "kind": "source_local_ball",
+                "center": {
+                    "schema_version": "1",
+                    "frame": source_frame,
+                    "x": {"value": 0.0, "unit": "mm"},
+                    "y": {"value": 0.0, "unit": "mm"},
+                    "z": {"value": 0.0, "unit": "mm"},
+                },
+                "radius": {"value": 6.0, "unit": "mm"},
+            },
+        }
+    ]
+    criterion = next(
+        item
+        for item in values["quality_policy"]["criteria"]
+        if item["metric_id"] == "mesh_dependence"
+    )
+    criterion["criterion_id"] = "source_local_mesh_study"
+    criterion["metric_id"] = "source_local_mesh_dependence"
+    criterion["evidence"]["target_field"] = "quality_policy.criteria.source_local_mesh_study"
+    return payload
+
+
 def _registered_mesh_result(
     service: Any,
     created: Any,
@@ -789,9 +934,7 @@ def _registered_mesh_result(
                 / str(owner.owner_generation)
             )
             (process_root / "output").mkdir(parents=True)
-            (process_root / "output/results.xplt").write_bytes(
-                b"registered synthetic XPLT result"
-            )
+            (process_root / "output/results.xplt").write_bytes(b"registered synthetic XPLT result")
             if include_log:
                 log = _reported_log("pass").replace(
                     b"2.000000e+00 1.000000e-02 ", b"2.000000e+00 1.000000e-03 "
@@ -816,9 +959,7 @@ def _registered_mesh_result(
                 (
                     *bundle.settings,
                     ExecutionSetting("attempt_root", str(process_root)),
-                    ExecutionSetting(
-                        "max_elapsed_seconds", budget.max_elapsed.to_si().value
-                    ),
+                    ExecutionSetting("max_elapsed_seconds", budget.max_elapsed.to_si().value),
                 ),
             )
 
@@ -864,18 +1005,14 @@ def _registered_mesh_result(
                         for component in (
                             0.0,
                             0.0,
-                            -time * travel
-                            if node_id not in part_nodes
-                            else 0.0,
+                            -time * travel if node_id not in part_nodes else 0.0,
                         )
                     )
                     for time in times
                 )
             elif mapping.canonical_id == "reaction":
                 entities = tuple(
-                    str(node.node_id)
-                    for node in mesh.nodes
-                    if str(node.node_id) in part_nodes
+                    str(node.node_id) for node in mesh.nodes if str(node.node_id) in part_nodes
                 )
                 part_count = len(entities)
                 rows = tuple(
@@ -895,9 +1032,7 @@ def _registered_mesh_result(
             elif mapping.canonical_id == "rigid_position":
                 entities = (revision.spec.rigid_tool.primitive.body_id.value,)
                 base_z = revision.spec.rigid_tool.primitive.placement.translation.z.to_si().value
-                rows = tuple(
-                    (0.0, 0.0, base_z - time * travel) for time in times
-                )
+                rows = tuple((0.0, 0.0, base_z - time * travel) for time in times)
             else:
                 raise AssertionError(f"unexpected synthetic mapping: {mapping.canonical_id}")
             data = NumericResultData(
@@ -1024,6 +1159,244 @@ def _registered_mesh_study_summary(
     return service.run_status(created.case_id, final_run_id)
 
 
+def _partial_case_spec(spec: Any) -> Any:
+    from febio_cae.domain import PartialCaseSpec
+
+    return PartialCaseSpec(
+        **{
+            field: getattr(spec, field)
+            for field in (
+                "geometry",
+                "material",
+                "support",
+                "rigid_tool",
+                "motion",
+                "contact",
+                "mesh_policy",
+                "solver_policy",
+                "outputs",
+                "quality_policy",
+                "budget",
+            )
+        }
+    )
+
+
+def _publish_source_local_stage(
+    service: Any,
+    created: Any,
+    parent: Any,
+    payload: dict[str, Any],
+) -> Any:
+    import importlib
+
+    from febio_cae.application._preparation import geometry_from_output
+    from febio_cae.adapters.geometry.preparation import inspection_from_dict
+    from febio_cae.domain import CaseRevision, EvidenceRef, MeshArtifact, PartialCaseSpec
+    from febio_cae.domain.canonical import canonical_bytes
+    from febio_cae.domain.codec import decode_record
+    from febio_cae.storage.demo_budget import reserve_preparation_mesh_attempt
+    from febio_cae.storage.mesh_quality import PlanarPreparationRegistration
+    from febio_cae.storage.preparation import PreparationStore, digest
+
+    worker = importlib.import_module("febio_cae.adapters.geometry.preparation")
+    storage = service._storage(created.case_id)
+    records = PreparationStore(storage)
+    source = service.resolve_source(created.case_id, "cad")
+    parent_registration = storage.resolve_revision_mesh_quality(parent)
+    parent_record = records.read(parent_registration.preparation_id)
+    limits = dict(parent_record["limits"])
+    limits["mesh_generations"] = 1
+    current = storage.current_draft(created.case_id)
+    record = records.begin(
+        created.case_id,
+        input_generation=current.generation,
+        input_snapshot_digest=digest(current.to_dict()),
+        source_digest=source.source_asset.content_digest,
+        request_digest=digest(payload),
+        limits=limits,
+    )
+    previous_geometry, previous_selection = service.geometry, service._placed_selection
+    try:
+        request_asset = storage.ingest_source(
+            asset_id="prepare-" + record["preparation_id"],
+            source_kind="user_instruction",
+            media_type="application/json",
+            content=canonical_bytes(payload),
+        )
+        admission = EvidenceRef(
+            "1",
+            "user_instruction",
+            request_asset.asset_id,
+            "mesh.admission",
+            request_asset.content_digest,
+        )
+        if not reserve_preparation_mesh_attempt(storage, created.case_id, record["preparation_id"]):
+            raise ValueError("preparation generation was already reserved")
+        producer = worker.produce(source, payload, limits)
+        original = decode_record(canonical_bytes(producer["mesh"]), MeshArtifact)
+        carrier = decode_record(canonical_bytes(producer["carrier"]), CaseRevision)
+        report = inspection_from_dict(producer["inspection"])
+        geometry = geometry_from_output(
+            producer,
+            source,
+            expected_primitive=carrier.spec.rigid_tool.primitive,
+            expected_tool_geometry_digest=carrier.spec.rigid_tool.contact_surface.geometry_digest,
+        )
+        registration = PlanarPreparationRegistration(
+            "prepare-" + record["preparation_id"],
+            source.source_asset.content_digest,
+            report.geometry_digest,
+            original.artifact_digest,
+            original.provenance.mesh_recipe_digest,
+            parent_registration.generation_profile,
+            (admission,),
+            record["preparation_id"],
+        )
+        storage.register_mesh_quality(registration)
+        values = _partial_case_spec(carrier.spec)
+        assert isinstance(values, PartialCaseSpec)
+        values = replace(
+            values,
+            mesh_policy=replace(
+                values.mesh_policy,
+                quality_profile=registration.reference,
+            ),
+        )
+        draft = service.set_spec(
+            created.case_id,
+            values=values,
+            expected_generation=current.generation,
+            evidence=(*parent.evidence, admission),
+            input_intent="registered synthetic source-local refinement",
+            parent_revision_id=parent.revision_id,
+        )
+        service.geometry = geometry
+        service._placed_selection = geometry.resolve_placed_selection
+        frozen = service.freeze_case(created.case_id)
+        if frozen.status != "FROZEN" or frozen.revision is None:
+            raise ValueError(f"source-local stage failed validation: {frozen.to_dict()}")
+        revision = storage.get_revision(created.case_id, frozen.revision.revision_id)
+        record.update(
+            revision_id=revision.revision_id,
+            generation=draft.generation,
+            snapshot_digest=digest(draft.to_dict()),
+            inspection_digest=digest(report.to_dict()),
+            mesh_digest=original.artifact_digest,
+            recipe_digest=original.provenance.mesh_recipe_digest,
+            backend_id=producer["backend_id"],
+            backend_version=producer["backend_version"],
+            backend=producer["backend"],
+        )
+        mesh, receipt = service._adopt_planar_mesh(registration, original, carrier, revision)
+        records.publish(
+            record,
+            revision,
+            {"producer": producer, "mesh": mesh.to_dict(), "adoption": receipt},
+        )
+        return revision
+    except BaseException as error:
+        records.failed(record, error)
+        raise
+    finally:
+        service.geometry, service._placed_selection = previous_geometry, previous_selection
+
+
+def _far_field_maximum(mesh: Any, body_id: str) -> float:
+    import math
+
+    coordinates = {node.node_id: node.coordinates_si for node in mesh.nodes}
+    lengths = []
+    for element in mesh.elements:
+        if element.body_id != body_id:
+            continue
+        corners = tuple(coordinates[node_id] for node_id in element.node_ids[:4])
+        if min(point[0] for point in corners) < 0.019:
+            continue
+        lengths.extend(
+            math.dist(corners[left], corners[right])
+            for left in range(4)
+            for right in range(left + 1, 4)
+        )
+    if not lengths:
+        raise AssertionError("source-local fixture has no far-field control element")
+    return max(lengths)
+
+
+def _registered_source_local_study_summary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    factors: tuple[float, float, float],
+    logs: tuple[bool, bool, bool],
+    delete_current_receipt: bool = False,
+) -> dict[str, object]:
+    import copy
+    import importlib
+
+    from febio_cae.application import _mesh_refinement, _required_quality
+    from febio_cae.application._mesh_refinement import _local_mesh_measurements
+    from febio_cae.storage.preparation import PreparationStore
+
+    service, created, request, _, _ = prepared_input.__wrapped__(tmp_path, monkeypatch)
+    fixtures = importlib.import_module("geometry.conftest")
+    backend = _source_local_mesh_backend(fixtures)
+    _isolate(monkeypatch, backend)
+    payload = _source_local_study_payload(service, request)
+    prepared = service.prepare_planar(created.case_id, payload, expected_generation=0)
+    storage = service._storage(created.case_id)
+    revision = service.get_revision(created.case_id, str(prepared["revision_id"]))
+    registrations = []
+    meshes = []
+    stage_revisions = [revision]
+    final_run_id = ""
+    for index, (factor, include_log) in enumerate(zip(factors, logs, strict=True)):
+        registration = storage.resolve_revision_mesh_quality(revision)
+        registrations.append(registration)
+        mesh = service._planar_execution_mesh(storage, registration, revision)
+        meshes.append(mesh)
+        final_run_id = _registered_mesh_result(
+            service,
+            created,
+            revision,
+            label=f"source-local-stage-{index}",
+            factor=factor,
+            include_log=include_log,
+        )
+        if index < 2:
+            child_payload = copy.deepcopy(payload)
+            child_payload["values"]["mesh_policy"]["local_refinements"][0]["size"] = {
+                "value": 1.0 if index == 0 else 0.5,
+                "unit": "mm",
+            }
+            revision = _publish_source_local_stage(service, created, revision, child_payload)
+            stage_revisions.append(revision)
+    assert len({item.preparation_id for item in registrations}) == 3
+    assert len({item.generation_profile for item in registrations}) == 1
+    far_maxima = [
+        _far_field_maximum(mesh, stage_revision.spec.geometry.body_id.value)
+        for mesh, stage_revision in zip(meshes, stage_revisions, strict=True)
+    ]
+    assert far_maxima == pytest.approx([far_maxima[0]] * 3)
+    observed = [
+        _local_mesh_measurements(stage_revision, mesh)
+        for stage_revision, mesh in zip(stage_revisions, meshes, strict=True)
+    ]
+    values = [item.balls["part-ball"].maximum_edge_m for item in observed]
+    counts = [item.balls["part-ball"].corner_edge_count for item in observed]
+    assert values[0] > values[1] > values[2]
+    assert counts[0] < counts[1] < counts[2]
+    monkeypatch.setattr(_required_quality, "has_qualified_runtime", lambda bundle: True)
+    monkeypatch.setattr(_mesh_refinement, "has_qualified_runtime", lambda bundle: True)
+    assert final_run_id
+    if delete_current_receipt:
+        current_registration = storage.resolve_revision_mesh_quality(revision)
+        path = storage.root / "preparation" / current_registration.preparation_id / "prepared.json"
+        path.unlink()
+        assert not path.exists()
+    return service.run_status(created.case_id, final_run_id)
+
+
 @pytest.mark.parametrize(
     ("factors", "logs", "expected"),
     [
@@ -1049,3 +1422,47 @@ def test_registered_mesh_refinement_consumer_routes_observed_status(
     assert rows["mesh_dependence"]["status"] == expected
     assert result["quality_status"] == expected
     assert coverage["mesh_refinement"].get("status", expected) == expected
+
+
+@pytest.mark.parametrize(
+    ("factors", "logs", "expected"),
+    [
+        ((1.0, 1.0, 1.0), (True, True, True), "PASS"),
+        ((1.0, 1.1, 1.2), (True, True, True), "FAIL"),
+        ((1.0, 1.0, 1.0), (True, True, False), "UNVERIFIED"),
+    ],
+)
+def test_registered_source_local_refinement_consumer_routes_observed_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    factors: tuple[float, float, float],
+    logs: tuple[bool, bool, bool],
+    expected: str,
+) -> None:
+    result = _registered_source_local_study_summary(
+        tmp_path,
+        monkeypatch,
+        factors=factors,
+        logs=logs,
+    )
+    rows, coverage = _numerical_rows(result)
+
+    assert rows["source_local_mesh_study"]["status"] == expected
+    assert result["quality_status"] == expected
+    assert coverage["mesh_refinement"]["scope"] == "three_declared_source_local_tet10_sizes"
+
+
+def test_registered_source_local_missing_receipt_is_unverified(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = _registered_source_local_study_summary(
+        tmp_path,
+        monkeypatch,
+        factors=(1.0, 1.0, 1.0),
+        logs=(True, True, True),
+        delete_current_receipt=True,
+    )
+    rows, _ = _numerical_rows(result)
+
+    assert rows["source_local_mesh_study"]["status"] == "UNVERIFIED"
+    assert result["quality_status"] == "UNVERIFIED"

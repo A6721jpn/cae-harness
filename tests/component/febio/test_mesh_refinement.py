@@ -269,9 +269,7 @@ def _local_mesh(revision: Any, local_elements: int, local_size_m: float) -> Any:
             tuple((corners[left][axis] + corners[right][axis]) / 2 for axis in range(3))
             for left, right in edge_positions
         )
-        nodes.extend(
-            MeshNode(base + index, point) for index, point in enumerate((*corners, *mids))
-        )
+        nodes.extend(MeshNode(base + index, point) for index, point in enumerate((*corners, *mids)))
         elements.append(MeshElement(element_id, "tet10", tuple(range(base, base + 10)), body))
 
     for index in range(local_elements):
@@ -314,9 +312,7 @@ def test_local_measurement_counts_in_ball_edges_and_ignores_unchanged_far_field(
         _local_mesh_measurements(revision, mesh)
         for revision, mesh in zip(revisions, meshes, strict=True)
     )
-    observations = tuple(
-        measurement.balls["part-ball"] for measurement in measurements
-    )
+    observations = tuple(measurement.balls["part-ball"] for measurement in measurements)
     assert tuple(item.corner_edge_count for item in observations) == (6, 12, 18)
     assert (
         observations[0].maximum_edge_m
@@ -361,3 +357,23 @@ def test_local_mesh_index_deduplicates_edges_before_ball_membership() -> None:
 
     assert index.body_element_counts == {"part-body": 3}
     assert len(index.edges_by_body["part-body"]) == 12
+
+
+def test_global_comparison_preserves_non_current_registered_admission(
+    tmp_path: Any,
+) -> None:
+    from test_planar_adoption import _fixture
+
+    from febio_cae.application._mesh_refinement import _global_comparison_revision
+
+    registration, mesh, _, revision = _fixture(tmp_path)
+
+    class Storage:
+        def resolve_revision_mesh_quality(self, candidate: Any) -> Any:
+            assert candidate is revision
+            return registration
+
+    compared, resolved = _global_comparison_revision(Storage(), revision, mesh)
+
+    assert compared is revision
+    assert resolved == registration

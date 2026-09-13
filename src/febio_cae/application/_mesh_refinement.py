@@ -37,9 +37,10 @@ from febio_cae.storage.comparison import ComparisonTarget, successful_targets
 from febio_cae.storage.mesh_quality import (
     CurrentPreparationRegistration,
     MeshQualityRegistration,
+    PlanarDemoRegistration,
 )
 from febio_cae.storage.preparation import PreparationStore
-from febio_cae.storage.registry import CaseStorage
+from febio_cae.storage.registry import CaseStorage, StorageIntegrityError
 
 from ._comparison import _curve
 
@@ -296,6 +297,35 @@ def _authenticated_prepared_revision(
     return _normalised_admission_revision(revision, registration), registration
 
 
+def _global_comparison_revision(
+    storage: CaseStorage,
+    revision: CaseRevision,
+    mesh: MeshArtifact | None = None,
+    *,
+    common_generation_profile: NumericalProfileRef | None = None,
+) -> tuple[
+    CaseRevision,
+    MeshQualityRegistration | PlanarDemoRegistration | CurrentPreparationRegistration,
+]:
+    """Resolve one global candidate without weakening its admission identity."""
+
+    registration = storage.resolve_revision_mesh_quality(revision)
+    if isinstance(registration, CurrentPreparationRegistration):
+        return _authenticated_prepared_revision(
+            storage,
+            revision,
+            mesh,
+            common_generation_profile=common_generation_profile,
+        )
+    if not isinstance(registration, (MeshQualityRegistration, PlanarDemoRegistration)):
+        raise ValueError("global refinement requires a registered mesh-quality admission")
+    if registration.reference != revision.spec.mesh_policy.quality_profile:
+        raise ValueError("revision mesh quality admission reference is not registered")
+    if isinstance(registration, PlanarDemoRegistration):
+        registration.check_spec(revision.spec)
+    return revision, registration
+
+
 def _same_local_physics(candidate: CaseRevision, current: CaseRevision) -> bool:
     """Compare local candidates after verified admission projection and size normalisation."""
 
@@ -346,8 +376,7 @@ def validate_next_refinement(
         previous = _local_stage_size(parent, declaration)
         requested_size = _local_stage_size(requested, declaration)
         if (
-            float(parent.global_size.to_si().value)
-            != float(requested.global_size.to_si().value)
+            float(parent.global_size.to_si().value) != float(requested.global_size.to_si().value)
             or _normalised_local_policy(parent).to_bytes()
             != _normalised_local_policy(requested).to_bytes()
         ):
@@ -542,9 +571,7 @@ def _local_mesh_measurement(
     )
 
 
-def _local_mesh_measurements(
-    revision: CaseRevision, mesh: MeshArtifact
-) -> _LocalMeshMeasurement:
+def _local_mesh_measurements(revision: CaseRevision, mesh: MeshArtifact) -> _LocalMeshMeasurement:
     refinements = tuple(revision.spec.mesh_policy.local_refinements)
     if not refinements or not any(
         item.selection.body_id == revision.spec.geometry.body_id for item in refinements
@@ -553,8 +580,7 @@ def _local_mesh_measurements(
     bodies = {item.selection.body_id.value for item in refinements}
     index = _local_mesh_index(mesh, bodies)
     balls = {
-        item.refinement_id: _local_ball_measurement(revision, item, index)
-        for item in refinements
+        item.refinement_id: _local_ball_measurement(revision, item, index) for item in refinements
     }
     return _LocalMeshMeasurement(balls, index.body_element_counts)
 
@@ -576,14 +602,9 @@ def _assess_source_local_mesh_refinement(
     current_curve: tuple[float, ...] | None = None
     targets = successful_targets(storage)
     current_targets = tuple(
-        candidate
-        for candidate in targets
-        if candidate.manifest.manifest_id == manifest.manifest_id
+        candidate for candidate in targets if candidate.manifest.manifest_id == manifest.manifest_id
     )
-    if (
-        len(current_targets) != 1
-        or current_targets[0].revision.to_bytes() != revision.to_bytes()
-    ):
+    if len(current_targets) != 1 or current_targets[0].revision.to_bytes() != revision.to_bytes():
         raise ValueError("current manifest is not an eligible registered local study result")
     current_target = current_targets[0]
     current_revision, current_registration = _authenticated_prepared_revision(
@@ -639,8 +660,7 @@ def _assess_source_local_mesh_refinement(
 
     for refinement in local_refinements:
         ball_values = tuple(
-            measurements.balls[refinement.refinement_id]
-            for _, _, measurements in study
+            measurements.balls[refinement.refinement_id] for _, _, measurements in study
         )
         if not all(item.corner_edge_count >= 3 for item in ball_values):
             raise ValueError("source-local ball has insufficient in-ball edge evidence")
@@ -655,9 +675,7 @@ def _assess_source_local_mesh_refinement(
         )
         for refinement in local_refinements
     }
-    error = _refinement_error(
-        tuple(curve for _, curve, _ in study), declaration.absolute_floor
-    )
+    error = _refinement_error(tuple(curve for _, curve, _ in study), declaration.absolute_floor)
     force_passed = error <= declaration.relative_max
     local_passed = all(
         ball_values[0].corner_edge_count
@@ -719,12 +737,8 @@ def _assess_source_local_mesh_refinement(
         )
     for body, element_counts in body_growth.items():
         measured.extend(
-            MeasuredValue(
-                f"{body}.{stage}_element_count", value, "1"
-            )
-            for stage, value in zip(
-                ("coarse", "refined", "fine"), element_counts, strict=True
-            )
+            MeasuredValue(f"{body}.{stage}_element_count", value, "1")
+            for stage, value in zip(("coarse", "refined", "fine"), element_counts, strict=True)
         )
     status = (
         AssessmentStatus.PASS
@@ -788,19 +802,24 @@ def assess_mesh_refinement(
         ):
             raise ValueError("current manifest is not an eligible registered study result")
         current_target = current_targets[0]
-        current_revision, current_registration = _authenticated_prepared_revision(
+        current_revision, current_registration = _global_comparison_revision(
             storage, current_target.revision, current_target.mesh
+        )
+        common_generation_profile = (
+            current_registration.generation_profile
+            if isinstance(current_registration, CurrentPreparationRegistration)
+            else None
         )
         for candidate in targets:
             try:
                 comparable_revision = (
                     current_revision
                     if candidate.manifest.manifest_id == current_target.manifest.manifest_id
-                    else _authenticated_prepared_revision(
+                    else _global_comparison_revision(
                         storage,
                         candidate.revision,
                         candidate.mesh,
-                        common_generation_profile=current_registration.generation_profile,
+                        common_generation_profile=common_generation_profile,
                     )[0]
                 )
             except (AttributeError, TypeError, ValueError, OverflowError):
@@ -838,10 +857,10 @@ def assess_mesh_refinement(
         while baseline_modulus is None and ancestor_id is not None:
             ancestor = storage.get_revision(revision.case_id, ancestor_id)
             try:
-                comparable_ancestor, _ = _authenticated_prepared_revision(
+                comparable_ancestor, _ = _global_comparison_revision(
                     storage,
                     ancestor,
-                    common_generation_profile=current_registration.generation_profile,
+                    common_generation_profile=common_generation_profile,
                 )
             except (AttributeError, TypeError, ValueError, OverflowError):
                 break
@@ -909,7 +928,7 @@ def assess_mesh_refinement(
             tuple(measured),
             "two successive registered global refinements evaluated over the declared force states",
         ), evidence
-    except (ValueError, TypeError, KeyError, OverflowError) as error:
+    except (StorageIntegrityError, ValueError, TypeError, KeyError, OverflowError) as error:
         return CriterionAssessment(
             criterion_id,
             "numeric",
