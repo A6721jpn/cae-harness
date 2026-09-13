@@ -1,4 +1,4 @@
-"""Current planar generation and minimal case-local publication orchestration."""
+"""Current preparation generation and minimal case-local publication orchestration."""
 
 from __future__ import annotations
 
@@ -9,18 +9,19 @@ from typing import TYPE_CHECKING, Any
 
 from febio_cae.adapters.febio.profile_scope import require_profile_scope
 from febio_cae.adapters.geometry import StepGeometryMeshAdapter
+from febio_cae.adapters.meshing.approximation import ApproximationCriteria, NATIVE_ALGORITHM
 from febio_cae.adapters.geometry.preparation import (
     CurrentInspection,
     inspection_from_dict,
     resource_snapshot,
     run_preparation,
 )
-from febio_cae.domain import CaseRevision, EvidenceRef, MeshArtifact, Quantity
+from febio_cae.domain import CaseRevision, EvidenceRef, MeshArtifact, Quantity, RigidPrimitive
 from febio_cae.domain.canonical import canonical_bytes
 from febio_cae.domain.codec import decode_record
 from febio_cae.domain.compatibility import CapabilityStatus
 from febio_cae.storage.demo_budget import reserve_preparation_mesh_attempt
-from febio_cae.storage.mesh_quality import MeshQualityRegistration, PlanarPreparationRegistration
+from febio_cae.storage.mesh_quality import CurrentPreparationRegistration, MeshQualityRegistration
 from febio_cae.storage.preparation import PreparationStore, digest
 
 from ._preparation_request import normalize_request, request_parts
@@ -29,11 +30,114 @@ if TYPE_CHECKING:
     from .service import RegisteredCaseService
 
 
-def geometry_from_output(output: dict[str, Any], source: Any) -> StepGeometryMeshAdapter:
+def _bound_generation_criteria(
+    registration: MeshQualityRegistration, primitive_kind: str, max_elements: int
+) -> dict[str, object] | None:
+    if primitive_kind == "box":
+        return None
+    if primitive_kind not in {"sphere", "cylinder"}:
+        raise ValueError("preparation supports only box, sphere, or cylinder tools")
+    if registration.algorithm_id != NATIVE_ALGORITHM:
+        raise ValueError("curved preparation requires the registered native approximation algorithm")
+    supported = tuple(kind for kind in registration.primitive_kinds if kind in {"sphere", "cylinder"})
+    try:
+        criteria = ApproximationCriteria(
+            profile=registration.reference,
+            max_boundary_deviation=registration.max_boundary_deviation,
+            supported_kinds=supported,
+            algorithm_id=registration.algorithm_id,
+            evidence_scope=registration.evidence_scope,
+            max_elements=max_elements,
+        )
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("registered curved approximation criteria are invalid") from error
+    if primitive_kind not in criteria.supported_kinds:
+        raise ValueError("registered curved approximation criteria do not cover the tool kind")
+    return criteria.to_dict()
+
+
+def geometry_from_output(
+    output: dict[str, Any],
+    source: Any,
+    *,
+    expected_primitive: RigidPrimitive | None = None,
+    expected_tool_geometry_digest: str | None = None,
+) -> StepGeometryMeshAdapter:
     producer = output.get("producer", output)
-    report = inspection_from_dict(producer["inspection"])
+    if not isinstance(producer, dict):
+        raise ValueError("preparation producer output is not an object")
+    required = {
+        "carrier",
+        "inspection",
+        "generation_criteria",
+        "native_tool_inspection",
+        "native_tool_primitive",
+        "backend_id",
+        "backend_version",
+    }
+    if not required <= producer.keys():
+        raise ValueError("preparation producer output is incomplete")
+    try:
+        carrier = decode_record(canonical_bytes(producer["carrier"]), CaseRevision)
+        report = inspection_from_dict(producer["inspection"])
+        backend_id = producer["backend_id"]
+        backend_version = producer["backend_version"]
+    except (KeyError, TypeError, ValueError, OverflowError) as error:
+        raise ValueError("preparation producer inspection is malformed") from error
+    if (
+        canonical_bytes(carrier.to_dict()) != canonical_bytes(producer["carrier"])
+        or canonical_bytes(report.to_dict()) != canonical_bytes(producer["inspection"])
+    ):
+        raise ValueError("preparation producer records are not canonical")
+    if report.source_digest != source.source_asset.content_digest:
+        raise ValueError("preparation producer inspection source differs from registered STEP")
+    primitive = carrier.spec.rigid_tool.primitive
+    if expected_primitive is not None:
+        if not isinstance(expected_primitive, RigidPrimitive):
+            raise TypeError("expected primitive must be a RigidPrimitive")
+        if primitive.to_bytes() != expected_primitive.to_bytes():
+            raise ValueError("preparation producer primitive differs from the expected carrier")
+    tool_geometry_digest = carrier.spec.rigid_tool.contact_surface.geometry_digest
+    if (
+        expected_tool_geometry_digest is not None
+        and tool_geometry_digest != expected_tool_geometry_digest
+    ):
+        raise ValueError("preparation producer tool geometry differs from the expected carrier")
+    native_raw = producer.get("native_tool_inspection")
+    native_primitive_raw = producer.get("native_tool_primitive")
+    native_inspection = None
+    native_primitive = None
+    if (native_raw is None) != (native_primitive_raw is None):
+        raise ValueError("preparation native tool inspection and primitive must be paired")
+    if primitive.kind in {"sphere", "cylinder"}:
+        if not isinstance(native_raw, dict) or not isinstance(native_primitive_raw, dict):
+            raise ValueError("curved preparation requires its native tool record")
+        try:
+            native_inspection = inspection_from_dict(native_raw)
+            native_primitive = decode_record(
+                canonical_bytes(native_primitive_raw), RigidPrimitive
+            )
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ValueError("preparation native tool record is malformed") from error
+        if (
+            canonical_bytes(native_inspection.to_dict()) != canonical_bytes(native_raw)
+            or canonical_bytes(native_primitive.to_dict()) != canonical_bytes(native_primitive_raw)
+            or native_primitive.to_bytes() != primitive.to_bytes()
+        ):
+            raise ValueError("preparation native tool record differs from the carrier")
+    elif native_raw is not None or native_primitive_raw is not None:
+        raise ValueError("flat-box preparation must not carry a native tool record")
     return StepGeometryMeshAdapter(
-        CurrentInspection(report, producer["backend_id"], producer["backend_version"]),
+        CurrentInspection(
+            report,
+            backend_id,
+            backend_version,
+            native_tool_inspection=native_inspection,
+            native_tool_primitive=native_primitive,
+            native_tool_geometry_digest=tool_geometry_digest
+            if native_inspection is not None
+            else None,
+        ),
         source_asset=source.source_asset,
     )
 
@@ -71,7 +175,7 @@ def prepare_planar(
             registration = storage.resolve_revision_mesh_quality(old)
             if parent_revision_id is None:
                 if (
-                    not isinstance(registration, PlanarPreparationRegistration)
+                    not isinstance(registration, CurrentPreparationRegistration)
                     or old.parent_revision_id is not None
                     or records.read(registration.preparation_id)["status"] != "FAILED"
                 ):
@@ -79,7 +183,7 @@ def prepare_planar(
                         "initial preparation cannot replace a frozen descendant or accepted origin"
                     )
             else:
-                if not isinstance(registration, PlanarPreparationRegistration):
+                if not isinstance(registration, CurrentPreparationRegistration):
                     raise ValueError("refinement requires a current prepared origin")
                 records.origin_output(registration, old)
                 if current.values.to_case_spec().to_bytes() != old.spec.to_bytes():
@@ -175,6 +279,13 @@ def prepare_planar(
             preliminary.budget.cpu_workers, policy.cpu_workers or preliminary.budget.cpu_workers
         )
         limits = {**asdict(policy), **resource_snapshot(cpu_limit), "mesh_generations": 1}
+        generation_criteria = _bound_generation_criteria(
+            generation_quality,
+            preliminary.rigid_tool.primitive.kind,
+            limits["max_tetrahedra"],
+        )
+        if generation_criteria is not None:
+            limits["_generation_criteria"] = generation_criteria
         record = records.begin(
             case_id,
             input_generation=expected_generation,
@@ -226,7 +337,24 @@ def prepare_planar(
                     or len(original.elements) > policy.max_tetrahedra
                 ):
                     raise ValueError("producer mesh exceeds finite counts")
-                geometry = geometry_from_output(producer, source)
+                try:
+                    criteria_match = canonical_bytes(
+                        producer["generation_criteria"]
+                    ) == canonical_bytes(limits.get("_generation_criteria"))
+                except (KeyError, TypeError, ValueError):
+                    criteria_match = False
+                if (
+                    not criteria_match
+                    or producer.get("backend_id") != original.provenance.tool_id
+                    or producer.get("backend_version") != original.provenance.tool_version
+                ):
+                    raise ValueError("producer criteria/backend provenance binding mismatch")
+                geometry = geometry_from_output(
+                    producer,
+                    source,
+                    expected_primitive=carrier.spec.rigid_tool.primitive,
+                    expected_tool_geometry_digest=carrier.spec.rigid_tool.contact_surface.geometry_digest,
+                )
                 normalized = normalize_request(
                     request,
                     geometry_digest=report.geometry_digest,
@@ -244,7 +372,7 @@ def prepare_planar(
                     raise ValueError(
                         "producer changed explicit specification or selection snapshot"
                     )
-                registration = PlanarPreparationRegistration(
+                registration = CurrentPreparationRegistration(
                     "prepare-" + record["preparation_id"],
                     source.source_asset.content_digest,
                     report.geometry_digest,
@@ -282,6 +410,24 @@ def prepare_planar(
                     inspection_digest=digest(report.to_dict()),
                     mesh_digest=original.artifact_digest,
                     recipe_digest=original.provenance.mesh_recipe_digest,
+                    generation_criteria=producer.get("generation_criteria"),
+                    native_tool_inspection_digest=(
+                        None
+                        if producer.get("native_tool_inspection") is None
+                        else digest(producer["native_tool_inspection"])
+                    ),
+                    native_tool_primitive_digest=(
+                        None
+                        if producer.get("native_tool_primitive") is None
+                        else digest(producer["native_tool_primitive"])
+                    ),
+                    native_tool_geometry_digest=(
+                        None
+                        if carrier.spec.rigid_tool.primitive.kind == "box"
+                        else carrier.spec.rigid_tool.contact_surface.geometry_digest
+                    ),
+                    backend_id=producer["backend_id"],
+                    backend_version=producer["backend_version"],
                     backend=producer["backend"],
                 )
                 mesh, receipt = service._adopt_planar_mesh(

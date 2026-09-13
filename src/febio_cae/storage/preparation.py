@@ -13,7 +13,7 @@ from febio_cae.domain import CaseRevision, IsotropicLinearElastic, MeshArtifact
 from febio_cae.domain.canonical import canonical_bytes
 from febio_cae.domain.codec import decode_record
 
-from .mesh_quality import PlanarPreparationRegistration
+from .mesh_quality import CurrentPreparationRegistration
 from .registry import CaseStorage, _read_owned, _safe_identifier, _write_atomic, nested_evidence
 
 
@@ -114,7 +114,7 @@ class PreparationStore:
             self._write(record)  # Sole final publication point; earlier bytes are incomplete.
 
     def prepared(
-        self, registration: PlanarPreparationRegistration, revision: CaseRevision
+        self, registration: CurrentPreparationRegistration, revision: CaseRevision
     ) -> dict[str, Any]:
         with self.storage.evidence_snapshot():
             record = self.read(registration.preparation_id)
@@ -135,7 +135,7 @@ class PreparationStore:
             return dict(output)
 
     def origin(
-        self, registration: PlanarPreparationRegistration, revision: CaseRevision
+        self, registration: CurrentPreparationRegistration, revision: CaseRevision
     ) -> CaseRevision:
         """Resolve registered E-only ancestry without transferring producer authority."""
         with self.storage.evidence_snapshot():
@@ -199,13 +199,13 @@ class PreparationStore:
                 current = parent
 
     def origin_output(
-        self, registration: PlanarPreparationRegistration, revision: CaseRevision
+        self, registration: CurrentPreparationRegistration, revision: CaseRevision
     ) -> dict[str, Any]:
         with self.storage.evidence_snapshot():
             return self.prepared(registration, self.origin(registration, revision))
 
     def mesh(
-        self, registration: PlanarPreparationRegistration, revision: CaseRevision
+        self, registration: CurrentPreparationRegistration, revision: CaseRevision
     ) -> MeshArtifact:
         from febio_cae.application.service import RegisteredCaseService
 

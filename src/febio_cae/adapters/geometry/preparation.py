@@ -1,4 +1,4 @@
-"""Private, bounded current-source planar producer. No public replay/fake mode."""
+"""Private, bounded current-source producer. No public replay/fake mode."""
 
 from __future__ import annotations
 
@@ -15,12 +15,16 @@ from typing import Any
 from febio_cae.adapters.febio._windows_job import LaunchCleanupPending, WindowsJobProcess
 from febio_cae.application._preparation_request import normalize_request
 from febio_cae.domain import (
-    AsPlaced,
     CaseRevision,
     FrameId,
     GeometryInspectionRequest,
+    NumericalProfileRef,
+    PortError,
+    PortErrorCategory,
+    RigidPrimitive,
     SourceAssetContent,
     SourceAssetRef,
+    Quantity,
 )
 from febio_cae.domain.canonical import canonical_bytes
 from febio_cae.domain.codec import decode_record
@@ -162,10 +166,65 @@ def _make_backend(cpu: int) -> Any:
 class CurrentInspection:
     """Re-use only inspection emitted by this producer, never caller/demo assets."""
 
-    def __init__(self, report: BackendInspection, backend_id: str, backend_version: str) -> None:
+    def __init__(
+        self,
+        report: BackendInspection,
+        backend_id: str,
+        backend_version: str,
+        *,
+        native_tool_inspection: BackendInspection | None = None,
+        native_tool_primitive: RigidPrimitive | None = None,
+        native_tool_geometry_digest: str | None = None,
+    ) -> None:
+        if not isinstance(report, BackendInspection):
+            raise TypeError("current inspection report must be a BackendInspection")
+        for value, name in ((backend_id, "backend_id"), (backend_version, "backend_version")):
+            if not isinstance(value, str) or not value or value != value.strip():
+                raise ValueError(f"{name} must be non-empty text")
+        if (native_tool_inspection is None) != (native_tool_primitive is None):
+            raise ValueError("native tool inspection and primitive must be recorded together")
+        if native_tool_inspection is not None and native_tool_primitive is not None:
+            if not isinstance(native_tool_primitive, RigidPrimitive):
+                raise TypeError("native tool primitive must be a RigidPrimitive")
+            if (
+                not isinstance(native_tool_geometry_digest, str)
+                or len(native_tool_geometry_digest) != 64
+                or any(c not in "0123456789abcdef" for c in native_tool_geometry_digest)
+            ):
+                raise ValueError("native tool geometry digest must be a SHA256 identity")
+            self._validate_native_record(
+                native_tool_inspection,
+                native_tool_primitive,
+                native_tool_geometry_digest,
+            )
+        elif native_tool_geometry_digest is not None:
+            raise ValueError("native tool geometry identity requires a native tool record")
         self.report = report
         self.backend_id = backend_id
         self.backend_version = backend_version
+        self.native_tool_inspection = native_tool_inspection
+        self.native_tool_primitive = native_tool_primitive
+        self.native_tool_geometry_digest = native_tool_geometry_digest
+
+    @staticmethod
+    def _validate_native_record(
+        report: BackendInspection,
+        primitive: RigidPrimitive,
+        expected_geometry_digest: str | None = None,
+    ) -> None:
+        if primitive.kind not in {"sphere", "cylinder"}:
+            raise ValueError("current native tool record requires a curved primitive")
+        if expected_geometry_digest is not None and report.geometry_digest != expected_geometry_digest:
+            raise ValueError("current native tool geometry identity differs")
+        if report.frame != primitive.local_frame or tuple(report.declared_units) != ("m",):
+            raise ValueError("current native tool record must remain in its local metre frame")
+        if len(report.bodies) != 1 or report.bodies[0].body_id != primitive.body_id.value:
+            raise ValueError("current native tool body identity differs")
+        body = report.bodies[0]
+        if not body.closed_solid or report.unsupported_topology or report.defects or body.defects:
+            raise ValueError("current native tool inspection contains unsupported topology")
+        if any(face.defects or face.frame != primitive.local_frame for face in body.faces):
+            raise ValueError("current native tool face identity differs")
 
     def inspect(self, content: bytes, requested_body_ids: Sequence[str]) -> BackendInspection:
         if hashlib.sha256(content).hexdigest() != self.report.source_digest or not set(
@@ -183,7 +242,102 @@ class CurrentInspection:
         local_refinements: tuple[BackendLocalRefinement, ...] = (),
     ) -> BackendMesh:
         del local_refinements
-        raise ValueError("current preparation generation allowance has already been consumed")
+        raise PortError(
+            PortErrorCategory.CONFLICT,
+            "current preparation generation allowance has already been consumed",
+        )
+
+    def inspect_rigid_primitive(
+        self, primitive: RigidPrimitive, *, geometry_digest: str
+    ) -> BackendInspection:
+        """Replay the producer-owned local native inspection only."""
+
+        if self.native_tool_inspection is None or self.native_tool_primitive is None:
+            raise PortError(
+                PortErrorCategory.UNSUPPORTED_CAPABILITY,
+                "current preparation has no authenticated native tool inspection",
+            )
+        if primitive.to_bytes() != self.native_tool_primitive.to_bytes():
+            raise PortError(
+                PortErrorCategory.INTEGRITY,
+                "current native tool primitive differs from the producer record",
+            )
+        if geometry_digest != self.native_tool_inspection.geometry_digest:
+            raise PortError(
+                PortErrorCategory.INTEGRITY,
+                "current native tool geometry differs from the producer record",
+            )
+        self._validate_native_record(
+            self.native_tool_inspection,
+            primitive,
+            self.native_tool_geometry_digest,
+        )
+        return self.native_tool_inspection
+
+    def mesh_rigid_primitive(
+        self,
+        primitive: RigidPrimitive,
+        *,
+        geometry_digest: str,
+        global_size_si: float,
+        local_refinements: tuple[BackendLocalRefinement, ...] = (),
+    ) -> BackendMesh:
+        del primitive, geometry_digest, global_size_si, local_refinements
+        raise PortError(
+            PortErrorCategory.CONFLICT,
+            "current preparation native mesh generation is not permitted during replay",
+        )
+
+
+def _criteria_from_limits(
+    limits: dict[str, Any], profile: NumericalProfileRef, kind: str
+) -> Any:
+    raw = limits.get("_generation_criteria")
+    if kind == "box":
+        if raw is not None:
+            raise ValueError("box preparation must not carry curved generation criteria")
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError("curved preparation requires parent-bound generation criteria")
+    expected = {
+        "profile",
+        "max_boundary_deviation_si",
+        "supported_kinds",
+        "algorithm_id",
+        "evidence_scope",
+        "max_elements",
+    }
+    if set(raw) != expected or not isinstance(raw.get("profile"), dict):
+        raise ValueError("generation criteria record is not canonical")
+    profile_raw = raw["profile"]
+    if set(profile_raw) != {"schema_version", "profile_id", "purpose", "record_digest"}:
+        raise ValueError("generation criteria profile is not canonical")
+    from febio_cae.adapters.meshing.approximation import ApproximationCriteria, NATIVE_ALGORITHM
+
+    try:
+        criteria = ApproximationCriteria(
+            profile=NumericalProfileRef(
+                profile_raw["profile_id"],
+                profile_raw["purpose"],
+                profile_raw["record_digest"],
+            ),
+            max_boundary_deviation=Quantity(float(raw["max_boundary_deviation_si"]), "m"),
+            supported_kinds=tuple(raw["supported_kinds"]),
+            algorithm_id=raw["algorithm_id"],
+            evidence_scope=raw["evidence_scope"],
+            max_elements=raw["max_elements"],
+        )
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("generation criteria record is invalid") from error
+    if (
+        canonical_bytes(criteria.to_dict()) != canonical_bytes(raw)
+        or criteria.profile != profile
+        or criteria.algorithm_id != NATIVE_ALGORITHM
+        or kind not in criteria.supported_kinds
+        or criteria.max_elements > limits["max_tetrahedra"]
+    ):
+        raise ValueError("generation criteria binding differs from the registered profile")
+    return criteria
 
 
 def inspection_from_dict(raw: dict[str, Any]) -> BackendInspection:
@@ -229,13 +383,27 @@ def produce(
     if source.source_asset.content_digest != spec.geometry.source_step_digest:
         raise ValueError("preparation STEP source digest mismatch")
     _require_ap214_header(source.content)
-    if spec.rigid_tool.primitive.kind != "box" or not isinstance(
-        spec.contact.arrangement, AsPlaced
-    ):
-        raise ValueError("preparation supports only explicit planar box/AsPlaced")
+    primitive_kind = spec.rigid_tool.primitive.kind
+    criteria = _criteria_from_limits(
+        limits, spec.mesh_policy.quality_profile, primitive_kind
+    )
     backend = _make_backend(limits["cpu_workers"])
+    if primitive_kind in {"sphere", "cylinder"}:
+        if not all(
+            callable(getattr(backend, name, None))
+            for name in ("inspect_rigid_primitive", "mesh_rigid_primitive")
+        ):
+            raise ValueError("curved preparation requires a complete native backend pair")
+    elif primitive_kind != "box":
+        raise ValueError("preparation supports only box, sphere, or cylinder tools")
+    resolve_criteria = None
+    if criteria is not None:
+        resolve_criteria = lambda profile: criteria if profile == criteria.profile else None
     adapter = StepGeometryMeshAdapter(
-        backend, source_asset=source.source_asset, source_resolver=_Source(source)
+        backend,
+        source_asset=source.source_asset,
+        source_resolver=_Source(source),
+        resolve_mesh_quality=resolve_criteria,
     )
     inspection = adapter.inspect(
         GeometryInspectionRequest(source.source_asset, (spec.geometry.body_id.value,)), source
@@ -257,6 +425,21 @@ def produce(
         or spec.geometry.body_id.value not in inspection.closed_solid_body_ids
     ):
         raise ValueError("explicit STEP unit/body differs from current inspection")
+    native_tool_inspection = None
+    native_tool_primitive = None
+    if primitive_kind in {"sphere", "cylinder"}:
+        native_tool_inspection = backend.inspect_rigid_primitive(
+            spec.rigid_tool.primitive,
+            geometry_digest=spec.rigid_tool.contact_surface.geometry_digest,
+        )
+        if not isinstance(native_tool_inspection, BackendInspection):
+            raise ValueError("native backend returned an invalid primitive inspection record")
+        CurrentInspection._validate_native_record(
+            native_tool_inspection,
+            spec.rigid_tool.primitive,
+            spec.rigid_tool.contact_surface.geometry_digest,
+        )
+        native_tool_primitive = spec.rigid_tool.primitive
     resolutions = {
         selection.to_bytes(): adapter.resolve_placed_selection(
             source, spec.geometry, spec.rigid_tool, selection
@@ -279,6 +462,13 @@ def produce(
         "carrier": carrier.to_dict(),
         "mesh": mesh.to_dict(),
         "inspection": report.to_dict(),
+        "generation_criteria": None if criteria is None else criteria.to_dict(),
+        "native_tool_inspection": None
+        if native_tool_inspection is None
+        else native_tool_inspection.to_dict(),
+        "native_tool_primitive": None
+        if native_tool_primitive is None
+        else native_tool_primitive.to_dict(),
         "backend": backend.evidence,
         "backend_id": backend.backend_id,
         "backend_version": backend.backend_version,

@@ -66,13 +66,13 @@ def reserve_prepared_solver_attempt(
     storage: CaseStorage, revision: CaseRevision, operation_id: str
 ) -> bool:
     """Bound the prepared study to four starts and the unchanged declared attempt cap."""
-    from .mesh_quality import PlanarPreparationRegistration
+    from .mesh_quality import CurrentPreparationRegistration
 
     with storage.transaction():
         if storage.get_revision(revision.case_id, revision.revision_id) != revision:
             raise StorageConflictError("prepared solver revision differs from registration")
         if not isinstance(
-            storage.resolve_revision_mesh_quality(revision), PlanarPreparationRegistration
+            storage.resolve_revision_mesh_quality(revision), CurrentPreparationRegistration
         ):
             raise StorageConflictError("prepared solver budget requires a generated origin")
         return _reserve(

@@ -7,6 +7,8 @@ import math
 from dataclasses import dataclass
 from typing import Any
 
+from febio_cae.domain import AsPlaced
+
 from .specs import SpecInputError, SpecUpdateRequest, parse_spec_request
 
 
@@ -94,5 +96,9 @@ def normalize_request(
 
     selections(request["values"])
     parsed = parse_spec_request(request)
-    parsed.values.to_case_spec()  # Missing physics is never filled by this normalizer.
+    spec = parsed.values.to_case_spec()  # Missing physics is never filled by this normalizer.
+    if spec.rigid_tool.primitive.kind not in {"box", "sphere", "cylinder"}:
+        raise SpecInputError("preparation supports only box, sphere, or cylinder tools")
+    if not isinstance(spec.contact.arrangement, AsPlaced):
+        raise SpecInputError("preparation requires an explicit AsPlaced arrangement")
     return parsed
