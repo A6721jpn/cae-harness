@@ -83,16 +83,17 @@ def require_positive_quadratic_mapping(points: Sequence[Sequence[float]]) -> flo
         ]
         vertex_jacobians.append(
             tuple(
-                tuple(affine[i][j] + perturbation[i][j] for j in range(3))
+                (
+                    affine[i][0] + perturbation[i][0],
+                    affine[i][1] + perturbation[i][1],
+                    affine[i][2] + perturbation[i][2],
+                )
                 for i in range(3)
             )
         )
         if neumann_certified:
             relative = [
-                [
-                    sum(cofactors[i][k] * perturbation[k][j] for k in range(3))
-                    for j in range(3)
-                ]
+                [sum(cofactors[i][k] * perturbation[k][j] for k in range(3)) for j in range(3)]
                 for i in range(3)
             ]
             bound = max(sum(abs(v) for v in row) for row in relative)
@@ -135,22 +136,16 @@ def _strictly_positive_cubic_bernstein_determinant(
     for first_vertex in range(4):
         for second_vertex in range(4):
             for third_vertex in range(4):
-                exponent = tuple(
+                count0, count1, count2, count3 = (
                     int(first_vertex == vertex)
                     + int(second_vertex == vertex)
                     + int(third_vertex == vertex)
                     for vertex in range(4)
                 )
-                first_column = tuple(
-                    vertex_jacobians[first_vertex][row][0] for row in range(3)
-                )
-                second_column = tuple(
-                    vertex_jacobians[second_vertex][row][1] for row in range(3)
-                )
-                third_column = tuple(
-                    vertex_jacobians[third_vertex][row][2] for row in range(3)
-                )
-                coefficients[exponent] += _determinant_from_columns(
+                first_column = tuple(vertex_jacobians[first_vertex][row][0] for row in range(3))
+                second_column = tuple(vertex_jacobians[second_vertex][row][1] for row in range(3))
+                third_column = tuple(vertex_jacobians[third_vertex][row][2] for row in range(3))
+                coefficients[(count0, count1, count2, count3)] += _determinant_from_columns(
                     first_column, second_column, third_column
                 )
     return all(coefficient > 0 for coefficient in coefficients.values())

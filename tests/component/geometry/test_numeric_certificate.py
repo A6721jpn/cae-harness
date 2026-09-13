@@ -132,10 +132,7 @@ def test_quadratic_shear_with_identically_positive_jacobian_is_certified() -> No
 
 def test_positive_vertex_jacobians_with_negative_interior_are_rejected() -> None:
     reference = _midpoints([(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)])
-    points = [
-        (x * x - y * y - 1.25 * x, 2 * x * y - 1.75 * y, z)
-        for x, y, z in reference
-    ]
+    points = [(x * x - y * y - 1.25 * x, 2 * x * y - 1.75 * y, z) for x, y, z in reference]
 
     def jacobian_determinant(x: float, y: float) -> float:
         return (2 * x - 1.25) * (2 * x - 1.75) + 4 * y * y
