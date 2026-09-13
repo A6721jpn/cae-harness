@@ -830,3 +830,25 @@ evidence or authorized real-model/BottomFrame acceptance.
   curved normals, averaging or Coulomb stick/slip semantics. Record those missing
   facts explicitly; qualify the separate physical studies before broadening
   mandatory numerical producers or publishing a curved/friction profile.
+
+### Installed preparation qualification correction
+
+- Preserve the rejected `installed-public-preparation01` artifacts and zero-native
+  history. Refreeze a new candidate; a missing-release probe must not consume the
+  later release-bound one-shot execution claim.
+- Add actual-child Gmsh runtime identity admission to the public inspection and
+  preparation producers, with no Gmsh API before verification and matching parent
+  receipts. The private protocol additionally binds the complete installed import
+  closure, bytecode and environment configuration; file hashes alone do not prove
+  the loaded native library.
+- Enforce prelaunch, live and final aggregate output accounting across all owned
+  case-store, native and protocol outputs. Retain owned handles through confirmed
+  drain, including constructor/cleanup failures, without replacing the primary
+  failure. Prove harmless descendant and nested-job behavior separately.
+- Make every frozen geometric observation executable, including current
+  registrations/selections, curved edges, boundary/volume checks, one-time pose
+  and fixed near/far refinement comparisons. Stop on an observed failure.
+- Preserve approved physical provenance for unchanged conditions. New
+  geometry-only evidence substantiates only its explicit geometric changes.
+- Repeat independent review before the three bounded native preparations.
+  These corrections do not authorize a solver or physical-profile qualification.
