@@ -326,9 +326,7 @@ def _contact_entities(revision: Any, mesh: Any) -> dict[str, tuple[str, ...]]:
         elif location == "surface":
             result[canonical_id] = tuple(face_set.set_id for face_set in face_sets)
         else:
-            result[canonical_id] = tuple(
-                str(face_set.member_ids[0]) for face_set in face_sets
-            )
+            result[canonical_id] = tuple(str(face_set.member_ids[0]) for face_set in face_sets)
     return result
 
 
@@ -685,9 +683,7 @@ def _surface_case(
         state_times=(0.0, 1.0),
         part_bodies={1: mesh.elements[0].body_id, 2: mesh.elements[1].body_id},
         entity_ids=entity_ids,
-        active_contact_surfaces=tuple(
-            item.set_id for item in _contact_face_sets(revision, mesh)
-        ),
+        active_contact_surfaces=tuple(item.set_id for item in _contact_face_sets(revision, mesh)),
     )
     reader = XpltReaderAdapter(profile=profile, data_store=data_store)
     return revision, reader, attempt, bundle, mesh, profile, data_store, store

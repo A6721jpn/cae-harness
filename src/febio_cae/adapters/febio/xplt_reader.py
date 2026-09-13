@@ -732,9 +732,11 @@ class _NativeParser:
             if variable.mapping.location == "face":
                 if not registered <= set(face_by_id):
                     raise _ParseError("registered contact faces are foreign")
-            elif variable.mapping.location == "surface_node":
-                if not registered <= trusted_surface_node_ids:
-                    raise _ParseError("registered contact surface nodes are foreign")
+            elif (
+                variable.mapping.location == "surface_node"
+                and not registered <= trusted_surface_node_ids
+            ):
+                raise _ParseError("registered contact surface nodes are foreign")
 
         if not active_surface_names.issubset(native_surfaces):
             raise _ParseError("registered contact surfaces are foreign")
