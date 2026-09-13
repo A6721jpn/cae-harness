@@ -898,3 +898,33 @@ CaseStorage or used by the public compiler, controller or QualityAdapter, whose
 CaseRevision production semantics remain unchanged. Local arithmetic is checked
 separately against its predeclared policy; printed or local arithmetic PASS does
 not establish public quality, mandatory E2E or native qualification.
+
+### Explicit source-local refinement for the required Hertz study
+
+The required contact-local refinement study must not depend on refining an entire
+rigid sphere uniformly. Extend `LocalRefinement` with an optional typed
+`SourceLocalRefinementBall`: an explicit `Point3` center and positive length
+radius. The center uses the selected body's source-local frame, before placement;
+it is not a contact location inferred from shape, motion or results. A ball is
+allowed only with an explicit `WholeBodyRule` for that body. Case validation binds
+its frame to the part placement's source frame or the rigid primitive's local
+frame. Existing refinements without this optional region retain their identity
+and semantics; no current unsupported refinement is silently treated as global.
+
+The native boundary carries immutable source-local ball requests with body,
+frame, center, radius and SI target size. STEP and rigid-primitive meshing use the
+same bounded field composition: the smallest requested size wins in overlapping
+balls, the declared global size remains the exterior target, and transition
+grading is deterministic and recorded. Size-field bounds are mesher
+characteristic-size requests, not an unmeasured claim about every produced edge.
+Actual geometric approximation, element quality and declared profile criteria
+remain separate admission obligations. Unsupported scope, stale body/frame
+bindings or invalid dimensions fail explicitly. No native operation is authorized
+by constructing these records.
+
+Native curved backend generation must be connected to registered adapter
+composition without relabeling the existing affine-polyhedron approximation
+criteria as a curved-Tet10 certificate. Placement remains downstream and is
+applied exactly once. New algorithm criteria, native source identity and profile
+approval require their own evidence; an API smoke does not qualify a public
+sphere, cylinder, friction or Hertz profile.

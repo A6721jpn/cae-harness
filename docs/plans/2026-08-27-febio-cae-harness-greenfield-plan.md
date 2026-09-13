@@ -757,3 +757,28 @@ FAIL and one malformed prefix demoting the stream. Review the exact clean commit
 run the single final full suite/build/fresh install and source-wheel binding only
 after all required slices receive CODE_ACCEPT. Actual manual runtime wiring and
 required native/public E2E remain separately verified dependencies.
+
+### Source-local refinement and native curved composition sequence
+
+Freeze the source-local ball contract in the design before implementation. One
+owner changes the optional domain/codec boundary and native backend request
+shape. Preserve non-ball canonical records and reject foreign body/source-frame
+bindings. First record executable RED for the typed round trip and changed mesh
+behavior; collection errors are not RED. Implement the smallest native field
+composition and migrate its callers, then verify the actual local-versus-far-field
+mesh behavior in a separately predeclared, bounded native gate.
+
+Connect native sphere/cylinder generation to the registered geometry adapter
+under a distinct, bound geometric-approximation algorithm. Do not bypass trusted
+criteria, reuse an affine certificate for curved faces, apply placement twice,
+or substitute private backend success for installed execution. Review exact clean
+commits and qualify changed reader/geometry identities before updating approved
+provisioning artifacts. Preserve the existing native and public qualification
+boundaries throughout this sequence.
+
+The Hertz material, radius, indentation, 5% reference-force criterion, 1% finite
+boundary criterion and two successive 2% local-refinement criteria in section 5.2
+remain unchanged. Refinement centers, radii, sizes, transition policy, solver/output
+settings, expected observations and finite operation/resource limits are fixed
+before each native study. This work does not waive mandatory E2Es, live LLM
+evidence or authorized real-model/BottomFrame acceptance.
