@@ -546,6 +546,18 @@ def _synthetic_cdll_setup(
     return expected, library
 
 
+def _rewrite_synthetic_source(expected: dict[str, object], source: str) -> None:
+    module = expected["module"]
+    assert isinstance(module, dict)
+    module_path = Path(module["path"])
+    module_path.write_text(source, encoding="utf-8")
+    expected["module"] = {
+        "path": str(module_path.resolve()),
+        "size": module_path.stat().st_size,
+        "sha256": hashlib.sha256(module_path.read_bytes()).hexdigest(),
+    }
+
+
 def test_verified_session_rejects_instance_level_lazy_dispatch_override(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -758,6 +770,171 @@ def test_verified_load_rejects_dependency_dict_descriptor_without_execution(
     with pytest.raises((OSError, ValueError), match="dependency|available|module"):
         runtime.load_verified_gmsh(expected)
     assert not marker.exists()
+
+
+def test_verified_load_rejects_same_module_builtin_symbol_substitution(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = (
+        "import signal\n"
+        "def probe():\n"
+        "    return signal.signal(signal.SIGINT, None)\n"
+        "__version__ = '4.15.2'\n"
+        "class Lib:\n"
+        "    _handle = 99\n"
+        "lib = Lib()\n"
+    )
+    signal_module = signal.signal.__globals__["_signal"]
+    replacement = signal_module.getsignal
+    monkeypatch.setattr(signal_module, "signal", replacement)
+    expected, _library = _synthetic_cdll_setup(monkeypatch, tmp_path)
+    _rewrite_synthetic_source(expected, source)
+
+    with pytest.raises((OSError, ValueError), match="dependency|builtin|symbol|source"):
+        runtime.load_verified_gmsh(expected)
+
+
+def test_verified_load_rejects_exact_module_dependency_substitution(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = (
+        "import signal\n"
+        "def probe():\n"
+        "    return signal.signal(signal.SIGINT, None)\n"
+        "__version__ = '4.15.2'\n"
+        "class Lib:\n"
+        "    _handle = 99\n"
+        "lib = Lib()\n"
+    )
+    signal_globals = signal.signal.__globals__
+    fake_signal = ModuleType("_signal")
+    fake_signal.signal = signal_globals["_signal"].getsignal
+    monkeypatch.setitem(signal_globals, "_signal", fake_signal)
+    expected, _library = _synthetic_cdll_setup(monkeypatch, tmp_path)
+    _rewrite_synthetic_source(expected, source)
+
+    with pytest.raises((OSError, ValueError), match="dependency|module|source|namespace"):
+        runtime.load_verified_gmsh(expected)
+
+
+def test_verified_load_rejects_callable_instance_in_recursive_dependency(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    marker = tmp_path / "unsafe-recursive-callable"
+    source = (
+        "import signal\n"
+        "def probe():\n"
+        "    return signal.signal(signal.SIGINT, None)\n"
+        "__version__ = '4.15.2'\n"
+        "class Lib:\n"
+        "    _handle = 99\n"
+        "lib = Lib()\n"
+    )
+
+    class CallableInstance:
+        def __call__(self, value: Any) -> int:
+            marker.write_text("called", encoding="ascii")
+            return int(value)
+
+    monkeypatch.setitem(signal.signal.__globals__, "_enum_to_int", CallableInstance())
+    expected, _library = _synthetic_cdll_setup(monkeypatch, tmp_path)
+    _rewrite_synthetic_source(expected, source)
+
+    with pytest.raises((OSError, ValueError), match="dependency|callable|function"):
+        runtime.load_verified_gmsh(expected)
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("namespace_kind", ["module-subclass", "arbitrary-object"])
+def test_verified_load_rejects_cached_dependency_namespace_without_attribute_execution(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, namespace_kind: str
+) -> None:
+    marker = tmp_path / f"unsafe-cached-namespace-{namespace_kind}"
+    source = (
+        "import platform\n"
+        "def probe():\n"
+        "    return platform.system()\n"
+        "__version__ = '4.15.2'\n"
+        "class Lib:\n"
+        "    _handle = 99\n"
+        "lib = Lib()\n"
+    )
+
+    if namespace_kind == "module-subclass":
+
+        class MaliciousModule(ModuleType):
+            def __getattribute__(self, attribute: str) -> Any:
+                if attribute == "__spec__":
+                    marker.write_text("called", encoding="ascii")
+                return super().__getattribute__(attribute)
+
+        replacement: Any = MaliciousModule("platform")
+        replacement.system = platform.system
+    else:
+
+        class MaliciousNamespace:
+            @property
+            def __class__(self) -> Any:
+                marker.write_text("called", encoding="ascii")
+                return ModuleType
+
+        replacement = MaliciousNamespace()
+    monkeypatch.setitem(sys.modules, "platform", replacement)
+    expected, _library = _synthetic_cdll_setup(monkeypatch, tmp_path)
+    _rewrite_synthetic_source(expected, source)
+
+    with pytest.raises((OSError, ValueError), match="dependency|module|namespace|import"):
+        runtime.load_verified_gmsh(expected)
+    assert not marker.exists()
+
+
+def test_ctypes_bootstrap_rejects_reassigned_cast_conversion_descriptor(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _isolated(monkeypatch)
+    original_argtypes = ctypes._cast.argtypes
+    assert isinstance(original_argtypes, tuple)
+    with monkeypatch.context() as context:
+        context.setattr(ctypes.c_void_p, "from_param", lambda value: value)
+        context.setattr(ctypes._cast, "argtypes", tuple(original_argtypes))
+        with pytest.raises((OSError, ValueError), match="ctypes|conversion|descriptor|cast"):
+            runtime._build_ctypes_trust()
+    runtime._build_ctypes_trust()
+
+
+@pytest.mark.parametrize("target", ["c_void_p", "wintypes.HMODULE"])
+def test_ctypes_bootstrap_rejects_same_module_type_substitution(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, target: str
+) -> None:
+    _isolated(monkeypatch)
+    if target == "c_void_p":
+        monkeypatch.setattr(ctypes, "c_void_p", ctypes.c_int)
+    else:
+        monkeypatch.setattr(ctypes.wintypes, "HMODULE", ctypes.wintypes.LPCSTR)
+    with pytest.raises((OSError, ValueError), match="ctypes|type|binding|conversion"):
+        runtime._build_ctypes_trust()
+    monkeypatch.undo()
+    runtime._build_ctypes_trust()
+
+
+def test_verified_load_accepts_actual_platform_system_dependency_and_cache(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = (
+        "import platform\n"
+        "platform.system()\n"
+        "__version__ = '4.15.2'\n"
+        "class Lib:\n"
+        "    _handle = 99\n"
+        "lib = Lib()\n"
+    )
+    expected, _library = _synthetic_cdll_setup(monkeypatch, tmp_path)
+    _rewrite_synthetic_source(expected, source)
+
+    loaded, _ = runtime.load_verified_gmsh(expected)
+    reused, _ = runtime.load_verified_gmsh(expected)
+
+    assert reused is loaded
 
 
 def test_ctypes_bootstrap_rejects_preexisting_cast_restype_callback(
