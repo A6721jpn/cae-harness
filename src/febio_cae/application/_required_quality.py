@@ -38,6 +38,7 @@ _PRODUCED_METRICS = frozenset(
         "motion_support_contact_fidelity",
         "quasistatic_equilibrium",
         "mesh_dependence",
+        "source_local_mesh_dependence",
     }
 )
 

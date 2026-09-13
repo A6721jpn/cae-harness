@@ -50,3 +50,31 @@ def test_required_looking_criterion_label_cannot_hide_an_unknown_method() -> Non
         ),
     )
     assert _quality_status((criterion,), arithmetic, required, "PASS") == "UNVERIFIED"
+
+
+def test_source_local_metric_routes_its_declared_criterion_to_the_mesh_producer() -> None:
+    from febio_cae.application._required_quality import _quality_status
+
+    criterion = replace(
+        make_revision().spec.quality_policy.criteria[0],
+        metric_id="source_local_mesh_dependence",
+    )
+    arithmetic = (
+        CriterionAssessment(
+            criterion.criterion_id,
+            "numeric",
+            AssessmentStatus.UNVERIFIED,
+            (),
+            "public arithmetic adapter does not own source-local studies",
+        ),
+    )
+    required = (
+        CriterionAssessment(
+            criterion.criterion_id,
+            "numeric",
+            AssessmentStatus.PASS,
+            (),
+            "registered source-local producer evidence",
+        ),
+    )
+    assert _quality_status((criterion,), arithmetic, required, "PASS") == "PASS"
