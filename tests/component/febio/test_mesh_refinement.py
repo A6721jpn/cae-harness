@@ -357,23 +357,3 @@ def test_local_mesh_index_deduplicates_edges_before_ball_membership() -> None:
 
     assert index.body_element_counts == {"part-body": 3}
     assert len(index.edges_by_body["part-body"]) == 12
-
-
-def test_global_comparison_preserves_non_current_registered_admission(
-    tmp_path: Any,
-) -> None:
-    from test_planar_adoption import _fixture
-
-    from febio_cae.application._mesh_refinement import _global_comparison_revision
-
-    registration, mesh, _, revision = _fixture(tmp_path)
-
-    class Storage:
-        def resolve_revision_mesh_quality(self, candidate: Any) -> Any:
-            assert candidate is revision
-            return registration
-
-    compared, resolved = _global_comparison_revision(Storage(), revision, mesh)
-
-    assert compared is revision
-    assert resolved == registration

@@ -504,6 +504,7 @@ def _mesh_study_request(request: dict[str, Any]) -> dict[str, Any]:
     criterion.update(
         criterion_id="mesh_study",
         metric_id="mesh_dependence",
+        evaluation_ids=["evaluation_tool"],
         thresholds=[
             QualityThreshold(name, Quantity(value, unit)).to_dict()
             for name, value, unit in (

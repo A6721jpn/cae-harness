@@ -21,6 +21,6 @@ V2は独立した開発履歴を持つPython 3.12のheadless CLI。ケース登�
 
 開発体制・検証手順は[開発契約](AGENTS.md)に従う。実部品の材料・荷重・拘束・接触・ROIなどの物理条件は、形状や慣例から推測せず、権威ある根拠で確定する。不足する必須条件は`ASK_AND_BLOCK`とする。
 
-PM兼PdMはAstra X-high、実装は単独のAstra Low、独立レビューは別タスクのAstra Mediumが担当する。PM兼PdMが承認済み要求内の優先順位・実装範囲・技術方針・受け入れ基準・有限予算を決定する。テストと追加機能は計画達成に必要な最小限とし、レビュー済みの小さな変更を順次統合する。
+開発PMは`gpt-6-astra` / `high`、実装はLuna Spawnによる独立した`gpt-5.6-luna` / `max`タスク、独立レビューは別タスクの`gpt-6-astra` / `medium`が担当する。PMが承認済み要求内の優先順位・実装範囲・技術方針・受け入れ基準・有限予算を決定する。テストと追加機能は計画達成に必要な最小限とし、レビュー済みの小さな変更を順次統合する。
 
 実CAEモデル・結果・認証情報はGitへ含めない。公開先は[GitHubのV2ブランチ](https://github.com/A6721jpn/cae-harness/tree/V2)、状態は`REMOTE_CONFIGURED`。既存CAE Harnessの資産はV2へ引き継がない。

@@ -9,14 +9,22 @@ from typing import TYPE_CHECKING, Any
 
 from febio_cae.adapters.febio.profile_scope import require_profile_scope
 from febio_cae.adapters.geometry import StepGeometryMeshAdapter
-from febio_cae.adapters.meshing.approximation import ApproximationCriteria, NATIVE_ALGORITHM
 from febio_cae.adapters.geometry.preparation import (
     CurrentInspection,
     inspection_from_dict,
     resource_snapshot,
     run_preparation,
 )
-from febio_cae.domain import CaseRevision, EvidenceRef, MeshArtifact, Quantity, RigidPrimitive
+from febio_cae.adapters.meshing.approximation import (
+    NATIVE_ALGORITHM,
+    ApproximationCriteria,
+)
+from febio_cae.domain import (
+    CaseRevision,
+    EvidenceRef,
+    MeshArtifact,
+    RigidPrimitive,
+)
 from febio_cae.domain.canonical import canonical_bytes
 from febio_cae.domain.codec import decode_record
 from febio_cae.domain.compatibility import CapabilityStatus
@@ -28,6 +36,7 @@ from febio_cae.storage.mesh_quality import (
 )
 from febio_cae.storage.preparation import PreparationStore, digest
 
+from ._mesh_refinement import validate_next_refinement
 from ._preparation_request import normalize_request, request_parts
 
 if TYPE_CHECKING:
@@ -42,8 +51,12 @@ def _bound_generation_criteria(
     if primitive_kind not in {"sphere", "cylinder"}:
         raise ValueError("preparation supports only box, sphere, or cylinder tools")
     if registration.algorithm_id != NATIVE_ALGORITHM:
-        raise ValueError("curved preparation requires the registered native approximation algorithm")
-    supported = tuple(kind for kind in registration.primitive_kinds if kind in {"sphere", "cylinder"})
+        raise ValueError(
+            "curved preparation requires the registered native approximation algorithm"
+        )
+    supported = tuple(
+        kind for kind in registration.primitive_kinds if kind in {"sphere", "cylinder"}
+    )
     try:
         criteria = ApproximationCriteria(
             profile=registration.reference,
@@ -85,10 +98,9 @@ def geometry_from_output(
         backend_version = producer["backend_version"]
     except (KeyError, TypeError, ValueError, OverflowError) as error:
         raise ValueError("preparation producer inspection is malformed") from error
-    if (
-        canonical_bytes(carrier.to_dict()) != canonical_bytes(producer["carrier"])
-        or canonical_bytes(report.to_dict()) != canonical_bytes(producer["inspection"])
-    ):
+    if canonical_bytes(carrier.to_dict()) != canonical_bytes(
+        producer["carrier"]
+    ) or canonical_bytes(report.to_dict()) != canonical_bytes(producer["inspection"]):
         raise ValueError("preparation producer records are not canonical")
     if report.source_digest != source.source_asset.content_digest:
         raise ValueError("preparation producer inspection source differs from registered STEP")
@@ -214,46 +226,25 @@ def prepare_planar(
                         raise ValueError("refinement changed a declared selection")
                     resolutions[selection.to_bytes()] = resolution
                 restored = _resolved_values(preliminary, resolutions)
+                validate_next_refinement(
+                    old.spec.mesh_policy,
+                    replace(
+                        restored.mesh_policy,
+                        quality_profile=old.spec.mesh_policy.quality_profile,
+                    ),
+                    old.spec.quality_policy.criteria,
+                )
                 restored = replace(
                     restored,
                     mesh_policy=replace(
                         restored.mesh_policy,
                         global_size=old.spec.mesh_policy.global_size,
+                        local_refinements=old.spec.mesh_policy.local_refinements,
                         quality_profile=old.spec.mesh_policy.quality_profile,
                     ),
                 )
                 if restored.to_bytes() != old.spec.to_bytes():
-                    raise ValueError("refinement may change only the declared global mesh size")
-                criteria = [
-                    criterion
-                    for criterion in old.spec.quality_policy.criteria
-                    if criterion.metric_id == "mesh_dependence"
-                ]
-                if len(criteria) != 1:
-                    raise ValueError("refinement requires one declared mesh-dependence criterion")
-                thresholds = {
-                    threshold.parameter_id: threshold.value for threshold in criteria[0].thresholds
-                }
-                names = ("coarse_size", "refined_size", "fine_size")
-                if any(
-                    name not in thresholds
-                    or thresholds[name].dimension != Quantity(1, "m").dimension
-                    for name in names
-                ):
-                    raise ValueError("refinement requires three declared physical mesh sizes")
-                sizes = tuple(float(thresholds[name].to_si().value) for name in names)
-                if not sizes[0] > sizes[1] > sizes[2] > 0:
-                    raise ValueError("refinement sizes must be positive and strictly decreasing")
-                previous_size = float(old.spec.mesh_policy.global_size.to_si().value)
-                if previous_size not in sizes:
-                    raise ValueError("parent mesh size is outside the declared refinement study")
-                next_index = sizes.index(previous_size) + 1
-                if (
-                    next_index >= len(sizes)
-                    or next_index > old.spec.mesh_policy.max_refinements
-                    or float(preliminary.mesh_policy.global_size.to_si().value) != sizes[next_index]
-                ):
-                    raise ValueError("refinement must use the next declared mesh size")
+                    raise ValueError("refinement may change only the declared mesh sizes")
                 parent = old
         source = storage.resolve_source(storage.source_asset("cad"))
         if preliminary.geometry.source_step_digest != source.source_asset.content_digest:
@@ -405,7 +396,7 @@ def prepare_planar(
                 storage.register_mesh_quality(registration)
                 values = replace(
                     values,
-                    mesh_policy=replace(spec.mesh_policy, quality_profile=registration.reference),
+                    mesh_policy=replace(values.mesh_policy, quality_profile=registration.reference),
                 )
                 draft = service.set_spec(
                     case_id,

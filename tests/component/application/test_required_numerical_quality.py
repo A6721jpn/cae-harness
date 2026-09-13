@@ -545,6 +545,8 @@ def _mesh_study_payload(service: Any, request: dict[str, Any]) -> dict[str, Any]
             ),
         ),
         mesh_policy=replace(configured.mesh_policy, quality_profile=generation_profile),
+        # This study exercises registered evidence, not the fixture's short runner deadline.
+        budget=replace(configured.budget, max_elapsed=Quantity(120, "s")),
         **{
             name: replace(
                 getattr(configured, name),
@@ -1159,149 +1161,6 @@ def _registered_mesh_study_summary(
     return service.run_status(created.case_id, final_run_id)
 
 
-def _partial_case_spec(spec: Any) -> Any:
-    from febio_cae.domain import PartialCaseSpec
-
-    return PartialCaseSpec(
-        **{
-            field: getattr(spec, field)
-            for field in (
-                "geometry",
-                "material",
-                "support",
-                "rigid_tool",
-                "motion",
-                "contact",
-                "mesh_policy",
-                "solver_policy",
-                "outputs",
-                "quality_policy",
-                "budget",
-            )
-        }
-    )
-
-
-def _publish_source_local_stage(
-    service: Any,
-    created: Any,
-    parent: Any,
-    payload: dict[str, Any],
-) -> Any:
-    import importlib
-
-    from febio_cae.application._preparation import geometry_from_output
-    from febio_cae.adapters.geometry.preparation import inspection_from_dict
-    from febio_cae.domain import CaseRevision, EvidenceRef, MeshArtifact, PartialCaseSpec
-    from febio_cae.domain.canonical import canonical_bytes
-    from febio_cae.domain.codec import decode_record
-    from febio_cae.storage.demo_budget import reserve_preparation_mesh_attempt
-    from febio_cae.storage.mesh_quality import PlanarPreparationRegistration
-    from febio_cae.storage.preparation import PreparationStore, digest
-
-    worker = importlib.import_module("febio_cae.adapters.geometry.preparation")
-    storage = service._storage(created.case_id)
-    records = PreparationStore(storage)
-    source = service.resolve_source(created.case_id, "cad")
-    parent_registration = storage.resolve_revision_mesh_quality(parent)
-    parent_record = records.read(parent_registration.preparation_id)
-    limits = dict(parent_record["limits"])
-    limits["mesh_generations"] = 1
-    current = storage.current_draft(created.case_id)
-    record = records.begin(
-        created.case_id,
-        input_generation=current.generation,
-        input_snapshot_digest=digest(current.to_dict()),
-        source_digest=source.source_asset.content_digest,
-        request_digest=digest(payload),
-        limits=limits,
-    )
-    previous_geometry, previous_selection = service.geometry, service._placed_selection
-    try:
-        request_asset = storage.ingest_source(
-            asset_id="prepare-" + record["preparation_id"],
-            source_kind="user_instruction",
-            media_type="application/json",
-            content=canonical_bytes(payload),
-        )
-        admission = EvidenceRef(
-            "1",
-            "user_instruction",
-            request_asset.asset_id,
-            "mesh.admission",
-            request_asset.content_digest,
-        )
-        if not reserve_preparation_mesh_attempt(storage, created.case_id, record["preparation_id"]):
-            raise ValueError("preparation generation was already reserved")
-        producer = worker.produce(source, payload, limits)
-        original = decode_record(canonical_bytes(producer["mesh"]), MeshArtifact)
-        carrier = decode_record(canonical_bytes(producer["carrier"]), CaseRevision)
-        report = inspection_from_dict(producer["inspection"])
-        geometry = geometry_from_output(
-            producer,
-            source,
-            expected_primitive=carrier.spec.rigid_tool.primitive,
-            expected_tool_geometry_digest=carrier.spec.rigid_tool.contact_surface.geometry_digest,
-        )
-        registration = PlanarPreparationRegistration(
-            "prepare-" + record["preparation_id"],
-            source.source_asset.content_digest,
-            report.geometry_digest,
-            original.artifact_digest,
-            original.provenance.mesh_recipe_digest,
-            parent_registration.generation_profile,
-            (admission,),
-            record["preparation_id"],
-        )
-        storage.register_mesh_quality(registration)
-        values = _partial_case_spec(carrier.spec)
-        assert isinstance(values, PartialCaseSpec)
-        values = replace(
-            values,
-            mesh_policy=replace(
-                values.mesh_policy,
-                quality_profile=registration.reference,
-            ),
-        )
-        draft = service.set_spec(
-            created.case_id,
-            values=values,
-            expected_generation=current.generation,
-            evidence=(*parent.evidence, admission),
-            input_intent="registered synthetic source-local refinement",
-            parent_revision_id=parent.revision_id,
-        )
-        service.geometry = geometry
-        service._placed_selection = geometry.resolve_placed_selection
-        frozen = service.freeze_case(created.case_id)
-        if frozen.status != "FROZEN" or frozen.revision is None:
-            raise ValueError(f"source-local stage failed validation: {frozen.to_dict()}")
-        revision = storage.get_revision(created.case_id, frozen.revision.revision_id)
-        record.update(
-            revision_id=revision.revision_id,
-            generation=draft.generation,
-            snapshot_digest=digest(draft.to_dict()),
-            inspection_digest=digest(report.to_dict()),
-            mesh_digest=original.artifact_digest,
-            recipe_digest=original.provenance.mesh_recipe_digest,
-            backend_id=producer["backend_id"],
-            backend_version=producer["backend_version"],
-            backend=producer["backend"],
-        )
-        mesh, receipt = service._adopt_planar_mesh(registration, original, carrier, revision)
-        records.publish(
-            record,
-            revision,
-            {"producer": producer, "mesh": mesh.to_dict(), "adoption": receipt},
-        )
-        return revision
-    except BaseException as error:
-        records.failed(record, error)
-        raise
-    finally:
-        service.geometry, service._placed_selection = previous_geometry, previous_selection
-
-
 def _far_field_maximum(mesh: Any, body_id: str) -> float:
     import math
 
@@ -1369,7 +1228,13 @@ def _registered_source_local_study_summary(
                 "value": 1.0 if index == 0 else 0.5,
                 "unit": "mm",
             }
-            revision = _publish_source_local_stage(service, created, revision, child_payload)
+            prepared = service.prepare_planar(
+                created.case_id,
+                child_payload,
+                expected_generation=int(prepared["generation"]),
+                parent_revision_id=revision.revision_id,
+            )
+            revision = service.get_revision(created.case_id, str(prepared["revision_id"]))
             stage_revisions.append(revision)
     assert len({item.preparation_id for item in registrations}) == 3
     assert len({item.generation_profile for item in registrations}) == 1

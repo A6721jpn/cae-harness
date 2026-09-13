@@ -2,7 +2,7 @@
 
 Python 3.12のheadlessプロトタイプ、`febio-cae 0.1.0`の公開コマンドを説明する。製品仕様の決定元は[設計仕様書](specs/2026-08-27-febio-llm-cae-harness-design-v2.md)と[実装・検証計画](plans/2026-08-27-febio-cae-harness-greenfield-plan.md)。本書は仕様を追加しない。
 
-開発・修正の担当と判断権限は2026-09-09改訂の[開発契約](../AGENTS.md)に従う（PM兼PdM: Astra X-high、単独実装: Astra Low、別タスクの独立レビュー: Astra Medium）。この体制変更による公開CLIの構文変更はない。
+開発・修正の担当と判断権限は[開発契約](../AGENTS.md)に従う。開発PMは`gpt-6-astra` / `high`、実装は独立したLuna Spawnの`gpt-5.6-luna` / `max`タスク、独立レビューは別タスクの`gpt-6-astra` / `medium`が担当する。
 
 ## インストール済みCLIの確認
 
@@ -44,9 +44,26 @@ febio-cae case --state-dir '<STATE_DIR>' freeze '<CASE_ID>' --json
 febio-cae case --state-dir '<STATE_DIR>' patch '<CASE_ID>' --file '<PATCH_JSON>' --expected-generation '<GENERATION>' --json
 ```
 
+## 現在のメッシュ準備と宣言済み細分化
+
+`prepare-planar`は、対応するネイティブツール、登録済みの生成品質・互換性プロファイル、完全な明示入力、有限予算を前提とする。要求形式は[preparation要求パーサー](../src/febio_cae/application/_preparation_request.py)を参照する。初回はまだ固定リビジョンのない登録済みケースに対して実行する。
+
+```powershell
+febio-cae case --state-dir '<STATE_DIR>' prepare-planar '<CASE_ID>' --file '<PREPARATION_REQUEST_JSON>' --expected-generation '<GENERATION>' --json
+febio-cae case --state-dir '<STATE_DIR>' prepare-planar '<CASE_ID>' --file '<REFINEMENT_REQUEST_JSON>' --expected-generation '<GENERATION>' --parent-revision-id '<PARENT_REVISION_ID>' --json
+```
+
+細分化には現在の固定リビジョンを親として指定し、未固定の変更を残さない。要求の`mesh_policy.quality_profile`には元の生成プロファイルを指定する。返却された準備ごとの採用登録で置き換えない。
+
+- `mesh_dependence`では、宣言した3段階の隣接する次の`global_size`へ進める。
+- `source_local_mesh_dependence`では、`global_size`、選択領域、source-local ballの位置・半径を保ち、宣言した局所サイズの隣接する次の段階へ進める。
+- 材料、運動、支持、接触、出力、品質条件、予算などの物理条件・判断根拠を同時に変更しない。段階の飛び越しや細分化回数超過は拒否される。親のメッシュ・来歴は保持される。
+
+`PREPARED`は準備と登録の完了であり、ソルバー成功や数値収束・物理的妥当性の認定ではない。局所細分化の公開APIと登録済み品質評価は合成入力で検証しており、この記述を実Gmsh/FEBio、インストール済み曲面経路、実モデルのE2E合格証拠として扱わない。
+
 ## 登録済み平面プロトタイプの実行
 
-`run-demo`は制限付きの内部登録経路である。対象リビジョンの平面デモ登録、採用済みメッシュと来歴・検査記録、互換性プロファイル、登録されたリーダー資産、予算などの前提を必要とし、ソルバーとリーダーの一致も確認する。この準備を任意のSTEPに対して行う汎用の公開CLIはない。`create`→`spec`→`freeze`だけで任意の部品を実行できるとは限らない。前提がない場合、記録を手作業で偽装せず未対応として扱う。
+`run-demo`は制限付きの登録経路である。対象リビジョンの平面デモ登録、採用済みメッシュと来歴・検査記録、互換性プロファイル、登録されたリーダー資産、予算などの前提を必要とし、ソルバーとリーダーの一致も確認する。`prepare-planar`も登録・適用範囲・予算の制限を満たす準備経路であり、任意のSTEPの解析成功を保証しない。`create`→`spec`→`freeze`だけで任意の部品を実行できるとは限らない。前提がない場合、記録を手作業で偽装せず未対応として扱う。
 
 ```powershell
 febio-cae case --state-dir '<STATE_DIR>' run-demo '<CASE_ID>' --revision-id '<REVISION_ID>' --solver '<SOLVER_EXE>' --preflight --json
