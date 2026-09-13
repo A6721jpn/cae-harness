@@ -27,7 +27,7 @@ from febio_cae.domain import (
     SelectionRef,
 )
 from febio_cae.domain.canonical import canonical_bytes
-from febio_cae.domain.results import numeric_state_indices
+from febio_cae.domain.results import numeric_state_indices, surface_node_entity_id
 
 
 class QualityAdapter:
@@ -345,6 +345,23 @@ class QualityAdapter:
                 raise ValueError("rigid ROI must identify one body or its node/face projection")
             return {body}
         matching = [item for item in candidates if item.kind == location]
+        if location in {"surface", "surface_node"}:
+            matching = [item for item in candidates if item.kind == "face"]
+            if len(matching) != 1:
+                raise ValueError(f"ROI does not resolve to one {location} mesh set")
+            face_by_id = {face.face_id: face for face in mesh.faces}
+            face_set = matching[0]
+            face_ids = tuple(str(face_id) for face_id in face_set.member_ids)
+            if location == "surface":
+                return {face_set.set_id}
+            try:
+                return {
+                    surface_node_entity_id(face_id, node_id)
+                    for face_id in face_ids
+                    for node_id in face_by_id[face_id].node_ids
+                }
+            except KeyError as error:
+                raise ValueError("surface-node ROI references an unknown face") from error
         if not matching and location == "node":
             faces = [item for item in candidates if item.kind == "face"]
             if len(faces) == 1:
@@ -366,6 +383,13 @@ class QualityAdapter:
             "node": {str(item.node_id) for item in mesh.nodes},
             "element": {str(item.element_id) for item in mesh.elements},
             "rigid_body": {item.body_id for item in mesh.elements},
+            "face": {item.face_id for item in mesh.faces},
+            "surface": {item.set_id for item in mesh.sets if item.kind == "face"},
+            "surface_node": {
+                surface_node_entity_id(face.face_id, node_id)
+                for face in mesh.faces
+                for node_id in face.node_ids
+            },
         }.get(numeric.mapping.location, set())
         actual = set(numeric.entity_ids)
         if not wanted or not wanted <= actual or not actual <= allowed:

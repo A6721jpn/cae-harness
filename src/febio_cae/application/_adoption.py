@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Sequence
 from dataclasses import replace
 from typing import Any
 
@@ -25,6 +26,15 @@ def _selection_key(selection: SelectionRef) -> bytes:
     projection = selection.to_dict()
     projection.pop("resolution", None)
     return canonical_bytes(_without_evidence(projection))
+
+
+def _mesh_sets_by_selection_digest(
+    sets: Sequence[MeshSet],
+) -> dict[str, tuple[MeshSet, ...]]:
+    grouped: dict[str, list[MeshSet]] = {}
+    for item in sets:
+        grouped.setdefault(item.source_selection_digest, []).append(item)
+    return {digest: tuple(items) for digest, items in grouped.items()}
 
 
 def adopt(
@@ -91,6 +101,7 @@ def adopt(
     targets = {
         hashlib.sha256(selection.to_bytes()).hexdigest(): selection for selection in selections
     }
+    original_sets_by_digest = _mesh_sets_by_selection_digest(original.sets)
     aliases: list[dict[str, object]] = []
     sets: list[MeshSet] = []
     for digest, selection in sorted(targets.items()):
@@ -102,9 +113,7 @@ def adopt(
         if source.resolution is not None and source.resolution != selection.resolution:
             raise ValueError("adoption changes an existing resolved selection snapshot")
         original_digest = hashlib.sha256(source.to_bytes()).hexdigest()
-        matching = [
-            item for item in original.sets if item.source_selection_digest == original_digest
-        ]
+        matching = original_sets_by_digest.get(original_digest, ())
         if not matching or any(item.body_id != selection.body_id.value for item in matching):
             raise ValueError("original generated selection is absent or crosses body ownership")
         mapped = [
@@ -121,6 +130,10 @@ def adopt(
             }
             for location in sorted(locations):
                 kind = str(location)
+                if location in {"face", "surface", "surface_node"}:
+                    if any(item.kind == "face" for item in mapped):
+                        continue
+                    raise ValueError("unsupported whole-body output projection")
                 if any(item.kind == location for item in mapped):
                     continue
                 body = selection.body_id.value
@@ -145,6 +158,29 @@ def adopt(
                 "derived_sets": [item.to_dict() for item in mapped],
             }
         )
+    contact_selections = (
+        current.contact.part_surface,
+        current.contact.tool_surface,
+    )
+    contact_output_locations = {
+        request.location
+        for request in current.outputs.requests
+        if request.selection in contact_selections
+        and request.location in {"face", "surface", "surface_node"}
+    }
+    if contact_output_locations:
+        adopted_sets_by_digest = _mesh_sets_by_selection_digest(sets)
+        for selection in contact_selections:
+            digest = hashlib.sha256(selection.to_bytes()).hexdigest()
+            face_sets = tuple(
+                item
+                for item in adopted_sets_by_digest.get(digest, ())
+                if item.kind == "face" and item.body_id == selection.body_id.value
+            )
+            if len(face_sets) != 1:
+                raise ValueError(
+                    f"contact selection does not resolve to one adopted face set: {selection.name}"
+                )
     receipt: dict[str, object] = {
         "format_version": 1,
         "operation": "explicit-planar-metadata-adoption",

@@ -42,6 +42,7 @@ from febio_cae.domain import (
 )
 from febio_cae.domain.codec import decode_record, encode_record
 from febio_cae.domain.lifecycle import TaskStatus
+from febio_cae.domain.results import surface_node_entity_id
 from febio_cae.storage import CaseStorage
 from febio_cae.storage.mesh_quality import PlanarDemoRegistration, PlanarPreparationRegistration
 
@@ -64,12 +65,64 @@ def _read_native_result(
     data = LocalResultDataStore()
     part = revision.spec.geometry.body_id.value
     tool = revision.spec.rigid_tool.primitive.body_id.value
+    face_by_id = {face.face_id: face for face in mesh.faces}
+    contact_entities: dict[str, tuple[str, ...]] = {}
+    active_contact_surfaces: tuple[str, ...] = ()
+    contact_selections = (
+        revision.spec.contact.part_surface,
+        revision.spec.contact.tool_surface,
+    )
+    contact_locations = {
+        mapping.location
+        for mapping in profile.output_mappings
+        if mapping.location in {"face", "surface", "surface_node"}
+    }
+    if contact_locations:
+        face_sets_by_binding: dict[tuple[str, str], list[Any]] = {}
+        for item in mesh.sets:
+            if item.kind == "face":
+                face_sets_by_binding.setdefault(
+                    (item.source_selection_digest, item.body_id), []
+                ).append(item)
+        contact_face_sets: list[Any] = []
+        for selection in contact_selections:
+            digest = hashlib.sha256(selection.to_bytes()).hexdigest()
+            matches = face_sets_by_binding.get((digest, selection.body_id.value), [])
+            if len(matches) != 1:
+                raise PortError(
+                    PortErrorCategory.INTEGRITY,
+                    f"contact selection does not resolve to one face set: {selection.name}",
+                )
+            contact_face_sets.append(matches[0])
+        contact_face_ids = tuple(
+            str(face_id) for face_set in contact_face_sets for face_id in face_set.member_ids
+        )
+        try:
+            contact_surface_node_ids = tuple(
+                surface_node_entity_id(face_id, node_id)
+                for face_id in contact_face_ids
+                for node_id in face_by_id[face_id].node_ids
+            )
+        except KeyError as error:
+            raise PortError(
+                PortErrorCategory.INTEGRITY,
+                "contact selection references an unknown mesh face",
+            ) from error
+        contact_entities.update(
+            {
+                "face": contact_face_ids,
+                "surface": tuple(face_set.set_id for face_set in contact_face_sets),
+                "surface_node": contact_surface_node_ids,
+            }
+        )
+        active_contact_surfaces = tuple(face_set.set_id for face_set in contact_face_sets)
     entities = {
         "node": tuple(str(node.node_id) for node in mesh.nodes),
         "element": tuple(
             str(element.element_id) for element in mesh.elements if element.body_id == part
         ),
         "rigid_body": (tool,),
+        **contact_entities,
     }
     data.register_source(
         attempt,
@@ -81,6 +134,7 @@ def _read_native_result(
         entity_ids={
             mapping.canonical_id: entities[mapping.location] for mapping in profile.output_mappings
         },
+        active_contact_surfaces=active_contact_surfaces,
     )
     manifest = XpltReaderAdapter(profile=profile, data_store=data).read(attempt, bundle)
     for observation in manifest.read_result.observations:
