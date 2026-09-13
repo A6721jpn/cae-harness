@@ -585,6 +585,9 @@ if isinstance(_CFUNC_PTR_TYPE, type):
     _CFUNC_PTR_GETATTRIBUTE_OWNER, _CFUNC_PTR_GETATTRIBUTE = _raw_type_descriptor(
         _CFUNC_PTR_TYPE, "__getattribute__"
     )
+    _CFUNC_PTR_SETATTR_OWNER, _CFUNC_PTR_SETATTR = _raw_type_descriptor(
+        _CFUNC_PTR_TYPE, "__setattr__"
+    )
     _CFUNC_PTR_METADATA = {
         attribute: _raw_type_descriptor(_CFUNC_PTR_TYPE, attribute)
         for attribute in _NATIVE_CALL_ATTRIBUTES
@@ -594,6 +597,8 @@ else:
     _CFUNC_PTR_CALL = _MISSING
     _CFUNC_PTR_GETATTRIBUTE_OWNER = None
     _CFUNC_PTR_GETATTRIBUTE = _MISSING
+    _CFUNC_PTR_SETATTR_OWNER = None
+    _CFUNC_PTR_SETATTR = _MISSING
     _CFUNC_PTR_METADATA = {}
 
 
@@ -988,7 +993,7 @@ def _is_ctypes_callable(value: object) -> bool:
 
 def _ctypes_dispatch_descriptor(
     value: object, name: str
-) -> tuple[type, object, type, object]:
+) -> tuple[type, object, type, object, type, object]:
     if not _is_ctypes_callable(value):
         raise _error(f"cached native callable {name} is not a ctypes function")
     value_type = type(value)
@@ -998,11 +1003,14 @@ def _ctypes_dispatch_descriptor(
     attribute_owner, attribute_descriptor = _raw_type_descriptor(
         value_type, "__getattribute__"
     )
+    setattr_owner, setattr_descriptor = _raw_type_descriptor(value_type, "__setattr__")
     if (
         call_owner is not _CFUNC_PTR_CALL_OWNER
         or call_descriptor is not _CFUNC_PTR_CALL
         or attribute_owner is not _CFUNC_PTR_GETATTRIBUTE_OWNER
         or attribute_descriptor is not _CFUNC_PTR_GETATTRIBUTE
+        or setattr_owner is not _CFUNC_PTR_SETATTR_OWNER
+        or setattr_descriptor is not _CFUNC_PTR_SETATTR
     ):
         raise _error(f"cached native callable {name} dispatch was overridden")
     for attribute in _NATIVE_CALL_ATTRIBUTES:
@@ -1017,7 +1025,14 @@ def _ctypes_dispatch_descriptor(
             or metadata_descriptor is not expected_descriptor
         ):
             raise _error(f"cached native callable {name} metadata access was overridden")
-    return call_owner, call_descriptor, attribute_owner, attribute_descriptor
+    return (
+        call_owner,
+        call_descriptor,
+        attribute_owner,
+        attribute_descriptor,
+        setattr_owner,
+        setattr_descriptor,
+    )
 
 
 def _ctypes_pointer(value: object, name: str) -> int:
@@ -1244,6 +1259,8 @@ class _NativeCallableState:
     dispatch_descriptor: object | None
     getattribute_owner: type | None
     getattribute_descriptor: object | None
+    setattr_owner: type | None = None
+    setattr_descriptor: object | None = None
 
 
 def _native_callable_state(
@@ -1261,6 +1278,8 @@ def _native_callable_state(
             dispatch_descriptor,
             getattribute_owner,
             getattribute_descriptor,
+            setattr_owner,
+            setattr_descriptor,
         ) = _ctypes_dispatch_descriptor(value, name)
         pointer = _validate_ctypes_callable(library, name, value, native_symbols)
         _validate_ctypes_call_signature(value, name, signature_policy)
@@ -1273,6 +1292,8 @@ def _native_callable_state(
             dispatch_descriptor,
             getattribute_owner,
             getattribute_descriptor,
+            setattr_owner,
+            setattr_descriptor,
         )
     if isinstance(value, FunctionType):
         return _NativeCallableState(
@@ -1284,6 +1305,8 @@ def _native_callable_state(
             dispatch_descriptor,
             getattribute_owner,
             getattribute_descriptor,
+            setattr_owner,
+            setattr_descriptor,
         ) = _ctypes_dispatch_descriptor(value, name)
         pointer = _validate_ctypes_callable(library, name, value, native_symbols)
         _validate_ctypes_call_signature(value, name, signature_policy)
@@ -1296,6 +1319,8 @@ def _native_callable_state(
             dispatch_descriptor,
             getattribute_owner,
             getattribute_descriptor,
+            setattr_owner,
+            setattr_descriptor,
         )
     if not callable(value):
         raise _error(f"cached native callable {name} is not callable")
@@ -1331,6 +1356,8 @@ class _LiveState:
     library_namespace_owner: type
     library_namespace_descriptor: object
     library_namespace: dict[str, object]
+    library_funcptr_owner: type
+    library_funcptr_descriptor: object
     library_funcptr: _FactoryState | None
     native_symbols: frozenset[str]
     native_signature_policy: dict[str, frozenset[tuple[object, ...]]]
@@ -1351,6 +1378,9 @@ def _capture_live_state(
     namespace = _library_namespace(
         library,
         expected=(library_namespace_owner, library_namespace_descriptor),
+    )
+    library_funcptr_owner, library_funcptr_descriptor = _raw_type_descriptor(
+        type(library), "_FuncPtr"
     )
     library_funcptr = _factory_state(namespace.get("_FuncPtr", _MISSING))
     module_dispatch = _attribute_dispatch_state(
@@ -1412,6 +1442,8 @@ def _capture_live_state(
         library_namespace_owner=library_namespace_owner,
         library_namespace_descriptor=library_namespace_descriptor,
         library_namespace=namespace,
+        library_funcptr_owner=library_funcptr_owner,
+        library_funcptr_descriptor=library_funcptr_descriptor,
         library_funcptr=library_funcptr,
         native_symbols=native_symbols,
         native_signature_policy=native_signature_policy,
@@ -1451,12 +1483,16 @@ def _validate_native_callable_state(
             dispatch_descriptor,
             getattribute_owner,
             getattribute_descriptor,
+            setattr_owner,
+            setattr_descriptor,
         ) = _ctypes_dispatch_descriptor(current, name)
         if (
             dispatch_owner is not state.dispatch_owner
             or dispatch_descriptor is not state.dispatch_descriptor
             or getattribute_owner is not state.getattribute_owner
             or getattribute_descriptor is not state.getattribute_descriptor
+            or setattr_owner is not state.setattr_owner
+            or setattr_descriptor is not state.setattr_descriptor
         ):
             raise _error(f"live Gmsh native callable {name} dispatch changed")
         pointer = _validate_ctypes_callable(library, name, current, native_symbols)
@@ -1526,6 +1562,14 @@ def _validate_live_state(state: _LiveState, module: ModuleType, library: object)
     )
     if current_library_namespace is not state.library_namespace:
         raise _error("live Gmsh native library namespace changed")
+    current_funcptr_owner, current_funcptr_descriptor = _raw_type_descriptor(
+        type(library), "_FuncPtr"
+    )
+    if (
+        current_funcptr_owner is not state.library_funcptr_owner
+        or current_funcptr_descriptor is not state.library_funcptr_descriptor
+    ):
+        raise _error("live Gmsh native library factory descriptor changed")
     current_funcptr = current_library_namespace.get("_FuncPtr", _MISSING)
     if state.library_funcptr is None:
         if current_funcptr is not _MISSING:
