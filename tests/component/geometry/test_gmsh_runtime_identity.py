@@ -593,6 +593,52 @@ def test_verified_session_accepts_legitimate_lazy_native_cache(
     assert reused is loaded
 
 
+def test_verified_session_rejects_ctypes_dispatch_tampering(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The synthetic CFuncPtr type dispatch is part of the native call surface."""
+
+    _isolated(monkeypatch)
+    source = (
+        "__version__ = '4.15.2'\n"
+        "def isInitialized():\n"
+        "    return lib.gmshIsInitialized()\n"
+        "class Lib:\n"
+        "    _handle = 99\n"
+        "lib = Lib()\n"
+    )
+    module, library, launcher, image, python_library = _files(tmp_path, source)
+    expected = _binding(tmp_path, module=module, library=library)
+    monkeypatch.setattr(
+        runtime,
+        "_current_process_binding",
+        lambda: {
+            "python": _identity(launcher),
+            "python_image": _identity(image),
+            "python_library": _identity(python_library),
+            "pyvenv_cfg": None,
+        },
+    )
+    monkeypatch.setattr(runtime, "_mapped_module_path", lambda handle: library)
+    monkeypatch.syspath_prepend(str(module.parent))
+    sys.modules.pop("gmsh", None)
+    loaded, _ = runtime.load_verified_gmsh(expected)
+
+    native = _synthetic_native_callable()
+    _install_synthetic_native_export(monkeypatch, loaded, "gmshIsInitialized", native)
+    runtime.load_verified_gmsh(expected)
+
+    native_type = type(native)
+
+    def replacement(_self: Any, *args: Any, **kwargs: Any) -> Any:
+        del args, kwargs
+        return None
+
+    monkeypatch.setattr(native_type, "__call__", replacement)
+    with pytest.raises((OSError, ValueError), match="dispatch|callable|native"):
+        runtime.load_verified_gmsh(expected)
+
+
 def test_verified_session_accepts_authenticated_source_restype_transition(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -627,10 +673,11 @@ def test_verified_session_accepts_authenticated_source_restype_transition(
     loaded, _ = runtime.load_verified_gmsh(expected)
 
     native = _synthetic_native_callable()
-    native.restype = ctypes.c_double
     _install_synthetic_native_export(
         monkeypatch, loaded, "gmshLoggerGetWallTime", native
     )
+    runtime.load_verified_gmsh(expected)
+    native.restype = ctypes.c_double
 
     reused, _ = runtime.load_verified_gmsh(expected)
     assert reused is loaded

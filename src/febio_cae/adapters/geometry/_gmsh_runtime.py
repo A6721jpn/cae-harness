@@ -557,6 +557,12 @@ def _code_digest(code: CodeType) -> str:
 
 
 _MISSING = object()
+_CFUNC_PTR_TYPE = getattr(ctypes, "_CFuncPtr", None)
+_CFUNC_PTR_CALL = (
+    vars(_CFUNC_PTR_TYPE).get("__call__", _MISSING)
+    if isinstance(_CFUNC_PTR_TYPE, type)
+    else _MISSING
+)
 
 
 def _value_signature(value: object, *, depth: int = 0, budget: int = _MAX_VALUE_ITEMS) -> object:
@@ -819,8 +825,28 @@ def _builtin_binding(module: ModuleType, name: str) -> object:
 
 
 def _is_ctypes_callable(value: object) -> bool:
-    function_type = getattr(ctypes, "_CFuncPtr", None)
-    return isinstance(function_type, type) and isinstance(value, function_type)
+    return isinstance(_CFUNC_PTR_TYPE, type) and isinstance(value, _CFUNC_PTR_TYPE)
+
+
+def _ctypes_dispatch_descriptor(value: object, name: str) -> tuple[type, object]:
+    if not _is_ctypes_callable(value):
+        raise _error(f"cached native callable {name} is not a ctypes function")
+    value_type = type(value)
+    try:
+        method_resolution_order = value_type.__mro__
+    except (AttributeError, TypeError) as exc:
+        raise _error(f"cached native callable {name} dispatch cannot be inspected") from exc
+    for owner in method_resolution_order:
+        try:
+            descriptor = vars(owner).get("__call__", _MISSING)
+        except TypeError as exc:
+            raise _error(f"cached native callable {name} dispatch cannot be inspected") from exc
+        if descriptor is _MISSING:
+            continue
+        if owner is not _CFUNC_PTR_TYPE or descriptor is not _CFUNC_PTR_CALL:
+            raise _error(f"cached native callable {name} dispatch was overridden")
+        return owner, descriptor
+    raise _error(f"cached native callable {name} has no authenticated dispatch")
 
 
 def _ctypes_pointer(value: object, name: str) -> int:
@@ -1019,6 +1045,8 @@ class _NativeCallableState:
     value_type: type
     function: _FunctionState | None
     pointer: int | None
+    dispatch_owner: type | None
+    dispatch_descriptor: object | None
 
 
 def _native_callable_state(
@@ -1031,20 +1059,36 @@ def _native_callable_state(
     allow_new: bool,
 ) -> _NativeCallableState:
     if allow_new:
+        dispatch_owner, dispatch_descriptor = _ctypes_dispatch_descriptor(value, name)
         pointer = _validate_ctypes_callable(library, name, value, native_symbols)
         _validate_ctypes_call_signature(value, name, signature_policy)
         return _NativeCallableState(
-            value, type(value), None, pointer
+            value,
+            type(value),
+            None,
+            pointer,
+            dispatch_owner,
+            dispatch_descriptor,
         )
     if isinstance(value, FunctionType):
-        return _NativeCallableState(value, type(value), _function_state(value), None)
+        return _NativeCallableState(
+            value, type(value), _function_state(value), None, None, None
+        )
     if _is_ctypes_callable(value):
+        dispatch_owner, dispatch_descriptor = _ctypes_dispatch_descriptor(value, name)
         pointer = _validate_ctypes_callable(library, name, value, native_symbols)
         _validate_ctypes_call_signature(value, name, signature_policy)
-        return _NativeCallableState(value, type(value), None, pointer)
+        return _NativeCallableState(
+            value,
+            type(value),
+            None,
+            pointer,
+            dispatch_owner,
+            dispatch_descriptor,
+        )
     if not callable(value):
         raise _error(f"cached native callable {name} is not callable")
-    return _NativeCallableState(value, type(value), None, None)
+    return _NativeCallableState(value, type(value), None, None, None, None)
 
 
 def _capture_native_callables(
@@ -1159,6 +1203,12 @@ def _validate_native_callable_state(
             raise _error(f"live Gmsh native callable {name} changed type")
         _validate_function_state(state.function, f"native {name}")
     elif state.pointer is not None:
+        dispatch_owner, dispatch_descriptor = _ctypes_dispatch_descriptor(current, name)
+        if (
+            dispatch_owner is not state.dispatch_owner
+            or dispatch_descriptor is not state.dispatch_descriptor
+        ):
+            raise _error(f"live Gmsh native callable {name} dispatch changed")
         pointer = _validate_ctypes_callable(library, name, current, native_symbols)
         if pointer != state.pointer:
             raise _error(f"live Gmsh native callable {name} address changed")
