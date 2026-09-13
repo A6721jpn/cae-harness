@@ -114,6 +114,7 @@ def _http(
             _run_owned(
                 (sys.executable, "-m", __name__, str(directory)),
                 directory,
+                cpu_workers=settings["budget"]["cpu_workers"],
                 timeout_seconds=remaining,
                 memory_bytes=256 * 1024 * 1024,
             )
