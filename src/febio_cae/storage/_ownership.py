@@ -26,15 +26,14 @@ def identity(path: Path) -> tuple[int, int]:
 
 _api_lock = threading.Lock()
 _kernel32: Any | None = None
-_create_file: Any | None = None
-_close_handle: Any | None = None
+_api_pair: tuple[Any, Any] | None = None
 
 
 def _win32_api() -> tuple[Any, Any]:
-    global _close_handle, _create_file, _kernel32
-    if _create_file is None or _close_handle is None:
+    global _api_pair, _kernel32
+    if _api_pair is None:
         with _api_lock:
-            if _create_file is None or _close_handle is None:
+            if _api_pair is None:
                 from ctypes import wintypes
 
                 kernel = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -53,10 +52,9 @@ def _win32_api() -> tuple[Any, Any]:
                 close.argtypes = [wintypes.HANDLE]
                 close.restype = wintypes.BOOL
                 _kernel32 = kernel
-                _create_file = create
-                _close_handle = close
-    assert _create_file is not None and _close_handle is not None
-    return _create_file, _close_handle
+                _api_pair = (create, close)
+    assert _api_pair is not None
+    return _api_pair
 
 
 def _open(path: Path, *, directory: bool = False, writable: bool = False) -> int:
