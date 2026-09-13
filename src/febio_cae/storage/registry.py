@@ -53,6 +53,7 @@ from ._ownership import identity, lease, pin_directories, pinned_read
 from ._sqlite import connect as _connect
 from .catalog import validate_case_id
 from .mesh_quality import (
+    CurrentPreparationRegistration,
     MeshQualityRecord,
     MeshQualityRegistration,
     PlanarDemoRegistration,
@@ -1146,7 +1147,7 @@ class CaseStorage:
         try:
             for evidence in (
                 record.admission_evidence
-                if isinstance(record, PlanarDemoRegistration)
+                if isinstance(record, (PlanarDemoRegistration, CurrentPreparationRegistration))
                 else record.qualification_evidence
             ):
                 asset = self.source_asset(evidence.reference)
@@ -1182,7 +1183,9 @@ class CaseStorage:
 
     def register_mesh_quality(self, record: MeshQualityRecord) -> NumericalProfileRef:
         """Trusted case-local registration; never exposed as a public JSON import."""
-        if not isinstance(record, (MeshQualityRegistration, PlanarDemoRegistration)):
+        if not isinstance(
+            record, (MeshQualityRegistration, PlanarDemoRegistration, CurrentPreparationRegistration)
+        ):
             raise PortError(
                 PortErrorCategory.INVALID_INPUT, "explicit mesh quality record required"
             )

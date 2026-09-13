@@ -46,9 +46,9 @@ from febio_cae.domain.selection import FaceSetRule, ResolutionSnapshot, Selectio
 from febio_cae.domain.units import Quantity
 from febio_cae.storage.catalog import CaseCatalog, CaseCatalogError
 from febio_cae.storage.mesh_quality import (
+    CurrentPreparationRegistration,
     MeshQualityRecord,
     PlanarDemoRegistration,
-    PlanarPreparationRegistration,
 )
 from febio_cae.storage.profiles import SQLiteCompatibilityRegistry
 from febio_cae.storage.registry import (
@@ -665,11 +665,14 @@ class RegisteredCaseService:
                     OSError,
                 ):
                     origin_quality = None
-                if isinstance(origin_quality, PlanarPreparationRegistration):
+                if isinstance(origin_quality, CurrentPreparationRegistration):
                     try:
                         output = PreparationStore(storage).origin_output(origin_quality, origin)
                         geometry_port = geometry_from_output(
-                            output, storage.resolve_source(storage.source_asset("cad"))
+                            output,
+                            storage.resolve_source(storage.source_asset("cad")),
+                            expected_primitive=origin.spec.rigid_tool.primitive,
+                            expected_tool_geometry_digest=origin.spec.rigid_tool.contact_surface.geometry_digest,
                         )
                         placed_selection = geometry_port.resolve_placed_selection
                     except (StorageIntegrityError, ValueError, OSError) as error:
@@ -869,7 +872,10 @@ class RegisteredCaseService:
                     if field == "mesh_policy.quality_profile":
                         registered_quality = storage.resolve_mesh_quality(profile_ref)
                         if (
-                            isinstance(registered_quality, PlanarDemoRegistration)
+                            isinstance(
+                                registered_quality,
+                                (PlanarDemoRegistration, CurrentPreparationRegistration),
+                            )
                             and not draft.unresolved_fields
                         ):
                             try:
@@ -1040,7 +1046,7 @@ class RegisteredCaseService:
 
     @staticmethod
     def _adopt_planar_mesh(
-        registration: PlanarDemoRegistration,
+        registration: PlanarDemoRegistration | CurrentPreparationRegistration,
         original: MeshArtifact,
         carrier: CaseRevision,
         revision: CaseRevision,
@@ -1130,7 +1136,7 @@ class RegisteredCaseService:
         revision: CaseRevision,
         mesh: MeshArtifact,
     ) -> None:
-        if not isinstance(registration, PlanarDemoRegistration):
+        if not isinstance(registration, (PlanarDemoRegistration, CurrentPreparationRegistration)):
             if not mesh.quality_records or any(r.status != "PASS" for r in mesh.quality_records):
                 raise ValueError("execution requires passing mesh quality")
             return
@@ -1139,12 +1145,15 @@ class RegisteredCaseService:
             raise ValueError("execution adoption differs from registered origin derivation")
 
     def _planar_execution_mesh(
-        self, storage: CaseStorage, registration: PlanarDemoRegistration, revision: CaseRevision
+        self,
+        storage: CaseStorage,
+        registration: PlanarDemoRegistration | CurrentPreparationRegistration,
+        revision: CaseRevision,
     ) -> MeshArtifact:
         """Rebind material-only descendants, preserving the registered root mesh/receipt."""
         from febio_cae.domain.codec import decode_record, encode_record
 
-        if isinstance(registration, PlanarPreparationRegistration):
+        if isinstance(registration, CurrentPreparationRegistration):
             from febio_cae.storage.preparation import PreparationStore
 
             return PreparationStore(storage).mesh(registration, revision)
@@ -1265,7 +1274,7 @@ class RegisteredCaseService:
                     raise PortError(
                         PortErrorCategory.EXECUTION, "preparation exhausted operation budget"
                     )
-                if isinstance(registration, PlanarPreparationRegistration):
+                if isinstance(registration, CurrentPreparationRegistration):
                     from febio_cae.storage.demo_budget import reserve_prepared_solver_attempt
 
                     if not reserve_prepared_solver_attempt(storage, revision, owner.attempt_id):

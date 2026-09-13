@@ -1,5 +1,6 @@
 """Synthetic admission evidence only; no native modules or mesh quality claims."""
 
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -10,8 +11,11 @@ from febio_cae.adapters.geometry import (
     GmshOCCBackend,
     GmshOCCConfig,
 )
+from febio_cae.adapters.geometry.preparation import _MeasuredGmsh
+from febio_cae.domain import Quantity, RigidPrimitive
 
 from .test_gmsh_units import _FakeGmsh
+from .conftest import TOOL_BODY, TOOL_LOCAL, _evidence, _identity_transform
 
 
 def _source(header: str = "FILE_SCHEMA(('AUTOMOTIVE_DESIGN'));") -> bytes:
@@ -151,3 +155,180 @@ def test_unowned_session_does_not_query_or_set_preparation_options(
     with pytest.raises(BackendError, match="unowned"):
         backend.inspect(_source(), ())
     assert fake.events == []
+
+
+class _NativePrimitiveOCC:
+    def __init__(self, owner: "_NativePrimitiveGmsh") -> None:
+        self.owner = owner
+
+    def addSphere(self, x: float, y: float, z: float, radius: float) -> int:
+        del x, y, z, radius
+        self.owner.kind = "sphere"
+        return 1
+
+    def addCylinder(
+        self, x: float, y: float, z: float, dx: float, dy: float, dz: float, radius: float
+    ) -> int:
+        del x, y, z, dx, dy, dz, radius
+        self.owner.kind = "cylinder"
+        return 1
+
+    def synchronize(self) -> None:
+        return None
+
+    def getMass(self, dimension: int, tag: int) -> float:
+        del tag
+        return 1.0 if dimension == 3 else 0.5
+
+    def getCenterOfMass(self, dimension: int, tag: int) -> tuple[float, float, float]:
+        del tag
+        if dimension != 2:
+            raise RuntimeError("unexpected dimension")
+        return (0.0, 0.0, 0.0)
+
+
+class _NativePrimitiveModel:
+    def __init__(self, owner: "_NativePrimitiveGmsh") -> None:
+        self.owner = owner
+        self.occ = _NativePrimitiveOCC(owner)
+
+    def add(self, name: str) -> None:
+        del name
+
+    def getEntities(self, dimension: int) -> list[tuple[int, int]]:
+        return [(3, 1)] if dimension == 3 else []
+
+    def getBoundary(
+        self, entities: list[tuple[int, int]], combined: bool, oriented: bool
+    ) -> list[tuple[int, int]]:
+        del entities, combined, oriented
+        return [(2, 1), (2, 2)]
+
+    def getAdjacencies(self, dimension: int, tag: int) -> tuple[list[int], list[int]]:
+        if dimension != 2 or tag not in {1, 2}:
+            raise RuntimeError("unexpected adjacency query")
+        return [1], []
+
+    def getType(self, dimension: int, tag: int) -> str:
+        if dimension != 2 or tag not in {1, 2}:
+            raise RuntimeError("unexpected type query")
+        return "Sphere" if self.owner.kind == "sphere" else "Cylinder"
+
+
+class _NativePrimitiveGmsh:
+    __version__ = "4.15.2"
+
+    def __init__(self) -> None:
+        self.kind = "sphere"
+        self.option = type(
+            "Option",
+            (),
+            {"setString": lambda self, name, value: None},
+        )()
+        self.model = _NativePrimitiveModel(self)
+
+    def isInitialized(self) -> bool:
+        return False
+
+    def initialize(self) -> None:
+        return None
+
+    def clear(self) -> None:
+        return None
+
+    def finalize(self) -> None:
+        return None
+
+
+def _native_primitive(kind: str) -> RigidPrimitive:
+    dimensions = {"radius": Quantity(1, "mm")}
+    if kind == "cylinder":
+        dimensions["height"] = Quantity(2, "mm")
+    return RigidPrimitive(
+        kind,
+        TOOL_BODY,
+        TOOL_LOCAL,
+        _identity_transform(TOOL_LOCAL, TOOL_LOCAL),
+        dimensions,
+        {name: _evidence(f"rigid_tool.{name}", f"native-{kind}-{name}") for name in dimensions},
+        _evidence("rigid_tool.model", f"native-{kind}-model"),
+        _evidence("rigid_tool.placement", f"native-{kind}-placement"),
+    )
+
+
+class _WorktreeTemporaryDirectory:
+    _counter = 0
+
+    def __init__(self, prefix: str = "") -> None:
+        type(self)._counter += 1
+        self.name = str(
+            Path(".local/v/current-prep-review-red-01")
+            / f"{prefix}{type(self)._counter}"
+        )
+        Path(self.name).mkdir(parents=True, exist_ok=True)
+
+    def cleanup(self) -> None:
+        return None
+
+
+@pytest.mark.parametrize("kind", ["sphere", "cylinder"])
+def test_measured_backend_native_dispatch_allows_curved_faces(
+    monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    monkeypatch.setattr(
+        "febio_cae.adapters.geometry.gmsh_occ.tempfile.TemporaryDirectory",
+        _WorktreeTemporaryDirectory,
+    )
+    module = _NativePrimitiveGmsh()
+    backend = _MeasuredGmsh(1)
+    monkeypatch.setattr(backend, "_load_module", lambda: module)
+    monkeypatch.setattr(backend, "_prepare_owned_session", lambda gmsh: None)
+    monkeypatch.setattr(backend, "_mesh_context", lambda *args, **kwargs: "native-mesh")
+    primitive = _native_primitive(kind)
+    digest = "a" * 64
+
+    report = backend.inspect_rigid_primitive(primitive, geometry_digest=digest)
+    assert report.frame == TOOL_LOCAL
+    assert report.bodies[0].body_id == TOOL_BODY.value
+    assert backend.mesh_rigid_primitive(
+        primitive,
+        geometry_digest=digest,
+        global_size_si=0.001,
+    ) == "native-mesh"
+
+
+def test_measured_backend_keeps_planar_guard_for_imported_step_faces() -> None:
+    module = _NativePrimitiveGmsh()
+    module.model.getType = lambda dimension, tag: "BSpline surface"
+    backend = _MeasuredGmsh(1)
+    with pytest.raises(ValueError, match="planar STEP faces"):
+        backend._inspect_faces(module, "body-1", 1, 1.0)
+
+
+def test_measured_backend_restores_planar_guard_after_native_success_and_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from febio_cae.adapters.geometry import gmsh_occ
+
+    module = _NativePrimitiveGmsh()
+    backend = _MeasuredGmsh(1)
+    primitive = _native_primitive("sphere")
+    monkeypatch.setattr(
+        "febio_cae.adapters.geometry.gmsh_occ.tempfile.TemporaryDirectory",
+        _WorktreeTemporaryDirectory,
+    )
+    monkeypatch.setattr(backend, "_load_module", lambda: module)
+    monkeypatch.setattr(backend, "_prepare_owned_session", lambda gmsh: None)
+    monkeypatch.setattr(backend, "_mesh_context", lambda *args, **kwargs: "native-mesh")
+    backend.inspect_rigid_primitive(primitive, geometry_digest="a" * 64)
+    assert backend._native_context_depth == 0
+
+    def fail_context(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("injected native context failure")
+
+    monkeypatch.setattr(gmsh_occ.GmshOCCBackend, "_primitive_context", fail_context)
+    with pytest.raises(RuntimeError, match="injected native context failure"):
+        backend._primitive_context(module, 1, primitive)
+    assert backend._native_context_depth == 0
+    with pytest.raises(ValueError, match="planar STEP faces"):
+        backend._inspect_faces(module, "body-1", 1, 1.0)

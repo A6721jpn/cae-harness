@@ -28,7 +28,7 @@ from febio_cae.domain.canonical import canonical_bytes
 from febio_cae.domain.codec import encode_record
 from febio_cae.domain.ports import PortError, PortErrorCategory
 from febio_cae.storage.comparison import ComparisonTarget, publish, target
-from febio_cae.storage.mesh_quality import PlanarDemoRegistration
+from febio_cae.storage.mesh_quality import CurrentPreparationRegistration, PlanarDemoRegistration
 from febio_cae.storage.registry import CaseStorage, StorageConflictError
 
 if TYPE_CHECKING:
@@ -163,11 +163,23 @@ def _eligible(
         storage, (), (*profile.evidence, *(e for cap in profile.capabilities for e in cap.evidence))
     )
     registration = storage.resolve_revision_mesh_quality(item.revision)
-    if not isinstance(registration, PlanarDemoRegistration):
+    if not isinstance(registration, (PlanarDemoRegistration, CurrentPreparationRegistration)):
         raise PortError(
             PortErrorCategory.INVALID_INPUT,
             "comparison subset requires registered planar admission",
         )
+    if item.revision.spec.rigid_tool.primitive.kind != "box":
+        raise PortError(
+            PortErrorCategory.INVALID_INPUT,
+            "comparison subset is limited to explicit planar box preparation",
+        )
+    try:
+        registration.check_spec(item.revision.spec)
+    except ValueError as error:
+        raise PortError(
+            PortErrorCategory.INTEGRITY,
+            "comparison registration does not match the prepared producer origin",
+        ) from error
     service._verify_execution_mesh(storage, registration, item.revision, item.mesh)
     quality = QualityAdapter().assess(item.manifest, item.revision, item.mesh, profile, storage)
     numerical_status, coverage = required_quality_summary(

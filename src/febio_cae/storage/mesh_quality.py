@@ -180,17 +180,96 @@ class PlanarDemoRegistration:
 
 
 @dataclass(frozen=True, slots=True)
-class PlanarPreparationRegistration(PlanarDemoRegistration):
-    """Current-operation origin, distinct from legacy synthetic demo assets."""
+class CurrentPreparationRegistration(PlanarDemoRegistration):
+    """Current-operation preparation origin, separate from synthetic demos."""
 
     preparation_id: str
 
     def __post_init__(self) -> None:
-        PlanarDemoRegistration.__post_init__(self)
-        if len(self.preparation_id) != 32 or any(
-            c not in "0123456789abcdef" for c in self.preparation_id
+        if (
+            not isinstance(self.profile_id, str)
+            or not self.profile_id
+            or self.profile_id.strip() != self.profile_id
+        ):
+            raise ValueError("explicit preparation admission identity required")
+        for value in (
+            self.source_step_digest,
+            self.geometry_digest,
+            self.original_mesh_digest,
+            self.original_recipe_digest,
+        ):
+            if not isinstance(value, str) or len(value) != 64 or any(
+                c not in "0123456789abcdef" for c in value
+            ):
+                raise ValueError("preparation admission requires pinned SHA256 identities")
+        if not isinstance(self.generation_profile, NumericalProfileRef) or (
+            self.generation_profile.purpose != "mesh_quality"
+        ):
+            raise ValueError("original generation profile must be preserved")
+        if not self.admission_evidence or any(
+            not isinstance(e, EvidenceRef) or e.target_field != "mesh.admission"
+            for e in self.admission_evidence
+        ):
+            raise ValueError("explicit admission evidence required, not qualification evidence")
+        if (
+            not isinstance(self.preparation_id, str)
+            or len(self.preparation_id) != 32
+            or any(c not in "0123456789abcdef" for c in self.preparation_id)
         ):
             raise ValueError("invalid preparation identity")
+        object.__setattr__(self, "admission_evidence", tuple(self.admission_evidence))
+
+    @property
+    def approximation_status(self) -> str:
+        return "UNVERIFIED"
+
+    def check_spec(self, spec: CaseSpec) -> None:
+        if (
+            spec.geometry.source_step_digest != self.source_step_digest
+            or spec.geometry.geometry_digest != self.geometry_digest
+            or spec.rigid_tool.primitive.kind not in {"box", "sphere", "cylinder"}
+            or not isinstance(spec.contact.arrangement, AsPlaced)
+        ):
+            raise ValueError(
+                "current preparation admission only covers the explicit source and placed primitive"
+            )
+
+    def to_bytes(self) -> bytes:
+        return canonical_bytes(
+            {
+                "format_version": 1,
+                "admission_kind": "current-preparation",
+                "approximation_status": self.approximation_status,
+                "profile_id": self.profile_id,
+                "source_step_digest": self.source_step_digest,
+                "geometry_digest": self.geometry_digest,
+                "original_mesh_digest": self.original_mesh_digest,
+                "original_recipe_digest": self.original_recipe_digest,
+                "generation_profile": self.generation_profile.to_dict(),
+                "admission_evidence": [e.to_dict() for e in self.admission_evidence],
+                "preparation_id": self.preparation_id,
+            }
+        )
+
+    @property
+    def reference(self) -> NumericalProfileRef:
+        return NumericalProfileRef(
+            self.profile_id, "mesh_quality", hashlib.sha256(self.to_bytes()).hexdigest()
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class PlanarPreparationRegistration(CurrentPreparationRegistration):
+    """Current planar-box admission with the original core wire format."""
+
+    def check_spec(self, spec: CaseSpec) -> None:
+        if (
+            spec.geometry.source_step_digest != self.source_step_digest
+            or spec.geometry.geometry_digest != self.geometry_digest
+            or spec.rigid_tool.primitive.kind != "box"
+            or not isinstance(spec.contact.arrangement, AsPlaced)
+        ):
+            raise ValueError("planar admission only covers the explicit source and flat box pose")
 
     def to_bytes(self) -> bytes:
         data = json.loads(PlanarDemoRegistration.to_bytes(self))
@@ -199,28 +278,67 @@ class PlanarPreparationRegistration(PlanarDemoRegistration):
         return canonical_bytes(data)
 
 
-MeshQualityRecord = MeshQualityRegistration | PlanarDemoRegistration
+MeshQualityRecord = (
+    MeshQualityRegistration | PlanarDemoRegistration | CurrentPreparationRegistration
+)
 
 
 def decode_mesh_quality(payload: bytes) -> MeshQualityRecord:
     data = json.loads(payload)
+    if not isinstance(data, dict):
+        raise ValueError("invalid mesh quality payload")
     if "admission_kind" not in data:
         return MeshQualityRegistration.from_bytes(payload)
+    kind = data["admission_kind"]
+    if not isinstance(kind, str) or kind not in {
+        "current-preparation",
+        "current-planar-preparation",
+        "synthetic-planar-demo",
+    }:
+        raise ValueError("invalid or unsupported mesh quality admission kind")
+    required = {
+        "format_version",
+        "admission_kind",
+        "approximation_status",
+        "profile_id",
+        "source_step_digest",
+        "geometry_digest",
+        "original_mesh_digest",
+        "original_recipe_digest",
+        "generation_profile",
+        "admission_evidence",
+    }
+    if kind in {"current-preparation", "current-planar-preparation"}:
+        required.add("preparation_id")
+    if set(data) != required:
+        raise ValueError("invalid mesh quality admission fields")
+    if data["format_version"] != 1 or data["approximation_status"] != "UNVERIFIED":
+        raise ValueError("invalid mesh quality admission header")
     profile = data["generation_profile"]
-    values = (
-        data["profile_id"],
-        data["source_step_digest"],
-        data["geometry_digest"],
-        data["original_mesh_digest"],
-        data["original_recipe_digest"],
-        NumericalProfileRef(profile["profile_id"], profile["purpose"], profile["record_digest"]),
-        tuple(EvidenceRef(**e) for e in data["admission_evidence"]),
-    )
-    result = (
-        PlanarPreparationRegistration(*values, data["preparation_id"])
-        if data.get("admission_kind") == "current-planar-preparation"
-        else PlanarDemoRegistration(*values)
-    )
+    if not isinstance(profile, dict):
+        raise ValueError("invalid mesh quality generation profile")
+    try:
+        values = (
+            data["profile_id"],
+            data["source_step_digest"],
+            data["geometry_digest"],
+            data["original_mesh_digest"],
+            data["original_recipe_digest"],
+            NumericalProfileRef(
+                profile["profile_id"], profile["purpose"], profile["record_digest"]
+            ),
+            tuple(EvidenceRef(**e) for e in data["admission_evidence"]),
+        )
+        if kind == "current-preparation":
+            result: MeshQualityRecord = CurrentPreparationRegistration(
+                *values, data["preparation_id"]
+            )
+        elif kind == "current-planar-preparation":
+            result = PlanarPreparationRegistration(*values, data["preparation_id"])
+        else:
+            result = PlanarDemoRegistration(*values)
+    except (KeyError, TypeError, ValueError, OverflowError) as error:
+        raise ValueError("invalid mesh quality admission record") from error
     if result.to_bytes() != payload:
-        raise ValueError("invalid or noncanonical planar admission")
+        raise ValueError("invalid or noncanonical mesh quality admission")
     return result
