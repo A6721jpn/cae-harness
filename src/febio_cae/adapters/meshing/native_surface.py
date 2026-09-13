@@ -1,15 +1,19 @@
 """Whole-face Bernstein certificates for local native primitive surfaces.
 
-The public function in this module is deliberately a small numerical leaf.  It
-certifies the represented quadratic face and returns a one-sided upper bound on
-its distance to a finite analytic primitive boundary.  It does not classify
-physical regions, apply placement, or establish a two-sided Hausdorff bound.
+The unsigned public function in this module certifies a represented quadratic
+face and returns a one-sided upper bound on its maximum distance to a finite
+analytic primitive boundary.  The signed public function instead encloses the
+minimum signed distance and has a finite subdivision budget; an interval that
+has not reached the requested tolerance remains conservative but may be
+ambiguous.  Neither API classifies physical regions, applies placement, or
+establishes a two-sided Hausdorff bound.
 
 All input binary numbers are first represented as exact integers over one common
 scale.  The fixed-degree Bernstein operations below retain a common exact
-integer denominator; subdivision uses the four dyadic child triangles.  Float
-conversion is used only for square roots and is checked against the exact
-rational value before a result is returned.
+integer denominator; subdivision uses the four dyadic child triangles.  The
+unsigned path converts square-root bounds to floats only after exact checks;
+the signed path retains rational square-root enclosures through signed-feature
+subtractions and checks float conversion only at the final interval endpoints.
 """
 
 from __future__ import annotations
@@ -701,6 +705,7 @@ def primitive_face_distance_upper_bound(
 
 _SIGNED_MAX_DEPTH = 24
 _SIGNED_MAX_WORK = 4096
+_SIGNED_SQRT_SCALE = 1 << 64
 
 
 @dataclass(frozen=True, slots=True)
@@ -724,7 +729,7 @@ class _SignedCell:
 
 def _signed_binary_ratio(value: object, label: str) -> tuple[int, int]:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError(f"{label} must be a finite binary number")
+        raise TypeError(f"{label} must be a finite binary number")
     try:
         ratio = _binary_ratio(value)
     except (TypeError, ValueError) as error:
@@ -755,7 +760,7 @@ def _signed_read_input(
     if not isinstance(kind, str) or kind not in {"sphere", "cylinder", "box"}:
         raise ValueError("signed primitive kind must be sphere, cylinder, or box")
     if isinstance(max_subdivisions, bool) or not isinstance(max_subdivisions, int):
-        raise ValueError("max_subdivisions must be a positive integer")
+        raise TypeError("max_subdivisions must be a positive integer")
     if max_subdivisions <= 0:
         raise ValueError("max_subdivisions must be a positive integer")
 
@@ -919,19 +924,21 @@ def _signed_float_up(value: _Rational) -> float:
     return -positive
 
 
-def _signed_sqrt_down(value: _Rational) -> float:
-    try:
-        return _sqrt_down(value)
-    except ValueError:
-        maximum = _float_as_rational(sys.float_info.max)
-        if _q_less(_q_square(maximum), value):
-            return sys.float_info.max
-        raise
-
-
 def _signed_sqrt_bound(value: _Rational, *, upward: bool) -> _Rational:
-    root = _sqrt_up(value) if upward else _signed_sqrt_down(value)
-    return _float_as_rational(root)
+    if value.numerator < 0:
+        raise ValueError("internal signed square-root ratio must be nonnegative")
+    if value.numerator == 0:
+        return _q_zero()
+
+    # Keep the root exact as a rational enclosure until any primitive radius or
+    # half-dimension has been subtracted.  Converting sqrt(value) to a float
+    # first can overflow even when the final signed distance is representable.
+    scale = _SIGNED_SQRT_SCALE
+    scaled = value.numerator * value.denominator * scale * scale
+    root = math.isqrt(scaled)
+    if upward and root * root < scaled:
+        root += 1
+    return _rational(root, value.denominator * scale)
 
 
 def _signed_abs(value: _Rational) -> _Rational:
