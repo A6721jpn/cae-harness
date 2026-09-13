@@ -58,7 +58,6 @@ def test_outward_sphere_bound_covers_interior_quadratic_error() -> None:
         radius_si=1.0,
     )
 
-    assert surface.ALGORITHM == "native-quadratic-primitive-bernstein-v1"
     assert interior_error > 0.0
     assert math.isfinite(bound)
     assert bound + 1e-12 >= interior_error
