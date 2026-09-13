@@ -729,9 +729,9 @@ class _NativeParser:
             "surface_node": expected_surface_node_ids,
         }
         for variable in contact_variables:
-            registered = registered_entities[variable.mapping.canonical_id]
+            registered = set(registered_entities[variable.mapping.canonical_id])
             expected = expected_by_location.get(variable.mapping.location)
-            if expected is None or set(registered) != expected:
+            if expected is None or registered != expected:
                 raise _ParseError(
                     "registered contact entities do not match native surfaces: "
                     f"{variable.mapping.canonical_id}"

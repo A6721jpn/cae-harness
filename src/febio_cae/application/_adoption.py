@@ -179,8 +179,7 @@ def adopt(
             )
             if len(face_sets) != 1:
                 raise ValueError(
-                    "contact selection does not resolve to one adopted face set: "
-                    f"{selection.name}"
+                    f"contact selection does not resolve to one adopted face set: {selection.name}"
                 )
     receipt: dict[str, object] = {
         "format_version": 1,

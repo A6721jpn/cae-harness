@@ -662,9 +662,7 @@ def test_native_contact_outputs_compile_and_project_exact_entities(tmp_path: Pat
         name for _, name, _ in _NATIVE_SURFACES
     }
     assert len(compiled_surfaces) == 6
-    assert all(
-        len(surface) == 1 and surface[0].tag == "tri6" for surface in compiled_surfaces
-    )
+    assert all(len(surface) == 1 and surface[0].tag == "tri6" for surface in compiled_surfaces)
     expected_native_names = {
         "displacement",
         "rigid force",
