@@ -498,6 +498,9 @@ def _mesh_study_request(request: dict[str, Any]) -> dict[str, Any]:
 
     payload = copy.deepcopy(request)
     values = payload["values"]
+    for evaluation in values["outputs"]["evaluations"]:
+        if evaluation["evaluation_id"] == "evaluation_tool":
+            evaluation["aggregation_id"] = "identity"
     values["mesh_policy"]["max_refinements"] = 2
     values["budget"]["max_attempts"] = 4
     criterion = copy.deepcopy(values["quality_policy"]["criteria"][0])
