@@ -988,3 +988,26 @@ no allowance for elastic displacement. Its recorded-output diagnostic does not
 convert that execution to PASS. A revised protocol requires new immutable
 identities, independent review and a separate bounded release; no automatic
 numerical tuning or reuse of failed output as a fresh successful run is allowed.
+
+### Signed primitive interference evidence boundary
+
+Curved contact needs an inside/outside check, not a relabeled unsigned tool
+approximation certificate. Add a bounded geometric leaf that returns an outward
+interval enclosing the minimum signed Euclidean distance of a complete canonical
+Tri6 patch to an explicit sphere, finite capped cylinder or centered box. Distance
+is negative inside the closed primitive. Inputs are the six represented binary
+coordinates in the primitive's source-local frame and its explicit SI dimensions;
+this leaf neither selects physical regions nor applies placement or motion.
+
+Reuse the existing exact dyadic/Bernstein arithmetic rather than a separate
+sampling certificate. Interior extrema must be enclosed. A positive requested
+interval precision controls bounded subdivision; fixed depth/work ceilings may
+leave a wider but still valid interval. A threshold intersecting that interval
+remains UNVERIFIED in a consumer, never a sampled PASS. Reject invalid/nonfinite
+inputs and unrepresentable bounds explicitly.
+
+This proves only the represented geometric patch. It does not include native
+result quantization, coordinate-transform error, continuous-time motion, surface
+pairing, pressure averaging or a Coulomb law. Those bindings and their error
+envelopes require separate evidence before a physical quality producer can use
+the leaf. Existing unsigned native boundary certification is unchanged.
