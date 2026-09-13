@@ -27,8 +27,8 @@ import threading
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
-from types import CodeType, FunctionType, ModuleType
-from typing import Any, BinaryIO
+from types import CodeType, FunctionType, GetSetDescriptorType, ModuleType
+from typing import Any, BinaryIO, cast
 
 _SCHEMA_VERSION = "gmsh-runtime-identity-v1"
 _GMSH_DISTRIBUTION = "gmsh"
@@ -691,11 +691,14 @@ class _FunctionState:
     name: str
     qualname: str
     module_name: str | None
+    global_states: dict[str, _GlobalState] | None = None
 
 
-def _function_state(function: FunctionType) -> _FunctionState:
+def _function_state(
+    function: FunctionType, *, capture_globals: bool = False
+) -> _FunctionState:
     function_dict = function.__dict__
-    return _FunctionState(
+    state = _FunctionState(
         function=function,
         code=function.__code__,
         globals_dict=function.__globals__,
@@ -713,6 +716,9 @@ def _function_state(function: FunctionType) -> _FunctionState:
         qualname=function.__qualname__,
         module_name=function.__module__,
     )
+    if capture_globals:
+        state.global_states = _capture_function_globals(function)
+    return state
 
 
 def _validate_function_state(state: _FunctionState, label: str) -> None:
@@ -747,6 +753,7 @@ def _validate_function_state(state: _FunctionState, label: str) -> None:
         or function.__module__ != state.module_name
     ):
         raise _error(f"live Gmsh executable function {label} metadata changed")
+    _validate_function_globals(state, label)
 
 
 def _code_global_names(code: CodeType) -> frozenset[str]:
@@ -808,7 +815,10 @@ def _dispatch_descriptor_state(value_type: type, name: str) -> _DispatchDescript
     return _DispatchDescriptorState(
         owner,
         descriptor,
-        tuple(_function_state(function) for function in _descriptor_functions(descriptor)),
+        tuple(
+            _function_state(function, capture_globals=True)
+            for function in _descriptor_functions(descriptor)
+        ),
     )
 
 
@@ -881,13 +891,69 @@ class _GlobalState:
     builtin_signature: object | None
 
 
-def _builtin_binding(module: ModuleType, name: str) -> object:
-    builtins_value = vars(module).get("__builtins__", _MISSING)
+def _builtin_binding_from_globals(globals_dict: dict[str, object], name: str) -> object:
+    builtins_value = globals_dict.get("__builtins__", _MISSING)
     if isinstance(builtins_value, dict):
         return builtins_value.get(name, _MISSING)
     if isinstance(builtins_value, ModuleType):
         return vars(builtins_value).get(name, _MISSING)
     return _MISSING
+
+
+def _builtin_binding(module: ModuleType, name: str) -> object:
+    return _builtin_binding_from_globals(vars(module), name)
+
+
+def _capture_function_globals(function: FunctionType) -> dict[str, _GlobalState]:
+    globals_dict = function.__globals__
+    names = set(_code_global_names(function.__code__))
+    names.add("__builtins__")
+    result: dict[str, _GlobalState] = {}
+    for name in names:
+        if name in globals_dict:
+            value = globals_dict[name]
+            result[name] = _GlobalState(
+                value,
+                _stable_global_signature(value),
+                _MISSING,
+                None,
+            )
+        else:
+            builtin = _builtin_binding_from_globals(globals_dict, name)
+            result[name] = _GlobalState(
+                _MISSING,
+                None,
+                builtin,
+                _stable_global_signature(builtin),
+            )
+        if len(result) > _MAX_LIVE_GLOBALS:
+            raise _error("Gmsh dispatch globals exceed the finite verification limit")
+    return result
+
+
+def _validate_function_globals(state: _FunctionState, label: str) -> None:
+    if state.global_states is None:
+        return
+    globals_dict = state.globals_dict
+    for name, global_state in state.global_states.items():
+        current = globals_dict.get(name, _MISSING)
+        if global_state.value is _MISSING:
+            if current is not _MISSING:
+                raise _error(f"live Gmsh dispatch global {label}.{name} was added")
+            builtin = _builtin_binding_from_globals(globals_dict, name)
+            if builtin is not global_state.builtin_value:
+                raise _error(f"live Gmsh dispatch builtin {label}.{name} was replaced")
+            if global_state.builtin_signature is not None and _stable_global_signature(
+                builtin
+            ) != global_state.builtin_signature:
+                raise _error(f"live Gmsh dispatch builtin {label}.{name} changed")
+        else:
+            if current is not global_state.value:
+                raise _error(f"live Gmsh dispatch global {label}.{name} was replaced")
+            if global_state.stable_signature is not None and _stable_global_signature(
+                current
+            ) != global_state.stable_signature:
+                raise _error(f"live Gmsh dispatch global {label}.{name} changed")
 
 
 def _is_ctypes_callable(value: object) -> bool:
@@ -1071,10 +1137,19 @@ def _validate_ctypes_call_signature(
         raise _error(f"cached native callable {name} has unauthorized call metadata")
 
 
-def _library_namespace(library: object) -> dict[str, object]:
+def _library_namespace(
+    library: object, expected: tuple[type, object] | None = None
+) -> dict[str, object]:
+    owner, descriptor = _raw_type_descriptor(type(library), "__dict__")
+    if expected is not None and (
+        owner is not expected[0] or descriptor is not expected[1]
+    ):
+        raise _error("Gmsh native library namespace descriptor changed")
+    if type(descriptor) is not GetSetDescriptorType:
+        raise _error("Gmsh native library namespace uses an unsupported descriptor")
     try:
-        namespace = vars(library)
-    except TypeError as exc:
+        namespace = cast(Any, descriptor).__get__(library, type(library))
+    except (AttributeError, TypeError, ValueError) as exc:
         raise _error("Gmsh native library namespace cannot be inspected") from exc
     if not isinstance(namespace, dict):
         raise _error("Gmsh native library namespace is malformed")
@@ -1227,6 +1302,12 @@ class _LiveState:
     globals: dict[str, _GlobalState]
     module_dispatch: _AttributeDispatchState
     library_dispatch: _AttributeDispatchState
+    library_namespace_owner: type
+    library_namespace_descriptor: object
+    library_namespace: dict[str, object]
+    library_funcptr_owner: type
+    library_funcptr_descriptor: object
+    library_funcptr: object
     native_symbols: frozenset[str]
     native_signature_policy: dict[str, frozenset[tuple[object, ...]]]
     native_callables: dict[str, _NativeCallableState]
@@ -1240,19 +1321,30 @@ def _capture_live_state(
     native_handle: int,
 ) -> _LiveState:
     native_symbols = _native_symbol_names(source)
+    library_namespace_owner, library_namespace_descriptor = _raw_type_descriptor(
+        type(library), "__dict__"
+    )
+    namespace = _library_namespace(
+        library,
+        expected=(library_namespace_owner, library_namespace_descriptor),
+    )
+    library_funcptr_owner, library_funcptr_descriptor = _raw_type_descriptor(
+        type(library), "_FuncPtr"
+    )
+    library_funcptr = namespace.get("_FuncPtr", _MISSING)
     module_dispatch = _attribute_dispatch_state(
         module, ("__getattribute__", "__getattr__")
     )
     library_dispatch = _attribute_dispatch_state(
         library,
-        ("__getattribute__", "__getattr__", *sorted(native_symbols)),
+        ("__getattribute__", "__getattr__", "__getitem__", *sorted(native_symbols)),
     )
-    namespace = vars(module)
+    module_namespace = vars(module)
     module_name = module.__name__
     module_functions: dict[str, _FunctionState] = {}
     classes: dict[tuple[str, ...], _ClassState] = {}
     functions: list[_FunctionState] = []
-    for name, value in tuple(namespace.items()):
+    for name, value in tuple(module_namespace.items()):
         if isinstance(value, FunctionType) and value.__module__ == module_name:
             module_functions[name] = _function_state(value)
             functions.append(module_functions[name])
@@ -1265,8 +1357,8 @@ def _capture_live_state(
     for function in functions:
         global_names.update(_code_global_names(function.code))
     for name in global_names:
-        if name in namespace:
-            value = namespace[name]
+        if name in module_namespace:
+            value = module_namespace[name]
             global_states[name] = _GlobalState(
                 value,
                 _stable_global_signature(value),
@@ -1285,17 +1377,23 @@ def _capture_live_state(
             raise _error("Gmsh live globals exceed the finite verification limit")
     native_signature_policy = _native_signature_policy(source, native_symbols)
     return _LiveState(
-        module_functions,
-        classes,
-        global_states,
-        module_dispatch,
-        library_dispatch,
-        native_symbols,
-        native_signature_policy,
-        _capture_native_callables(
+        module_functions=module_functions,
+        classes=classes,
+        globals=global_states,
+        module_dispatch=module_dispatch,
+        library_dispatch=library_dispatch,
+        library_namespace_owner=library_namespace_owner,
+        library_namespace_descriptor=library_namespace_descriptor,
+        library_namespace=namespace,
+        library_funcptr_owner=library_funcptr_owner,
+        library_funcptr_descriptor=library_funcptr_descriptor,
+        library_funcptr=library_funcptr,
+        native_symbols=native_symbols,
+        native_signature_policy=native_signature_policy,
+        native_callables=_capture_native_callables(
             library, native_symbols, native_signature_policy
         ),
-        native_handle,
+        native_handle=native_handle,
     )
 
 
@@ -1362,6 +1460,22 @@ def _validate_attribute_dispatch(
 def _validate_live_state(state: _LiveState, module: ModuleType, library: object) -> None:
     _validate_attribute_dispatch(state.module_dispatch, module, "module")
     _validate_attribute_dispatch(state.library_dispatch, library, "native library")
+    current_library_namespace = _library_namespace(
+        library,
+        expected=(state.library_namespace_owner, state.library_namespace_descriptor),
+    )
+    if current_library_namespace is not state.library_namespace:
+        raise _error("live Gmsh native library namespace changed")
+    current_funcptr_owner, current_funcptr_descriptor = _raw_type_descriptor(
+        type(library), "_FuncPtr"
+    )
+    if (
+        current_funcptr_owner is not state.library_funcptr_owner
+        or current_funcptr_descriptor is not state.library_funcptr_descriptor
+    ):
+        raise _error("live Gmsh native library factory descriptor changed")
+    if current_library_namespace.get("_FuncPtr", _MISSING) is not state.library_funcptr:
+        raise _error("live Gmsh native library factory changed")
     namespace = vars(module)
     for name, function_state in state.module_functions.items():
         if namespace.get(name, _MISSING) is not function_state.function:
@@ -1401,7 +1515,6 @@ def _validate_live_state(state: _LiveState, module: ModuleType, library: object)
             ) != global_state.stable_signature:
                 raise _error(f"live Gmsh global {name} changed")
 
-    current_library_namespace = _library_namespace(library)
     if _library_handle(library) != state.native_handle:
         raise _error("live Gmsh native library handle changed")
     for name, callable_state in state.native_callables.items():
