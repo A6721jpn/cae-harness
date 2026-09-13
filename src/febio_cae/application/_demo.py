@@ -66,45 +66,53 @@ def _read_native_result(
     tool = revision.spec.rigid_tool.primitive.body_id.value
     face_by_id = {face.face_id: face for face in mesh.faces}
     contact_entities: dict[str, tuple[str, ...]] = {}
+    contact_selections = (
+        revision.spec.contact.part_surface,
+        revision.spec.contact.tool_surface,
+    )
     contact_locations = {
         mapping.location
         for mapping in profile.output_mappings
         if mapping.location in {"face", "surface", "surface_node"}
     }
-    for location in ("face", "surface", "surface_node"):
-        if location not in contact_locations:
-            continue
-        ids: list[str] = []
-        for selection in (
-            revision.spec.contact.part_surface,
-            revision.spec.contact.tool_surface,
-        ):
+    if contact_locations:
+        face_sets_by_binding: dict[tuple[str, str], list[Any]] = {}
+        for item in mesh.sets:
+            if item.kind == "face":
+                face_sets_by_binding.setdefault(
+                    (item.source_selection_digest, item.body_id), []
+                ).append(item)
+        contact_face_sets: list[Any] = []
+        for selection in contact_selections:
             digest = hashlib.sha256(selection.to_bytes()).hexdigest()
-            matches = [
-                item
-                for item in mesh.sets
-                if item.kind == "face"
-                and item.source_selection_digest == digest
-                and item.body_id == selection.body_id.value
-            ]
+            matches = face_sets_by_binding.get((digest, selection.body_id.value), [])
             if len(matches) != 1:
                 raise PortError(
                     PortErrorCategory.INTEGRITY,
                     f"contact selection does not resolve to one face set: {selection.name}",
                 )
-            face_set = matches[0]
-            face_ids = tuple(str(face_id) for face_id in face_set.member_ids)
-            if location == "surface":
-                ids.append(face_set.set_id)
-            elif location == "face":
-                ids.extend(face_ids)
-            else:
-                ids.extend(
-                    surface_node_entity_id(face_id, node_id)
-                    for face_id in face_ids
-                    for node_id in face_by_id[face_id].node_ids
-                )
-        contact_entities[location] = tuple(ids)
+            contact_face_sets.append(matches[0])
+        contact_face_ids = tuple(
+            str(face_id) for face_set in contact_face_sets for face_id in face_set.member_ids
+        )
+        try:
+            contact_surface_node_ids = tuple(
+                surface_node_entity_id(face_id, node_id)
+                for face_id in contact_face_ids
+                for node_id in face_by_id[face_id].node_ids
+            )
+        except KeyError as error:
+            raise PortError(
+                PortErrorCategory.INTEGRITY,
+                "contact selection references an unknown mesh face",
+            ) from error
+        contact_entities.update(
+            {
+                "face": contact_face_ids,
+                "surface": tuple(face_set.set_id for face_set in contact_face_sets),
+                "surface_node": contact_surface_node_ids,
+            }
+        )
     entities = {
         "node": tuple(str(node.node_id) for node in mesh.nodes),
         "element": tuple(

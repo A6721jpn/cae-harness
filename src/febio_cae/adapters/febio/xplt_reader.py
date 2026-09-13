@@ -549,13 +549,11 @@ class _NativeParser:
         if 0x01046000 in fields:
             self.region_sets(fields[0x01046000], 0x01046000, observed_elements)
         has_contact_outputs = any(variable.group == _CONTACT_DICTIONARY for variable in variables)
-        registered_entities = dict(self.source.entity_ids) if has_contact_outputs else {}
-        expected_surface_names = (
+        expected_face_sets = (
             {
-                entity_id
-                for variable in variables
-                if variable.mapping.location == "surface"
-                for entity_id in registered_entities[variable.mapping.canonical_id]
+                item.set_id: tuple(str(face_id) for face_id in item.member_ids)
+                for item in self.source.mesh.sets
+                if item.kind == "face"
             }
             if has_contact_outputs
             else None
@@ -566,9 +564,9 @@ class _NativeParser:
                 fields[0x01043000],
                 0x01043000,
                 tuple(node_ids),
-                expected_surface_names,
+                expected_face_sets,
             )
-        elif expected_surface_names:
+        elif has_contact_outputs:
             raise _ParseError("contact output requires the native surface section")
         if 0x01047000 in fields:
             self.surfaces(fields[0x01047000], 0x01047000, tuple(node_ids), None)
@@ -605,13 +603,12 @@ class _NativeParser:
         payload: bytes,
         base: int,
         node_ids: tuple[int, ...],
-        expected_names: set[str] | None,
+        expected_face_sets: Mapping[str, tuple[str, ...]] | None,
     ) -> tuple[_Surface, ...]:
         seen: set[int] = set()
         names: set[str] = set()
         result: list[_Surface] = []
         face_by_id = {face.face_id: face for face in self.source.mesh.faces}
-        face_sets = {item.set_id: item for item in self.source.mesh.sets if item.kind == "face"}
         for item in self.blocks(payload):
             if item.identifier != base + 0x100:
                 raise _ParseError("unknown surface/facet-set layout")
@@ -634,10 +631,12 @@ class _NativeParser:
                 raise _ParseError("surface face count mismatch")
             face_ids: set[int] = set()
             native_face_ids: list[str] = []
-            expected_set = face_sets.get(name) if base == 0x01043000 else None
-            if expected_names is not None and (expected_set is None or name not in expected_names):
+            expected_members = (
+                expected_face_sets.get(name) if expected_face_sets is not None else None
+            )
+            if expected_face_sets is not None and expected_members is None:
                 raise _ParseError("native contact surface is not a registered mesh set")
-            if expected_names is not None and maximum != 6:
+            if expected_face_sets is not None and maximum != 6:
                 raise _ParseError("contact surfaces require ordered tri6 connectivity")
             for ordinal, face in enumerate(faces, 1):
                 if face.identifier != base + 0x201 or len(face.payload) != (maximum + 2) * 4:
@@ -646,57 +645,90 @@ class _NativeParser:
                 if (
                     face_id <= 0
                     or face_id in face_ids
-                    or (expected_names is not None and face_id != ordinal)
-                    or (count != 6 if expected_names is not None else count not in {4, 6})
+                    or (expected_face_sets is not None and face_id != ordinal)
+                    or (count != 6 if expected_face_sets is not None else count not in {4, 6})
                     or count > maximum
                     or any(index >= len(node_ids) for index in indices[:count])
                     or len(set(indices[:count])) != count
                 ):
                     raise _ParseError("invalid surface connectivity")
                 face_ids.add(face_id)
-                if expected_names is not None:
+                if expected_face_sets is not None:
                     native_nodes = tuple(node_ids[index] for index in indices[:count])
-                    if expected_set is None or ordinal > len(expected_set.member_ids):
+                    if expected_members is None or ordinal > len(expected_members):
                         raise _ParseError("native contact surface membership is incomplete")
-                    canonical_face_id = str(expected_set.member_ids[ordinal - 1])
+                    canonical_face_id = expected_members[ordinal - 1]
                     canonical_face = face_by_id.get(canonical_face_id)
                     if canonical_face is None or native_nodes != tuple(canonical_face.node_ids):
                         raise _ParseError(
                             "native contact surface orientation/connectivity differs from mesh"
                         )
                     native_face_ids.append(canonical_face.face_id)
-            if expected_names is not None and (
-                expected_set is None or tuple(native_face_ids) != tuple(expected_set.member_ids)
+            if expected_face_sets is not None and (
+                expected_members is None or tuple(native_face_ids) != expected_members
             ):
                 raise _ParseError("native contact surface face order differs from mesh")
             result.append(_Surface(identifier, name, tuple(native_face_ids)))
-        if expected_names is not None and names != expected_names:
+        if expected_face_sets is not None and names != set(expected_face_sets):
             raise _ParseError("native contact surfaces do not match registered mesh sets")
         return tuple(result)
 
     def _validate_contact_entities(
         self, variables: tuple[_Variable, ...], surfaces: tuple[_Surface, ...]
     ) -> None:
-        if not any(variable.group == _CONTACT_DICTIONARY for variable in variables):
+        contact_variables = tuple(
+            variable for variable in variables if variable.group == _CONTACT_DICTIONARY
+        )
+        if not contact_variables:
             return
         face_by_id = {face.face_id: face for face in self.source.mesh.faces}
-        surface_face_ids = tuple(face_id for surface in surfaces for face_id in surface.face_ids)
-        surface_node_ids = tuple(
-            surface_node_entity_id(face_id, node_id)
-            for surface in surfaces
-            for face_id in surface.face_ids
-            for node_id in face_by_id[face_id].node_ids
-        )
-        expected_surface_ids = tuple(surface.name for surface in surfaces)
-        expected_by_location = {
-            "surface": set(expected_surface_ids),
-            "face": set(surface_face_ids),
-            "surface_node": set(surface_node_ids),
+        native_surfaces = {surface.name: surface for surface in surfaces}
+        trusted_surface_node_ids = {
+            surface_node_entity_id(face.face_id, node_id)
+            for face in face_by_id.values()
+            for node_id in face.node_ids
         }
         registered_entities = dict(self.source.entity_ids)
-        for variable in variables:
-            if variable.group != _CONTACT_DICTIONARY:
-                continue
+        active_surface_names: set[str] = set()
+        registered_face_ids: set[str] = set()
+        registered_surface_node_ids: set[str] = set()
+        for variable in contact_variables:
+            registered = set(registered_entities[variable.mapping.canonical_id])
+            if variable.mapping.location == "surface":
+                active_surface_names.update(registered)
+            elif variable.mapping.location == "face":
+                if not registered <= set(face_by_id):
+                    raise _ParseError("registered contact faces are foreign")
+                registered_face_ids.update(registered)
+            elif variable.mapping.location == "surface_node":
+                if not registered <= trusted_surface_node_ids:
+                    raise _ParseError("registered contact surface nodes are foreign")
+                registered_surface_node_ids.update(registered)
+
+        if not active_surface_names.issubset(native_surfaces):
+            raise _ParseError("registered contact surfaces are foreign")
+        active_faces = {
+            face_id
+            for surface_name in active_surface_names
+            for face_id in native_surfaces[surface_name].face_ids
+        }
+        expected_face_ids = active_faces if active_surface_names else registered_face_ids
+        active_nodes = {
+            surface_node_entity_id(face_id, node_id)
+            for face_id in expected_face_ids
+            for node_id in face_by_id[face_id].node_ids
+        }
+        expected_surface_node_ids = (
+            active_nodes
+            if active_surface_names or registered_face_ids
+            else registered_surface_node_ids
+        )
+        expected_by_location = {
+            "surface": active_surface_names,
+            "face": expected_face_ids,
+            "surface_node": expected_surface_node_ids,
+        }
+        for variable in contact_variables:
             registered = registered_entities[variable.mapping.canonical_id]
             expected = expected_by_location.get(variable.mapping.location)
             if expected is None or set(registered) != expected:
