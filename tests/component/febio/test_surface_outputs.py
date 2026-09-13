@@ -241,6 +241,17 @@ _CONTACT_RAW_VALUES: dict[str, tuple[tuple[float, ...], tuple[float, ...]]] = {
     ),
 }
 
+_OBSERVED_CONTACT_ANCILLARY_UNITS: dict[str, str | None] = {
+    "contact_nodal_gap": "L",
+    "contact_nodal_pressure": "P",
+    "contact_nodal_traction": "P",
+    "contact_area": "L^2",
+    "contact_surface_force": "F",
+    "contact_face_pressure": "P",
+    "contact_status": None,
+    "contact_face_traction": "P",
+}
+
 
 def block(identifier: int, payload: bytes) -> bytes:
     return struct.pack("<II", identifier, len(payload)) + payload
@@ -264,12 +275,13 @@ def vector(identifier: int, values: tuple[float, ...]) -> bytes:
     return block(identifier, struct.pack("<" + "f" * len(values), *values))
 
 
-def descriptor(name: str, value_type: int, storage_format: int, unit: str) -> bytes:
+def descriptor(name: str, value_type: int, storage_format: int, unit: str | None) -> bytes:
+    ancillary = b"" if unit is None else fixed(0x01020007, unit)
     return (
         uint(0x01020002, value_type)
         + uint(0x01020003, storage_format)
         + uint(0x01020005, 0)
-        + fixed(0x01020007, unit)
+        + ancillary
         + fixed(0x01020004, name)
     )
 
@@ -310,7 +322,9 @@ def _contact_entities(revision: Any, mesh: Any) -> dict[str, tuple[str, ...]]:
     return result
 
 
-def native_bytes(mesh: Any, *, defect: str = "") -> bytes:
+def native_bytes(
+    mesh: Any, *, defect: str = "", observed_metadata: bool = False
+) -> bytes:
     header = (
         uint(0x01010001, 0x35)
         + uint(0x01010004, 0)
@@ -320,7 +334,24 @@ def native_bytes(mesh: Any, *, defect: str = "") -> bytes:
     node_dictionary = block(0x01020001, descriptor("displacement", 1, 0, "m"))
     domain_dictionary = block(0x01020001, descriptor("rigid force", 1, 3, "N"))
     contact_dictionary = b"".join(
-        block(0x01020001, descriptor(spec[1], spec[9], spec[10], spec[4]))
+        block(
+            0x01020001,
+            descriptor(
+                spec[1],
+                spec[9],
+                spec[10],
+                (
+                    _OBSERVED_CONTACT_ANCILLARY_UNITS[spec[0]]
+                    if observed_metadata
+                    else (
+                        "P"
+                        if defect == "wrong-contact-unit"
+                        and spec[0] == "contact_nodal_gap"
+                        else spec[4]
+                    )
+                ),
+            ),
+        )
         for spec in _CONTACT_SPECS
     )
     if defect == "extra-dictionary":
@@ -436,6 +467,11 @@ def native_bytes(mesh: Any, *, defect: str = "") -> bytes:
                     (6, raw_values[per_surface_width:]),
                     (1, raw_values[:per_surface_width]),
                 )
+            elif defect == "substituted-contact-region" and index == 1:
+                regions = (
+                    (6, raw_values[per_surface_width:]),
+                    (2, raw_values[:per_surface_width]),
+                )
             contact_fields += block(
                 0x02020001,
                 uint(0x02020002, index)
@@ -460,7 +496,11 @@ def native_bytes(mesh: Any, *, defect: str = "") -> bytes:
 
 
 def _surface_case(
-    tmp_path: Path, *, quality: bool = False, defect: str = ""
+    tmp_path: Path,
+    *,
+    quality: bool = False,
+    defect: str = "",
+    observed_metadata: bool = False,
 ) -> tuple[
     Any,
     Any,
@@ -599,7 +639,7 @@ def _surface_case(
         revision, mesh, profile
     )
     attempt_root = tmp_path / "attempt"
-    payload = native_bytes(mesh, defect=defect)
+    payload = native_bytes(mesh, defect=defect, observed_metadata=observed_metadata)
     output_path = attempt_root / "output/results.xplt"
     output_path.parent.mkdir(parents=True)
     output_path.write_bytes(payload)
@@ -723,6 +763,14 @@ def test_native_contact_outputs_compile_and_project_exact_entities(tmp_path: Pat
     assert surface_force.values[-1] == (-3.0, -4.0, -5.0, -4.0, -5.0, -6.0)
 
 
+def test_native_contact_dictionary_accepts_observed_ancillary_metadata(tmp_path: Path) -> None:
+    _, reader, attempt, bundle, *_ = _surface_case(tmp_path, observed_metadata=True)
+
+    manifest = reader.read(attempt, bundle)
+
+    assert manifest.read_result.status.value == "VALIDATED"
+
+
 def test_quality_evaluates_contact_surface_node_surface_and_face_scopes(tmp_path: Path) -> None:
     revision, reader, attempt, bundle, mesh, profile, data_store, _ = _surface_case(
         tmp_path, quality=True
@@ -752,11 +800,13 @@ def test_quality_evaluates_contact_surface_node_surface_and_face_scopes(tmp_path
         "foreign-surface",
         "duplicate-surface",
         "surface-connectivity",
+        "substituted-contact-region",
         "missing-contact-region",
         "duplicate-contact-region",
         "nonfinite-contact",
         "truncated-contact",
         "extra-dictionary",
+        "wrong-contact-unit",
         "wrong-contact-width",
     ],
 )
