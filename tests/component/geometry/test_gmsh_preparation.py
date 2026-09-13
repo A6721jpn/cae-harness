@@ -256,29 +256,11 @@ def _native_primitive(kind: str) -> RigidPrimitive:
     )
 
 
-class _WorktreeTemporaryDirectory:
-    _counter = 0
-
-    def __init__(self, prefix: str = "") -> None:
-        type(self)._counter += 1
-        self.name = str(
-            Path(".local/v/current-prep-review-red-01")
-            / f"{prefix}{type(self)._counter}"
-        )
-        Path(self.name).mkdir(parents=True, exist_ok=True)
-
-    def cleanup(self) -> None:
-        return None
-
-
 @pytest.mark.parametrize("kind", ["sphere", "cylinder"])
 def test_measured_backend_native_dispatch_allows_curved_faces(
-    monkeypatch: pytest.MonkeyPatch, kind: str
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, kind: str
 ) -> None:
-    monkeypatch.setattr(
-        "febio_cae.adapters.geometry.gmsh_occ.tempfile.TemporaryDirectory",
-        _WorktreeTemporaryDirectory,
-    )
+    monkeypatch.setattr("tempfile.tempdir", str(tmp_path))
     module = _NativePrimitiveGmsh()
     backend = _MeasuredGmsh(1)
     monkeypatch.setattr(backend, "_load_module", lambda: module)
@@ -306,22 +288,20 @@ def test_measured_backend_keeps_planar_guard_for_imported_step_faces() -> None:
 
 
 def test_measured_backend_restores_planar_guard_after_native_success_and_error(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
     from febio_cae.adapters.geometry import gmsh_occ
 
     module = _NativePrimitiveGmsh()
     backend = _MeasuredGmsh(1)
     primitive = _native_primitive("sphere")
-    monkeypatch.setattr(
-        "febio_cae.adapters.geometry.gmsh_occ.tempfile.TemporaryDirectory",
-        _WorktreeTemporaryDirectory,
-    )
+    monkeypatch.setattr("tempfile.tempdir", str(tmp_path))
     monkeypatch.setattr(backend, "_load_module", lambda: module)
     monkeypatch.setattr(backend, "_prepare_owned_session", lambda gmsh: None)
     monkeypatch.setattr(backend, "_mesh_context", lambda *args, **kwargs: "native-mesh")
     backend.inspect_rigid_primitive(primitive, geometry_digest="a" * 64)
-    assert backend._native_context_depth == 0
+    with pytest.raises(ValueError, match="planar STEP faces"):
+        backend._inspect_faces(module, "body-1", 1, 1.0)
 
     def fail_context(*args: Any, **kwargs: Any) -> Any:
         raise RuntimeError("injected native context failure")
@@ -329,6 +309,5 @@ def test_measured_backend_restores_planar_guard_after_native_success_and_error(
     monkeypatch.setattr(gmsh_occ.GmshOCCBackend, "_primitive_context", fail_context)
     with pytest.raises(RuntimeError, match="injected native context failure"):
         backend._primitive_context(module, 1, primitive)
-    assert backend._native_context_depth == 0
     with pytest.raises(ValueError, match="planar STEP faces"):
         backend._inspect_faces(module, "body-1", 1, 1.0)

@@ -478,10 +478,9 @@ def test_comparison_refuses_incompatible_or_ineligible_results(tmp_path: Path, d
 
 
 def test_current_prepared_box_is_an_explicit_comparison_origin(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
     from types import SimpleNamespace
-    from uuid import uuid4
 
     from test_planar_preparation import _isolate, prepared_input
 
@@ -492,9 +491,7 @@ def test_current_prepared_box_is_an_explicit_comparison_origin(
     from febio_cae.storage.mesh_quality import PlanarPreparationRegistration
     from febio_cae.storage.preparation import PreparationStore
 
-    root = Path.cwd() / ".local/v/current-prep-comparison" / uuid4().hex
-    root.mkdir(parents=True, exist_ok=False)
-    service, created, request, backend, _ = prepared_input.__wrapped__(root, monkeypatch)
+    service, created, request, backend, _ = prepared_input.__wrapped__(tmp_path, monkeypatch)
     _isolate(monkeypatch, backend)
     storage = service._storage(created.case_id)
     source_digest = storage.source_asset("cad").content_digest

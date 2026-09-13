@@ -663,12 +663,11 @@ def test_failed_refinement_cannot_restart_as_changed_initial_preparation(
 
 
 def test_native_preparation_replays_nonidentity_placement_without_regeneration(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
     import copy
     from dataclasses import replace
     from types import MethodType
-    from uuid import uuid4
 
     from febio_cae.adapters.geometry import (
         BACKEND_TET10_ORDER_ID,
@@ -695,9 +694,7 @@ def test_native_preparation_replays_nonidentity_placement_without_regeneration(
     )
     from febio_cae.storage.mesh_quality import MeshQualityRegistration
 
-    root = Path.cwd() / ".local/v/current-prep-review-green-01" / ("native-" + uuid4().hex)
-    root.mkdir(parents=True, exist_ok=False)
-    service, created, request, backend, _ = prepared_input.__wrapped__(root, monkeypatch)
+    service, created, request, backend, _ = prepared_input.__wrapped__(tmp_path, monkeypatch)
     _isolate(monkeypatch, backend)
     fixtures = importlib.import_module("geometry.conftest")
     primitive = fixtures.make_case_spec("0" * 64).rigid_tool.primitive
@@ -917,6 +914,22 @@ def test_native_preparation_replays_nonidentity_placement_without_regeneration(
         )
     assert (len(native_inspections), len(native_meshes)) == before
 
+    def inspect_stale(
+        self: Any, current: Any, *, geometry_digest: str
+    ) -> BackendInspection:
+        return replace(
+            inspect_native(self, current, geometry_digest=geometry_digest),
+            source_digest="0" * 64,
+        )
+
+    monkeypatch.setattr(backend, "inspect_rigid_primitive", MethodType(inspect_stale, backend))
+    before_generation = (len(backend.mesh_requests), len(native_meshes))
+    with pytest.raises(ValueError, match="source identity"):
+        importlib.import_module("febio_cae.adapters.geometry.preparation").produce(
+            source, payload, limits
+        )
+    assert (len(backend.mesh_requests), len(native_meshes)) == before_generation
+
 
 def test_box_preparation_preserves_core_record_and_producer_contract(
     monkeypatch: pytest.MonkeyPatch,
@@ -930,6 +943,7 @@ def test_box_preparation_preserves_core_record_and_producer_contract(
         EvidenceRef,
         GeometryInspectionRequest,
         MeshArtifact,
+        Quantity,
         SourceAssetContent,
         SourceAssetRef,
     )
@@ -940,6 +954,7 @@ def test_box_preparation_preserves_core_record_and_producer_contract(
         decode_mesh_quality,
     )
 
+    monkeypatch.syspath_prepend(str(Path(__file__).parents[1]))
     fixtures = importlib.import_module("geometry.conftest")
     step = (
         b"ISO-10303-21; HEADER; FILE_SCHEMA(('AUTOMOTIVE_DESIGN')); ENDSEC; "
@@ -1018,3 +1033,28 @@ def test_box_preparation_preserves_core_record_and_producer_contract(
         registration, original, carrier, revision
     )
     assert receipt["operation"] == "explicit-planar-metadata-adoption"
+
+    selection = revision.spec.rigid_tool.contact_surface
+    resolution = selection.resolution
+    assert resolution is not None
+    face = resolution.faces[0]
+    altered = replace(
+        selection,
+        resolution=replace(
+            resolution,
+            faces=(
+                replace(face, area=Quantity(face.area.value * 2, face.area.unit)),
+                *resolution.faces[1:],
+            ),
+        ),
+    )
+    changed = replace(
+        revision,
+        spec=replace(
+            revision.spec,
+            rigid_tool=replace(revision.spec.rigid_tool, contact_surface=altered),
+            contact=replace(revision.spec.contact, tool_surface=altered),
+        ),
+    )
+    with pytest.raises(ValueError, match="resolved selection snapshot"):
+        RegisteredCaseService._adopt_planar_mesh(registration, original, carrier, changed)
