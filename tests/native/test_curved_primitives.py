@@ -450,10 +450,10 @@ def test_native_curved_primitive_inspection_and_tet10_mesh(case: _PrimitiveCase)
 def test_native_source_local_ball_refines_only_bounded_sphere_region() -> None:
     """Predeclared native gate: exactly two mesh calls and no inspection call.
 
-    The sphere uses the existing 10 mm measured fixture dimensions.  Unique
-    Tet10 corner-edge midpoints inside the explicit 6 mm source-local ball are
-    compared with the coarse baseline; a far shell must retain an edge larger
-    than the 1 mm local request, so the local field is not uniform globally.
+    Compare interior and far-shell edge medians with the coarse baseline.
+    The 4 mm ball plus the 5 mm transition ends at 9 mm; the measured far
+    shell starts at 9.5 mm. These distribution checks distinguish a local
+    field from uniform refinement without treating size as a hard edge bound.
     """
 
     case = next(item for item in CASES if item.kind == "sphere")
@@ -466,7 +466,7 @@ def test_native_source_local_ball_refines_only_bounded_sphere_region() -> None:
         body_id=primitive.body_id.value,
         frame=primitive.local_frame,
         center_si=(0.0, 0.0, 0.0),
-        radius_si=0.006,
+        radius_si=0.004,
         size_si=local_size_si,
     )
     coarse = backend.mesh_rigid_primitive(
@@ -483,13 +483,15 @@ def test_native_source_local_ball_refines_only_bounded_sphere_region() -> None:
 
     coarse_records = _corner_edge_records(coarse)
     refined_records = _corner_edge_records(refined)
-    coarse_inside = [length for distance, length in coarse_records if distance <= 0.006]
-    refined_inside = [length for distance, length in refined_records if distance <= 0.006]
-    refined_far = [length for distance, length in refined_records if distance >= 0.009]
+    coarse_inside = [length for distance, length in coarse_records if distance <= 0.003]
+    refined_inside = [length for distance, length in refined_records if distance <= 0.003]
+    coarse_far = [length for distance, length in coarse_records if distance >= 0.0095]
+    refined_far = [length for distance, length in refined_records if distance >= 0.0095]
 
-    assert coarse_inside
-    assert refined_inside
-    assert median(refined_inside) < median(coarse_inside) * 0.75
-    assert len(refined_inside) > len(coarse_inside)
-    assert refined_far
-    assert max(refined_far) > local_size_si * 1.5
+    # At least three samples prevent a single oversized edge from qualifying.
+    assert min(map(len, (coarse_inside, refined_inside, coarse_far, refined_far))) >= 3
+    inside_median = median(refined_inside)
+    far_median = median(refined_far)
+    assert inside_median < median(coarse_inside) * 0.6
+    assert far_median >= median(coarse_far) * 0.65
+    assert far_median >= inside_median * 2.0
