@@ -516,12 +516,10 @@ def _find_gmsh_spec(module_path: Path) -> Any:
 
 def _module_handle(module: ModuleType) -> tuple[Any, int]:
     try:
-        library = getattr(module, "lib")
-        handle = getattr(library, "_handle")
-    except (AttributeError, TypeError, ValueError) as exc:
+        library = vars(module)["lib"]
+    except (AttributeError, KeyError, TypeError, ValueError) as exc:
         raise _error("Gmsh native handle is unavailable") from exc
-    if type(handle) is not int or handle <= 0:
-        raise _error("Gmsh native handle is not a positive integer")
+    handle = _library_handle(library)
     _coerce_module_handle(handle)
     return library, handle
 
@@ -1213,13 +1211,24 @@ def _library_namespace(
     return namespace
 
 
-def _library_handle(library: object) -> int:
+def _library_handle_descriptor(
+    library: object, expected: tuple[type, object] | None = None
+) -> tuple[type, object]:
+    owner, descriptor = _raw_type_descriptor(type(library), "_handle")
+    if expected is not None and (owner is not expected[0] or descriptor is not expected[1]):
+        raise _error("Gmsh native library handle descriptor changed")
+    if type(descriptor) is not int:
+        raise _error("Gmsh native library handle uses an unsupported descriptor")
+    return owner, descriptor
+
+
+def _library_handle(
+    library: object, expected: tuple[type, object] | None = None
+) -> int:
+    _owner, descriptor = _library_handle_descriptor(library, expected)
     handle = _library_namespace(library).get("_handle", _MISSING)
     if handle is _MISSING:
-        try:
-            handle = getattr(library, "_handle")
-        except (AttributeError, TypeError, ValueError) as exc:
-            raise _error("Gmsh native library handle is unavailable") from exc
+        handle = descriptor
     if type(handle) is not int or handle <= 0:
         raise _error("Gmsh native library handle is not a positive integer")
     return handle
@@ -1364,6 +1373,8 @@ class _LiveState:
     library_namespace_owner: type
     library_namespace_descriptor: object
     library_namespace: dict[str, object]
+    library_handle_owner: type
+    library_handle_descriptor: object
     library_funcptr_owner: type
     library_funcptr_descriptor: object
     library_funcptr: _FactoryState | None
@@ -1387,6 +1398,7 @@ def _capture_live_state(
         library,
         expected=(library_namespace_owner, library_namespace_descriptor),
     )
+    library_handle_owner, library_handle_descriptor = _library_handle_descriptor(library)
     library_funcptr_owner, library_funcptr_descriptor = _raw_type_descriptor(
         type(library), "_FuncPtr"
     )
@@ -1450,6 +1462,8 @@ def _capture_live_state(
         library_namespace_owner=library_namespace_owner,
         library_namespace_descriptor=library_namespace_descriptor,
         library_namespace=namespace,
+        library_handle_owner=library_handle_owner,
+        library_handle_descriptor=library_handle_descriptor,
         library_funcptr_owner=library_funcptr_owner,
         library_funcptr_descriptor=library_funcptr_descriptor,
         library_funcptr=library_funcptr,
@@ -1577,6 +1591,12 @@ def _validate_live_state(state: _LiveState, module: ModuleType, library: object)
     )
     if current_library_namespace is not state.library_namespace:
         raise _error("live Gmsh native library namespace changed")
+    current_handle_owner, current_handle_descriptor = _library_handle_descriptor(library)
+    if (
+        current_handle_owner is not state.library_handle_owner
+        or current_handle_descriptor is not state.library_handle_descriptor
+    ):
+        raise _error("live Gmsh native library handle descriptor changed")
     current_funcptr_owner, current_funcptr_descriptor = _raw_type_descriptor(
         type(library), "_FuncPtr"
     )
@@ -1630,7 +1650,10 @@ def _validate_live_state(state: _LiveState, module: ModuleType, library: object)
             ) != global_state.stable_signature:
                 raise _error(f"live Gmsh global {name} changed")
 
-    if _library_handle(library) != state.native_handle:
+    if _library_handle(
+        library,
+        expected=(state.library_handle_owner, state.library_handle_descriptor),
+    ) != state.native_handle:
         raise _error("live Gmsh native library handle changed")
     for name, callable_state in state.native_callables.items():
         current = current_library_namespace.get(name, _MISSING)
@@ -1740,9 +1763,13 @@ def _cached_session(
                 _validate_loaded_module(
                     module, module_path, spec, session.code_digest, session.code_object
                 )
-                library_object, handle = _module_handle(module)
+                try:
+                    library_object = vars(module)["lib"]
+                except (AttributeError, KeyError, TypeError, ValueError) as exc:
+                    raise _error("verified Gmsh native library object is unavailable") from exc
                 if library_object is not session.library:
                     raise _error("verified Gmsh native library object changed")
+                handle = session.live_state.native_handle
                 mapped_path = _mapped_module_path(handle)
                 if not _same_path(str(mapped_path), str(library_path)):
                     raise _error("verified Gmsh native library mapping changed")

@@ -808,6 +808,45 @@ def test_verified_session_does_not_execute_ctypes_symbol_name_fallback(
     assert calls == []
 
 
+def test_verified_session_rejects_library_handle_descriptor_tampering(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A library _handle descriptor cannot redirect a reused verified session."""
+
+    _isolated(monkeypatch)
+    source = (
+        "import ctypes\n"
+        "__version__ = '4.15.2'\n"
+        "def isInitialized():\n"
+        "    return False\n"
+        "lib = object.__new__(ctypes.CDLL)\n"
+        "lib._handle = 99\n"
+        "lib._FuncPtr = object\n"
+    )
+    module, library, launcher, image, python_library = _files(tmp_path, source)
+    expected = _binding(tmp_path, module=module, library=library)
+    monkeypatch.setattr(
+        runtime,
+        "_current_process_binding",
+        lambda: {
+            "python": _identity(launcher),
+            "python_image": _identity(image),
+            "python_library": _identity(python_library),
+            "pyvenv_cfg": None,
+        },
+    )
+    monkeypatch.setattr(runtime, "_mapped_module_path", lambda handle: library)
+    monkeypatch.syspath_prepend(str(module.parent))
+    sys.modules.pop("gmsh", None)
+    loaded, _ = runtime.load_verified_gmsh(expected)
+
+    monkeypatch.setattr(
+        type(loaded.lib), "_handle", property(lambda self: 99), raising=False
+    )
+    with pytest.raises((OSError, ValueError), match="handle|descriptor|library|dispatch"):
+        runtime.load_verified_gmsh(expected)
+
+
 def test_verified_session_rejects_ctypes_metadata_access_tampering(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
