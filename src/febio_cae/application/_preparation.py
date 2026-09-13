@@ -21,7 +21,11 @@ from febio_cae.domain.canonical import canonical_bytes
 from febio_cae.domain.codec import decode_record
 from febio_cae.domain.compatibility import CapabilityStatus
 from febio_cae.storage.demo_budget import reserve_preparation_mesh_attempt
-from febio_cae.storage.mesh_quality import CurrentPreparationRegistration, MeshQualityRegistration
+from febio_cae.storage.mesh_quality import (
+    CurrentPreparationRegistration,
+    MeshQualityRegistration,
+    PlanarPreparationRegistration,
+)
 from febio_cae.storage.preparation import PreparationStore, digest
 
 from ._preparation_request import normalize_request, request_parts
@@ -69,9 +73,6 @@ def geometry_from_output(
     required = {
         "carrier",
         "inspection",
-        "generation_criteria",
-        "native_tool_inspection",
-        "native_tool_primitive",
         "backend_id",
         "backend_version",
     }
@@ -103,6 +104,13 @@ def geometry_from_output(
         and tool_geometry_digest != expected_tool_geometry_digest
     ):
         raise ValueError("preparation producer tool geometry differs from the expected carrier")
+    curved_fields = {"generation_criteria", "native_tool_inspection", "native_tool_primitive"}
+    if primitive.kind == "box":
+        if curved_fields & producer.keys():
+            raise ValueError("flat-box preparation must use the core producer format")
+        native_raw = native_primitive_raw = None
+    elif not curved_fields <= producer.keys():
+        raise ValueError("curved preparation producer output is incomplete")
     native_raw = producer.get("native_tool_inspection")
     native_primitive_raw = producer.get("native_tool_primitive")
     native_inspection = None
@@ -335,9 +343,19 @@ def prepare_planar(
                 ):
                     raise ValueError("producer mesh exceeds finite counts")
                 try:
-                    criteria_match = canonical_bytes(
-                        producer["generation_criteria"]
-                    ) == canonical_bytes(limits.get("_generation_criteria"))
+                    if carrier.spec.rigid_tool.primitive.kind == "box":
+                        criteria_match = not any(
+                            key in producer
+                            for key in (
+                                "generation_criteria",
+                                "native_tool_inspection",
+                                "native_tool_primitive",
+                            )
+                        )
+                    else:
+                        criteria_match = canonical_bytes(
+                            producer["generation_criteria"]
+                        ) == canonical_bytes(limits.get("_generation_criteria"))
                 except (KeyError, TypeError, ValueError):
                     criteria_match = False
                 if (
@@ -369,7 +387,12 @@ def prepare_planar(
                     raise ValueError(
                         "producer changed explicit specification or selection snapshot"
                     )
-                registration = CurrentPreparationRegistration(
+                registration_type = (
+                    PlanarPreparationRegistration
+                    if carrier.spec.rigid_tool.primitive.kind == "box"
+                    else CurrentPreparationRegistration
+                )
+                registration = registration_type(
                     "prepare-" + record["preparation_id"],
                     source.source_asset.content_digest,
                     report.geometry_digest,
@@ -407,26 +430,25 @@ def prepare_planar(
                     inspection_digest=digest(report.to_dict()),
                     mesh_digest=original.artifact_digest,
                     recipe_digest=original.provenance.mesh_recipe_digest,
-                    generation_criteria=producer.get("generation_criteria"),
-                    native_tool_inspection_digest=(
-                        None
-                        if producer.get("native_tool_inspection") is None
-                        else digest(producer["native_tool_inspection"])
-                    ),
-                    native_tool_primitive_digest=(
-                        None
-                        if producer.get("native_tool_primitive") is None
-                        else digest(producer["native_tool_primitive"])
-                    ),
-                    native_tool_geometry_digest=(
-                        None
-                        if carrier.spec.rigid_tool.primitive.kind == "box"
-                        else carrier.spec.rigid_tool.contact_surface.geometry_digest
-                    ),
                     backend_id=producer["backend_id"],
                     backend_version=producer["backend_version"],
                     backend=producer["backend"],
                 )
+                if carrier.spec.rigid_tool.primitive.kind != "box":
+                    record.update(
+                        generation_criteria=producer["generation_criteria"],
+                        native_tool_inspection_digest=(
+                            None
+                            if producer["native_tool_inspection"] is None
+                            else digest(producer["native_tool_inspection"])
+                        ),
+                        native_tool_primitive_digest=(
+                            None
+                            if producer["native_tool_primitive"] is None
+                            else digest(producer["native_tool_primitive"])
+                        ),
+                        native_tool_geometry_digest=carrier.spec.rigid_tool.contact_surface.geometry_digest,
+                    )
                 mesh, receipt = service._adopt_planar_mesh(
                     registration, original, carrier, revision
                 )

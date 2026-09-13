@@ -61,7 +61,30 @@ FIXED = (
 )
 
 
-def _configure(service: Any, spec: Any) -> Any:
+def _configure(
+    service: Any, spec: Any, *, source_digest: str | None = None
+) -> Any:
+    def bind_profile_evidence(profile: Any) -> Any:
+        if source_digest is None:
+            return profile
+        capabilities = tuple(
+            replace(
+                capability,
+                evidence=tuple(
+                    replace(item, content_digest=source_digest)
+                    for item in capability.evidence
+                ),
+            )
+            for capability in profile.capabilities
+        )
+        return replace(
+            profile,
+            capabilities=capabilities,
+            evidence=tuple(
+                replace(item, content_digest=source_digest) for item in profile.evidence
+            ),
+        )
+
     profile = replace(
         _profile("comparison-synthetic"),
         output_mappings=(
@@ -89,6 +112,7 @@ def _configure(service: Any, spec: Any) -> Any:
             ),
         ),
     )
+    profile = bind_profile_evidence(profile)
     service.register_profile(profile)
     digest = hashlib.sha256(profile.to_bytes()).hexdigest()
 
@@ -115,6 +139,7 @@ def _configure(service: Any, spec: Any) -> Any:
     criterion = replace(
         spec.quality_policy.criteria[0],
         metric_id="peak_abs_value",
+        evaluation_ids=(evaluation.evaluation_id,),
         thresholds=(QualityThreshold("max_value", Quantity(1e-4, "m")),),
     )
     return replace(
@@ -456,103 +481,126 @@ def test_current_prepared_box_is_an_explicit_comparison_origin(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from types import SimpleNamespace
+    from uuid import uuid4
+
+    from test_planar_preparation import _isolate, prepared_input
 
     from febio_cae.application import _comparison
-    from febio_cae.domain import AsPlaced, PortError
-    from febio_cae.storage.mesh_quality import CurrentPreparationRegistration
+    from febio_cae.application._preparation_request import normalize_request
+    from febio_cae.domain import CasePatch, CasePatchEdit
+    from febio_cae.storage.comparison import target
+    from febio_cae.storage.mesh_quality import PlanarPreparationRegistration
+    from febio_cae.storage.preparation import PreparationStore
 
-    source_digest = "a" * 64
-    geometry_digest = "b" * 64
-    spec = SimpleNamespace(
-        geometry=SimpleNamespace(
-            source_step_digest=source_digest,
-            geometry_digest=geometry_digest,
+    root = Path.cwd() / ".local/v/current-prep-comparison" / uuid4().hex
+    root.mkdir(parents=True, exist_ok=False)
+    service, created, request, backend, _ = prepared_input.__wrapped__(root, monkeypatch)
+    _isolate(monkeypatch, backend)
+    storage = service._storage(created.case_id)
+    source_digest = storage.source_asset("cad").content_digest
+    configured = _configure(
+        service,
+        normalize_request(request).values.to_case_spec(),
+        source_digest=source_digest,
+    )
+    request["values"] = configured.to_dict()
+
+    def bind_evidence(value: Any) -> None:
+        if isinstance(value, dict):
+            if {"reference", "target_field", "content_digest"} <= value.keys():
+                value["reference"] = "cad"
+                value["content_digest"] = source_digest
+            if value.get("body_id") == request["values"]["geometry"]["body_id"]:
+                if "geometry_digest" in value:
+                    value["geometry_digest"] = None
+            if "inspection_digest" in value:
+                value["inspection_digest"] = None
+            for child in value.values():
+                bind_evidence(child)
+        elif isinstance(value, list):
+            for child in value:
+                bind_evidence(child)
+
+    bind_evidence(request["values"])
+
+    prepared = service.prepare_planar(created.case_id, request, expected_generation=0)
+    parent = service.get_revision(created.case_id, prepared["revision_id"])
+    registration = storage.resolve_revision_mesh_quality(parent)
+    assert isinstance(registration, PlanarPreparationRegistration)
+    origin_store = PreparationStore(storage)
+    origin = origin_store.origin(registration, parent)
+    stored_output = origin_store.origin_output(registration, parent)
+    assert origin == parent
+    assert stored_output["adoption"]["operation"] == "explicit-planar-metadata-adoption"
+    assert service._planar_execution_mesh(storage, registration, parent).to_dict() == stored_output[
+        "mesh"
+    ]
+
+    baseline = _result(service, storage, parent, "baseline", (0, 0.5, 1), 1)
+    material = replace(parent.spec.material, youngs_modulus=Quantity(2e6, "Pa"))
+    service.apply_patch(
+        created.case_id,
+        CasePatch(
+            parent.revision_id,
+            parent.spec_digest,
+            (CasePatchEdit("material", material, True),),
+            (replace(_evidence("material.youngs_modulus"), content_digest=source_digest),),
         ),
-        rigid_tool=SimpleNamespace(primitive=SimpleNamespace(kind="box")),
-        contact=SimpleNamespace(arrangement=AsPlaced(_evidence("contact.arrangement"))),
     )
-    current = CurrentPreparationRegistration(
-        "current-prepared",
-        source_digest,
-        geometry_digest,
-        "c" * 64,
-        "d" * 64,
-        NumericalProfileRef("mesh", "mesh_quality", "e" * 64),
-        (_evidence("mesh.admission"),),
-        "0" * 32,
-    )
-
-    class _Quality:
-        assessment_id = "quality-current"
-        overall_status = SimpleNamespace(value="PASS")
-
-        @staticmethod
-        def to_dict() -> dict[str, str]:
-            return {"status": "PASS"}
-
-    quality = _Quality()
-    revision = SimpleNamespace(
-        case_id="case-current",
-        revision_id="revision-current",
-        spec_digest="f" * 64,
-        spec=spec,
-        to_bytes=lambda: b"revision-current",
-    )
-    item = SimpleNamespace(
-        profile=SimpleNamespace(
-            profile_id="comparison-profile",
-            evidence=(),
-            capabilities=(),
-            to_bytes=lambda: b"comparison-profile",
+    child = service.freeze_case(created.case_id).revision
+    assert child is not None
+    candidate = _result(service, storage, child, "candidate", (0, 0.25, 0.75, 1), 1.5)
+    interval = ComparisonInterval("m", 0, 1e-5)
+    spec = ComparisonSpec(
+        "comparison-current-prepared",
+        baseline.manifest_id,
+        candidate.manifest_id,
+        ("material.youngs_modulus",),
+        FIXED,
+        (
+            ComparisonAxis(
+                "tool_compression.force_z",
+                "m",
+                child.spec.rigid_tool.primitive.body_id.value,
+                "contact_force.world_z",
+                "identity",
+                interval,
+                "linear",
+            ),
+            ComparisonAxis(
+                "tool_compression.part_peak_abs_displacement_z",
+                "m",
+                child.spec.geometry.body_id.value,
+                "displacement.world_z",
+                "peak_abs",
+                interval,
+                "linear",
+            ),
         ),
-        revision=revision,
-        mesh=SimpleNamespace(artifact_digest="1" * 64),
-        manifest=SimpleNamespace(
-            manifest_id="manifest-current", to_bytes=lambda: b"manifest-current"
+    )
+    result = service.compare_case(
+        created.case_id,
+        spec,
+        baseline_run_id="run-baseline",
+        candidate_run_id="run-candidate",
+    )
+    assert result["status"] == "COMPARED"
+    assert result["comparison"]["sources"][0]["root_mesh_digest"] == (
+        registration.original_mesh_digest
+    )
+
+    baseline_target = target(storage, baseline.manifest_id, "run-baseline")
+    curved_item = replace(
+        baseline_target,
+        revision=SimpleNamespace(
+            case_id=baseline_target.revision.case_id,
+            revision_id=baseline_target.revision.revision_id,
+            to_bytes=baseline_target.revision.to_bytes,
+            spec=SimpleNamespace(
+                rigid_tool=SimpleNamespace(primitive=SimpleNamespace(kind="sphere")),
+                mesh_policy=baseline_target.revision.spec.mesh_policy,
+            ),
         ),
-        attempt=SimpleNamespace(
-            attempt_id="attempt-current",
-            run_id="run-current",
-            state=SimpleNamespace(value="SUCCEEDED"),
-        ),
-        bundle=SimpleNamespace(bundle_digest="2" * 64),
     )
-    storage = SimpleNamespace(
-        resolve_revision_mesh_quality=lambda _revision: current,
-        source_asset=lambda _asset_id: SimpleNamespace(asset_id="quality-current"),
-        resolve_source=lambda _asset: SimpleNamespace(content=b"quality-record"),
-    )
-    service = SimpleNamespace(
-        compatibility=SimpleNamespace(get_profile=lambda _profile_id: item.profile),
-        _resolve_declarations=lambda *_args: None,
-    )
-    verified: list[str] = []
-
-    def verify(_storage: Any, registration: Any, revision: Any, mesh: Any) -> None:
-        assert registration is current
-        assert mesh is not None
-        verified.append(revision.revision_id)
-
-    service._verify_execution_mesh = verify
-    monkeypatch.setattr(
-        _comparison,
-        "QualityAdapter",
-        lambda: SimpleNamespace(assess=lambda *args: quality),
-    )
-    required = importlib.import_module("febio_cae.application._required_quality")
-    monkeypatch.setattr(required, "required_quality_summary", lambda *args: ("PASS", {}))
-    monkeypatch.setattr(_comparison, "encode_record", lambda _value: b"quality-record")
-
-    identity = _comparison._eligible(service, storage, item)
-    assert identity["root_mesh_digest"] == current.original_mesh_digest
-    assert verified == [revision.revision_id]
-    curved_spec = SimpleNamespace(
-        geometry=spec.geometry,
-        rigid_tool=SimpleNamespace(primitive=SimpleNamespace(kind="sphere")),
-        contact=spec.contact,
-    )
-    curved_revision = SimpleNamespace(**{**vars(revision), "spec": curved_spec})
-    curved_item = SimpleNamespace(**{**vars(item), "revision": curved_revision})
     with pytest.raises(PortError, match="explicit planar box"):
         _comparison._eligible(service, storage, curved_item)
-    assert verified == [revision.revision_id]

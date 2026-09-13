@@ -9,7 +9,11 @@ from typing import Any
 
 from febio_cae.domain import CaseRevision, MeshArtifact, MeshSet, SelectionRef, WholeBodyRule
 from febio_cae.domain.canonical import canonical_bytes
-from febio_cae.storage.mesh_quality import CurrentPreparationRegistration, PlanarDemoRegistration
+from febio_cae.storage.mesh_quality import (
+    CurrentPreparationRegistration,
+    PlanarDemoRegistration,
+    PlanarPreparationRegistration,
+)
 
 
 def _without_evidence(value: Any) -> Any:
@@ -110,7 +114,13 @@ def adopt(
             raise ValueError(
                 "new selection is not an evidence-only adoption of a generated selection"
             )
-        if source.resolution is not None and source.resolution != selection.resolution:
+        if source.resolution is not None and (
+            selection.resolution is None
+            or canonical_bytes(
+                source.resolution.to_dict(), unordered_paths=(("faces",),)
+            )
+            != canonical_bytes(selection.resolution.to_dict(), unordered_paths=(("faces",),))
+        ):
             raise ValueError("adoption changes an existing resolved selection snapshot")
         original_digest = hashlib.sha256(source.to_bytes()).hexdigest()
         matching = original_sets_by_digest.get(original_digest, ())
@@ -186,6 +196,7 @@ def adopt(
         "operation": (
             "explicit-preparation-metadata-adoption"
             if isinstance(registration, CurrentPreparationRegistration)
+            and not isinstance(registration, PlanarPreparationRegistration)
             else "explicit-planar-metadata-adoption"
         ),
         "original_mesh_digest": original.artifact_digest,

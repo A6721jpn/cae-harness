@@ -38,6 +38,7 @@ from .backend import (
     BackendMesh,
 )
 from .gmsh_occ import GmshOCCBackend, GmshOCCConfig, _require_ap214_header
+from .native_backend import primitive_source_digest
 
 _pending: list[WindowsJobProcess] = []
 
@@ -225,6 +226,12 @@ class CurrentInspection:
             raise ValueError("current native tool record requires a curved primitive")
         if expected_geometry_digest is not None and report.geometry_digest != expected_geometry_digest:
             raise ValueError("current native tool geometry identity differs")
+        if report.source_digest != primitive_source_digest(
+            primitive,
+            geometry_digest=report.geometry_digest,
+            global_size_si=None,
+        ):
+            raise ValueError("current native tool source identity differs")
         if report.frame != primitive.local_frame or tuple(report.declared_units) != ("m",):
             raise ValueError("current native tool record must remain in its local metre frame")
         if len(report.bodies) != 1 or report.bodies[0].body_id != primitive.body_id.value:
@@ -467,22 +474,26 @@ def produce(
     mesh = adapter.mesh(carrier)
     if len(mesh.nodes) > limits["max_nodes"] or len(mesh.elements) > limits["max_tetrahedra"]:
         raise ValueError("preparation mesh exceeds explicit node/element limits")
-    return {
+    output = {
         "carrier": carrier.to_dict(),
         "mesh": mesh.to_dict(),
         "inspection": report.to_dict(),
-        "generation_criteria": None if criteria is None else criteria.to_dict(),
-        "native_tool_inspection": None
-        if native_tool_inspection is None
-        else native_tool_inspection.to_dict(),
-        "native_tool_primitive": None
-        if native_tool_primitive is None
-        else native_tool_primitive.to_dict(),
         "backend": backend.evidence,
         "backend_id": backend.backend_id,
         "backend_version": backend.backend_version,
         "mesh_generations": 1,
     }
+    if primitive_kind in {"sphere", "cylinder"}:
+        output.update(
+            generation_criteria=criteria.to_dict() if criteria is not None else None,
+            native_tool_inspection=(
+                None if native_tool_inspection is None else native_tool_inspection.to_dict()
+            ),
+            native_tool_primitive=(
+                None if native_tool_primitive is None else native_tool_primitive.to_dict()
+            ),
+        )
+    return output
 
 
 def run_preparation(

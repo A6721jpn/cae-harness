@@ -180,16 +180,9 @@ class PlanarDemoRegistration:
 
 
 @dataclass(frozen=True, slots=True)
-class CurrentPreparationRegistration:
+class CurrentPreparationRegistration(PlanarDemoRegistration):
     """Current-operation preparation origin, separate from synthetic demos."""
 
-    profile_id: str
-    source_step_digest: str
-    geometry_digest: str
-    original_mesh_digest: str
-    original_recipe_digest: str
-    generation_profile: NumericalProfileRef
-    admission_evidence: tuple[EvidenceRef, ...]
     preparation_id: str
 
     def __post_init__(self) -> None:
@@ -265,6 +258,26 @@ class CurrentPreparationRegistration:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class PlanarPreparationRegistration(CurrentPreparationRegistration):
+    """Current planar-box admission with the original core wire format."""
+
+    def check_spec(self, spec: CaseSpec) -> None:
+        if (
+            spec.geometry.source_step_digest != self.source_step_digest
+            or spec.geometry.geometry_digest != self.geometry_digest
+            or spec.rigid_tool.primitive.kind != "box"
+            or not isinstance(spec.contact.arrangement, AsPlaced)
+        ):
+            raise ValueError("planar admission only covers the explicit source and flat box pose")
+
+    def to_bytes(self) -> bytes:
+        data = json.loads(PlanarDemoRegistration.to_bytes(self))
+        data["admission_kind"] = "current-planar-preparation"
+        data["preparation_id"] = self.preparation_id
+        return canonical_bytes(data)
+
+
 MeshQualityRecord = (
     MeshQualityRegistration | PlanarDemoRegistration | CurrentPreparationRegistration
 )
@@ -279,6 +292,7 @@ def decode_mesh_quality(payload: bytes) -> MeshQualityRecord:
     kind = data["admission_kind"]
     if not isinstance(kind, str) or kind not in {
         "current-preparation",
+        "current-planar-preparation",
         "synthetic-planar-demo",
     }:
         raise ValueError("invalid or unsupported mesh quality admission kind")
@@ -294,7 +308,7 @@ def decode_mesh_quality(payload: bytes) -> MeshQualityRecord:
         "generation_profile",
         "admission_evidence",
     }
-    if kind == "current-preparation":
+    if kind in {"current-preparation", "current-planar-preparation"}:
         required.add("preparation_id")
     if set(data) != required:
         raise ValueError("invalid mesh quality admission fields")
@@ -319,6 +333,8 @@ def decode_mesh_quality(payload: bytes) -> MeshQualityRecord:
             result: MeshQualityRecord = CurrentPreparationRegistration(
                 *values, data["preparation_id"]
             )
+        elif kind == "current-planar-preparation":
+            result = PlanarPreparationRegistration(*values, data["preparation_id"])
         else:
             result = PlanarDemoRegistration(*values)
     except (KeyError, TypeError, ValueError, OverflowError) as error:
