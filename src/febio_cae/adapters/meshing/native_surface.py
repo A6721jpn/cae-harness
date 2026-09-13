@@ -291,13 +291,15 @@ def _certify_positive(value: _Bernstein) -> bool:
     pending: list[tuple[_Bernstein, int]] = [(value, 0)]
     visited = 0
     while pending:
+        if visited >= _ORIENTATION_MAX_NODES:
+            return False
         current, depth = pending.pop()
         visited += 1
         if all(numerator > 0 for numerator in current.numerators):
             continue
         if all(numerator <= 0 for numerator in current.numerators):
             return False
-        if depth >= _ORIENTATION_MAX_DEPTH or visited >= _ORIENTATION_MAX_NODES:
+        if depth >= _ORIENTATION_MAX_DEPTH:
             return False
         pending.extend((child, depth + 1) for child in _subdivide(current))
     return True
