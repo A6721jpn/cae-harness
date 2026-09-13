@@ -835,6 +835,7 @@ class _FactoryState:
     metaclass_getattribute: _DispatchDescriptorState
     new: _DispatchDescriptorState
     init: _DispatchDescriptorState
+    instance_descriptors: dict[str, _DispatchDescriptorState]
 
 
 def _factory_state(value: object) -> _FactoryState | None:
@@ -843,6 +844,17 @@ def _factory_state(value: object) -> _FactoryState | None:
     if not isinstance(value, type):
         raise _error("Gmsh native library factory is not a type")
     metaclass = type(value)
+    instance_names = (
+        "__call__",
+        "__getattribute__",
+        "__setattr__",
+        *(_NATIVE_CALL_ATTRIBUTES + ("_name",)),
+    )
+    instance_descriptors = {
+        name: _dispatch_descriptor_state(value, name) for name in instance_names
+    }
+    if instance_descriptors["_name"].descriptor is not _MISSING:
+        raise _error("Gmsh native library factory has an unsupported name descriptor")
     return _FactoryState(
         value,
         metaclass,
@@ -850,6 +862,7 @@ def _factory_state(value: object) -> _FactoryState | None:
         _dispatch_descriptor_state(metaclass, "__getattribute__"),
         _dispatch_descriptor_state(value, "__new__"),
         _dispatch_descriptor_state(value, "__init__"),
+        instance_descriptors,
     )
 
 
@@ -999,6 +1012,9 @@ def _ctypes_dispatch_descriptor(
     value_type = type(value)
     if type(value_type) is not _CFUNC_PTR_METACLASS:
         raise _error(f"cached native callable {name} uses an unsupported metaclass")
+    _name_owner, name_descriptor = _raw_type_descriptor(value_type, "_name")
+    if name_descriptor is not _MISSING:
+        raise _error(f"cached native callable {name} has an unsupported name descriptor")
     call_owner, call_descriptor = _raw_type_descriptor(value_type, "__call__")
     attribute_owner, attribute_descriptor = _raw_type_descriptor(
         value_type, "__getattribute__"
@@ -1551,6 +1567,13 @@ def _validate_factory_state(state: _FactoryState, value: object) -> None:
     _validate_dispatch_descriptor(
         state.init, state.value, "__init__", "native library factory constructor"
     )
+    for name, descriptor_state in state.instance_descriptors.items():
+        _validate_dispatch_descriptor(
+            descriptor_state,
+            state.value,
+            name,
+            "native library factory instance",
+        )
 
 
 def _validate_live_state(state: _LiveState, module: ModuleType, library: object) -> None:
