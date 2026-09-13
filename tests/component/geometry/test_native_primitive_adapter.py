@@ -26,6 +26,8 @@ from febio_cae.adapters.geometry import (
 from febio_cae.domain import (
     TET10_FACE_NODE_POSITIONS,
     CaseRevision,
+    FaceId,
+    FaceSetRule,
     FrameId,
     LocalRefinement,
     Point3,
@@ -580,6 +582,7 @@ def test_native_preflight_rejects_unsupported_criteria_before_curved_effects(
     assert error.value.category == PortErrorCategory.UNSUPPORTED_CAPABILITY
     assert backend.curved_inspection_calls == 0
     assert backend.curved_mesh_calls == 0
+    assert backend.mesh_requests == []
 
 
 def test_native_legacy_regionless_refinement_fails_closed_before_curved_effects(
@@ -607,6 +610,39 @@ def test_native_legacy_regionless_refinement_fails_closed_before_curved_effects(
     assert error.value.category == PortErrorCategory.UNSUPPORTED_CAPABILITY
     assert backend.curved_inspection_calls == 0
     assert backend.curved_mesh_calls == 0
+    assert backend.mesh_requests == []
+
+
+def test_unknown_native_contact_face_is_rejected_before_any_mesh_generation(
+    source_content: SourceAssetContent,
+    synthetic_case_revision: CaseRevision,
+) -> None:
+    revision = _curved_revision(synthetic_case_revision)
+    tool = revision.spec.rigid_tool
+    selection = replace(
+        tool.contact_surface,
+        rule=FaceSetRule(
+            tool.contact_surface.geometry_digest,
+            tool.contact_surface.body_id,
+            tool.contact_surface.frame,
+            (FaceId("unknown-native-face"),),
+            _evidence("selection.faces", "unknown-native-face"),
+        ),
+    )
+    revision = replace(
+        revision,
+        spec=replace(
+            revision.spec,
+            rigid_tool=replace(tool, contact_surface=selection),
+            contact=replace(revision.spec.contact, tool_surface=selection),
+        ),
+    )
+    backend = SyntheticCurvedBackend()
+    with pytest.raises(PortError) as error:
+        _adapter(backend, source_content, _criteria(revision, limit=RADIUS)).mesh(revision)
+    assert error.value.category == PortErrorCategory.INVALID_INPUT
+    assert backend.curved_mesh_calls == 0
+    assert backend.mesh_requests == []
 
 
 def test_native_source_local_ball_passes_and_changes_mesh_identity(
