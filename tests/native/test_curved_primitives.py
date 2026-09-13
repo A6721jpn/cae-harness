@@ -369,16 +369,17 @@ def _corner_edge_records(mesh: BackendMesh) -> tuple[tuple[float, float], ...]:
             (1, 3),
             (2, 3),
         ):
-            edge = tuple(sorted((corners[first], corners[second])))
+            first_id, second_id = corners[first], corners[second]
+            edge = (first_id, second_id) if first_id < second_id else (second_id, first_id)
             if edge in seen:
                 continue
             seen.add(edge)
             first_point = nodes[edge[0]]
             second_point = nodes[edge[1]]
-            midpoint = tuple(
-                (first_point[axis] + second_point[axis]) / 2.0 for axis in range(3)
+            midpoint = tuple((first_point[axis] + second_point[axis]) / 2.0 for axis in range(3))
+            records.append(
+                (math.dist(midpoint, (0.0, 0.0, 0.0)), math.dist(first_point, second_point))
             )
-            records.append((math.dist(midpoint, (0.0, 0.0, 0.0)), math.dist(first_point, second_point)))
     return tuple(records)
 
 

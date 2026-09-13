@@ -770,7 +770,12 @@ class GmshOCCBackend:
         set_number = getattr(field_api, "setNumber", None)
         set_numbers = getattr(field_api, "setNumbers", None)
         set_background = getattr(field_api, "setAsBackgroundMesh", None)
-        if not all(callable(item) for item in (add, set_number, set_numbers, set_background)):
+        if (
+            not callable(add)
+            or not callable(set_number)
+            or not callable(set_numbers)
+            or not callable(set_background)
+        ):
             raise BackendError(
                 BackendErrorCategory.UNSUPPORTED_CAPABILITY,
                 "configured Gmsh module has an incomplete mesh size-field API",

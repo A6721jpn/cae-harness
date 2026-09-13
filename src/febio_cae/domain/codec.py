@@ -812,9 +812,7 @@ def _mesh_policy(value: object, field: str) -> MeshPolicy:
         refinements.append(
             LocalRefinement(
                 _text(item_payload["refinement_id"], "refinement_id"),
-                _selection(
-                    item_payload["selection"], f"{refinement_field}.selection"
-                ),
+                _selection(item_payload["selection"], f"{refinement_field}.selection"),
                 _quantity(item_payload["size"], f"{refinement_field}.size"),
                 None
                 if "region" not in item_payload

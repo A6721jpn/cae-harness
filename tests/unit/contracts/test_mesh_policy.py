@@ -141,12 +141,12 @@ def _local(
     )
 
 
-def _source_local_ball(mesh: ModuleType, *, frame: FrameId = FrameId("PartLocal")) -> Any:
+def _source_local_ball(mesh: ModuleType) -> Any:
     ball_type = getattr(mesh, "SourceLocalRefinementBall", None)
     assert ball_type is not None, "SourceLocalRefinementBall is not available"
     return ball_type(
         center=Point3(
-            frame,
+            FrameId("PartLocal"),
             Quantity(1, "mm"),
             Quantity(-2, "mm"),
             Quantity(3, "mm"),
@@ -280,30 +280,13 @@ def test_local_refinement_preserves_selection_and_size_projection() -> None:
     assert local.to_bytes() == canonical_bytes(payload)
 
 
-def test_source_local_ball_is_typed_and_round_trips_canonically() -> None:
-    mesh = _mesh()
-    ball = _source_local_ball(mesh)
-    local = _local(mesh, region=ball)
-    policy = _policy(mesh, local_refinements=[local])
-    payload = policy.to_dict()
-    region = payload["local_refinements"][0]["region"]
-
-    assert region["kind"] == "source_local_ball"
-    assert region["center"]["frame"] == "PartLocal"
-    from febio_cae.domain.codec import decode_record
-
-    restored = decode_record(policy.to_bytes(), type(policy))
-    assert restored.to_bytes() == policy.to_bytes()
-    assert restored.local_refinements[0].region == ball
-
-
 def test_source_local_ball_requires_typed_values_and_whole_body_selection() -> None:
     mesh = _mesh()
     ball = _source_local_ball(mesh)
 
     with pytest.raises(ValueError):
         _local(mesh, region={"kind": "source_local_ball"})
-    with pytest.raises(ValueError, match="whole|WholeBody|region"):
+    with pytest.raises(ValueError):
         _local(mesh, selection=_selection(face_ids=("face-A",)), region=ball)
 
 

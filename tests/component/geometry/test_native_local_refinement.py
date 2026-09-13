@@ -46,9 +46,7 @@ def _primitive() -> RigidPrimitive:
                 Quantity(0, "m"),
                 Quantity(0, "m"),
             ),
-            rotation=ProperRotation(
-                ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
-            ),
+            rotation=ProperRotation(((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))),
         ),
         dimensions={"radius": Quantity(10, "mm")},
         dimension_evidence={"radius": _evidence("rigid_tool.radius", "a")},
@@ -60,20 +58,19 @@ def _primitive() -> RigidPrimitive:
 def test_malformed_local_refinement_is_rejected_before_native_entry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    backend = GmshOCCBackend(
-        GmshOCCConfig(module_name="module-that-must-not-be-loaded")
-    )
+    backend = GmshOCCBackend(GmshOCCConfig(module_name="module-that-must-not-be-loaded"))
 
     def forbidden_native_entry() -> Any:
         pytest.fail("malformed local refinement entered the native backend")
 
     monkeypatch.setattr(backend, "_load_module", forbidden_native_entry)
+    malformed: Any = (object(),)
     with pytest.raises(BackendError) as error:
         backend.mesh_rigid_primitive(
             _primitive(),
             geometry_digest="a" * 64,
             global_size_si=0.005,
-            local_refinements=(object(),),
+            local_refinements=malformed,
         )
     assert error.value.category is BackendErrorCategory.INVALID_INPUT
 
