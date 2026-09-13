@@ -253,8 +253,12 @@ def test_cpu_affinity_bounds_root_and_descendant_and_drains(tmp_path: Path) -> N
         "ctypes.POINTER(ctypes.c_size_t)];api.GetProcessAffinityMask.restype=ctypes.c_int;"
         "p=ctypes.c_size_t();s=ctypes.c_size_t();"
         "assert api.GetProcessAffinityMask(ctypes.c_void_p(-1),ctypes.byref(p),ctypes.byref(s));"
-        "Path('output/descendant-affinity.json').write_text(json.dumps({'mask':p.value}));"
-        "time.sleep(0.4)"
+        "report=Path('output/descendant-affinity.json');temporary=report.with_suffix('.tmp');"
+        "temporary.write_text(json.dumps({'mask':p.value}));temporary.replace(report);\n"
+        "deadline=time.monotonic()+15\n"
+        "while not Path('output/release-descendant').exists():\n"
+        "    if time.monotonic() >= deadline: raise TimeoutError('descendant release expired')\n"
+        "    time.sleep(.01)\n"
     )
     code = (
         "import ctypes,json,subprocess,sys,time;from pathlib import Path;"
@@ -263,10 +267,11 @@ def test_cpu_affinity_bounds_root_and_descendant_and_drains(tmp_path: Path) -> N
         "ctypes.POINTER(ctypes.c_size_t)];api.GetProcessAffinityMask.restype=ctypes.c_int;"
         "p=ctypes.c_size_t();s=ctypes.c_size_t();"
         "assert api.GetProcessAffinityMask(ctypes.c_void_p(-1),ctypes.byref(p),ctypes.byref(s));"
-        "Path('output/root-affinity.json').write_text(json.dumps({'mask':p.value}));"
-        f"subprocess.Popen([sys.executable,'-c',{child!r}]);time.sleep(0.08)"
+        "report=Path('output/root-affinity.json');temporary=report.with_suffix('.tmp');"
+        "temporary.write_text(json.dumps({'mask':p.value}));temporary.replace(report);"
+        f"subprocess.Popen([sys.executable,'-c',{child!r}])"
     )
-    runner, attempt = _start(tmp_path, code)
+    runner, attempt = _start(tmp_path, code, budget_seconds=20)
     managed = next(iter(runner._managed.values()))
     process = managed.process
     try:
@@ -281,6 +286,7 @@ def test_cpu_affinity_bounds_root_and_descendant_and_drains(tmp_path: Path) -> N
         draining = runner.poll(attempt, _owner()).attempt
         assert draining.state is RunState.DRAINING
         assert process.active_processes() >= 1
+        (managed.attempt_root / "output/release-descendant").touch(exist_ok=False)
         _until(lambda: process.active_processes() == 0)
         assert runner.reconcile(draining, _owner()).attempt.state is RunState.VALIDATING
         assert process.closed and not runner._managed
