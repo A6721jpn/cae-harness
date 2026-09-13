@@ -10,7 +10,7 @@ import py_compile
 import sys
 import ctypes
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import Any
 
 import pytest
@@ -783,6 +783,135 @@ def test_verified_session_rejects_ctypes_metaclass_mro_spoof(
     native.__class__ = RedirectedCFunc
     _install_synthetic_native_export(monkeypatch, loaded, "gmshIsInitialized", native)
     with pytest.raises((OSError, ValueError), match="dispatch|metaclass|type|native"):
+        runtime.load_verified_gmsh(expected)
+
+
+def test_verified_session_rejects_library_symbol_descriptor_tampering(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A synthetic external CDLL type cannot shadow an authenticated symbol."""
+
+    _isolated(monkeypatch)
+    source = (
+        "__version__ = '4.15.2'\n"
+        "def isInitialized():\n"
+        "    return lib.gmshIsInitialized()\n"
+        "class Lib:\n"
+        "    _handle = 99\n"
+        "Lib.__module__ = 'ctypes'\n"
+        "lib = Lib()\n"
+    )
+    module, library, launcher, image, python_library = _files(tmp_path, source)
+    expected = _binding(tmp_path, module=module, library=library)
+    monkeypatch.setattr(
+        runtime,
+        "_current_process_binding",
+        lambda: {
+            "python": _identity(launcher),
+            "python_image": _identity(image),
+            "python_library": _identity(python_library),
+            "pyvenv_cfg": None,
+        },
+    )
+    monkeypatch.setattr(runtime, "_mapped_module_path", lambda handle: library)
+    monkeypatch.syspath_prepend(str(module.parent))
+    sys.modules.pop("gmsh", None)
+    loaded, _ = runtime.load_verified_gmsh(expected)
+    native = _synthetic_native_callable()
+    _install_synthetic_native_export(monkeypatch, loaded, "gmshIsInitialized", native)
+    runtime.load_verified_gmsh(expected)
+
+    monkeypatch.setattr(
+        type(loaded.lib),
+        "gmshIsInitialized",
+        property(lambda self: None),
+        raising=False,
+    )
+    with pytest.raises((OSError, ValueError), match="library|symbol|attribute|dispatch"):
+        runtime.load_verified_gmsh(expected)
+
+
+def test_verified_session_rejects_library_lazy_dispatch_code_tampering(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An external-library lazy resolver cannot have its Python body replaced."""
+
+    _isolated(monkeypatch)
+    source = (
+        "__version__ = '4.15.2'\n"
+        "def isInitialized():\n"
+        "    return lib.gmshIsInitialized()\n"
+        "class Lib:\n"
+        "    _handle = 99\n"
+        "    def __getattr__(self, name):\n"
+        "        raise AttributeError(name)\n"
+        "Lib.__module__ = 'ctypes'\n"
+        "lib = Lib()\n"
+    )
+    module, library, launcher, image, python_library = _files(tmp_path, source)
+    expected = _binding(tmp_path, module=module, library=library)
+    monkeypatch.setattr(
+        runtime,
+        "_current_process_binding",
+        lambda: {
+            "python": _identity(launcher),
+            "python_image": _identity(image),
+            "python_library": _identity(python_library),
+            "pyvenv_cfg": None,
+        },
+    )
+    monkeypatch.setattr(runtime, "_mapped_module_path", lambda handle: library)
+    monkeypatch.syspath_prepend(str(module.parent))
+    sys.modules.pop("gmsh", None)
+    loaded, _ = runtime.load_verified_gmsh(expected)
+    resolver = type(loaded.lib).__getattr__
+
+    def replacement(self: Any, name: str) -> Any:
+        del self, name
+        return None
+
+    monkeypatch.setattr(resolver, "__code__", replacement.__code__)
+    with pytest.raises((OSError, ValueError), match="library|function|dispatch|code"):
+        runtime.load_verified_gmsh(expected)
+
+
+def test_verified_session_rejects_module_attribute_dispatch_tampering(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _isolated(monkeypatch)
+    source = (
+        "__version__ = '4.15.2'\n"
+        "def isInitialized():\n"
+        "    return False\n"
+        "class Lib:\n"
+        "    _handle = 99\n"
+        "lib = Lib()\n"
+    )
+    module, library, launcher, image, python_library = _files(tmp_path, source)
+    expected = _binding(tmp_path, module=module, library=library)
+    monkeypatch.setattr(
+        runtime,
+        "_current_process_binding",
+        lambda: {
+            "python": _identity(launcher),
+            "python_image": _identity(image),
+            "python_library": _identity(python_library),
+            "pyvenv_cfg": None,
+        },
+    )
+    monkeypatch.setattr(runtime, "_mapped_module_path", lambda handle: library)
+    monkeypatch.syspath_prepend(str(module.parent))
+    sys.modules.pop("gmsh", None)
+    loaded, _ = runtime.load_verified_gmsh(expected)
+
+    class RedirectingModule(ModuleType):
+        def __getattribute__(self, attribute: str) -> Any:
+            if attribute == "isInitialized":
+                return lambda: True
+            return super().__getattribute__(attribute)
+
+    monkeypatch.setattr(loaded, "__class__", RedirectingModule)
+    with pytest.raises((OSError, ValueError), match="module|dispatch|attribute|type"):
         runtime.load_verified_gmsh(expected)
 
 

@@ -797,6 +797,40 @@ def _descriptor_functions(member: object) -> tuple[FunctionType, ...]:
 
 
 @dataclass(slots=True)
+class _DispatchDescriptorState:
+    owner: type
+    descriptor: object
+    functions: tuple[_FunctionState, ...]
+
+
+def _dispatch_descriptor_state(value_type: type, name: str) -> _DispatchDescriptorState:
+    owner, descriptor = _raw_type_descriptor(value_type, name)
+    return _DispatchDescriptorState(
+        owner,
+        descriptor,
+        tuple(_function_state(function) for function in _descriptor_functions(descriptor)),
+    )
+
+
+@dataclass(slots=True)
+class _AttributeDispatchState:
+    value_type: type
+    descriptors: dict[str, _DispatchDescriptorState]
+
+
+def _attribute_dispatch_state(
+    value: object, names: tuple[str, ...]
+) -> _AttributeDispatchState:
+    value_type = type(value)
+    if type(value_type) is not type:
+        raise _error("Gmsh attribute dispatch uses an unsupported metaclass")
+    return _AttributeDispatchState(
+        value_type,
+        {name: _dispatch_descriptor_state(value_type, name) for name in names},
+    )
+
+
+@dataclass(slots=True)
 class _MemberState:
     descriptor: object
     functions: tuple[_FunctionState, ...]
@@ -1111,32 +1145,6 @@ class _NativeCallableState:
     getattribute_descriptor: object | None
 
 
-@dataclass(slots=True)
-class _LibraryDispatchState:
-    value_type: type
-    getattribute_owner: type
-    getattribute_descriptor: object
-    getattr_owner: type
-    getattr_descriptor: object
-
-
-def _library_dispatch_state(library: object) -> _LibraryDispatchState:
-    value_type = type(library)
-    if type(value_type) is not type:
-        raise _error("Gmsh native library uses an unsupported metaclass")
-    getattribute_owner, getattribute_descriptor = _raw_type_descriptor(
-        value_type, "__getattribute__"
-    )
-    getattr_owner, getattr_descriptor = _raw_type_descriptor(value_type, "__getattr__")
-    return _LibraryDispatchState(
-        value_type,
-        getattribute_owner,
-        getattribute_descriptor,
-        getattr_owner,
-        getattr_descriptor,
-    )
-
-
 def _native_callable_state(
     library: object,
     name: str,
@@ -1217,7 +1225,8 @@ class _LiveState:
     module_functions: dict[str, _FunctionState]
     classes: dict[tuple[str, ...], _ClassState]
     globals: dict[str, _GlobalState]
-    library_dispatch: _LibraryDispatchState
+    module_dispatch: _AttributeDispatchState
+    library_dispatch: _AttributeDispatchState
     native_symbols: frozenset[str]
     native_signature_policy: dict[str, frozenset[tuple[object, ...]]]
     native_callables: dict[str, _NativeCallableState]
@@ -1230,7 +1239,14 @@ def _capture_live_state(
     source: bytes,
     native_handle: int,
 ) -> _LiveState:
-    library_dispatch = _library_dispatch_state(library)
+    native_symbols = _native_symbol_names(source)
+    module_dispatch = _attribute_dispatch_state(
+        module, ("__getattribute__", "__getattr__")
+    )
+    library_dispatch = _attribute_dispatch_state(
+        library,
+        ("__getattribute__", "__getattr__", *sorted(native_symbols)),
+    )
     namespace = vars(module)
     module_name = module.__name__
     module_functions: dict[str, _FunctionState] = {}
@@ -1267,12 +1283,12 @@ def _capture_live_state(
             )
         if len(global_states) > _MAX_LIVE_GLOBALS:
             raise _error("Gmsh live globals exceed the finite verification limit")
-    native_symbols = _native_symbol_names(source)
     native_signature_policy = _native_signature_policy(source, native_symbols)
     return _LiveState(
         module_functions,
         classes,
         global_states,
+        module_dispatch,
         library_dispatch,
         native_symbols,
         native_signature_policy,
@@ -1326,22 +1342,26 @@ def _validate_native_callable_state(
         _validate_ctypes_call_signature(current, name, signature_policy)
 
 
-def _validate_library_dispatch(
-    state: _LibraryDispatchState, library: object
+def _validate_attribute_dispatch(
+    state: _AttributeDispatchState, value: object, label: str
 ) -> None:
-    current = _library_dispatch_state(library)
-    if (
-        current.value_type is not state.value_type
-        or current.getattribute_owner is not state.getattribute_owner
-        or current.getattribute_descriptor is not state.getattribute_descriptor
-        or current.getattr_owner is not state.getattr_owner
-        or current.getattr_descriptor is not state.getattr_descriptor
-    ):
-        raise _error("live Gmsh native library attribute dispatch changed")
+    current = _attribute_dispatch_state(value, tuple(state.descriptors))
+    if current.value_type is not state.value_type:
+        raise _error(f"live Gmsh {label} attribute dispatch changed")
+    for name, descriptor_state in state.descriptors.items():
+        current_descriptor = current.descriptors[name]
+        if (
+            current_descriptor.owner is not descriptor_state.owner
+            or current_descriptor.descriptor is not descriptor_state.descriptor
+        ):
+            raise _error(f"live Gmsh {label} attribute {name} dispatch changed")
+        for function_state in descriptor_state.functions:
+            _validate_function_state(function_state, f"{label} {name} dispatch")
 
 
 def _validate_live_state(state: _LiveState, module: ModuleType, library: object) -> None:
-    _validate_library_dispatch(state.library_dispatch, library)
+    _validate_attribute_dispatch(state.module_dispatch, module, "module")
+    _validate_attribute_dispatch(state.library_dispatch, library, "native library")
     namespace = vars(module)
     for name, function_state in state.module_functions.items():
         if namespace.get(name, _MISSING) is not function_state.function:
