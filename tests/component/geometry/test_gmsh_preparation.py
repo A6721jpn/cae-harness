@@ -279,6 +279,38 @@ def test_measured_backend_native_dispatch_allows_curved_faces(
     ) == "native-mesh"
 
 
+def test_measured_backend_allows_verified_load_per_producer_operation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    module = _NativePrimitiveGmsh()
+    binding = {"synthetic": "binding"}
+    identity = {"synthetic": "identity"}
+    calls: list[object] = []
+
+    def verified_load(value: object) -> tuple[Any, dict[str, object]]:
+        calls.append(value)
+        return module, identity
+
+    monkeypatch.setattr("febio_cae.adapters.geometry.preparation.load_verified_gmsh", verified_load)
+    monkeypatch.setattr("tempfile.tempdir", str(tmp_path))
+    backend = _MeasuredGmsh(1, binding)
+    monkeypatch.setattr(backend, "_prepare_owned_session", lambda gmsh: None)
+    monkeypatch.setattr(backend, "_mesh_context", lambda *args, **kwargs: "native-mesh")
+    primitive = _native_primitive("sphere")
+
+    backend.inspect_rigid_primitive(primitive, geometry_digest="a" * 64)
+    assert (
+        backend.mesh_rigid_primitive(
+            primitive,
+            geometry_digest="a" * 64,
+            global_size_si=0.001,
+        )
+        == "native-mesh"
+    )
+
+    assert calls == [binding, binding]
+
+
 def test_measured_backend_keeps_planar_guard_for_imported_step_faces() -> None:
     module = _NativePrimitiveGmsh()
     module.model.getType = lambda dimension, tag: "BSpline surface"

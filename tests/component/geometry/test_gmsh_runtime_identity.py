@@ -400,3 +400,133 @@ def test_verified_session_revalidates_exact_reuse_state(
 
     with pytest.raises((OSError, ValueError), match="runtime|module|cache|code|pyvenv"):
         runtime.load_verified_gmsh(expected)
+
+
+@pytest.mark.parametrize(
+    "mutation", ["module_function", "function_code", "class_method", "lib_callable"]
+)
+def test_verified_session_rejects_live_executable_tampering(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, mutation: str
+) -> None:
+    _isolated(monkeypatch)
+    source = (
+        "events = []\n"
+        "__version__ = '4.15.2'\n"
+        "def isInitialized():\n"
+        "    events.append('isInitialized')\n"
+        "    return False\n"
+        "def replacement():\n"
+        "    events.append('replacement')\n"
+        "    return False\n"
+        "class model:\n"
+        "    @staticmethod\n"
+        "    def getEntities():\n"
+        "        return []\n"
+        "class Lib:\n"
+        "    _handle = 99\n"
+        "lib = Lib()\n"
+        "lib.gmsh_isInitialized = isInitialized\n"
+    )
+    module, library, launcher, image, python_library = _files(tmp_path, source)
+    expected = _binding(tmp_path, module=module, library=library)
+    monkeypatch.setattr(
+        runtime,
+        "_current_process_binding",
+        lambda: {
+            "python": _identity(launcher),
+            "python_image": _identity(image),
+            "python_library": _identity(python_library),
+            "pyvenv_cfg": None,
+        },
+    )
+    monkeypatch.setattr(runtime, "_mapped_module_path", lambda handle: library)
+    monkeypatch.syspath_prepend(str(module.parent))
+    sys.modules.pop("gmsh", None)
+    loaded, _ = runtime.load_verified_gmsh(expected)
+
+    if mutation == "module_function":
+        loaded.isInitialized = loaded.replacement
+    elif mutation == "function_code":
+        loaded.isInitialized.__code__ = loaded.replacement.__code__
+    elif mutation == "class_method":
+        loaded.model.getEntities = loaded.replacement
+    else:
+        loaded.lib.gmsh_isInitialized = loaded.replacement
+
+    with pytest.raises((OSError, ValueError), match="live|executable|function|class|native"):
+        runtime.load_verified_gmsh(expected)
+    assert loaded.events == []
+
+
+def test_verified_session_preserves_legitimate_module_state(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _isolated(monkeypatch)
+    source = (
+        "events = []\n"
+        "__version__ = '4.15.2'\n"
+        "def isInitialized():\n"
+        "    events.append('isInitialized')\n"
+        "    return False\n"
+        "class Lib:\n"
+        "    _handle = 99\n"
+        "lib = Lib()\n"
+    )
+    module, library, launcher, image, python_library = _files(tmp_path, source)
+    expected = _binding(tmp_path, module=module, library=library)
+    monkeypatch.setattr(
+        runtime,
+        "_current_process_binding",
+        lambda: {
+            "python": _identity(launcher),
+            "python_image": _identity(image),
+            "python_library": _identity(python_library),
+            "pyvenv_cfg": None,
+        },
+    )
+    monkeypatch.setattr(runtime, "_mapped_module_path", lambda handle: library)
+    monkeypatch.syspath_prepend(str(module.parent))
+    sys.modules.pop("gmsh", None)
+    loaded, _ = runtime.load_verified_gmsh(expected)
+    loaded.events.append("legitimate API state")
+
+    reused, _ = runtime.load_verified_gmsh(expected)
+
+    assert reused is loaded
+    assert loaded.events == ["legitimate API state"]
+
+
+def test_cached_session_resolves_current_import_precedence_independently(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _isolated(monkeypatch)
+    source = (
+        "__version__ = '4.15.2'\n"
+        "class Lib:\n"
+        "    _handle = 99\n"
+        "lib = Lib()\n"
+    )
+    module, library, launcher, image, python_library = _files(tmp_path, source)
+    expected = _binding(tmp_path, module=module, library=library)
+    earlier = tmp_path / "earlier" / "gmsh.py"
+    earlier.parent.mkdir()
+    earlier.write_text(source, encoding="utf-8")
+    monkeypatch.setattr(
+        runtime,
+        "_current_process_binding",
+        lambda: {
+            "python": _identity(launcher),
+            "python_image": _identity(image),
+            "python_library": _identity(python_library),
+            "pyvenv_cfg": None,
+        },
+    )
+    monkeypatch.setattr(runtime, "_mapped_module_path", lambda handle: library)
+    monkeypatch.syspath_prepend(str(module.parent))
+    sys.modules.pop("gmsh", None)
+    loaded, _ = runtime.load_verified_gmsh(expected)
+    assert loaded.__file__ == str(module)
+
+    monkeypatch.syspath_prepend(str(earlier.parent))
+    with pytest.raises((OSError, ValueError), match="different module|import"):
+        runtime.load_verified_gmsh(expected)

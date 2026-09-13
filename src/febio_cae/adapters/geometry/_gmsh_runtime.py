@@ -25,7 +25,7 @@ import threading
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
-from types import CodeType, ModuleType
+from types import CodeType, FunctionType, ModuleType
 from typing import Any, BinaryIO
 
 _SCHEMA_VERSION = "gmsh-runtime-identity-v1"
@@ -50,6 +50,11 @@ _HASH_CHUNK = 1024 * 1024
 _MAX_SOURCE_BYTES = 32 * 1024 * 1024
 _MAX_CACHE_BYTES = 32 * 1024 * 1024
 _MAX_WINDOWS_PATH = 32768
+_MAX_LIVE_CLASSES = 1024
+_MAX_LIVE_MEMBERS = 8192
+_MAX_LIVE_GLOBALS = 16384
+_MAX_VALUE_ITEMS = 128
+_MAX_VALUE_DEPTH = 4
 
 
 class _RuntimeBindingError(OSError):
@@ -491,7 +496,9 @@ class _SourceOnlyLoader(importlib.machinery.SourceFileLoader):
 
 def _find_gmsh_spec(module_path: Path) -> Any:
     try:
-        spec = importlib.util.find_spec("gmsh")
+        # Do not consult sys.modules: util.find_spec returns the cached
+        # module's existing spec once the first verified session is loaded.
+        spec = importlib.machinery.PathFinder.find_spec("gmsh", list(sys.path))
     except (ImportError, OSError, RuntimeError, ValueError) as exc:
         raise _error("Gmsh import resolution failed") from exc
     if spec is None or getattr(spec, "origin", None) is None:
@@ -545,6 +552,501 @@ def _code_digest(code: CodeType) -> str:
     return hashlib.sha256(content).hexdigest()
 
 
+_MISSING = object()
+
+
+def _value_signature(value: object, *, depth: int = 0, budget: int = _MAX_VALUE_ITEMS) -> object:
+    """Describe only bounded built-in values; never walk arbitrary user objects."""
+
+    value_type = type(value)
+    if value is None or value_type in (bool, int, complex):
+        return (value_type.__name__, value)
+    if value_type is float:
+        return (value_type.__name__, repr(value))
+    if value_type is str:
+        if len(value) <= 256:
+            return (value_type.__name__, value)
+        return (value_type.__name__, len(value), hashlib.sha256(value.encode()).hexdigest())
+    if value_type is bytes:
+        if len(value) <= 256:
+            return (value_type.__name__, value)
+        return (value_type.__name__, len(value), hashlib.sha256(value).hexdigest())
+    if depth >= _MAX_VALUE_DEPTH or budget <= 0:
+        return ("object", value_type, id(value))
+    if value_type is tuple:
+        items = tuple(
+            _value_signature(item, depth=depth + 1, budget=budget - index - 1)
+            for index, item in enumerate(value[:budget])
+        )
+        return ("tuple", len(value), items)
+    if value_type is list:
+        items = tuple(
+            _value_signature(item, depth=depth + 1, budget=budget - index - 1)
+            for index, item in enumerate(value[:budget])
+        )
+        return ("list", len(value), items)
+    if value_type is dict:
+        items_list: list[object] = []
+        for index, (key, item) in enumerate(value.items()):
+            if index >= budget:
+                break
+            items_list.append(
+                (
+                    _value_signature(key, depth=depth + 1, budget=budget - index - 1),
+                    _value_signature(item, depth=depth + 1, budget=budget - index - 1),
+                )
+            )
+        items = tuple(items_list)
+        return ("dict", len(value), items)
+    if value_type is frozenset:
+        items_list: list[object] = []
+        for index, item in enumerate(value):
+            if index >= budget:
+                break
+            items_list.append(
+                _value_signature(item, depth=depth + 1, budget=budget - index - 1)
+            )
+        items = tuple(sorted(items_list, key=repr))
+        return ("frozenset", len(value), items)
+    return ("object", value_type, id(value))
+
+
+def _stable_global_signature(value: object) -> object | None:
+    if type(value) in (type(None), bool, int, float, complex, str, bytes):
+        return _value_signature(value, budget=1)
+    return None
+
+
+def _closure_signature(closure: tuple[Any, ...] | None) -> tuple[object, ...] | None:
+    if closure is None:
+        return None
+    result: list[object] = []
+    for cell in closure:
+        try:
+            content = cell.cell_contents
+        except ValueError:
+            result.append(("empty",))
+        else:
+            result.append(_value_signature(content))
+    return tuple(result)
+
+
+@dataclass(slots=True)
+class _FunctionState:
+    function: FunctionType
+    code: CodeType
+    globals_dict: dict[str, object]
+    defaults: object
+    defaults_signature: object
+    kwdefaults: object
+    kwdefaults_signature: object
+    annotations: object
+    annotations_signature: object
+    function_dict: dict[str, object]
+    function_dict_signature: object
+    closure: tuple[Any, ...] | None
+    closure_signature: tuple[object, ...] | None
+    name: str
+    qualname: str
+    module_name: str | None
+
+
+def _function_state(function: FunctionType) -> _FunctionState:
+    function_dict = function.__dict__
+    return _FunctionState(
+        function=function,
+        code=function.__code__,
+        globals_dict=function.__globals__,
+        defaults=function.__defaults__,
+        defaults_signature=_value_signature(function.__defaults__),
+        kwdefaults=function.__kwdefaults__,
+        kwdefaults_signature=_value_signature(function.__kwdefaults__),
+        annotations=function.__annotations__,
+        annotations_signature=_value_signature(function.__annotations__),
+        function_dict=function_dict,
+        function_dict_signature=_value_signature(function_dict),
+        closure=function.__closure__,
+        closure_signature=_closure_signature(function.__closure__),
+        name=function.__name__,
+        qualname=function.__qualname__,
+        module_name=function.__module__,
+    )
+
+
+def _validate_function_state(state: _FunctionState, label: str) -> None:
+    function = state.function
+    if function.__code__ is not state.code:
+        raise _error(f"live Gmsh executable function {label} code changed")
+    if function.__globals__ is not state.globals_dict:
+        raise _error(f"live Gmsh executable function {label} globals changed")
+    if function.__defaults__ is not state.defaults or _value_signature(
+        function.__defaults__
+    ) != state.defaults_signature:
+        raise _error(f"live Gmsh executable function {label} defaults changed")
+    if function.__kwdefaults__ is not state.kwdefaults or _value_signature(
+        function.__kwdefaults__
+    ) != state.kwdefaults_signature:
+        raise _error(f"live Gmsh executable function {label} keyword defaults changed")
+    if function.__annotations__ is not state.annotations or _value_signature(
+        function.__annotations__
+    ) != state.annotations_signature:
+        raise _error(f"live Gmsh executable function {label} annotations changed")
+    if function.__dict__ is not state.function_dict or _value_signature(
+        function.__dict__
+    ) != state.function_dict_signature:
+        raise _error(f"live Gmsh executable function {label} attributes changed")
+    if function.__closure__ is not state.closure or _closure_signature(
+        function.__closure__
+    ) != state.closure_signature:
+        raise _error(f"live Gmsh executable function {label} closure changed")
+    if (
+        function.__name__ != state.name
+        or function.__qualname__ != state.qualname
+        or function.__module__ != state.module_name
+    ):
+        raise _error(f"live Gmsh executable function {label} metadata changed")
+
+
+def _code_names(code: CodeType) -> frozenset[str]:
+    names: set[str] = set()
+    pending = [code]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        names.update(name for name in current.co_names if isinstance(name, str))
+        pending.extend(constant for constant in current.co_consts if isinstance(constant, CodeType))
+    return frozenset(names)
+
+
+def _descriptor_functions(member: object) -> tuple[FunctionType, ...]:
+    if isinstance(member, (staticmethod, classmethod)):
+        function = member.__func__
+        return (function,) if isinstance(function, FunctionType) else ()
+    if isinstance(member, property):
+        return tuple(
+            function
+            for function in (member.fget, member.fset, member.fdel)
+            if isinstance(function, FunctionType)
+        )
+    return (member,) if isinstance(member, FunctionType) else ()
+
+
+@dataclass(slots=True)
+class _MemberState:
+    descriptor: object
+    functions: tuple[_FunctionState, ...]
+
+
+@dataclass(slots=True)
+class _ClassState:
+    class_object: type
+    members: dict[str, _MemberState]
+
+
+def _capture_class_state(
+    path: tuple[str, ...],
+    class_object: type,
+    module_name: str,
+    classes: dict[tuple[str, ...], _ClassState],
+    functions: list[_FunctionState],
+) -> None:
+    if path in classes:
+        return
+    if len(classes) >= _MAX_LIVE_CLASSES:
+        raise _error("Gmsh live class ownership exceeds the finite verification limit")
+    try:
+        namespace = vars(class_object)
+    except TypeError as exc:
+        raise _error("Gmsh live class namespace cannot be inspected") from exc
+    if namespace.get("__module__") != module_name:
+        return
+    class_state = _ClassState(class_object, {})
+    classes[path] = class_state
+    for name, descriptor in namespace.items():
+        member_functions = tuple(_function_state(function) for function in _descriptor_functions(descriptor))
+        nested = isinstance(descriptor, type) and getattr(descriptor, "__module__", None) == module_name
+        if member_functions or nested or callable(descriptor):
+            if len(class_state.members) >= _MAX_LIVE_MEMBERS:
+                raise _error("Gmsh live class members exceed the finite verification limit")
+            class_state.members[name] = _MemberState(descriptor, member_functions)
+            functions.extend(member_functions)
+        if nested:
+            _capture_class_state(path + (name,), descriptor, module_name, classes, functions)
+
+
+@dataclass(slots=True)
+class _GlobalState:
+    value: object
+    stable_signature: object | None
+
+
+def _is_ctypes_callable(value: object) -> bool:
+    function_type = getattr(ctypes, "_CFuncPtr", None)
+    return isinstance(function_type, type) and isinstance(value, function_type)
+
+
+def _ctypes_pointer(value: object, name: str) -> int:
+    try:
+        pointer = ctypes.cast(value, ctypes.c_void_p).value
+    except (AttributeError, OSError, TypeError, ValueError, OverflowError) as exc:
+        raise _error(f"cached native callable {name} has no address") from exc
+    if type(pointer) is not int or pointer <= 0:
+        raise _error(f"cached native callable {name} has an invalid address")
+    return pointer
+
+
+def _ctypes_call_signature(value: object, name: str) -> tuple[object, ...]:
+    try:
+        return (
+            _value_signature(getattr(value, "argtypes")),
+            _value_signature(getattr(value, "restype")),
+            _value_signature(getattr(value, "errcheck")),
+        )
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise _error(f"cached native callable {name} has malformed call metadata") from exc
+
+
+def _library_namespace(library: object) -> dict[str, object]:
+    try:
+        namespace = vars(library)
+    except TypeError as exc:
+        raise _error("Gmsh native library namespace cannot be inspected") from exc
+    if not isinstance(namespace, dict):
+        raise _error("Gmsh native library namespace is malformed")
+    return namespace
+
+
+def _library_handle(library: object) -> int:
+    handle = _library_namespace(library).get("_handle", _MISSING)
+    if handle is _MISSING:
+        try:
+            handle = getattr(library, "_handle")
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise _error("Gmsh native library handle is unavailable") from exc
+    if type(handle) is not int or handle <= 0:
+        raise _error("Gmsh native library handle is not a positive integer")
+    return handle
+
+
+def _native_export_address(library: object, name: str) -> int | None:
+    if os.name != "nt":
+        return None
+    handle = _library_handle(library)
+    try:
+        api = ctypes.WinDLL("kernel32", use_last_error=True)
+        function = api.GetProcAddress
+        function.argtypes = [ctypes.wintypes.HMODULE, ctypes.wintypes.LPCSTR]
+        function.restype = ctypes.c_void_p
+        address = function(ctypes.wintypes.HMODULE(handle), name.encode("ascii"))
+        address = int(address or 0)
+    except (AttributeError, OSError, TypeError, ValueError, UnicodeError) as exc:
+        raise _error(f"cached native callable {name} export cannot be inspected") from exc
+    if address <= 0:
+        raise _error(f"cached native callable {name} is not exported by the loaded DLL")
+    return address
+
+
+def _validate_ctypes_callable(
+    library: object, name: str, value: object, native_symbols: frozenset[str]
+) -> int:
+    if name not in native_symbols:
+        raise _error(f"cached native callable {name} is not in the authenticated source")
+    if not _is_ctypes_callable(value):
+        raise _error(f"cached native callable {name} is not a ctypes function")
+    symbol = getattr(value, "_name", None)
+    if isinstance(symbol, bytes):
+        try:
+            symbol = symbol.decode("ascii")
+        except UnicodeError as exc:
+            raise _error(f"cached native callable {name} has a malformed symbol") from exc
+    if isinstance(symbol, str) and symbol != name:
+        raise _error(f"cached native callable {name} has a different symbol")
+    pointer = _ctypes_pointer(value, name)
+    exported = _native_export_address(library, name)
+    if exported is not None and pointer != exported:
+        raise _error(f"cached native callable {name} is bound to a different export")
+    return pointer
+
+
+@dataclass(slots=True)
+class _NativeCallableState:
+    value: object
+    value_type: type
+    function: _FunctionState | None
+    pointer: int | None
+    call_signature: tuple[object, ...] | None
+
+
+def _native_callable_state(
+    library: object,
+    name: str,
+    value: object,
+    native_symbols: frozenset[str],
+    *,
+    allow_new: bool,
+) -> _NativeCallableState:
+    if allow_new:
+        pointer = _validate_ctypes_callable(library, name, value, native_symbols)
+        return _NativeCallableState(
+            value, type(value), None, pointer, _ctypes_call_signature(value, name)
+        )
+    if isinstance(value, FunctionType):
+        return _NativeCallableState(value, type(value), _function_state(value), None, None)
+    if _is_ctypes_callable(value):
+        pointer = _validate_ctypes_callable(library, name, value, native_symbols)
+        return _NativeCallableState(
+            value, type(value), None, pointer, _ctypes_call_signature(value, name)
+        )
+    if not callable(value):
+        raise _error(f"cached native callable {name} is not callable")
+    return _NativeCallableState(value, type(value), None, None, None)
+
+
+def _capture_native_callables(
+    library: object, native_symbols: frozenset[str]
+) -> dict[str, _NativeCallableState]:
+    result: dict[str, _NativeCallableState] = {}
+    for name, value in _library_namespace(library).items():
+        if isinstance(name, str) and name.startswith("gmsh_") and callable(value):
+            result[name] = _native_callable_state(
+                library, name, value, native_symbols, allow_new=False
+            )
+    return result
+
+
+@dataclass(slots=True)
+class _LiveState:
+    module_functions: dict[str, _FunctionState]
+    classes: dict[tuple[str, ...], _ClassState]
+    globals: dict[str, _GlobalState]
+    native_symbols: frozenset[str]
+    native_callables: dict[str, _NativeCallableState]
+    native_handle: int
+
+
+def _capture_live_state(
+    module: ModuleType, library: object, source_code: CodeType, native_handle: int
+) -> _LiveState:
+    namespace = vars(module)
+    module_name = module.__name__
+    module_functions: dict[str, _FunctionState] = {}
+    classes: dict[tuple[str, ...], _ClassState] = {}
+    functions: list[_FunctionState] = []
+    for name, value in tuple(namespace.items()):
+        if isinstance(value, FunctionType) and value.__module__ == module_name:
+            module_functions[name] = _function_state(value)
+            functions.append(module_functions[name])
+        elif isinstance(value, type):
+            _capture_class_state((name,), value, module_name, classes, functions)
+    if len(functions) > _MAX_LIVE_MEMBERS:
+        raise _error("Gmsh live executable functions exceed the finite verification limit")
+    global_states: dict[str, _GlobalState] = {}
+    global_names = {"__builtins__", "__name__", "__package__"}
+    for function in functions:
+        global_names.update(_code_names(function.code))
+    for name in global_names:
+        if name in namespace:
+            value = namespace[name]
+            global_states[name] = _GlobalState(value, _stable_global_signature(value))
+            if len(global_states) > _MAX_LIVE_GLOBALS:
+                raise _error("Gmsh live globals exceed the finite verification limit")
+    native_symbols = frozenset(
+        name for name in _code_names(source_code) if name.startswith("gmsh_")
+    )
+    return _LiveState(
+        module_functions,
+        classes,
+        global_states,
+        native_symbols,
+        _capture_native_callables(library, native_symbols),
+        native_handle,
+    )
+
+
+def _lookup_class_path(module: ModuleType, path: tuple[str, ...]) -> object:
+    current: object = vars(module).get(path[0], _MISSING)
+    for name in path[1:]:
+        if not isinstance(current, type):
+            return _MISSING
+        current = vars(current).get(name, _MISSING)
+    return current
+
+
+def _validate_native_callable_state(
+    library: object,
+    name: str,
+    state: _NativeCallableState,
+    current: object,
+    native_symbols: frozenset[str],
+) -> None:
+    if current is not state.value or type(current) is not state.value_type:
+        raise _error(f"live Gmsh native callable {name} was replaced")
+    if state.function is not None:
+        if not isinstance(current, FunctionType):
+            raise _error(f"live Gmsh native callable {name} changed type")
+        _validate_function_state(state.function, f"native {name}")
+    elif state.pointer is not None:
+        pointer = _validate_ctypes_callable(library, name, current, native_symbols)
+        if pointer != state.pointer:
+            raise _error(f"live Gmsh native callable {name} address changed")
+        if _ctypes_call_signature(current, name) != state.call_signature:
+            raise _error(f"live Gmsh native callable {name} call metadata changed")
+
+
+def _validate_live_state(state: _LiveState, module: ModuleType, library: object) -> None:
+    namespace = vars(module)
+    for name, function_state in state.module_functions.items():
+        if namespace.get(name, _MISSING) is not function_state.function:
+            raise _error(f"live Gmsh executable function {name} was replaced")
+        _validate_function_state(function_state, name)
+    for path, class_state in state.classes.items():
+        current_class = _lookup_class_path(module, path)
+        if current_class is not class_state.class_object:
+            raise _error(f"live Gmsh class {'.'.join(path)} was replaced")
+        try:
+            current_members = vars(class_state.class_object)
+        except TypeError as exc:
+            raise _error(f"live Gmsh class {'.'.join(path)} cannot be inspected") from exc
+        for name, member_state in class_state.members.items():
+            current = current_members.get(name, _MISSING)
+            if current is not member_state.descriptor:
+                raise _error(f"live Gmsh class API member {'.'.join(path + (name,))} changed")
+            for function_state in member_state.functions:
+                _validate_function_state(function_state, ".".join(path + (name,)))
+    for name, global_state in state.globals.items():
+        current = namespace.get(name, _MISSING)
+        if current is not global_state.value:
+            raise _error(f"live Gmsh global {name} was replaced")
+        if global_state.stable_signature is not None and _stable_global_signature(
+            current
+        ) != global_state.stable_signature:
+            raise _error(f"live Gmsh global {name} changed")
+
+    current_library_namespace = _library_namespace(library)
+    if _library_handle(library) != state.native_handle:
+        raise _error("live Gmsh native library handle changed")
+    for name, callable_state in state.native_callables.items():
+        current = current_library_namespace.get(name, _MISSING)
+        if current is _MISSING:
+            raise _error(f"live Gmsh native callable {name} was removed")
+        _validate_native_callable_state(
+            library, name, callable_state, current, state.native_symbols
+        )
+    additions: dict[str, _NativeCallableState] = {}
+    for name, current in current_library_namespace.items():
+        if not isinstance(name, str) or not name.startswith("gmsh_") or name in state.native_callables:
+            continue
+        if not callable(current):
+            raise _error(f"live Gmsh native member {name} is not callable")
+        additions[name] = _native_callable_state(
+            library, name, current, state.native_symbols, allow_new=True
+        )
+    state.native_callables.update(additions)
+
+
 def _validate_loaded_module(
     module: ModuleType,
     module_path: Path,
@@ -584,6 +1086,7 @@ class _VerifiedSession:
     library: Any
     binding: dict[str, object]
     observed: dict[str, object]
+    live_state: _LiveState
     code_digest: str
     code_object: CodeType
     cache_path: Path
@@ -601,6 +1104,7 @@ def _cached_session(
         return None
     for session in _VERIFIED_SESSIONS:
         if session.module is module and session.binding == binding:
+            _validate_live_state(session.live_state, module, session.library)
             verify_runtime_identity(binding, session.observed)
             process = _current_process_binding()
             _verify_process_binding(binding, process)
@@ -703,6 +1207,9 @@ def load_verified_gmsh(binding: dict[str, object]) -> tuple[Any, dict[str, objec
                 )
                 _verify_source_snapshot_current(snapshot)
                 library_object, handle = _module_handle(module)
+                live_state = _capture_live_state(
+                    module, library_object, snapshot.code, handle
+                )
                 mapped_path = _mapped_module_path(handle)
                 if not _same_path(str(mapped_path), str(library_path)):
                     raise _error("verified Gmsh native library mapping differs from binding")
@@ -725,6 +1232,7 @@ def load_verified_gmsh(binding: dict[str, object]) -> tuple[Any, dict[str, objec
             library_object,
             expected,
             observed,
+            live_state,
             code_digest,
             snapshot.code,
             cache_path,
