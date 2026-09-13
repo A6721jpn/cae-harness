@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import os
-import sys
+from ctypes import wintypes
 from pathlib import Path
 from typing import Any
 
@@ -14,12 +15,20 @@ import pytest
 def test_actual_current_process_identity_is_stable() -> None:
     from febio_cae.application._preview_windows import process_snapshot
 
+    module_name = ctypes.WinDLL("kernel32", use_last_error=True).GetModuleFileNameW
+    module_name.argtypes = (wintypes.HMODULE, wintypes.LPWSTR, wintypes.DWORD)
+    module_name.restype = wintypes.DWORD
+    buffer = ctypes.create_unicode_buffer(32768)
+    length = module_name(None, buffer, len(buffer))
+    assert 0 < length < len(buffer)
+    actual_image = Path(buffer.value).absolute()
+
     first = process_snapshot(os.getpid())
     second = process_snapshot(os.getpid())
     assert first == second
     assert first.process_id == os.getpid()
-    assert first.executable == Path(sys.executable).absolute()
-    assert first.executable_digest == hashlib.sha256(Path(sys.executable).read_bytes()).hexdigest()
+    assert first.executable == actual_image
+    assert first.executable_digest == hashlib.sha256(actual_image.read_bytes()).hexdigest()
     assert first.version and first.start_marker.startswith("windows-filetime:")
 
 
