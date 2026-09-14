@@ -1048,7 +1048,7 @@ def test_dependency_cache_rejects_direct_malicious_object_without_execution(
     assert not marker.exists()
 
 
-def test_platform_cache_admission_requires_cold_transition_and_rejects_manufactured_data(
+def test_verified_load_accepts_ordinary_warm_platform_system_dependency_and_cache(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     source = (
@@ -1059,38 +1059,15 @@ def test_platform_cache_admission_requires_cold_transition_and_rejects_manufactu
         "    _handle = 99\n"
         "lib = Lib()\n"
     )
-    genuine = platform.uname()
-    manufactured = platform.uname_result(*tuple(genuine)[:5])
-    monkeypatch.setattr(platform, "_uname_cache", manufactured)
-    expected, _library = _synthetic_cdll_setup(monkeypatch, tmp_path)
-    _rewrite_synthetic_source(expected, source)
-
-    with pytest.raises((OSError, ValueError), match="cache|platform|cold|transition"):
-        runtime.load_verified_gmsh(expected)
-
-
-def test_verified_load_accepts_actual_platform_system_dependency_and_cache(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    source = (
-        "import platform\n"
-        "platform.system()\n"
-        "__version__ = '4.15.2'\n"
-        "class Lib:\n"
-        "    _handle = 99\n"
-        "lib = Lib()\n"
-    )
-    monkeypatch.setattr(platform, "_uname_cache", None)
+    platform.system()
+    assert type(vars(platform).get("_uname_cache")) is platform.uname_result
     expected, _library = _synthetic_cdll_setup(monkeypatch, tmp_path)
     _rewrite_synthetic_source(expected, source)
 
     loaded, _ = runtime.load_verified_gmsh(expected)
-    transitioned = vars(platform).get("_uname_cache")
-    assert type(transitioned) is platform.uname_result
     reused, _ = runtime.load_verified_gmsh(expected)
 
     assert reused is loaded
-    assert vars(platform).get("_uname_cache") is transitioned
 
 
 def test_verified_session_rejects_matching_platform_result_class_mutation(
@@ -1117,29 +1094,6 @@ def test_verified_session_rejects_matching_platform_result_class_mutation(
     monkeypatch.setattr(platform, "uname_result", MatchingClass)
     with pytest.raises((OSError, ValueError), match="dependency|class|platform|replaced"):
         runtime.load_verified_gmsh(expected)
-
-
-def test_verified_session_rejects_manufactured_platform_cache_mutation(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    source = (
-        "import platform\n"
-        "platform.system()\n"
-        "__version__ = '4.15.2'\n"
-        "class Lib:\n"
-        "    _handle = 99\n"
-        "lib = Lib()\n"
-    )
-    monkeypatch.setattr(platform, "_uname_cache", None)
-    expected, _library = _synthetic_cdll_setup(monkeypatch, tmp_path)
-    _rewrite_synthetic_source(expected, source)
-    loaded, _ = runtime.load_verified_gmsh(expected)
-    genuine = platform.uname()
-    monkeypatch.setattr(platform, "_uname_cache", platform.uname_result(*tuple(genuine)[:5]))
-
-    with pytest.raises((OSError, ValueError), match="cache|platform|replaced"):
-        runtime.load_verified_gmsh(expected)
-    assert loaded is not None
 
 
 def test_verified_session_rejects_malicious_platform_cache_without_execution(

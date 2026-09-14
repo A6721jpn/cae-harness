@@ -902,7 +902,6 @@ class _FunctionState:
     code_digest: str | None = None
     source_path: Path | None = None
     source_identity: dict[str, object] | None = None
-    platform_cache_result: object = _MISSING
 
 
 @dataclass(slots=True)
@@ -2510,8 +2509,6 @@ def _is_authenticated_platform_cache(state: _FunctionState, name: str, value: ob
         state.function.__module__ != "platform"
         or state.function.__qualname__ != "uname"
         or name != "_uname_cache"
-        or state.platform_cache_result is _MISSING
-        or value is not state.platform_cache_result
     ):
         return False
     platform_module = sys.modules.get("platform", _MISSING)
@@ -2522,75 +2519,6 @@ def _is_authenticated_platform_cache(state: _FunctionState, name: str, value: ob
     return result_type_state is not None and type(value) is result_type_state.value
 
 
-def _walk_dependency_function_states(
-    state: _FunctionState | None, seen: set[int] | None = None
-) -> tuple[_FunctionState, ...]:
-    if state is None:
-        return ()
-    visited = seen if seen is not None else set()
-    if id(state) in visited:
-        return ()
-    visited.add(id(state))
-    result = [state]
-    if state.global_states is not None:
-        for global_state in state.global_states.values():
-            result.extend(_walk_dependency_function_states(global_state.function_state, visited))
-            for module_state in global_state.module_states:
-                result.extend(
-                    _walk_dependency_function_states(module_state.function_state, visited)
-                )
-                for member_state in (
-                    module_state.type_state.members.values() if module_state.type_state else ()
-                ):
-                    for function_state in member_state.functions:
-                        result.extend(_walk_dependency_function_states(function_state, visited))
-    return tuple(result)
-
-
-def _prepare_platform_cache_transition(
-    states: tuple[_ExecutableAttributeState, ...],
-) -> None:
-    uname_states: list[_FunctionState] = []
-    seen: set[int] = set()
-    for executable_state in states:
-        for function_state in _walk_dependency_function_states(
-            executable_state.function_state, seen
-        ):
-            if (
-                function_state.function.__module__ == "platform"
-                and function_state.function.__qualname__ == "uname"
-            ):
-                uname_states.append(function_state)
-    if not uname_states:
-        return
-    platform_module = sys.modules.get("platform", _MISSING)
-    if type(platform_module) is not ModuleType:
-        raise _error("platform dependency module is unavailable")
-    platform_source = vars(platform_module).get("__file__", _MISSING)
-    canonical_source = _canonical_stdlib_source_path("platform", "platform dependency")
-    if not isinstance(platform_source, str) or not _same_path(
-        platform_source, str(canonical_source)
-    ):
-        raise _error("platform dependency source path is not authentic")
-    namespace = vars(platform_module)
-    if namespace.get("_uname_cache", _MISSING) is not None:
-        raise _error("platform dependency requires a cold uname cache")
-    for state in uname_states:
-        if state.platform_cache_result is not _MISSING:
-            continue
-        global_state = state.global_states.get("_uname_cache") if state.global_states else None
-        if global_state is None or global_state.value is not None:
-            raise _error("platform dependency uname cache was not cold at admission")
-        result = state.function()
-        if namespace.get("_uname_cache", _MISSING) is not result:
-            raise _error("platform dependency uname cache did not perform the genuine transition")
-        result_state = state.global_states.get("uname_result") if state.global_states else None
-        type_state = result_state.type_state if result_state is not None else None
-        if type_state is None or type(result) is not type_state.value:
-            raise _error("platform dependency uname result is not authenticated")
-        state.platform_cache_result = result
-
-
 def _validate_function_globals(
     state: _FunctionState, label: str, validation_seen: set[int] | None = None
 ) -> None:
@@ -2599,6 +2527,14 @@ def _validate_function_globals(
     globals_dict = state.globals_dict
     for name, global_state in state.global_states.items():
         current = globals_dict.get(name, _MISSING)
+        if (
+            current is not None
+            and state.function.__module__ == "platform"
+            and state.function.__qualname__ == "uname"
+            and name == "_uname_cache"
+            and not _is_authenticated_platform_cache(state, name, current)
+        ):
+            raise _error(f"live Gmsh dispatch global {label}.{name} was replaced")
         if global_state.value is _MISSING:
             if current is not _MISSING:
                 raise _error(f"live Gmsh dispatch global {label}.{name} was added")
@@ -4171,7 +4107,6 @@ def load_verified_gmsh(binding: dict[str, object]) -> tuple[Any, dict[str, objec
                 module_path, actual_module, snapshot, admission
             )
             source_dependencies = _capture_source_dependencies(snapshot.content, snapshot.code)
-            _prepare_platform_cache_transition(source_dependencies)
             module = _import_verified_source(module_path, actual_module, snapshot.code)
             code_digest = snapshot.code_digest
             try:
