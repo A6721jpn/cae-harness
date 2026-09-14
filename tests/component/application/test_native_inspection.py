@@ -39,6 +39,16 @@ def initial(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
         "occt_version": "7.8.1",
         "build_info": "Synthetic fixture; OCC version: 7.8.1",
     }
+    runtime_identity = {
+        "schema_version": "gmsh-runtime-identity-v1",
+        "python": {"path": "synthetic/python.exe", "size": 1, "sha256": "0" * 64},
+        "python_image": {"path": "synthetic/python-image.exe", "size": 2, "sha256": "1" * 64},
+        "python_library": {"path": "synthetic/python312.dll", "size": 3, "sha256": "2" * 64},
+        "module": {"path": "synthetic/gmsh.py", "size": 4, "sha256": "3" * 64},
+        "library": {"path": "synthetic/gmsh-4.15.dll", "size": 5, "sha256": "4" * 64},
+        "pyvenv_cfg": None,
+    }
+    backend.evidence["runtime_identity"] = runtime_identity
     limits = {
         "available_cpus": 2,
         "cpu_workers": 2,
@@ -54,6 +64,7 @@ def initial(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
         real_backend_factory=worker._make_backend,
         application=application,
         backend=backend,
+        runtime_identity=runtime_identity,
         limits=limits,
         calls=calls,
         mutate=None,
@@ -86,7 +97,10 @@ def initial(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
         return {"pid": 123, "creation_time": 456, "exit_code": 0}
 
     monkeypatch.setattr(application, "resource_snapshot", resources, raising=False)
-    monkeypatch.setattr(worker, "_make_backend", lambda cpu: backend, raising=False)
+    monkeypatch.setattr(worker, "capture_runtime_binding", lambda: runtime_identity)
+    monkeypatch.setattr(
+        worker, "_make_backend", lambda cpu, runtime_binding=None: backend, raising=False
+    )
     monkeypatch.setattr(worker, "_run_owned", launch, raising=False)
     return state
 
@@ -153,6 +167,11 @@ def test_source_report_and_generation_admission(
     initial: Any, capsys: pytest.CaptureFixture[str]
 ) -> None:
     before = initial.service.current_draft(initial.created.case_id)
+    initial.mutate = lambda raw: raw["backend"]["runtime_identity"]["library"].update(size=999)
+    code, payload = invoke(initial, capsys)
+    assert code == 6 and payload["diagnostics"][0]["code"] == "integrity"
+    initial.mutate = None
+
     initial.mutate = lambda raw: raw["inspection"].update(source_digest="0" * 64)
     code, payload = invoke(initial, capsys)
     assert code == 6 and payload["diagnostics"][0]["code"] == "integrity"

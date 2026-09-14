@@ -1,5 +1,7 @@
 """Synthetic admission evidence only; no native modules or mesh quality claims."""
 
+import hashlib
+import json
 from pathlib import Path
 from typing import Any
 
@@ -12,10 +14,11 @@ from febio_cae.adapters.geometry import (
     GmshOCCConfig,
 )
 from febio_cae.adapters.geometry.preparation import _MeasuredGmsh
-from febio_cae.domain import Quantity, RigidPrimitive
+from febio_cae.domain import Quantity, RigidPrimitive, SourceAssetContent, SourceAssetRef
+from febio_cae.domain.canonical import canonical_bytes
 
-from .test_gmsh_units import _FakeGmsh
 from .conftest import TOOL_BODY, TOOL_LOCAL, _evidence, _identity_transform
+from .test_gmsh_units import _FakeGmsh
 
 
 def _source(header: str = "FILE_SCHEMA(('AUTOMOTIVE_DESIGN'));") -> bytes:
@@ -272,23 +275,59 @@ def test_measured_backend_native_dispatch_allows_curved_faces(
     report = backend.inspect_rigid_primitive(primitive, geometry_digest=digest)
     assert report.frame == TOOL_LOCAL
     assert report.bodies[0].body_id == TOOL_BODY.value
-    assert backend.mesh_rigid_primitive(
-        primitive,
-        geometry_digest=digest,
-        global_size_si=0.001,
-    ) == "native-mesh"
+    assert (
+        backend.mesh_rigid_primitive(
+            primitive,
+            geometry_digest=digest,
+            global_size_si=0.001,
+        )
+        == "native-mesh"
+    )
+
+
+def test_measured_backend_allows_verified_load_per_producer_operation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    module = _NativePrimitiveGmsh()
+    binding: dict[str, object] = {"synthetic": "binding"}
+    identity: dict[str, object] = {"synthetic": "identity"}
+    calls: list[object] = []
+
+    def verified_load(value: object) -> tuple[Any, dict[str, object]]:
+        calls.append(value)
+        return module, identity
+
+    monkeypatch.setattr("febio_cae.adapters.geometry.preparation.load_verified_gmsh", verified_load)
+    monkeypatch.setattr("tempfile.tempdir", str(tmp_path))
+    backend = _MeasuredGmsh(1, binding)
+    monkeypatch.setattr(backend, "_prepare_owned_session", lambda gmsh: None)
+    monkeypatch.setattr(backend, "_mesh_context", lambda *args, **kwargs: "native-mesh")
+    primitive = _native_primitive("sphere")
+
+    backend.inspect_rigid_primitive(primitive, geometry_digest="a" * 64)
+    assert (
+        backend.mesh_rigid_primitive(
+            primitive,
+            geometry_digest="a" * 64,
+            global_size_si=0.001,
+        )
+        == "native-mesh"
+    )
+
+    assert calls == [binding, binding]
 
 
 def test_measured_backend_keeps_planar_guard_for_imported_step_faces() -> None:
     module = _NativePrimitiveGmsh()
-    module.model.getType = lambda dimension, tag: "BSpline surface"
+    setattr(module.model, "getType", lambda dimension, tag: "BSpline surface")
     backend = _MeasuredGmsh(1)
     with pytest.raises(ValueError, match="planar STEP faces"):
         backend._inspect_faces(module, "body-1", 1, 1.0)
 
 
 def test_measured_backend_restores_planar_guard_after_native_success_and_error(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     from febio_cae.adapters.geometry import gmsh_occ
 
@@ -311,3 +350,73 @@ def test_measured_backend_restores_planar_guard_after_native_success_and_error(
         backend._primitive_context(module, 1, primitive)
     with pytest.raises(ValueError, match="planar STEP faces"):
         backend._inspect_faces(module, "body-1", 1, 1.0)
+
+
+@pytest.mark.parametrize("backend_id, accepted", [("gmsh-occ", True), ("spoofed", False)])
+def test_run_preparation_consumes_only_the_current_top_level_backend(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    backend_id: str,
+    accepted: bool,
+) -> None:
+    from febio_cae.adapters.geometry import preparation
+
+    step = b"synthetic-step"
+    source = SourceAssetContent(
+        SourceAssetRef("synthetic-step", hashlib.sha256(step).hexdigest(), "model/step"),
+        step,
+    )
+    runtime_binding = {
+        "schema_version": "gmsh-runtime-identity-v1",
+        "python": {"path": "synthetic/python.exe", "size": 1, "sha256": "0" * 64},
+        "python_image": {
+            "path": "synthetic/python-image.exe",
+            "size": 2,
+            "sha256": "1" * 64,
+        },
+        "python_library": {
+            "path": "synthetic/python312.dll",
+            "size": 3,
+            "sha256": "2" * 64,
+        },
+        "module": {"path": "synthetic/gmsh.py", "size": 4, "sha256": "3" * 64},
+        "library": {"path": "synthetic/gmsh-4.15.dll", "size": 5, "sha256": "4" * 64},
+        "pyvenv_cfg": None,
+    }
+    child_output = {
+        "carrier": {"synthetic": "carrier"},
+        "mesh": {"synthetic": "mesh"},
+        "inspection": {"synthetic": "inspection"},
+        "backend": {"runtime_identity": runtime_binding},
+        "backend_id": backend_id,
+        "backend_version": "4.15.2",
+        "mesh_generations": 1,
+    }
+
+    def launch(argv: tuple[str, ...], directory: Path, **budget: Any) -> dict[str, int]:
+        del argv, budget
+        json.loads((directory / "input.json").read_bytes())
+        (directory / "output.json").write_bytes(canonical_bytes(child_output))
+        return {"pid": 123, "creation_time": 456, "exit_code": 0}
+
+    monkeypatch.setattr(preparation, "capture_runtime_binding", lambda: runtime_binding)
+    monkeypatch.setattr(preparation, "_run_owned", launch)
+
+    if accepted:
+        result = preparation.run_preparation(
+            source,
+            {},
+            {"cpu_workers": 1, "wall_seconds": 1.0, "memory_bytes": 1024},
+            tmp_path / "work",
+        )
+        assert result["backend_id"] == "gmsh-occ"
+        assert result["runtime_binding"] == runtime_binding
+        assert result["process"]["exit_code"] == 0
+    else:
+        with pytest.raises(ValueError):
+            preparation.run_preparation(
+                source,
+                {},
+                {"cpu_workers": 1, "wall_seconds": 1.0, "memory_bytes": 1024},
+                tmp_path / "work",
+            )

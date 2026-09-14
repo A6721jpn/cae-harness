@@ -16,6 +16,7 @@ from febio_cae.domain.canonical import canonical_bytes
 from febio_cae.domain.codec import decode_record
 from febio_cae.domain.ports import PortError, PortErrorCategory
 
+from ._gmsh_runtime import capture_runtime_binding, load_verified_gmsh, verify_runtime_identity
 from .adapter import StepGeometryMeshAdapter
 from .backend import BackendInspection, GeometryMeshBackend
 from .gmsh_occ import GmshOCCBackend, GmshOCCConfig, _require_ap214_header
@@ -32,34 +33,65 @@ def remaining(deadline: float) -> float:
 class _ObservedGmsh(GmshOCCBackend):
     """Measure only; all admission and geometry operations stay in the existing backend."""
 
-    def __init__(self, cpu: int) -> None:
+    def __init__(self, cpu: int, runtime_binding: dict[str, object] | None = None) -> None:
         super().__init__(
             GmshOCCConfig(expected_occt_version="7.8.1", require_step_ap214=True, cpu_workers=cpu)
         )
-        self.evidence: dict[str, str] = {}
+        self.evidence: dict[str, Any] = {}
+        self._runtime_binding = runtime_binding
+        self._runtime_identity: dict[str, object] | None = None
+
+    def _load_module(self) -> Any:
+        if self._runtime_binding is None:
+            return super()._load_module()
+        module, identity = load_verified_gmsh(self._runtime_binding)
+        self._runtime_identity = identity
+        return module
 
     def _prepare_owned_session(self, gmsh: Any) -> None:
         super()._prepare_owned_session(gmsh)
-        module = Path(gmsh.__file__).resolve(strict=True)
+        if self._runtime_identity is not None:
+            module_record = self._runtime_identity["module"]
+            if not isinstance(module_record, dict) or not isinstance(
+                module_record.get("path"), str
+            ):
+                raise ValueError("verified Gmsh module identity is malformed")
+            module = Path(module_record["path"])
+            module_sha256 = module_record.get("sha256")
+            if not isinstance(module_sha256, str):
+                raise ValueError("verified Gmsh module digest is malformed")
+            runtime_identity = self._runtime_identity
+        else:
+            module = Path(gmsh.__file__).resolve(strict=True)
+            module_sha256 = hashlib.sha256(module.read_bytes()).hexdigest()
+            runtime_identity = None
         self.evidence = {
             "module": str(module),
-            "module_sha256": hashlib.sha256(module.read_bytes()).hexdigest(),
+            "module_sha256": module_sha256,
             "gmsh_version": gmsh.__version__,
             "occt_version": "7.8.1",
             "build_info": gmsh.option.getString("General.BuildInfo"),
         }
+        if runtime_identity is not None:
+            self.evidence["runtime_identity"] = runtime_identity
 
 
-def _make_backend(cpu: int) -> _ObservedGmsh:
-    return _ObservedGmsh(cpu)
+def _make_backend(cpu: int, runtime_binding: dict[str, object] | None = None) -> _ObservedGmsh:
+    return _ObservedGmsh(cpu, runtime_binding)
 
 
-def _identity(value: Any) -> dict[str, str]:
+def _identity(value: Any, expected_runtime: object | None = None) -> dict[str, Any]:
     fields = {"module", "module_sha256", "gmsh_version", "occt_version", "build_info"}
+    expected_fields = fields | {"runtime_identity"} if expected_runtime is not None else fields
     if (
         not isinstance(value, dict)
-        or set(value) != fields
-        or any(not isinstance(item, str) or not item or "\x00" in item for item in value.values())
+        or set(value) != expected_fields
+        or any(
+            not isinstance(value[field], str)
+            or not value[field]
+            or "\x00" in value[field]
+            for field in fields
+        )
     ):
         raise ValueError("invalid measured inspection backend identity")
     digest = value["module_sha256"]
@@ -78,12 +110,23 @@ def _identity(value: Any) -> dict[str, str]:
         raise PortError(
             PortErrorCategory.UNSUPPORTED_CAPABILITY, "inspection Gmsh/OCCT evidence mismatch"
         )
-    return dict(value)
+    result = dict(value)
+    if expected_runtime is not None:
+        verify_runtime_identity(expected_runtime, result["runtime_identity"])
+    return result
 
 
-def produce(source: SourceAssetContent, limits: dict[str, Any]) -> dict[str, Any]:
+def produce(
+    source: SourceAssetContent,
+    limits: dict[str, Any],
+    runtime_binding: dict[str, object] | None = None,
+) -> dict[str, Any]:
     _require_ap214_header(source.content)
-    backend = _make_backend(limits["cpu_workers"])
+    backend = (
+        _make_backend(limits["cpu_workers"], runtime_binding)
+        if runtime_binding is not None
+        else _make_backend(limits["cpu_workers"])
+    )
     adapter = StepGeometryMeshAdapter(
         cast(GeometryMeshBackend, backend), source_asset=source.source_asset
     )
@@ -92,7 +135,7 @@ def produce(source: SourceAssetContent, limits: dict[str, Any]) -> dict[str, Any
         "status": "INSPECTED",
         "inspection": adapter.inspection_details(geometry).to_dict(),
         "geometry": geometry.to_dict(),
-        "backend": _identity(backend.evidence),
+        "backend": _identity(backend.evidence, runtime_binding),
     }
 
 
@@ -136,7 +179,12 @@ def _topology(raw: Any, cap: int) -> BackendInspection:
     return report
 
 
-def _response(raw: Any, source: SourceAssetContent, cap: int) -> dict[str, Any]:
+def _response(
+    raw: Any,
+    source: SourceAssetContent,
+    cap: int,
+    expected_runtime: object | None = None,
+) -> dict[str, Any]:
     if not isinstance(raw, dict):
         raise TypeError("invalid inspection response")
     if raw.get("status") == "ERROR":
@@ -153,7 +201,7 @@ def _response(raw: Any, source: SourceAssetContent, cap: int) -> dict[str, Any]:
         raise PortError(category, raw["message"])
     if set(raw) != {"status", "inspection", "geometry", "backend"} or raw["status"] != "INSPECTED":
         raise ValueError("invalid successful inspection response")
-    backend = _identity(raw["backend"])
+    backend = _identity(raw["backend"], expected_runtime)
     report = _topology(raw["inspection"], cap)
     if report.source_digest != source.source_asset.content_digest:
         raise ValueError("inspection topology source digest differs from registered source")
@@ -174,10 +222,12 @@ def run_inspection(
     before_launch: Callable[[], None],
 ) -> dict[str, Any]:
     remaining(deadline)
+    runtime_binding = capture_runtime_binding()
     payload = {
         "source": source.source_asset.to_dict(),
         "content_hex": source.content.hex(),
         "limits": limits,
+        "runtime_binding": runtime_binding,
     }
     (directory / "input.json").write_bytes(canonical_bytes(payload))
     package_root = Path(__file__).resolve().parents[3]
@@ -211,7 +261,7 @@ def run_inspection(
         if len(content) > cap:
             raise ValueError("inspection response grew beyond finite byte limit")
         remaining(deadline)
-        result = _response(_json(content), source, cap)
+        result = _response(_json(content), source, cap, runtime_binding)
     except (OSError, ValueError, TypeError, KeyError, RecursionError, OverflowError) as error:
         if isinstance(error, TimeoutError):
             raise
@@ -220,6 +270,7 @@ def run_inspection(
         ) from error
     remaining(deadline)
     result["process"] = {**process, "argv": list(argv)}
+    result["runtime_binding"] = runtime_binding
     return result
 
 
@@ -228,11 +279,19 @@ def _main() -> None:
 
     try:
         payload = _json(Path("input.json").read_bytes())
-        if not isinstance(payload, dict) or set(payload) != {"source", "content_hex", "limits"}:
+        if not isinstance(payload, dict) or set(payload) != {
+            "source",
+            "content_hex",
+            "limits",
+            "runtime_binding",
+        }:
             raise ValueError("invalid private inspection input")
         source_ref = decode_record(canonical_bytes(payload["source"]), SourceAssetRef)
         source = SourceAssetContent(source_ref, bytes.fromhex(payload["content_hex"]))
-        result = produce(source, payload["limits"])
+        runtime_binding = payload["runtime_binding"]
+        if not isinstance(runtime_binding, dict):
+            raise TypeError("inspection runtime binding is missing")
+        result = produce(source, payload["limits"], runtime_binding)
     except (PortError, BackendError) as error:
         result = {"status": "ERROR", "category": error.category.value, "message": str(error)}
     except (OSError, RuntimeError) as error:

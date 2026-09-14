@@ -21,14 +21,15 @@ from febio_cae.domain import (
     NumericalProfileRef,
     PortError,
     PortErrorCategory,
+    Quantity,
     RigidPrimitive,
     SourceAssetContent,
     SourceAssetRef,
-    Quantity,
 )
 from febio_cae.domain.canonical import canonical_bytes
 from febio_cae.domain.codec import decode_record
 
+from ._gmsh_runtime import capture_runtime_binding, load_verified_gmsh, verify_runtime_identity
 from .adapter import StepGeometryMeshAdapter
 from .backend import (
     BackendBody,
@@ -135,23 +136,48 @@ def _run_owned(
 
 
 class _MeasuredGmsh(GmshOCCBackend):
-    def __init__(self, cpu: int) -> None:
+    def __init__(self, cpu: int, runtime_binding: dict[str, object] | None = None) -> None:
         super().__init__(
             GmshOCCConfig(expected_occt_version="7.8.1", require_step_ap214=True, cpu_workers=cpu)
         )
         self.evidence: dict[str, Any] = {}
         self._native_context_depth = 0
+        self._runtime_binding = runtime_binding
+        self._runtime_identity: dict[str, object] | None = None
+
+    def _load_module(self) -> Any:
+        if self._runtime_binding is None:
+            return super()._load_module()
+        module, identity = load_verified_gmsh(self._runtime_binding)
+        self._runtime_identity = identity
+        return module
 
     def _prepare_owned_session(self, gmsh: Any) -> None:
         super()._prepare_owned_session(gmsh)
-        module = Path(gmsh.__file__).resolve(strict=True)
+        if self._runtime_identity is not None:
+            module_record = self._runtime_identity["module"]
+            if not isinstance(module_record, dict) or not isinstance(
+                module_record.get("path"), str
+            ):
+                raise ValueError("verified Gmsh module identity is malformed")
+            module_path = Path(module_record["path"])
+            module_sha256 = module_record.get("sha256")
+            if not isinstance(module_sha256, str):
+                raise ValueError("verified Gmsh module digest is malformed")
+            runtime_identity = self._runtime_identity
+        else:
+            module_path = Path(gmsh.__file__).resolve(strict=True)
+            module_sha256 = hashlib.sha256(module_path.read_bytes()).hexdigest()
+            runtime_identity = None
         current = {
-            "module": str(module),
-            "module_sha256": hashlib.sha256(module.read_bytes()).hexdigest(),
+            "module": str(module_path),
+            "module_sha256": module_sha256,
             "gmsh_version": gmsh.__version__,
             "occt_version": "7.8.1",
             "build_info": gmsh.option.getString("General.BuildInfo"),
         }
+        if runtime_identity is not None:
+            current["runtime_identity"] = runtime_identity
         if self.evidence and self.evidence != current:
             raise ValueError("Gmsh module/build identity changed during preparation")
         self.evidence = current
@@ -175,8 +201,8 @@ class _MeasuredGmsh(GmshOCCBackend):
             self._native_context_depth -= 1
 
 
-def _make_backend(cpu: int) -> Any:
-    return _MeasuredGmsh(cpu)
+def _make_backend(cpu: int, runtime_binding: dict[str, object] | None = None) -> Any:
+    return _MeasuredGmsh(cpu, runtime_binding)
 
 
 class CurrentInspection:
@@ -230,7 +256,10 @@ class CurrentInspection:
     ) -> None:
         if primitive.kind not in {"sphere", "cylinder"}:
             raise ValueError("current native tool record requires a curved primitive")
-        if expected_geometry_digest is not None and report.geometry_digest != expected_geometry_digest:
+        if (
+            expected_geometry_digest is not None
+            and report.geometry_digest != expected_geometry_digest
+        ):
             raise ValueError("current native tool geometry identity differs")
         if report.source_digest != primitive_source_digest(
             primitive,
@@ -311,16 +340,14 @@ class CurrentInspection:
         )
 
 
-def _criteria_from_limits(
-    limits: dict[str, Any], profile: NumericalProfileRef, kind: str
-) -> Any:
+def _criteria_from_limits(limits: dict[str, Any], profile: NumericalProfileRef, kind: str) -> Any:
     raw = limits.get("_generation_criteria")
     if kind == "box":
         if raw is not None:
             raise ValueError("box preparation must not carry curved generation criteria")
         return None
     if not isinstance(raw, dict):
-        raise ValueError("curved preparation requires parent-bound generation criteria")
+        raise TypeError("curved preparation requires parent-bound generation criteria")
     expected = {
         "profile",
         "max_boundary_deviation_si",
@@ -334,7 +361,7 @@ def _criteria_from_limits(
     profile_raw = raw["profile"]
     if set(profile_raw) != {"schema_version", "profile_id", "purpose", "record_digest"}:
         raise ValueError("generation criteria profile is not canonical")
-    from febio_cae.adapters.meshing.approximation import ApproximationCriteria, NATIVE_ALGORITHM
+    from febio_cae.adapters.meshing.approximation import NATIVE_ALGORITHM, ApproximationCriteria
 
     try:
         criteria = ApproximationCriteria(
@@ -391,7 +418,10 @@ class _Source:
 
 
 def produce(
-    source: SourceAssetContent, request: dict[str, Any], limits: dict[str, Any]
+    source: SourceAssetContent,
+    request: dict[str, Any],
+    limits: dict[str, Any],
+    runtime_binding: dict[str, object] | None = None,
 ) -> dict[str, Any]:
     from febio_cae.application.service import (
         _merge_evidence,
@@ -406,10 +436,12 @@ def produce(
         raise ValueError("preparation STEP source digest mismatch")
     _require_ap214_header(source.content)
     primitive_kind = spec.rigid_tool.primitive.kind
-    criteria = _criteria_from_limits(
-        limits, spec.mesh_policy.quality_profile, primitive_kind
+    criteria = _criteria_from_limits(limits, spec.mesh_policy.quality_profile, primitive_kind)
+    backend = (
+        _make_backend(limits["cpu_workers"], runtime_binding)
+        if runtime_binding is not None
+        else _make_backend(limits["cpu_workers"])
     )
-    backend = _make_backend(limits["cpu_workers"])
     if primitive_kind in {"sphere", "cylinder"}:
         if not all(
             callable(getattr(backend, name, None))
@@ -436,6 +468,8 @@ def produce(
         or backend.evidence.get("occt_version") != "7.8.1"
     ):
         raise ValueError("preparation requires exact current Gmsh/OCCT version evidence")
+    if runtime_binding is not None:
+        verify_runtime_identity(runtime_binding, backend.evidence.get("runtime_identity"))
     parsed = normalize_request(
         request,
         geometry_digest=report.geometry_digest,
@@ -506,11 +540,13 @@ def run_preparation(
     source: SourceAssetContent, request: dict[str, Any], limits: dict[str, Any], directory: Path
 ) -> dict[str, Any]:
     directory.mkdir(parents=True, exist_ok=False)
+    runtime_binding = capture_runtime_binding()
     payload = {
         "source": source.source_asset.to_dict(),
         "content_hex": source.content.hex(),
         "request": request,
         "limits": limits,
+        "runtime_binding": runtime_binding,
     }
     (directory / "input.json").write_bytes(canonical_bytes(payload))
     package_root = Path(__file__).resolve().parents[3]
@@ -527,9 +563,43 @@ def run_preparation(
     if result_file.stat().st_size > limits["memory_bytes"]:
         raise ValueError("preparation output exceeds memory budget")
     result = json.loads(result_file.read_bytes())
-    if not isinstance(result, dict):
-        raise TypeError("invalid producer output")
+    _verify_preparation_output(result, runtime_binding)
+    result["runtime_binding"] = runtime_binding
     result["process"] = {**process, "argv": list(argv)}
+    return result
+
+
+def _verify_preparation_output(result: object, runtime_binding: object) -> dict[str, Any]:
+    """Verify the exact raw child response consumed by the application."""
+
+    required = {
+        "carrier",
+        "mesh",
+        "inspection",
+        "backend",
+        "backend_id",
+        "backend_version",
+        "mesh_generations",
+    }
+    optional = {
+        "generation_criteria",
+        "native_tool_inspection",
+        "native_tool_primitive",
+    }
+    if not isinstance(result, dict):
+        raise TypeError("invalid raw preparation response")
+    if (
+        "producer" in result
+        or not required <= set(result)
+        or not set(result) <= required | optional
+    ):
+        raise ValueError("preparation response is not the raw producer shape")
+    if result.get("backend_id") != "gmsh-occ" or result.get("backend_version") != "4.15.2":
+        raise ValueError("preparation response consumed backend differs from current backend")
+    backend = result.get("backend")
+    if not isinstance(backend, dict):
+        raise ValueError("preparation response backend is missing")
+    verify_runtime_identity(runtime_binding, backend.get("runtime_identity"))
     return result
 
 
@@ -538,7 +608,10 @@ def _main() -> None:
     source_ref = decode_record(canonical_bytes(payload["source"]), SourceAssetRef)
     source = SourceAssetContent(source_ref, bytes.fromhex(payload["content_hex"]))
     try:
-        result = produce(source, payload["request"], payload["limits"])
+        runtime_binding = payload["runtime_binding"]
+        if not isinstance(runtime_binding, dict):
+            raise TypeError("preparation runtime binding is missing")
+        result = produce(source, payload["request"], payload["limits"], runtime_binding)
         Path("output.json").write_bytes(canonical_bytes(result))
     except Exception as error:
         print(f"{type(error).__name__}: {error}", file=sys.stderr)
