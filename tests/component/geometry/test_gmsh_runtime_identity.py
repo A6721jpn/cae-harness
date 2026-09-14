@@ -92,6 +92,24 @@ def _isolated(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setitem(vars(runtime.sys), "flags", SimpleNamespace(**values))
 
 
+def _restore_runtime_module() -> None:
+    importlib.reload(runtime)
+
+
+def _reload_runtime_rejecting_ctypes_mutation(
+    monkeypatch: pytest.MonkeyPatch, target: object, name: str, replacement: object
+) -> None:
+    context = monkeypatch.context()
+    scoped = context.__enter__()
+    try:
+        scoped.setattr(target, name, replacement)
+        with pytest.raises((OSError, ValueError), match="ctypes|conversion|factory|binding|ABI"):
+            importlib.reload(runtime)
+    finally:
+        context.__exit__(None, None, None)
+        _restore_runtime_module()
+
+
 def test_capture_runtime_binding_uses_distribution_metadata_without_importing_gmsh(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -283,8 +301,8 @@ def test_load_verified_gmsh_refuses_stale_cache_and_unverified_preload(
     monkeypatch.setattr(runtime, "_mapped_module_path", lambda handle: library)
     monkeypatch.syspath_prepend(str(module.parent))
     preloaded = ModuleType("gmsh")
-    setattr(preloaded, "__file__", str(module))
-    setattr(preloaded, "__version__", "4.15.2")
+    preloaded.__file__ = str(module)
+    preloaded.__version__ = "4.15.2"
     sys.modules["gmsh"] = preloaded
     with pytest.raises((OSError, ValueError), match="preloaded"):
         runtime.load_verified_gmsh(expected)
@@ -502,7 +520,7 @@ def _synthetic_native_callable() -> Any:
     """Create a harmless CFuncPtr for the synthetic native-symbol tests."""
 
     native = ctypes.CFUNCTYPE(ctypes.c_int)(lambda: 0)
-    setattr(native, "argtypes", None)
+    native.argtypes = None
     return native
 
 
@@ -605,9 +623,10 @@ def test_verified_load_rejects_cast_errcheck_before_pointer_use(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     expected, _library = _synthetic_cdll_setup(monkeypatch, tmp_path)
-    loaded, _ = runtime.load_verified_gmsh(expected)
+    _loaded, _ = runtime.load_verified_gmsh(expected)
 
     marker = tmp_path / "unsafe-cast-called"
+
     def errcheck(result: Any, function: Any, arguments: Any) -> Any:
         del function, arguments
         marker.write_text("called", encoding="ascii")
@@ -906,15 +925,148 @@ def test_ctypes_bootstrap_rejects_reassigned_cast_conversion_descriptor(
 def test_ctypes_bootstrap_rejects_same_module_type_substitution(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, target: str
 ) -> None:
-    _isolated(monkeypatch)
+    del tmp_path
     if target == "c_void_p":
-        monkeypatch.setattr(ctypes, "c_void_p", ctypes.c_int)
+        _reload_runtime_rejecting_ctypes_mutation(monkeypatch, ctypes, "c_void_p", ctypes.c_int)
     else:
-        monkeypatch.setattr(ctypes.wintypes, "HMODULE", ctypes.wintypes.LPCSTR)
-    with pytest.raises((OSError, ValueError), match="ctypes|type|binding|conversion"):
-        runtime._build_ctypes_trust()
-    monkeypatch.undo()
-    runtime._build_ctypes_trust()
+        _reload_runtime_rejecting_ctypes_mutation(
+            monkeypatch,
+            ctypes.wintypes,
+            "HMODULE",
+            ctypes.wintypes.LPCSTR,
+        )
+
+
+def test_ctypes_bootstrap_rejects_converter_mutation_before_baseline(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    del tmp_path
+    _reload_runtime_rejecting_ctypes_mutation(
+        monkeypatch,
+        ctypes.c_void_p,
+        "from_param",
+        lambda value: value,
+    )
+
+
+def test_ctypes_bootstrap_rejects_pointer_factory_mutation_before_baseline(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    del tmp_path
+
+    def replacement(*args: Any, **kwargs: Any) -> Any:
+        del args, kwargs
+        return ctypes.c_void_p
+
+    _reload_runtime_rejecting_ctypes_mutation(monkeypatch, ctypes, "POINTER", replacement)
+
+
+def test_dependency_class_admission_requires_authenticated_implementation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = (
+        "import platform\n"
+        "def probe():\n"
+        "    return platform.uname_result\n"
+        "__version__ = '4.15.2'\n"
+        "class Lib:\n"
+        "    _handle = 99\n"
+        "lib = Lib()\n"
+    )
+
+    class MatchingClass(platform.uname_result):
+        pass
+
+    MatchingClass.__module__ = "platform"
+    MatchingClass.__qualname__ = "uname_result"
+    monkeypatch.setattr(platform, "uname_result", MatchingClass)
+    expected, _library = _synthetic_cdll_setup(monkeypatch, tmp_path)
+    _rewrite_synthetic_source(expected, source)
+
+    with pytest.raises((OSError, ValueError), match="dependency|class|source|platform"):
+        runtime.load_verified_gmsh(expected)
+
+
+def test_dependency_class_rejects_untrusted_metaclass(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = (
+        "import platform\n"
+        "def probe():\n"
+        "    return platform.uname_result\n"
+        "__version__ = '4.15.2'\n"
+        "class Lib:\n"
+        "    _handle = 99\n"
+        "lib = Lib()\n"
+    )
+    original = platform.uname_result
+
+    class MatchingMeta(type):
+        pass
+
+    namespace = {
+        name: value
+        for name, value in vars(original).items()
+        if name not in {"__module__", "__dict__", "__weakref__"}
+    }
+    matching = MatchingMeta("MatchingClass", (original.__bases__[0],), namespace)
+    matching.__module__ = "platform"
+    matching.__qualname__ = "uname_result"
+    monkeypatch.setattr(platform, "uname_result", matching)
+    expected, _library = _synthetic_cdll_setup(monkeypatch, tmp_path)
+    _rewrite_synthetic_source(expected, source)
+
+    with pytest.raises((OSError, ValueError), match="dependency|class|metaclass|platform"):
+        runtime.load_verified_gmsh(expected)
+
+
+def test_dependency_cache_rejects_direct_malicious_object_without_execution(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    marker = tmp_path / "malicious-platform-cache-executed"
+
+    class MaliciousCache:
+        def __getattribute__(self, name: str) -> Any:
+            marker.write_text(name, encoding="ascii")
+            return super().__getattribute__(name)
+
+    source = (
+        "import platform\n"
+        "def probe():\n"
+        "    return platform.system()\n"
+        "__version__ = '4.15.2'\n"
+        "class Lib:\n"
+        "    _handle = 99\n"
+        "lib = Lib()\n"
+    )
+    monkeypatch.setattr(platform, "_uname_cache", MaliciousCache())
+    expected, _library = _synthetic_cdll_setup(monkeypatch, tmp_path)
+    _rewrite_synthetic_source(expected, source)
+
+    with pytest.raises((OSError, ValueError), match="dependency|cache|platform|uname"):
+        runtime.load_verified_gmsh(expected)
+    assert not marker.exists()
+
+
+def test_platform_cache_admission_requires_cold_transition_and_rejects_manufactured_data(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = (
+        "import platform\n"
+        "platform.system()\n"
+        "__version__ = '4.15.2'\n"
+        "class Lib:\n"
+        "    _handle = 99\n"
+        "lib = Lib()\n"
+    )
+    genuine = platform.uname()
+    manufactured = platform.uname_result(*tuple(genuine)[:5])
+    monkeypatch.setattr(platform, "_uname_cache", manufactured)
+    expected, _library = _synthetic_cdll_setup(monkeypatch, tmp_path)
+    _rewrite_synthetic_source(expected, source)
+
+    with pytest.raises((OSError, ValueError), match="cache|platform|cold|transition"):
+        runtime.load_verified_gmsh(expected)
 
 
 def test_verified_load_accepts_actual_platform_system_dependency_and_cache(
@@ -928,13 +1080,94 @@ def test_verified_load_accepts_actual_platform_system_dependency_and_cache(
         "    _handle = 99\n"
         "lib = Lib()\n"
     )
+    monkeypatch.setattr(platform, "_uname_cache", None)
     expected, _library = _synthetic_cdll_setup(monkeypatch, tmp_path)
     _rewrite_synthetic_source(expected, source)
 
     loaded, _ = runtime.load_verified_gmsh(expected)
+    transitioned = vars(platform).get("_uname_cache")
+    assert type(transitioned) is platform.uname_result
     reused, _ = runtime.load_verified_gmsh(expected)
 
     assert reused is loaded
+    assert vars(platform).get("_uname_cache") is transitioned
+
+
+def test_verified_session_rejects_matching_platform_result_class_mutation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = (
+        "import platform\n"
+        "platform.system()\n"
+        "__version__ = '4.15.2'\n"
+        "class Lib:\n"
+        "    _handle = 99\n"
+        "lib = Lib()\n"
+    )
+    monkeypatch.setattr(platform, "_uname_cache", None)
+    expected, _library = _synthetic_cdll_setup(monkeypatch, tmp_path)
+    _rewrite_synthetic_source(expected, source)
+    runtime.load_verified_gmsh(expected)
+
+    class MatchingClass(platform.uname_result):
+        pass
+
+    MatchingClass.__module__ = "platform"
+    MatchingClass.__qualname__ = "uname_result"
+    monkeypatch.setattr(platform, "uname_result", MatchingClass)
+    with pytest.raises((OSError, ValueError), match="dependency|class|platform|replaced"):
+        runtime.load_verified_gmsh(expected)
+
+
+def test_verified_session_rejects_manufactured_platform_cache_mutation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = (
+        "import platform\n"
+        "platform.system()\n"
+        "__version__ = '4.15.2'\n"
+        "class Lib:\n"
+        "    _handle = 99\n"
+        "lib = Lib()\n"
+    )
+    monkeypatch.setattr(platform, "_uname_cache", None)
+    expected, _library = _synthetic_cdll_setup(monkeypatch, tmp_path)
+    _rewrite_synthetic_source(expected, source)
+    loaded, _ = runtime.load_verified_gmsh(expected)
+    genuine = platform.uname()
+    monkeypatch.setattr(platform, "_uname_cache", platform.uname_result(*tuple(genuine)[:5]))
+
+    with pytest.raises((OSError, ValueError), match="cache|platform|replaced"):
+        runtime.load_verified_gmsh(expected)
+    assert loaded is not None
+
+
+def test_verified_session_rejects_malicious_platform_cache_without_execution(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    marker = tmp_path / "malicious-platform-cache-reuse"
+    source = (
+        "import platform\n"
+        "platform.system()\n"
+        "__version__ = '4.15.2'\n"
+        "class Lib:\n"
+        "    _handle = 99\n"
+        "lib = Lib()\n"
+    )
+    monkeypatch.setattr(platform, "_uname_cache", None)
+    expected, _library = _synthetic_cdll_setup(monkeypatch, tmp_path)
+    _rewrite_synthetic_source(expected, source)
+    runtime.load_verified_gmsh(expected)
+
+    class MaliciousCache:
+        def __getattribute__(self, name: str) -> Any:
+            marker.write_text(name, encoding="ascii")
+            return super().__getattribute__(name)
+
+    monkeypatch.setattr(platform, "_uname_cache", MaliciousCache())
+    with pytest.raises((OSError, ValueError), match="cache|platform|replaced"):
+        runtime.load_verified_gmsh(expected)
+    assert not marker.exists()
 
 
 def test_ctypes_bootstrap_rejects_preexisting_cast_restype_callback(
@@ -1008,10 +1241,7 @@ def test_verified_load_rejects_tampered_import_attribute_before_gmsh_import(
 ) -> None:
     marker = tmp_path / f"unsafe-{dependency}-called"
     if dependency == "signal":
-        source = (
-            "import signal\n"
-            "signal.signal(signal.SIGINT, None)\n"
-        )
+        source = "import signal\nsignal.signal(signal.SIGINT, None)\n"
 
         def poisoned(*args: Any, **kwargs: Any) -> Any:
             del args, kwargs
@@ -1042,12 +1272,7 @@ def test_verified_load_rejects_tampered_import_attribute_before_gmsh_import(
         monkeypatch.setitem(sys.modules, "numpy", numpy)
         monkeypatch.setitem(sys.modules, "numpy.ctypeslib", ctypeslib)
 
-    source += (
-        "__version__ = '4.15.2'\n"
-        "class Lib:\n"
-        "    _handle = 99\n"
-        "lib = Lib()\n"
-    )
+    source += "__version__ = '4.15.2'\nclass Lib:\n    _handle = 99\nlib = Lib()\n"
     expected, _library = _synthetic_cdll_setup(monkeypatch, tmp_path)
     module = expected["module"]
     assert isinstance(module, dict)
@@ -1543,9 +1768,9 @@ def test_verified_session_rejects_ctypes_metaclass_mro_spoof(
         "RedirectedCFunc",
         (native_type,),
         {
-            "_argtypes_": getattr(native_type, "_argtypes_"),
-            "_restype_": getattr(native_type, "_restype_"),
-            "_flags_": getattr(native_type, "_flags_"),
+            "_argtypes_": native_type._argtypes_,
+            "_restype_": native_type._restype_,
+            "_flags_": native_type._flags_,
             "__call__": redirected_call,
         },
     )
@@ -2014,9 +2239,7 @@ def test_verified_load_rejects_function_builtins_mapping_mismatch(
         "class Lib:\n"
         "    _handle = 99\n"
         "lib = Lib()\n"
-        "_marker = "
-        + repr(str(marker))
-        + "\n"
+        "_marker = " + repr(str(marker)) + "\n"
         "__builtins__ = {'bool': poisoned}\n"
     )
     module, _library, launcher, image, python_library = _files(tmp_path, source)
@@ -2067,9 +2290,7 @@ def test_verified_load_rejects_forged_function_actual_builtins(
         "class Lib:\n"
         "    _handle = 99\n"
         "lib = Lib()\n"
-        "_marker = "
-        + repr(str(marker))
-        + "\n"
+        "_marker = " + repr(str(marker)) + "\n"
     )
     module, _library, launcher, image, python_library = _files(tmp_path, source)
     expected = _binding(tmp_path, module=module, library=_library)

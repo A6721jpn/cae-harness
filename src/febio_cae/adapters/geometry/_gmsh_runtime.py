@@ -34,6 +34,7 @@ from types import (
     CodeType,
     FunctionType,
     GetSetDescriptorType,
+    MappingProxyType,
     MethodDescriptorType,
     MethodWrapperType,
     ModuleType,
@@ -399,6 +400,40 @@ def _same_path(left: object, right: object) -> bool:
     return isinstance(left, str) and isinstance(right, str) and _path_key(left) == _path_key(right)
 
 
+def _canonical_stdlib_dir() -> Path:
+    stdlib_value = vars(sys).get("_stdlib_dir", _MISSING)
+    if not isinstance(stdlib_value, str) or not stdlib_value:
+        raise _error("Python stdlib runtime anchor is unavailable")
+    try:
+        path = Path(stdlib_value).resolve(strict=True)
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise _error("Python stdlib runtime anchor is unavailable") from exc
+    if not path.is_dir():
+        raise _error("Python stdlib runtime anchor is not a directory")
+    return path
+
+
+def _canonical_stdlib_source_path(module_name: str, label: str) -> Path:
+    if not isinstance(module_name, str) or not module_name or "\x00" in module_name:
+        raise _error(f"{label} module name is invalid")
+    parts = module_name.split(".")
+    if any(not part or part in {".", ".."} for part in parts):
+        raise _error(f"{label} module name is invalid")
+    root = _canonical_stdlib_dir()
+    candidates = (
+        root.joinpath(*parts).with_suffix(".py"),
+        root.joinpath(*parts, "__init__.py"),
+    )
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve(strict=True)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            continue
+        if resolved.is_file():
+            return resolved
+    raise _error(f"{label} canonical source is unavailable")
+
+
 def _cache_path(module_path: Path, spec: Any) -> Path:
     try:
         expected = Path(importlib.util.cache_from_source(str(module_path))).resolve(strict=False)
@@ -619,8 +654,69 @@ def _code_digest(code: CodeType) -> str:
 
 
 _MISSING = object()
+
+
+def _is_class_object(value: object) -> bool:
+    try:
+        mro = type.__getattribute__(value, "__mro__")
+    except (AttributeError, TypeError):
+        return False
+    return type(mro) is tuple
+
+
+def _raw_class_namespace(value: object) -> MappingProxyType | None:
+    if not _is_class_object(value):
+        return None
+    try:
+        namespace = type.__getattribute__(value, "__dict__")
+    except (AttributeError, TypeError):
+        return None
+    return namespace if type(namespace) is MappingProxyType else None
+
+
+def _raw_module_class(module: object, qualname: str) -> object:
+    if type(module) is not ModuleType or not qualname:
+        return _MISSING
+    current: object = vars(module).get(qualname.partition(".")[0], _MISSING)
+    for name in qualname.split(".")[1:]:
+        namespace = _raw_class_namespace(current)
+        if namespace is None:
+            return _MISSING
+        current = namespace.get(name, _MISSING)
+    return current
+
+
+def _authenticated_dependency_metaclass(value: object, label: str) -> bool:
+    if value is type:
+        return True
+    if not _is_class_object(value):
+        return False
+    try:
+        module_name = type.__getattribute__(value, "__module__")
+        qualname = type.__getattribute__(value, "__qualname__")
+    except (AttributeError, TypeError):
+        return False
+    if not isinstance(module_name, str) or not isinstance(qualname, str):
+        return False
+    stdlib_names = vars(sys).get("stdlib_module_names", frozenset())
+    if (
+        not isinstance(stdlib_names, (set, frozenset))
+        or module_name.partition(".")[0] not in stdlib_names
+    ):
+        return False
+    module = sys.modules.get(module_name, _MISSING)
+    if type(module) is not ModuleType or _raw_module_class(module, qualname) is not value:
+        return False
+    source = vars(module).get("__file__", _MISSING)
+    try:
+        canonical = _canonical_stdlib_source_path(module_name, label)
+    except _RuntimeBindingError:
+        return False
+    return isinstance(source, str) and _same_path(source, str(canonical))
+
+
 _CFUNC_PTR_TYPE = getattr(ctypes, "_CFuncPtr", None)
-_CFUNC_PTR_METACLASS = type(_CFUNC_PTR_TYPE) if isinstance(_CFUNC_PTR_TYPE, type) else None
+_CFUNC_PTR_METACLASS = type(_CFUNC_PTR_TYPE) if _is_class_object(_CFUNC_PTR_TYPE) else None
 
 _CFUNC_PTR_CALL_OWNER: type | None
 _CFUNC_PTR_CALL: object
@@ -632,26 +728,25 @@ _CFUNC_PTR_METADATA: dict[str, tuple[type, object]]
 
 
 class _DescriptorWithGet(Protocol):
-    def __get__(self, instance: object, owner: type | None = None) -> object:
-        ...
+    def __get__(self, instance: object, owner: type | None = None) -> object: ...
 
 
 def _raw_type_descriptor(value_type: type, name: str) -> tuple[type, object]:
     try:
-        method_resolution_order = value_type.__mro__
+        method_resolution_order = type.__getattribute__(value_type, "__mro__")
     except (AttributeError, TypeError):
         return value_type, _MISSING
     for owner in method_resolution_order:
-        try:
-            descriptor = vars(owner).get(name, _MISSING)
-        except TypeError:
+        namespace = _raw_class_namespace(owner)
+        if namespace is None:
             return owner, _MISSING
+        descriptor = namespace.get(name, _MISSING)
         if descriptor is not _MISSING:
             return owner, descriptor
     return value_type, _MISSING
 
 
-if isinstance(_CFUNC_PTR_TYPE, type):
+if _is_class_object(_CFUNC_PTR_TYPE):
     _CFUNC_PTR_CALL_OWNER, _CFUNC_PTR_CALL = _raw_type_descriptor(_CFUNC_PTR_TYPE, "__call__")
     _CFUNC_PTR_GETATTRIBUTE_OWNER, _CFUNC_PTR_GETATTRIBUTE = _raw_type_descriptor(
         _CFUNC_PTR_TYPE, "__getattribute__"
@@ -807,6 +902,7 @@ class _FunctionState:
     code_digest: str | None = None
     source_path: Path | None = None
     source_identity: dict[str, object] | None = None
+    platform_cache_result: object = _MISSING
 
 
 @dataclass(slots=True)
@@ -920,7 +1016,7 @@ def _validate_function_state(
     if state.source_path is not None or state.source_identity is not None:
         if state.source_path is None or state.source_identity is None:
             raise _error(f"live Gmsh executable function {label} source state malformed")
-        current_source_path = _dependency_source_path(function.__code__, label)
+        current_source_path = _dependency_source_path(function.__code__, label, state.module_name)
         if not _same_path(str(current_source_path), str(state.source_path)):
             raise _error(f"live Gmsh executable function {label} source changed")
         current_identity = _file_identity(state.source_path, f"Gmsh executable dependency {label}")
@@ -984,11 +1080,31 @@ class _SourceImportBinding:
 
 
 @dataclass(slots=True)
+class _DependencyTypeMemberState:
+    descriptor: object
+    signature: object
+    functions: tuple[_FunctionState, ...]
+
+
+@dataclass(slots=True)
+class _DependencyTypeState:
+    value: type
+    module_name: str
+    qualname: str
+    source_path: Path
+    source_identity: dict[str, object]
+    bases: tuple[type, ...]
+    base_signatures: tuple[object, ...]
+    members: dict[str, _DependencyTypeMemberState]
+
+
+@dataclass(slots=True)
 class _ExecutableAttributeState:
     root_name: str
     path: tuple[str, ...]
     values: tuple[object, ...]
     function_state: _FunctionState | None = None
+    type_state: _DependencyTypeState | None = None
 
 
 @dataclass(slots=True)
@@ -997,6 +1113,7 @@ class _ModuleDependencyState:
     path: tuple[str, ...]
     values: tuple[object, ...]
     function_state: _FunctionState | None = None
+    type_state: _DependencyTypeState | None = None
 
 
 def _attribute_chain(node: ast.AST) -> tuple[str, tuple[str, ...]] | None:
@@ -1047,7 +1164,7 @@ def _raw_dependency_attribute(value: object, name: str) -> object:
             return vars(value).get(name, _MISSING)
         except TypeError:
             return _MISSING
-    if type(value) is type or _CTYPES_TRUSTED_TYPES.get(id(value)) is value:
+    if _is_class_object(value) or _CTYPES_TRUSTED_TYPES.get(id(value)) is value:
         return _raw_type_descriptor(value, name)[1]
     if type(value) in _SAFE_ATTRIBUTE_NAMESPACE_TYPES:
         return _raw_type_descriptor(type(value), name)[1]
@@ -1057,23 +1174,129 @@ def _raw_dependency_attribute(value: object, name: str) -> object:
     raise _error(f"Gmsh executable dependency has an unsupported namespace before {name}")
 
 
-def _safe_import_dependency_module(name: str, label: str) -> ModuleType:
-    cached = sys.modules.get(name, _MISSING)
-    if cached is not _MISSING:
-        if type(cached) is not ModuleType:
-            raise _error(f"Gmsh executable dependency {label} has an unsupported module")
-        module = cached
+def _preflight_dependency_import(name: str, label: str) -> Path | None:
+    builtin_names = vars(sys).get("builtin_module_names", ())
+    if isinstance(builtin_names, tuple) and name in builtin_names:
+        return None
+    stdlib_names = vars(sys).get("stdlib_module_names", frozenset())
+    root_name = name.partition(".")[0]
+    if isinstance(stdlib_names, (set, frozenset)) and root_name in stdlib_names:
+        try:
+            return _canonical_stdlib_source_path(name, label)
+        except _RuntimeBindingError:
+            pass
+    try:
+        spec = importlib.machinery.PathFinder.find_spec(name, list(sys.path))
+    except (ImportError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise _error(f"Gmsh executable dependency {label} cannot be resolved") from exc
+    if spec is None:
+        raise _error(f"Gmsh executable dependency {label} cannot be resolved")
+    origin = getattr(spec, "origin", None)
+    if not isinstance(origin, str) or not origin or origin in {"built-in", "frozen"}:
+        raise _error(f"Gmsh executable dependency {label} has no authenticated source path")
+    resolved = _resolve_regular_file(origin, f"Gmsh executable dependency {label}")
+    if isinstance(stdlib_names, (set, frozenset)) and root_name in stdlib_names:
+        native_roots = (
+            _canonical_stdlib_dir().parent / "DLLs",
+            _canonical_stdlib_dir() / "lib-dynload",
+        )
+        if not any(resolved.parent.resolve() == root.resolve() for root in native_roots):
+            raise _error(f"Gmsh executable dependency {label} has an untrusted native path")
+    return resolved
+
+
+def _validate_dependency_module(module: object, label: str) -> ModuleType:
+    if type(module) is not ModuleType:
+        raise _error(f"Gmsh executable dependency {label} has an unsupported module")
+    namespace = vars(module)
+    name = namespace.get("__name__", _MISSING)
+    if not isinstance(name, str) or sys.modules.get(name) is not module:
+        raise _error(f"Gmsh executable dependency {label} has an unexpected module identity")
+    expected_source = _preflight_dependency_import(name, label)
+    if expected_source is not None:
+        source = namespace.get("__file__", _MISSING)
+        if not isinstance(source, str) or not _same_path(source, str(expected_source)):
+            raise _error(f"Gmsh executable dependency {label} has an unexpected source path")
+    return module
+
+
+def _execute_dependency_spec(name: str, expected_source: Path | None, label: str) -> ModuleType:
+    if expected_source is None:
+        try:
+            spec = importlib.machinery.BuiltinImporter.find_spec(name)
+        except (ImportError, OSError, RuntimeError, TypeError, ValueError) as exc:
+            raise _error(f"Gmsh executable dependency {label} cannot be resolved") from exc
+        if spec is None:
+            raise _error(f"Gmsh executable dependency {label} has no authenticated loader")
+        if vars(spec).get("loader", _MISSING) is not importlib.machinery.BuiltinImporter:
+            raise _error(f"Gmsh executable dependency {label} has no authenticated loader")
+    elif expected_source.name == "__init__.py" or expected_source.suffix == ".py":
+        locations = [str(expected_source.parent)] if expected_source.name == "__init__.py" else None
+        loader = importlib.machinery.SourceFileLoader(name, str(expected_source))
+        spec = importlib.util.spec_from_file_location(
+            name,
+            str(expected_source),
+            loader=loader,
+            submodule_search_locations=locations,
+        )
+        if spec is None:
+            raise _error(f"Gmsh executable dependency {label} has no authenticated loader")
+        if type(vars(spec).get("loader", _MISSING)) is not importlib.machinery.SourceFileLoader:
+            raise _error(f"Gmsh executable dependency {label} has no authenticated loader")
     else:
         try:
-            imported = importlib.import_module(name)
+            spec = importlib.machinery.PathFinder.find_spec(name, list(sys.path))
         except (ImportError, OSError, RuntimeError, TypeError, ValueError) as exc:
-            raise _error(f"Gmsh executable dependency {label} cannot be imported") from exc
-        if type(imported) is not ModuleType:
-            raise _error(f"Gmsh executable dependency {label} is not a module")
-        module = imported
+            raise _error(f"Gmsh executable dependency {label} cannot be resolved") from exc
+        if spec is None:
+            raise _error(f"Gmsh executable dependency {label} has no authenticated loader")
+        if not _same_path(str(vars(spec).get("origin", "")), str(expected_source)):
+            raise _error(f"Gmsh executable dependency {label} source path changed")
+        if type(vars(spec).get("loader", _MISSING)) is not importlib.machinery.ExtensionFileLoader:
+            raise _error(f"Gmsh executable dependency {label} has no authenticated loader")
+    loader = vars(spec).get("loader", _MISSING)
+    if loader is _MISSING or loader is None:
+        raise _error(f"Gmsh executable dependency {label} has no authenticated loader")
+    module: ModuleType | None = None
+    try:
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        loader.exec_module(module)
+    except BaseException as exc:
+        if module is not None and sys.modules.get(name) is module:
+            sys.modules.pop(name, None)
+        if isinstance(exc, _RuntimeBindingError):
+            raise
+        raise _error(f"Gmsh executable dependency {label} import failed") from exc
+    return _validate_dependency_module(module, label)
+
+
+def _safe_import_dependency_module(name: str, label: str) -> ModuleType:
+    parent_name = name.rpartition(".")[0]
+    if parent_name:
+        _safe_import_dependency_module(parent_name, label)
+    cached = sys.modules.get(name, _MISSING)
+    if cached is not _MISSING:
+        module = _validate_dependency_module(cached, label)
+        expected_source = _preflight_dependency_import(name, label)
+        current_source = vars(module).get("__file__", _MISSING)
+        if expected_source is not None and (
+            not isinstance(current_source, str)
+            or not _same_path(current_source, str(expected_source))
+        ):
+            raise _error(f"Gmsh executable dependency {label} has an unexpected source path")
+    else:
+        expected_source = _preflight_dependency_import(name, label)
+        module = _execute_dependency_spec(name, expected_source, label)
     namespace = vars(module)
     if namespace.get("__name__", _MISSING) != name or sys.modules.get(name) is not module:
         raise _error(f"Gmsh executable dependency {label} has an unexpected module identity")
+    if expected_source is not None:
+        current_source = namespace.get("__file__", _MISSING)
+        if not isinstance(current_source, str) or not _same_path(
+            current_source, str(expected_source)
+        ):
+            raise _error(f"Gmsh executable dependency {label} source path changed")
     return module
 
 
@@ -1103,9 +1326,19 @@ def _supported_dependency_builtin(value: object, parent: object, name: str) -> b
         WrapperDescriptorType,
     }
     if type(parent) in _SAFE_ATTRIBUTE_NAMESPACE_TYPES:
-        return type(value) in descriptor_types and vars(type(parent)).get(name, _MISSING) is value
+        namespace = _raw_class_namespace(type(parent))
+        return (
+            type(value) in descriptor_types
+            and namespace is not None
+            and namespace.get(name, _MISSING) is value
+        )
     if _DEPENDENCY_TRUSTED_OBJECTS.get(id(parent)) is parent:
-        return type(value) in descriptor_types and vars(type(parent)).get(name, _MISSING) is value
+        namespace = _raw_class_namespace(type(parent))
+        return (
+            type(value) in descriptor_types
+            and namespace is not None
+            and namespace.get(name, _MISSING) is value
+        )
     if type(value) is not BuiltinFunctionType or type(parent) is not ModuleType:
         return False
     expected = _ctypes_expected_binding(parent, name)
@@ -1120,36 +1353,281 @@ def _supported_dependency_builtin(value: object, parent: object, name: str) -> b
 
 
 def _supported_dependency_type(value: object, parent: object, name: str) -> bool:
-    if type(parent) is not ModuleType:
+    try:
+        expected = _ctypes_expected_binding(parent, name)
+        if expected is not _MISSING:
+            if expected is not value:
+                return False
+            _validate_ctypes_type(value, f"dependency.{name}")
+            return True
+        if _CTYPES_TRUSTED_TYPES.get(id(value)) is value:
+            _validate_ctypes_type(value, f"dependency.{name}")
+            return True
+        return (
+            _authenticate_dependency_type(
+                value,
+                parent,
+                f"{vars(parent).get('__name__', 'dependency')}.{name}",
+                dependency_context=_DependencyContext({}),
+            )
+            is not None
+        )
+    except (OSError, ValueError, TypeError):
         return False
-    value_metaclass = type(value)
-    if value_metaclass is not type and not issubclass(value_metaclass, type):
-        return False
-    parent_name = vars(parent).get("__name__", _MISSING)
-    if not isinstance(parent_name, str) or sys.modules.get(parent_name) is not parent:
-        return False
-    expected = _ctypes_expected_binding(parent, name)
+
+
+def _dependency_type_base_signature(value: object, label: str) -> object:
+    if type(value) is not type and type(type(value)) is not type:
+        raise _error(f"Gmsh executable dependency {label} has an unsupported base class")
+    try:
+        module_name = type.__getattribute__(value, "__module__")
+        qualname = type.__getattribute__(value, "__qualname__")
+        bases = type.__getattribute__(value, "__bases__")
+    except (AttributeError, TypeError) as exc:
+        raise _error(f"Gmsh executable dependency {label} base class cannot be inspected") from exc
+    if (
+        not isinstance(module_name, str)
+        or not isinstance(qualname, str)
+        or type(bases) is not tuple
+    ):
+        raise _error(f"Gmsh executable dependency {label} base class metadata is malformed")
+    return (
+        module_name,
+        qualname,
+        tuple(
+            (
+                type.__getattribute__(base, "__module__"),
+                type.__getattribute__(base, "__qualname__"),
+            )
+            for base in bases
+            if type(base) is type
+        ),
+    )
+
+
+def _dependency_class_node(tree: ast.AST, qualname: str) -> ast.ClassDef | None:
+    parts = tuple(part for part in qualname.split(".") if part)
+    if not parts or type(tree) is not ast.Module:
+        return None
+    body: list[ast.stmt] = list(tree.body)
+    current: ast.ClassDef | None = None
+    for part in parts:
+        candidates = [
+            statement
+            for statement in body
+            if isinstance(statement, ast.ClassDef) and statement.name == part
+        ]
+        if len(candidates) != 1:
+            return None
+        current = candidates[0]
+        body = current.body
+    return current
+
+
+def _dependency_class_member_nodes(node: ast.ClassDef) -> dict[str, ast.AST]:
+    result: dict[str, ast.AST] = {}
+    for statement in node.body:
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            result[statement.name] = statement
+        elif isinstance(statement, (ast.Assign, ast.AnnAssign)):
+            targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    result[target.id] = statement
+    return result
+
+
+def _authenticate_dependency_type(
+    value: object,
+    parent: object,
+    label: str,
+    *,
+    dependency_context: _DependencyContext | None = None,
+) -> _DependencyTypeState | None:
+    expected = _ctypes_expected_binding(parent, label.rpartition(".")[2])
     if expected is not _MISSING:
         if expected is not value:
-            return False
-        _validate_ctypes_type(value, f"{parent_name}.{name}")
-        return True
+            raise _error(f"Gmsh executable dependency {label} type was replaced")
+        _validate_ctypes_type(value, label)
+        return None
     if _CTYPES_TRUSTED_TYPES.get(id(value)) is value:
-        _validate_ctypes_type(value, f"{parent_name}.{name}")
-        return True
-    if vars(parent).get(name, _MISSING) is not value:
-        return False
+        _validate_ctypes_type(value, label)
+        return None
+    member_name = label.rpartition(".")[2]
+    expected_qualname: str
+    if type(parent) is ModuleType:
+        parent_namespace = vars(parent)
+        parent_name = parent_namespace.get("__name__", _MISSING)
+        if not isinstance(parent_name, str) or sys.modules.get(parent_name) is not parent:
+            raise _error(f"Gmsh executable dependency {label} has an unexpected module owner")
+        if parent_namespace.get(member_name, _MISSING) is not value:
+            raise _error(f"Gmsh executable dependency {label} was replaced")
+        expected_qualname = member_name
+    elif _is_class_object(parent) and type(type(parent)) is type:
+        parent_namespace = _raw_class_namespace(parent)
+        if parent_namespace is None:
+            raise _error(f"Gmsh executable dependency {label} has no class owner")
+        owner, descriptor = _raw_type_descriptor(parent, member_name)
+        if descriptor is not value:
+            raise _error(f"Gmsh executable dependency {label} was replaced")
+        parent_name = parent_namespace.get("__module__", _MISSING)
+        parent_qualname = parent_namespace.get("__qualname__", _MISSING)
+        if not isinstance(parent_name, str) or not isinstance(parent_qualname, str):
+            raise _error(f"Gmsh executable dependency {label} has an unexpected class owner")
+        owner_qualname = type.__getattribute__(owner, "__qualname__")
+        if not isinstance(owner_qualname, str):
+            raise _error(f"Gmsh executable dependency {label} has an unexpected class owner")
+        expected_qualname = f"{owner_qualname}.{member_name}"
+    else:
+        raise _error(f"Gmsh executable dependency {label} has no module owner")
+    if not _is_class_object(value) or not _authenticated_dependency_metaclass(type(value), label):
+        raise _error(f"Gmsh executable dependency {label} has an unsupported metaclass")
     try:
         value_module = type.__getattribute__(value, "__module__")
         value_qualname = type.__getattribute__(value, "__qualname__")
-    except (AttributeError, TypeError):
-        return False
-    if value_module == parent_name and value_qualname == name:
-        return True
-    if not isinstance(value_module, str) or value_qualname != name:
-        return False
-    owner = sys.modules.get(value_module)
-    return type(owner) is ModuleType and vars(owner).get(name, _MISSING) is value
+        bases = type.__getattribute__(value, "__bases__")
+        class_namespace = type.__getattribute__(value, "__dict__")
+    except (AttributeError, TypeError) as exc:
+        raise _error(f"Gmsh executable dependency {label} class cannot be inspected") from exc
+    if (
+        not isinstance(value_module, str)
+        or not isinstance(value_qualname, str)
+        or type(bases) is not tuple
+        or type(class_namespace) is not MappingProxyType
+    ):
+        raise _error(f"Gmsh executable dependency {label} has an unexpected class owner")
+    if value_module == parent_name:
+        if value_qualname != expected_qualname:
+            raise _error(f"Gmsh executable dependency {label} has an unexpected class owner")
+    else:
+        owner_module = sys.modules.get(value_module, _MISSING)
+        if (
+            type(owner_module) is not ModuleType
+            or _raw_module_class(owner_module, value_qualname) is not value
+        ):
+            raise _error(f"Gmsh executable dependency {label} has an unexpected class owner")
+    stdlib_names = vars(sys).get("stdlib_module_names", frozenset())
+    source_module_name = value_module
+    if (
+        isinstance(stdlib_names, (set, frozenset))
+        and source_module_name.partition(".")[0] in stdlib_names
+    ):
+        source_path = _canonical_stdlib_source_path(source_module_name, label)
+    else:
+        source_module = sys.modules.get(source_module_name, _MISSING)
+        source_value = (
+            vars(source_module).get("__file__", _MISSING)
+            if type(source_module) is ModuleType
+            else _MISSING
+        )
+        if not isinstance(source_value, str):
+            raise _error(f"Gmsh executable dependency {label} has no source file")
+        source_path = _resolve_regular_file(source_value, label)
+    source_identity = _file_identity(source_path, label)
+    source = _read_file_bounded(source_path, _MAX_SOURCE_BYTES, label)
+    compiled = _compile_source_bytes(source, source_path)
+    try:
+        tree = ast.parse(source.decode("utf-8"))
+    except (SyntaxError, UnicodeDecodeError, TypeError, ValueError) as exc:
+        raise _error(f"Gmsh executable dependency {label} source cannot be inspected") from exc
+    class_node = _dependency_class_node(tree, value_qualname)
+    expected_members = _dependency_class_member_nodes(class_node) if class_node is not None else {}
+    members: dict[str, _DependencyTypeMemberState] = {}
+    for member_name, member_node in expected_members.items():
+        namespace_name = member_name
+        class_name = value_qualname.rpartition(".")[2]
+        if member_name.startswith("__") and not member_name.endswith("__"):
+            namespace_name = f"_{class_name}{member_name}"
+        descriptor = class_namespace.get(namespace_name, _MISSING)
+        if descriptor is _MISSING:
+            raise _error(f"Gmsh executable dependency {label}.{namespace_name} is unavailable")
+        expected_code: CodeType | None = None
+        if isinstance(member_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            expected_code = _code_object(
+                compiled,
+                f"{value_qualname}.{member_name}",
+                member_node.lineno,
+            )
+            if expected_code is None:
+                expected_code = _code_object_by_qualname(
+                    compiled, f"{value_qualname}.{member_name}"
+                )
+            if expected_code is None:
+                raise _error(
+                    f"Gmsh executable dependency {label}.{member_name} source implementation is unavailable"
+                )
+        functions = _descriptor_functions(descriptor)
+        if expected_code is not None:
+            if not any(
+                type(function) is FunctionType
+                and function.__module__ == source_module_name
+                and function.__qualname__ == f"{value_qualname}.{member_name}"
+                and _code_digest(function.__code__) == _code_digest(expected_code)
+                for function in functions
+            ):
+                raise _error(
+                    f"Gmsh executable dependency {label}.{member_name} implementation changed"
+                )
+        elif isinstance(member_node, (ast.Assign, ast.AnnAssign)):
+            value_node = member_node.value
+            try:
+                literal = ast.literal_eval(value_node)
+            except (ValueError, TypeError, MemoryError):
+                literal = _MISSING
+            if (
+                literal is not _MISSING
+                and type(descriptor)
+                in (type(None), bool, int, float, complex, str, bytes, tuple, list, dict, frozenset)
+                and _value_signature(descriptor) != _value_signature(literal)
+            ):
+                raise _error(f"Gmsh executable dependency {label}.{member_name} value changed")
+        members[namespace_name] = _DependencyTypeMemberState(
+            descriptor,
+            _value_signature(descriptor),
+            tuple(
+                _function_state(
+                    function,
+                    code_digest=_code_digest(function.__code__),
+                    source_path=source_path,
+                    source_identity=source_identity,
+                )
+                for function in functions
+            ),
+        )
+    base_signatures = tuple(_dependency_type_base_signature(base, label) for base in bases)
+    for base_node, base_signature in zip(
+        class_node.bases if class_node is not None else (), base_signatures
+    ):
+        expected_base_name: str | None = None
+        if isinstance(base_node, ast.Name):
+            expected_base_name = base_node.id
+        elif isinstance(base_node, ast.Call) and base_node.args:
+            function = base_node.func
+            function_name = (
+                function.id
+                if isinstance(function, ast.Name)
+                else (function.attr if isinstance(function, ast.Attribute) else None)
+            )
+            if function_name == "namedtuple" and isinstance(base_node.args[0], ast.Constant):
+                expected_base_name = (
+                    base_node.args[0].value if isinstance(base_node.args[0].value, str) else None
+                )
+        if (
+            expected_base_name is not None
+            and base_signature[1].rpartition(".")[2] != expected_base_name
+        ):
+            raise _error(f"Gmsh executable dependency {label} base implementation changed")
+    state = _DependencyTypeState(
+        value,
+        source_module_name,
+        value_qualname,
+        source_path,
+        source_identity,
+        bases,
+        base_signatures,
+        members,
+    )
+    return state
 
 
 def _supported_dependency_ctypes_callable(value: object, parent: object, name: str) -> bool:
@@ -1175,7 +1653,7 @@ def _dependency_callable_state(
     dependency_depth: int,
     dependency_seen: frozenset[int],
     dependency_context: _DependencyContext | None = None,
-) -> _FunctionState | None:
+) -> _FunctionState | _DependencyTypeState | None:
     name = label.rpartition(".")[2]
     if type(value) is FunctionType:
         return _authenticate_dependency_function(
@@ -1186,15 +1664,30 @@ def _dependency_callable_state(
             dependency_seen=dependency_seen,
             dependency_context=dependency_context,
         )
-    if (
-        _supported_dependency_ctypes_callable(value, parent, name)
-        or _supported_dependency_builtin(value, parent, name)
-        or _supported_dependency_type(value, parent, name)
+    if _supported_dependency_ctypes_callable(value, parent, name) or _supported_dependency_builtin(
+        value, parent, name
     ):
         return None
+    if _is_class_object(value):
+        return _authenticate_dependency_type(
+            value,
+            parent,
+            label,
+            dependency_context=dependency_context,
+        )
     if callable(value):
         raise _error(f"Gmsh executable dependency {label} has an unsupported callable")
     return None
+
+
+def _split_dependency_state(
+    state: _FunctionState | _DependencyTypeState | None,
+) -> tuple[_FunctionState | None, _DependencyTypeState | None]:
+    if type(state) is _FunctionState:
+        return state, None
+    if type(state) is _DependencyTypeState:
+        return None, state
+    return None, None
 
 
 def _capture_module_dependency_states(
@@ -1206,11 +1699,7 @@ def _capture_module_dependency_states(
     dependency_seen: frozenset[int],
     dependency_context: _DependencyContext | None = None,
 ) -> tuple[_ModuleDependencyState, ...]:
-    if type(module) is not ModuleType:
-        raise _error(f"Gmsh executable dependency {root_name} has an unsupported module")
-    module_name = vars(module).get("__name__", _MISSING)
-    if not isinstance(module_name, str) or sys.modules.get(module_name) is not module:
-        raise _error(f"Gmsh executable dependency {root_name} has an unexpected module identity")
+    _validate_dependency_module(module, root_name)
     result: list[_ModuleDependencyState] = []
     for chain_root, path in sorted(_code_attribute_chains(function.__code__)):
         if chain_root != root_name:
@@ -1238,9 +1727,10 @@ def _capture_module_dependency_states(
             actual_path.append(name)
             values.append(current)
         function_state = None
+        type_state = None
         if current is not _MISSING and callable(current):
             parent = values[-2]
-            function_state = _dependency_callable_state(
+            dependency_state = _dependency_callable_state(
                 current,
                 parent,
                 f"{root_name}.{'.'.join(actual_path)}",
@@ -1248,8 +1738,11 @@ def _capture_module_dependency_states(
                 dependency_seen=dependency_seen,
                 dependency_context=dependency_context,
             )
+            function_state, type_state = _split_dependency_state(dependency_state)
         result.append(
-            _ModuleDependencyState(module, tuple(actual_path), tuple(values), function_state)
+            _ModuleDependencyState(
+                module, tuple(actual_path), tuple(values), function_state, type_state
+            )
         )
     return tuple(result)
 
@@ -1273,8 +1766,10 @@ def _authenticate_dependency_function(
         if parent_namespace.get(label.rpartition(".")[2], _MISSING) is not function:
             raise _error(f"Gmsh executable dependency {label} was replaced")
         expected_qualname = label.rpartition(".")[2]
-    elif type(parent) is type:
-        class_namespace = vars(parent)
+    elif _is_class_object(parent) and type(type(parent)) is type:
+        class_namespace = _raw_class_namespace(parent)
+        if class_namespace is None:
+            raise _error(f"Gmsh executable dependency {label} class namespace is unavailable")
         module_name = class_namespace.get("__module__", _MISSING)
         module = sys.modules.get(module_name) if isinstance(module_name, str) else None
         source_name = (
@@ -1283,19 +1778,27 @@ def _authenticate_dependency_function(
         owner, descriptor = _raw_type_descriptor(parent, label.rpartition(".")[2])
         if descriptor is not function:
             raise _error(f"Gmsh executable dependency {label} was replaced")
-        expected_qualname = f"{owner.__qualname__}.{label.rpartition('.')[2]}"
+        owner_qualname = type.__getattribute__(owner, "__qualname__")
+        if not isinstance(owner_qualname, str):
+            raise _error(f"Gmsh executable dependency {label} has an unexpected class owner")
+        expected_qualname = f"{owner_qualname}.{label.rpartition('.')[2]}"
     elif _DEPENDENCY_TRUSTED_OBJECTS.get(id(parent)) is parent:
         parent_type = type(parent)
         owner, descriptor = _raw_type_descriptor(parent_type, label.rpartition(".")[2])
         if descriptor is not function:
             raise _error(f"Gmsh executable dependency {label} was replaced")
-        class_namespace = vars(owner)
+        class_namespace = _raw_class_namespace(owner)
+        if class_namespace is None:
+            raise _error(f"Gmsh executable dependency {label} class namespace is unavailable")
         module_name = class_namespace.get("__module__", _MISSING)
         module = sys.modules.get(module_name) if isinstance(module_name, str) else None
         source_name = (
             vars(module).get("__file__", _MISSING) if type(module) is ModuleType else _MISSING
         )
-        expected_qualname = f"{owner.__qualname__}.{label.rpartition('.')[2]}"
+        owner_qualname = type.__getattribute__(owner, "__qualname__")
+        if not isinstance(owner_qualname, str):
+            raise _error(f"Gmsh executable dependency {label} has an unexpected class owner")
+        expected_qualname = f"{owner_qualname}.{label.rpartition('.')[2]}"
     else:
         raise _error(f"Gmsh executable dependency {label} has no module owner")
     if (
@@ -1304,9 +1807,12 @@ def _authenticate_dependency_function(
         or function.__qualname__ != expected_qualname
     ):
         raise _error(f"Gmsh executable dependency {label} has an unexpected source owner")
-    if isinstance(source_name, str) and not function.__code__.co_filename.startswith("<frozen "):
-        if not _same_path(function.__code__.co_filename, source_name):
-            raise _error(f"Gmsh executable dependency {label} has an unexpected source owner")
+    if (
+        isinstance(source_name, str)
+        and not function.__code__.co_filename.startswith("<frozen ")
+        and not _same_path(function.__code__.co_filename, source_name)
+    ):
+        raise _error(f"Gmsh executable dependency {label} has an unexpected source owner")
     state = _function_dependency_state(
         function,
         dependency_depth=dependency_depth,
@@ -1355,7 +1861,7 @@ def _capture_source_dependencies(
             continue
         parent = values[-2] if len(values) > 1 else module
         dependency_label = root_name if not path else f"{root_name}.{'.'.join(path)}"
-        function_state = _dependency_callable_state(
+        dependency_state = _dependency_callable_state(
             current,
             parent,
             dependency_label,
@@ -1363,7 +1869,10 @@ def _capture_source_dependencies(
             dependency_seen=frozenset(),
             dependency_context=dependency_context,
         )
-        result.append(_ExecutableAttributeState(root_name, path, tuple(values), function_state))
+        function_state, type_state = _split_dependency_state(dependency_state)
+        result.append(
+            _ExecutableAttributeState(root_name, path, tuple(values), function_state, type_state)
+        )
     return tuple(result)
 
 
@@ -1386,6 +1895,12 @@ def _validate_source_dependencies(
                 state.function_state,
                 f"{state.root_name}.{'.'.join(state.path)}",
             )
+        if state.type_state is not None:
+            _validate_dependency_type_state(
+                state.type_state,
+                current,
+                f"{state.root_name}.{'.'.join(state.path)}",
+            )
 
 
 def _native_symbol_names(source: bytes) -> frozenset[str]:
@@ -1405,16 +1920,24 @@ def _native_symbol_names(source: bytes) -> frozenset[str]:
 
 
 def _descriptor_functions(member: object) -> tuple[FunctionType, ...]:
-    if isinstance(member, (staticmethod, classmethod)):
+    if type(member) is staticmethod or type(member) is classmethod:
         function = member.__func__
-        return (function,) if isinstance(function, FunctionType) else ()
-    if isinstance(member, property):
+        return (function,) if type(function) is FunctionType else ()
+    if type(member) is property:
         return tuple(
             function
             for function in (member.fget, member.fset, member.fdel)
-            if isinstance(function, FunctionType)
+            if type(function) is FunctionType
         )
-    return (member,) if isinstance(member, FunctionType) else ()
+    member_type = type(member)
+    if (
+        type.__getattribute__(member_type, "__module__") == "functools"
+        and type.__getattribute__(member_type, "__qualname__") == "cached_property"
+    ):
+        descriptor_namespace = vars(member)
+        function = descriptor_namespace.get("func", _MISSING)
+        return (function,) if type(function) is FunctionType else ()
+    return (member,) if type(member) is FunctionType else ()
 
 
 @dataclass(slots=True)
@@ -1443,9 +1966,7 @@ def _dispatch_descriptor_state(value_type: type, name: str) -> _DispatchDescript
     return _DispatchDescriptorState(owner, descriptor, ())
 
 
-def _generic_dispatch_descriptor_state(
-    value_type: type, name: str
-) -> _DispatchDescriptorState:
+def _generic_dispatch_descriptor_state(value_type: type, name: str) -> _DispatchDescriptorState:
     owner, descriptor = _raw_type_descriptor(value_type, name)
     return _DispatchDescriptorState(
         owner,
@@ -1475,7 +1996,7 @@ def _factory_descriptor_state(value_type: type, name: str) -> _DispatchDescripto
         return _DispatchDescriptorState(owner, descriptor, ())
     if name not in {"__new__", "__init__"}:
         raise _error(f"ctypes {name} descriptor is not statically authenticated")
-    if owner is not value_type or not isinstance(descriptor, FunctionType):
+    if owner is not value_type or type(descriptor) is not FunctionType:
         raise _error(f"ctypes {name} descriptor is not statically authenticated")
     function_state = _function_dependency_state(
         descriptor,
@@ -1501,7 +2022,7 @@ class _FactoryState:
 def _factory_state(value: object) -> _FactoryState | None:
     if value is _MISSING:
         return None
-    if not isinstance(value, type):
+    if not _is_class_object(value):
         raise _error("Gmsh native library factory is not a type")
     metaclass = type(value)
     instance_names = (
@@ -1574,7 +2095,7 @@ def _capture_instance_bindings(
                 dependency_depth=0,
                 dependency_seen=frozenset(),
             )
-            if isinstance(value, FunctionType)
+            if type(value) is FunctionType
             else None
         )
         result[name] = _InstanceBindingState(
@@ -1627,7 +2148,9 @@ def _capture_class_state(
     if len(classes) >= _MAX_LIVE_CLASSES:
         raise _error("Gmsh live class ownership exceeds the finite verification limit")
     try:
-        namespace = vars(class_object)
+        namespace = _raw_class_namespace(class_object)
+        if namespace is None:
+            raise _error(f"Gmsh live class {'.'.join(path)} cannot be inspected")
     except TypeError as exc:
         raise _error("Gmsh live class namespace cannot be inspected") from exc
     if namespace.get("__module__") != module_name:
@@ -1639,9 +2162,9 @@ def _capture_class_state(
             _function_state(function, capture_globals=True)
             for function in _descriptor_functions(descriptor)
         )
-        nested = (
-            isinstance(descriptor, type) and getattr(descriptor, "__module__", None) == module_name
-        )
+        nested = False
+        if _is_class_object(descriptor):
+            nested = type.__getattribute__(descriptor, "__module__") == module_name
         if member_functions or nested or callable(descriptor):
             if len(class_state.members) >= _MAX_LIVE_MEMBERS:
                 raise _error("Gmsh live class members exceed the finite verification limit")
@@ -1659,6 +2182,7 @@ class _GlobalState:
     builtin_signature: object | None
     function_state: _FunctionState | None = None
     module_states: tuple[_ModuleDependencyState, ...] = ()
+    type_state: _DependencyTypeState | None = None
 
 
 def _builtin_binding_from_globals(globals_dict: dict[str, object], name: str) -> object:
@@ -1700,8 +2224,46 @@ def _code_object(root: CodeType, qualname: str, firstlineno: int) -> CodeType | 
     return candidates[0]
 
 
-def _dependency_source_path(code: CodeType, label: str) -> Path:
+def _code_object_by_qualname(root: CodeType, qualname: str) -> CodeType | None:
+    pending = [root]
+    candidates: list[CodeType] = []
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if current.co_qualname == qualname:
+            candidates.append(current)
+        pending.extend(constant for constant in current.co_consts if isinstance(constant, CodeType))
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _dependency_source_path(code: CodeType, label: str, module_name: str | None = None) -> Path:
     filename = code.co_filename
+    if isinstance(filename, str) and filename.startswith("<frozen ") and filename.endswith(">"):
+        frozen_name = filename[len("<frozen ") : -1]
+        frozen_module = sys.modules.get(frozen_name, _MISSING)
+        frozen_source = (
+            vars(frozen_module).get("__file__", _MISSING)
+            if type(frozen_module) is ModuleType
+            else _MISSING
+        )
+        if isinstance(frozen_source, str):
+            return _resolve_regular_file(frozen_source, f"Gmsh executable dependency {label}")
+    if isinstance(module_name, str):
+        stdlib_names = vars(sys).get("stdlib_module_names", frozenset())
+        root_name = module_name.partition(".")[0]
+        if isinstance(stdlib_names, (set, frozenset)) and root_name in stdlib_names:
+            canonical = _canonical_stdlib_source_path(module_name, label)
+            filename = code.co_filename
+            if (
+                isinstance(filename, str)
+                and not filename.startswith("<")
+                and not _same_path(filename, str(canonical))
+            ):
+                raise _error(f"Gmsh executable dependency {label} has an unexpected source file")
+            return canonical
     if not isinstance(filename, str) or not filename:
         raise _error(f"Gmsh executable dependency {label} has no source file")
     if filename.startswith("<frozen ") and filename.endswith(">"):
@@ -1718,8 +2280,10 @@ def _dependency_source_path(code: CodeType, label: str) -> Path:
     return _resolve_regular_file(filename, f"Gmsh executable dependency {label}")
 
 
-def _source_code_state(code: CodeType, label: str) -> tuple[Path, dict[str, object]]:
-    path = _dependency_source_path(code, label)
+def _source_code_state(
+    code: CodeType, label: str, module_name: str | None = None
+) -> tuple[Path, dict[str, object]]:
+    path = _dependency_source_path(code, label, module_name)
     before = _file_identity(path, f"Gmsh executable dependency {label}")
     content = _read_file_bounded(path, _MAX_SOURCE_BYTES, f"Gmsh executable dependency {label}")
     after = _file_identity(path, f"Gmsh executable dependency {label}")
@@ -1754,7 +2318,9 @@ def _function_dependency_state(
         context.functions[id(function)] = trusted
         _validate_function_state(trusted, f"imported {function.__qualname__}")
         return trusted
-    source_path, source_identity = _source_code_state(function.__code__, function.__qualname__)
+    source_path, source_identity = _source_code_state(
+        function.__code__, function.__qualname__, function.__module__
+    )
     state = _function_state(
         function,
         capture_globals=False,
@@ -1800,15 +2366,14 @@ def _capture_function_globals(
                 and name != "lib"
                 and type(value) is not ModuleType
                 and type(value) not in _SAFE_ATTRIBUTE_NAMESPACE_TYPES
+                and not _is_class_object(value)
             ):
                 raise _error(f"Gmsh executable dependency {name} has an unsupported namespace")
             if type(value) is ModuleType:
-                module_name = vars(value).get("__name__", _MISSING)
-                if not isinstance(module_name, str) or sys.modules.get(module_name) is not value:
-                    raise _error(f"Gmsh executable dependency {name} has an unexpected module identity")
+                _validate_dependency_module(value, f"{function.__qualname__}.{name}")
             owner_name = globals_dict.get("__name__", _MISSING)
             owner = sys.modules.get(owner_name) if isinstance(owner_name, str) else _MISSING
-            function_state = (
+            dependency_state = (
                 _dependency_callable_state(
                     value,
                     owner,
@@ -1820,6 +2385,7 @@ def _capture_function_globals(
                 if name != "lib" and callable(value)
                 else None
             )
+            function_state, type_state = _split_dependency_state(dependency_state)
             module_states = (
                 _capture_module_dependency_states(
                     function,
@@ -1829,7 +2395,7 @@ def _capture_function_globals(
                     dependency_seen=dependency_seen,
                     dependency_context=context,
                 )
-                if isinstance(value, ModuleType)
+                if type(value) is ModuleType
                 else ()
             )
             result[name] = _GlobalState(
@@ -1839,6 +2405,7 @@ def _capture_function_globals(
                 None,
                 function_state,
                 module_states,
+                type_state,
             )
         else:
             builtin = _builtin_binding_from_function(function, name)
@@ -1856,6 +2423,7 @@ def _capture_function_globals(
                 _stable_global_signature(builtin),
                 function_state,
                 (),
+                None,
             )
         if len(result) > _MAX_LIVE_GLOBALS:
             raise _error("Gmsh dispatch globals exceed the finite verification limit")
@@ -1887,30 +2455,140 @@ def _validate_module_dependency_states(
                 state.function_state,
                 f"{label}.{'.'.join(state.path)}",
                 validation_seen,
-    )
+            )
+        if state.type_state is not None:
+            _validate_dependency_type_state(
+                state.type_state,
+                current,
+                f"{label}.{'.'.join(state.path)}",
+                validation_seen,
+            )
 
 
-def _is_authenticated_platform_cache(
-    state: _FunctionState, name: str, value: object
-) -> bool:
-    if state.function.__module__ != "platform" or state.function.__qualname__ != "uname":
-        return False
-    platform_module = sys.modules.get("platform")
+def _validate_dependency_type_state(
+    state: _DependencyTypeState,
+    current: object,
+    label: str,
+    validation_seen: set[int] | None = None,
+) -> None:
+    if current is not state.value or type(current) is not type(state.value):
+        raise _error(f"live Gmsh executable dependency {label} class was replaced")
+    try:
+        module_name = type.__getattribute__(current, "__module__")
+        qualname = type.__getattribute__(current, "__qualname__")
+        bases = type.__getattribute__(current, "__bases__")
+        namespace = type.__getattribute__(current, "__dict__")
+    except (AttributeError, TypeError) as exc:
+        raise _error(f"live Gmsh executable dependency {label} class cannot be inspected") from exc
     if (
-        name != "_uname_cache"
-        or type(platform_module) is not ModuleType
-        or state.globals_dict is not vars(platform_module)
+        module_name != state.module_name
+        or qualname != state.qualname
+        or type(bases) is not tuple
+        or type(namespace) is not MappingProxyType
+        or tuple(_dependency_type_base_signature(base, label) for base in bases)
+        != state.base_signatures
+    ):
+        raise _error(f"live Gmsh executable dependency {label} class metadata changed")
+    module = sys.modules.get(state.module_name)
+    source_name = vars(module).get("__file__", _MISSING) if type(module) is ModuleType else _MISSING
+    if not isinstance(source_name, str) or not _same_path(source_name, str(state.source_path)):
+        raise _error(f"live Gmsh executable dependency {label} source path changed")
+    current_identity = _file_identity(state.source_path, label)
+    _compare_file_records(state.source_identity, current_identity, label)
+    for name, member_state in state.members.items():
+        member = namespace.get(name, _MISSING)
+        if member is not member_state.descriptor:
+            raise _error(f"live Gmsh executable dependency {label}.{name} changed")
+        if _value_signature(member) != member_state.signature:
+            raise _error(f"live Gmsh executable dependency {label}.{name} changed")
+        for function_state in member_state.functions:
+            _validate_function_state(function_state, f"{label}.{name}", validation_seen)
+
+
+def _is_authenticated_platform_cache(state: _FunctionState, name: str, value: object) -> bool:
+    if (
+        state.function.__module__ != "platform"
+        or state.function.__qualname__ != "uname"
+        or name != "_uname_cache"
+        or state.platform_cache_result is _MISSING
+        or value is not state.platform_cache_result
     ):
         return False
-    result_type = state.globals_dict.get("uname_result", _MISSING)
-    if type(result_type) is not type or type(value) is not result_type:
+    platform_module = sys.modules.get("platform", _MISSING)
+    if type(platform_module) is not ModuleType or state.globals_dict is not vars(platform_module):
         return False
-    try:
-        length = tuple.__len__(value)
-        items = tuple(tuple.__getitem__(value, index) for index in range(length))
-    except (IndexError, TypeError, ValueError):
-        return False
-    return 5 <= length <= 6 and all(type(item) is str for item in items)
+    result_state = state.global_states.get("uname_result") if state.global_states else None
+    result_type_state = result_state.type_state if result_state is not None else None
+    return result_type_state is not None and type(value) is result_type_state.value
+
+
+def _walk_dependency_function_states(
+    state: _FunctionState | None, seen: set[int] | None = None
+) -> tuple[_FunctionState, ...]:
+    if state is None:
+        return ()
+    visited = seen if seen is not None else set()
+    if id(state) in visited:
+        return ()
+    visited.add(id(state))
+    result = [state]
+    if state.global_states is not None:
+        for global_state in state.global_states.values():
+            result.extend(_walk_dependency_function_states(global_state.function_state, visited))
+            for module_state in global_state.module_states:
+                result.extend(
+                    _walk_dependency_function_states(module_state.function_state, visited)
+                )
+                for member_state in (
+                    module_state.type_state.members.values() if module_state.type_state else ()
+                ):
+                    for function_state in member_state.functions:
+                        result.extend(_walk_dependency_function_states(function_state, visited))
+    return tuple(result)
+
+
+def _prepare_platform_cache_transition(
+    states: tuple[_ExecutableAttributeState, ...],
+) -> None:
+    uname_states: list[_FunctionState] = []
+    seen: set[int] = set()
+    for executable_state in states:
+        for function_state in _walk_dependency_function_states(
+            executable_state.function_state, seen
+        ):
+            if (
+                function_state.function.__module__ == "platform"
+                and function_state.function.__qualname__ == "uname"
+            ):
+                uname_states.append(function_state)
+    if not uname_states:
+        return
+    platform_module = sys.modules.get("platform", _MISSING)
+    if type(platform_module) is not ModuleType:
+        raise _error("platform dependency module is unavailable")
+    platform_source = vars(platform_module).get("__file__", _MISSING)
+    canonical_source = _canonical_stdlib_source_path("platform", "platform dependency")
+    if not isinstance(platform_source, str) or not _same_path(
+        platform_source, str(canonical_source)
+    ):
+        raise _error("platform dependency source path is not authentic")
+    namespace = vars(platform_module)
+    if namespace.get("_uname_cache", _MISSING) is not None:
+        raise _error("platform dependency requires a cold uname cache")
+    for state in uname_states:
+        if state.platform_cache_result is not _MISSING:
+            continue
+        global_state = state.global_states.get("_uname_cache") if state.global_states else None
+        if global_state is None or global_state.value is not None:
+            raise _error("platform dependency uname cache was not cold at admission")
+        result = state.function()
+        if namespace.get("_uname_cache", _MISSING) is not result:
+            raise _error("platform dependency uname cache did not perform the genuine transition")
+        result_state = state.global_states.get("uname_result") if state.global_states else None
+        type_state = result_state.type_state if result_state is not None else None
+        if type_state is None or type(result) is not type_state.value:
+            raise _error("platform dependency uname result is not authenticated")
+        state.platform_cache_result = result
 
 
 def _validate_function_globals(
@@ -1945,6 +2623,15 @@ def _validate_function_globals(
         _validate_module_dependency_states(
             global_state.module_states, f"{label}.{name}", validation_seen
         )
+        if global_state.type_state is not None:
+            if current is not global_state.type_state.value:
+                raise _error(f"live Gmsh executable dependency {label}.{name} was replaced")
+            _validate_dependency_type_state(
+                global_state.type_state,
+                current,
+                f"{label}.{name}",
+                validation_seen,
+            )
         if global_state.function_state is not None:
             dependency = global_state.function_state
             resolved = (
@@ -1969,8 +2656,8 @@ _CTYPES_INTERNAL_SIGNATURE: tuple[object, ...] | None = None
 _CTYPES_NAMESPACE: dict[str, object] | None = None
 _CTYPES_SOURCE_PATH: Path | None = None
 _CTYPES_SOURCE_IDENTITY: dict[str, object] | None = None
-_CTYPES_INTERNAL_ARGTYPES = (ctypes.c_void_p, ctypes.py_object, ctypes.py_object)
-_CTYPES_INTERNAL_RESTYPE = ctypes.py_object
+_CTYPES_INTERNAL_ARGTYPES: tuple[type, ...] = ()
+_CTYPES_INTERNAL_RESTYPE: type | None = None
 _CTYPES_WINTYPES_MODULE = ctypes.wintypes
 _CTYPES_EXPECTED_BINDINGS: dict[str, object] = {}
 _CTYPES_EXPECTED_TYPE_STATES: dict[int, _CTypeState] = {}
@@ -2057,7 +2744,117 @@ def _capture_ctypes_type_state(value: type, label: str) -> _CTypeState:
     return _CTypeState(value, metaclass, value_descriptors, metaclass_descriptors)
 
 
+def _ctypes_native_module() -> ModuleType:
+    native = sys.modules.get("_ctypes", _MISSING)
+    if type(native) is not ModuleType:
+        raise _error("ctypes native module is unavailable")
+    namespace = vars(native)
+    if namespace.get("__name__", _MISSING) != "_ctypes":
+        raise _error("ctypes native module identity is invalid")
+    source = namespace.get("__file__", _MISSING)
+    if not isinstance(source, str):
+        raise _error("ctypes native module source is unavailable")
+    try:
+        source_path = Path(source).resolve(strict=True)
+        native_roots = (
+            _canonical_stdlib_dir().parent / "DLLs",
+            _canonical_stdlib_dir() / "lib-dynload",
+        )
+        if not any(source_path.parent.resolve() == root.resolve() for root in native_roots):
+            raise _error("ctypes native module is outside the Python runtime")
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        if isinstance(exc, _RuntimeBindingError):
+            raise
+        raise _error("ctypes native module source is unavailable") from exc
+    return native
+
+
+def _validate_ctypes_native_anchors() -> ModuleType:
+    native = _ctypes_native_module()
+    namespace = vars(ctypes)
+    native_namespace = vars(native)
+    native_bindings = {
+        "Array": "Array",
+        "Structure": "Structure",
+        "Union": "Union",
+        "_Pointer": "_Pointer",
+        "_CFuncPtr": "CFuncPtr",
+        "POINTER": "POINTER",
+    }
+    for current_name, native_name in native_bindings.items():
+        expected = native_namespace.get(native_name, _MISSING)
+        if expected is _MISSING or namespace.get(current_name, _MISSING) is not expected:
+            raise _error(f"ctypes native binding {current_name} is not authentic")
+    simple_data = native_namespace.get("_SimpleCData", _MISSING)
+    c_void_p = namespace.get("c_void_p", _MISSING)
+    c_void_p_mro = (
+        type.__getattribute__(c_void_p, "__mro__") if type(c_void_p) is type(simple_data) else ()
+    )
+    if (
+        type(type(simple_data)) is not type
+        or type(c_void_p) is not type(simple_data)
+        or simple_data not in c_void_p_mro
+        or (_raw_class_namespace(c_void_p) or {}).get("_type_", _MISSING) != "P"
+        or namespace.get("c_voidp", _MISSING) is not c_void_p
+    ):
+        raise _error("ctypes c_void_p native conversion anchor is not authentic")
+    converter_owner, converter = _raw_type_descriptor(c_void_p, "from_param")
+    if converter_owner is not c_void_p or type(converter) is not ClassMethodDescriptorType:
+        raise _error("ctypes c_void_p converter implementation is not authentic")
+    c_int = namespace.get("c_int", _MISSING)
+    c_long = namespace.get("c_long", _MISSING)
+    if os.name == "nt":
+        if c_int is not c_long:
+            raise _error("ctypes c_int native conversion anchor is not authentic")
+    elif (
+        not _is_class_object(c_int)
+        or (_raw_class_namespace(c_int) or {}).get("_type_", _MISSING) != "i"
+    ):
+        raise _error("ctypes c_int native conversion anchor is not authentic")
+    wintypes = sys.modules.get("ctypes.wintypes", _MISSING)
+    if type(wintypes) is not ModuleType:
+        raise _error("ctypes wintypes module is unavailable")
+    if namespace.get("wintypes", _MISSING) is not wintypes:
+        raise _error("ctypes wintypes module binding changed")
+    wintypes_source = vars(wintypes).get("__file__", _MISSING)
+    expected_wintypes_source = _canonical_stdlib_source_path("ctypes.wintypes", "ctypes wintypes")
+    if not isinstance(wintypes_source, str) or not _same_path(
+        wintypes_source, str(expected_wintypes_source)
+    ):
+        raise _error("ctypes wintypes source path is not authentic")
+    ctypes_source = namespace.get("__file__", _MISSING)
+    expected_ctypes_source = _canonical_stdlib_source_path("ctypes", "ctypes source")
+    if not isinstance(ctypes_source, str) or not _same_path(
+        ctypes_source, str(expected_ctypes_source)
+    ):
+        raise _error("ctypes source path is not authentic")
+    if vars(wintypes).get("HMODULE", _MISSING) is not c_void_p:
+        raise _error("ctypes wintypes HMODULE binding is not authentic")
+    py_object = namespace.get("py_object", _MISSING)
+    py_object_mro = (
+        type.__getattribute__(py_object, "__mro__") if type(py_object) is type(simple_data) else ()
+    )
+    if (
+        type(py_object) is not type(simple_data)
+        or simple_data not in py_object_mro
+        or (_raw_class_namespace(py_object) or {}).get("_type_", _MISSING) != "O"
+    ):
+        raise _error("ctypes py_object native conversion anchor is not authentic")
+    return native
+
+
 def _establish_ctypes_baseline() -> None:
+    global _CTYPES_INTERNAL_ARGTYPES
+    global _CTYPES_INTERNAL_RESTYPE
+    global _CTYPES_WINTYPES_MODULE
+    _validate_ctypes_native_anchors()
+    _CTYPES_WINTYPES_MODULE = sys.modules["ctypes.wintypes"]
+    _CTYPES_INTERNAL_ARGTYPES = (
+        vars(ctypes)["c_void_p"],
+        vars(ctypes)["py_object"],
+        vars(ctypes)["py_object"],
+    )
+    _CTYPES_INTERNAL_RESTYPE = vars(ctypes)["py_object"]
     if _CTYPES_EXPECTED_BINDINGS:
         return
     namespace = vars(ctypes)
@@ -2086,9 +2883,10 @@ def _establish_ctypes_baseline() -> None:
     for name in ("cast", "create_unicode_buffer", "sizeof", "POINTER", "CDLL", "_cast"):
         if _CTYPES_EXPECTED_BINDINGS.get(f"ctypes.{name}", _MISSING) is _MISSING:
             raise _error(f"ctypes {name} binding is unavailable")
-    if _CTYPES_EXPECTED_BINDINGS.get("ctypes.c_void_p", _MISSING) is _MISSING or _CTYPES_EXPECTED_BINDINGS.get(
-        "ctypes.py_object", _MISSING
-    ) is _MISSING:
+    if (
+        _CTYPES_EXPECTED_BINDINGS.get("ctypes.c_void_p", _MISSING) is _MISSING
+        or _CTYPES_EXPECTED_BINDINGS.get("ctypes.py_object", _MISSING) is _MISSING
+    ):
         raise _error("ctypes cast conversion bindings are unavailable")
     for key, value in _CTYPES_EXPECTED_BINDINGS.items():
         if key.startswith("ctypes.wintypes.") or key.rpartition(".")[2] not in _CTYPES_TYPE_NAMES:
@@ -2183,7 +2981,7 @@ def _ctypes_bootstrap_dispatch_expectations(
             raise _error(f"ctypes {name[0].__name__} {name[1]} dispatch baseline changed")
 
     if win_dll is not _MISSING:
-        if not isinstance(win_dll, type):
+        if not _is_class_object(win_dll):
             raise _error("ctypes WinDLL type is unavailable")
         win_namespace = vars(win_dll)
         for name in (
@@ -2238,10 +3036,7 @@ def _build_ctypes_trust() -> None:
     _establish_ctypes_baseline()
     _validate_ctypes_baseline()
     namespace = vars(ctypes)
-    source_value = namespace.get("__file__", _MISSING)
-    if not isinstance(source_value, str) or not source_value.endswith(".py"):
-        raise _error("ctypes source file is unavailable")
-    source_path = _resolve_regular_file(source_value, "ctypes source")
+    source_path = _canonical_stdlib_source_path("ctypes", "ctypes source")
     source_identity = _file_identity(source_path, "ctypes source")
     source = _read_file_bounded(source_path, _MAX_SOURCE_BYTES, "ctypes source")
     compiled = _compile_source_bytes(source, source_path)
@@ -2264,25 +3059,23 @@ def _build_ctypes_trust() -> None:
             compiled,
             qualname,
             getattr(function, "__code__", _MISSING).co_firstlineno
-            if isinstance(function, FunctionType)
+            if type(function) is FunctionType
             else -1,
         )
-        if not isinstance(function, FunctionType) or expected is None:
+        if type(function) is not FunctionType or expected is None:
             raise _error(f"ctypes {public_name} implementation is unavailable")
         definitions[public_name] = (function, expected)
     descriptor_specs: dict[str, tuple[object, FunctionType, CodeType]] = {}
     for method_name in ("__getattr__", "__getitem__", "__init__"):
         owner, descriptor = _raw_type_descriptor(cdll, method_name)
-        if owner is not cdll or not isinstance(descriptor, FunctionType):
+        if owner is not cdll or type(descriptor) is not FunctionType:
             raise _error(f"ctypes CDLL {method_name} implementation is unavailable")
         function = descriptor
         expected = _code_object(compiled, function.__qualname__, function.__code__.co_firstlineno)
         if expected is None:
             raise _error(f"ctypes CDLL {method_name} source implementation is unavailable")
         descriptor_specs[method_name] = (descriptor, function, expected)
-    dispatch_expectations = _ctypes_bootstrap_dispatch_expectations(
-        cdll, win_dll, descriptor_specs
-    )
+    dispatch_expectations = _ctypes_bootstrap_dispatch_expectations(cdll, win_dll, descriptor_specs)
     internal_cast = namespace.get("_cast", _MISSING)
     if not _is_ctypes_callable(internal_cast):
         raise _error("ctypes internal cast implementation is unavailable")
@@ -2369,9 +3162,10 @@ def _validate_ctypes_source() -> None:
 
 
 def _validate_ctypes_dispatch_expectations() -> None:
-    for (value_type, name), (expected_owner, expected_descriptor) in (
-        _CTYPES_DISPATCH_EXPECTATIONS.items()
-    ):
+    for (value_type, name), (
+        expected_owner,
+        expected_descriptor,
+    ) in _CTYPES_DISPATCH_EXPECTATIONS.items():
         owner, descriptor = _raw_type_descriptor(value_type, name)
         if owner is not expected_owner or descriptor is not expected_descriptor:
             raise _error(f"ctypes {value_type.__name__} {name} dispatch changed")
@@ -2393,7 +3187,7 @@ def _validate_ctypes_function(name: str) -> None:
     if name.startswith("CDLL."):
         method_name = name.partition(".")[2]
         cdll = _CTYPES_NAMESPACE.get("CDLL", _MISSING)
-        if not isinstance(cdll, type):
+        if not _is_class_object(cdll):
             raise _error("ctypes CDLL type changed")
         owner, descriptor = _raw_type_descriptor(cdll, method_name)
         trusted = _CTYPES_TRUSTED_DESCRIPTORS.get((cdll, method_name))
@@ -2411,7 +3205,7 @@ def _validate_ctypes_function(name: str) -> None:
         function = _CTYPES_NAMESPACE.get(name, _MISSING)
         if function is not state.function:
             raise _error(f"ctypes {name} implementation changed")
-    if not isinstance(function, FunctionType) or function.__globals__ is not _CTYPES_NAMESPACE:
+    if type(function) is not FunctionType or function.__globals__ is not _CTYPES_NAMESPACE:
         raise _error(f"ctypes {name} globals changed")
     _validate_function_state(state, name)
 
@@ -2448,7 +3242,15 @@ def _validate_ctypes_dependencies() -> None:
 
 
 def _is_ctypes_callable(value: object) -> bool:
-    return isinstance(_CFUNC_PTR_TYPE, type) and isinstance(value, _CFUNC_PTR_TYPE)
+    if not _is_class_object(_CFUNC_PTR_TYPE):
+        return False
+    value_type = type(value)
+    if not _is_class_object(value_type):
+        return False
+    try:
+        return _CFUNC_PTR_TYPE in type.__getattribute__(value_type, "__mro__")
+    except (AttributeError, TypeError):
+        return False
 
 
 def _ctypes_dispatch_descriptor(
@@ -2494,7 +3296,7 @@ def _ctypes_pointer(value: object, name: str) -> int:
     cast_state = _CTYPES_TRUSTED_FUNCTIONS_BY_NAME.get("cast")
     cast_function = None if cast_state is None else cast_state.function
     c_void_p = _CTYPES_BINDINGS.get("c_void_p", _MISSING)
-    if not isinstance(cast_function, FunctionType) or c_void_p is _MISSING:
+    if type(cast_function) is not FunctionType or c_void_p is _MISSING:
         raise _error(f"cached native callable {name} ctypes cast binding is unavailable")
     try:
         pointer = cast_function(value, c_void_p).value
@@ -2578,13 +3380,13 @@ def _static_ctypes_value(node: ast.AST) -> object:
             function_name = function.attr
         if function_name == "POINTER":
             pointed_type = _static_ctypes_value(node.args[0])
-            if isinstance(pointed_type, type):
+            if _is_class_object(pointed_type):
                 try:
                     pointer_factory = _CTYPES_EXPECTED_BINDINGS.get("ctypes.POINTER", _MISSING)
                     if vars(ctypes).get("POINTER", _MISSING) is not pointer_factory:
                         return _MISSING
                     pointer = pointer_factory(pointed_type)
-                    if not isinstance(pointer, type):
+                    if not _is_class_object(pointer):
                         return _MISSING
                     if id(pointer) not in _CTYPES_DYNAMIC_TYPE_STATES:
                         _CTYPES_DYNAMIC_TYPE_STATES[id(pointer)] = _capture_ctypes_type_state(
@@ -2605,9 +3407,7 @@ def _native_signature_policy(
         _value_signature(ctypes.c_int),
         _value_signature(None),
     )
-    permitted: dict[str, set[tuple[object, ...]]] = {
-        name: {default} for name in native_symbols
-    }
+    permitted: dict[str, set[tuple[object, ...]]] = {name: {default} for name in native_symbols}
     if not native_symbols:
         return {}
     try:
@@ -2643,9 +3443,7 @@ def _native_signature_policy(
     if len(assignments) > _MAX_LIVE_MEMBERS:
         raise _error("Gmsh native metadata exceeds the finite verification limit")
     assignments.sort(key=lambda item: (item[0], item[1]))
-    current: dict[str, list[object]] = {
-        name: list(default) for name in native_symbols
-    }
+    current: dict[str, list[object]] = {name: list(default) for name in native_symbols}
     for _line, _column, name, attribute, expression in assignments:
         value = _static_ctypes_value(expression)
         if value is _MISSING:
@@ -2794,7 +3592,7 @@ def _native_callable_state(
             setattr_owner,
             setattr_descriptor,
         )
-    if isinstance(value, FunctionType):
+    if type(value) is FunctionType:
         return _NativeCallableState(
             value,
             type(value),
@@ -2915,10 +3713,10 @@ def _capture_live_state(
     classes: dict[tuple[str, ...], _ClassState] = {}
     functions: list[_FunctionState] = []
     for name, value in tuple(module_namespace.items()):
-        if isinstance(value, FunctionType) and value.__module__ == module_name:
+        if type(value) is FunctionType and value.__module__ == module_name:
             module_functions[name] = _function_state(value, capture_globals=True)
             functions.append(module_functions[name])
-        elif isinstance(value, type):
+        elif _is_class_object(value):
             _capture_class_state((name,), value, module_name, classes, functions)
     if len(functions) > _MAX_LIVE_MEMBERS:
         raise _error("Gmsh live executable functions exceed the finite verification limit")
@@ -2935,7 +3733,7 @@ def _capture_live_state(
                     dependency_depth=0,
                     dependency_seen=frozenset(),
                 )
-                if isinstance(value, FunctionType)
+                if type(value) is FunctionType
                 else None
             )
             global_states[name] = _GlobalState(
@@ -2958,7 +3756,7 @@ def _capture_live_state(
                         dependency_depth=0,
                         dependency_seen=frozenset(),
                     )
-                    if isinstance(builtin, FunctionType)
+                    if type(builtin) is FunctionType
                     else None
                 ),
             )
@@ -2993,9 +3791,12 @@ def _capture_live_state(
 def _lookup_class_path(module: ModuleType, path: tuple[str, ...]) -> object:
     current: object = vars(module).get(path[0], _MISSING)
     for name in path[1:]:
-        if not isinstance(current, type):
+        if not _is_class_object(current):
             return _MISSING
-        current = vars(current).get(name, _MISSING)
+        namespace = _raw_class_namespace(current)
+        if namespace is None:
+            return _MISSING
+        current = namespace.get(name, _MISSING)
     return current
 
 
@@ -3010,7 +3811,7 @@ def _validate_native_callable_state(
     if current is not state.value or type(current) is not state.value_type:
         raise _error(f"live Gmsh native callable {name} was replaced")
     if state.function is not None:
-        if not isinstance(current, FunctionType):
+        if type(current) is not FunctionType:
             raise _error(f"live Gmsh native callable {name} changed type")
         _validate_function_state(state.function, f"native {name}")
     elif state.pointer is not None:
@@ -3142,9 +3943,11 @@ def _validate_live_state(state: _LiveState, module: ModuleType, library: object)
         if current_class is not class_state.class_object:
             raise _error(f"live Gmsh class {'.'.join(path)} was replaced")
         try:
-            current_members = vars(class_state.class_object)
+            current_members = _raw_class_namespace(class_state.class_object)
         except TypeError as exc:
             raise _error(f"live Gmsh class {'.'.join(path)} cannot be inspected") from exc
+        if current_members is None:
+            raise _error(f"live Gmsh class {'.'.join(path)} cannot be inspected")
         for name, member_state in class_state.members.items():
             current = current_members.get(name, _MISSING)
             if current is not member_state.descriptor:
@@ -3344,7 +4147,7 @@ def load_verified_gmsh(binding: dict[str, object]) -> tuple[Any, dict[str, objec
     expected = _normalise_binding(binding, "expected runtime")
     with _CACHE_LOCK:
         preloaded = sys.modules.get("gmsh")
-        if isinstance(preloaded, ModuleType):
+        if type(preloaded) is ModuleType:
             cached = _cached_session(preloaded, expected)
             if cached is not None:
                 return cached.module, dict(cached.observed)
@@ -3368,6 +4171,7 @@ def load_verified_gmsh(binding: dict[str, object]) -> tuple[Any, dict[str, objec
                 module_path, actual_module, snapshot, admission
             )
             source_dependencies = _capture_source_dependencies(snapshot.content, snapshot.code)
+            _prepare_platform_cache_transition(source_dependencies)
             module = _import_verified_source(module_path, actual_module, snapshot.code)
             code_digest = snapshot.code_digest
             try:
