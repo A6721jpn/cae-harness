@@ -1,8 +1,9 @@
-"""Trusted, portable provisioning of the reviewed planar compatibility bundle.
+"""Provisioning of the planar compatibility profiles.
 
-The bundle is external evidence, not a caller-authored authority declaration.  Its
-identity is pinned by the product and all bytes, typed records, and existing
-identities are checked before any source or profile registration is attempted.
+By default the product's built-in planar bundle (``febio_cae.resources``) is
+registered.  An explicit external bundle file may be supplied instead; either way
+the typed records, evidence bindings and existing identities are checked before
+any source or profile registration is attempted.
 """
 
 from __future__ import annotations
@@ -14,10 +15,10 @@ import json
 import re
 import stat
 from collections.abc import Mapping
+from importlib import resources
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
-from febio_cae.adapters.febio import xplt_reader
 from febio_cae.domain.artifacts import SourceAssetRef
 from febio_cae.domain.canonical import canonical_bytes
 from febio_cae.domain.codec import CodecError, decode_record
@@ -32,9 +33,8 @@ if TYPE_CHECKING:
     from .service import RegisteredCaseService
 
 
-_APPROVED_BUNDLE_SHA256 = "f5f5ce51367f6f9af6f19fc42da6641fd3b4202711e95681a89333d74a3d22c5"
-_APPROVED_BUNDLE_SIZE = 604962
-_APPROVED_READER_SHA256 = "8bed227c115babe2e038d0b928194308c4601cf2fd926ac77c4defb2ad9a0ca1"
+_BUILTIN_BUNDLE_NAME = "planar_default_bundle.json"
+_MAX_BUNDLE_SIZE = 4 * 1024 * 1024
 _SCOPE_CAPABILITY = "febio.scope.planar_linear_frictionless_fixed_xyz"
 _PROFILE_IDS = {
     "solver": "febio412-planar-solver-01",
@@ -122,27 +122,28 @@ def _read_bundle(path: Path) -> bytes:
         raise PortError(
             PortErrorCategory.ENVIRONMENT, f"bundle path is unavailable: {error}"
         ) from error
-    if not selected.is_file() or info.st_size != _APPROVED_BUNDLE_SIZE:
+    if not selected.is_file() or info.st_size > _MAX_BUNDLE_SIZE:
         raise PortError(
             PortErrorCategory.INTEGRITY,
-            f"approved bundle size does not match the pinned {_APPROVED_BUNDLE_SIZE} bytes",
+            f"bundle must be a regular file of at most {_MAX_BUNDLE_SIZE} bytes",
         )
     try:
         with selected.open("rb") as stream:
-            content = stream.read(_APPROVED_BUNDLE_SIZE + 1)
+            content = stream.read(_MAX_BUNDLE_SIZE + 1)
+    except OSError as error:
+        raise PortError(PortErrorCategory.ENVIRONMENT, f"cannot read bundle: {error}") from error
+    if len(content) != info.st_size:
+        raise PortError(PortErrorCategory.INTEGRITY, "bundle read was truncated or extended")
+    return content
+
+
+def _read_builtin_bundle() -> bytes:
+    try:
+        return (resources.files("febio_cae.resources") / _BUILTIN_BUNDLE_NAME).read_bytes()
     except OSError as error:
         raise PortError(
-            PortErrorCategory.ENVIRONMENT, f"cannot read approved bundle: {error}"
+            PortErrorCategory.ENVIRONMENT, f"built-in planar bundle is unavailable: {error}"
         ) from error
-    if len(content) != _APPROVED_BUNDLE_SIZE:
-        raise PortError(
-            PortErrorCategory.INTEGRITY, "approved bundle read was truncated or extended"
-        )
-    if hashlib.sha256(content).hexdigest() != _APPROVED_BUNDLE_SHA256:
-        raise PortError(
-            PortErrorCategory.INTEGRITY, "approved bundle digest does not match the product pin"
-        )
-    return content
 
 
 def _parse_bundle(
@@ -226,9 +227,8 @@ def _parse_bundle(
             if (
                 profile.reader.tool_id != "febio-cae-xplt-reader"
                 or profile.reader.version != "0.1.0"
-                or profile.reader.executable_digest != _APPROVED_READER_SHA256
             ):
-                raise _BundleError(f"bundle.profiles.{purpose} has an unapproved reader identity")
+                raise _BundleError(f"bundle.profiles.{purpose} has an unexpected reader identity")
             if profile.solver.tool_id != "febio" or profile.solver.version != "4.12.0":
                 raise _BundleError(f"bundle.profiles.{purpose} has an unexpected solver identity")
             if not any(
@@ -325,21 +325,14 @@ def provision_planar_profiles(
     service: RegisteredCaseService,
     case_id: str,
     *,
-    bundle_path: Path,
+    bundle_path: Path | None = None,
 ) -> dict[str, object]:
-    """Validate and publish the exact approved planar records without native work."""
-    content = _read_bundle(bundle_path)
+    """Validate and publish the planar profile records without native work.
+
+    ``bundle_path=None`` registers the product's built-in default bundle.
+    """
+    content = _read_builtin_bundle() if bundle_path is None else _read_bundle(bundle_path)
     bundle, source_bytes, source_metadata, profiles, mesh = _parse_bundle(content)
-    try:
-        reader_payload = Path(xplt_reader.__file__).read_bytes()
-    except OSError as error:
-        raise PortError(
-            PortErrorCategory.INTEGRITY, "installed reader bytes cannot be verified"
-        ) from error
-    if hashlib.sha256(reader_payload).hexdigest() != _APPROVED_READER_SHA256:
-        raise PortError(
-            PortErrorCategory.INTEGRITY, "installed reader differs from the qualified reader"
-        )
 
     # Preflight current identities; stores also enforce conflicts during publication.
     _prevalidate_existing(service, case_id, profiles, mesh, source_metadata, source_bytes)
@@ -369,7 +362,11 @@ def provision_planar_profiles(
         "case_id": case_id,
         "profiles": result_profiles,
         "mesh_quality": mesh.reference.to_dict(),
-        "approved_bundle": {"sha256": _APPROVED_BUNDLE_SHA256, "size": _APPROVED_BUNDLE_SIZE},
+        "bundle": {
+            "source": "builtin" if bundle_path is None else str(Path(bundle_path).expanduser()),
+            "sha256": hashlib.sha256(content).hexdigest(),
+            "size": len(content),
+        },
         "scope": cast(dict[str, object], bundle["scope"]),
         "native_operations": 0,
     }

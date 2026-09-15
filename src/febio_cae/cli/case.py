@@ -216,7 +216,8 @@ def run_case(arguments: Namespace) -> int:
             return 0
         if arguments.case_action == "provision-planar-profiles":
             payload = service.provision_planar_profiles(
-                arguments.case_id, bundle_path=Path(arguments.bundle_path)
+                arguments.case_id,
+                bundle_path=None if arguments.bundle_path is None else Path(arguments.bundle_path),
             )
             _print(payload) if arguments.json else print(payload["status"])
             return 0

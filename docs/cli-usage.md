@@ -1,6 +1,6 @@
 # CLI使用ガイド
 
-Python 3.12のheadlessプロトタイプ、`febio-cae 0.1.0`の公開コマンドを説明する。製品仕様の決定元は[設計仕様書](specs/2026-09-14-febio-llm-cae-harness-design-v2.md)と[実装・検証計画](plans/2026-09-14-febio-cae-harness-greenfield-plan.md)、細部は[実装ノート](specs/implementation-notes.md)。本書は仕様を追加しない。MVPの8手順（計画書 §2）のうち、汎用 `run`、同梱バンドル、`preview` の `LAUNCHED` は実装タスクT1〜T4であり、本書は現行CLIの構文を示す。
+Python 3.12のheadlessプロトタイプ、`febio-cae 0.1.0`の公開コマンドを説明する。製品仕様の決定元は[設計仕様書](specs/2026-09-14-febio-llm-cae-harness-design-v2.md)と[実装・検証計画](plans/2026-09-14-febio-cae-harness-greenfield-plan.md)、細部は[実装ノート](specs/implementation-notes.md)。本書は仕様を追加しない。MVPの8手順（計画書 §2）のうち、汎用 `run` と `preview` の `LAUNCHED` は実装タスクT1・T4であり、本書は現行CLIの構文を示す。
 
 開発・修正の担当と判断権限は2026-09-09改訂の[開発契約](../AGENTS.md)に従う（PM兼PdM: Astra X-high、単独実装: Astra Low、別タスクの独立レビュー: Astra Medium）。この体制変更による公開CLIの構文変更はない。
 
@@ -50,14 +50,14 @@ febio-cae case --state-dir '<STATE_DIR>' patch '<CASE_ID>' --file '<PATCH_JSON>'
 
 ```powershell
 febio-cae case --state-dir '<STATE_DIR>' inspect '<CASE_ID>' --native --wall-seconds '<SECONDS>' --cpu-workers '<N>' --json
-febio-cae case --state-dir '<STATE_DIR>' provision-planar-profiles '<CASE_ID>' --bundle-path '<BUNDLE_PATH>' --json
+febio-cae case --state-dir '<STATE_DIR>' provision-planar-profiles '<CASE_ID>' --json
 febio-cae case --state-dir '<STATE_DIR>' prepare-planar '<CASE_ID>' --file '<REQUEST_JSON>' --expected-generation '<GENERATION>' --json
 febio-cae case --state-dir '<STATE_DIR>' prepare-planar '<CASE_ID>' --file '<REQUEST_JSON>' --expected-generation '<GENERATION>' --parent-revision-id '<PARENT_REVISION_ID>' --json
 ```
 
 `inspect --native`は登録済みSTEPを所有子プロセスで1回調査し、ボディ、閉じたソリッド、単位、体積、面、欠陥を返す。物理条件や選択済みボディを要求せず、材料・支持・接触・評価領域の意味を付与しない。`INSPECTED`は観測完了であり、`native_qualification`は`UNVERIFIED`のまま。`--wall-seconds`は正の有限値で上限600秒、`--cpu-workers`は利用可能数以下の正整数。
 
-`provision-planar-profiles`は、製品が固定した審査済み対応表バンドルのSHA-256・サイズ・内容を検証してから、ソルバー・出力・品質・メッシュ品質の参照を新規ケースへ登録する。`PROVISIONED`は登録完了を示し、実ツール操作数は0で、解析や品質の合格ではない。同じIDで内容が異なるバンドルは競合として拒否される。現行では承認バンドルの現物が開発機の`.local/coordination/`にしかなく、新規環境では実行できない。計画書のタスクT2で設定値を製品に組み込み、`--bundle-path`を省略可能にする。
+`provision-planar-profiles`は、製品組み込みの既定対応表（ソルバー・出力・品質の3プロファイルとメッシュ品質基準）を新規ケースへ登録する。`--bundle-path`で外部バンドルを指定した場合は、その構造・証拠・対象範囲を検証してから登録する。`PROVISIONED`は登録完了を示し、実ツール操作数は0で、解析や品質の合格ではない。同じIDで内容が異なる対応表は競合として拒否される。
 
 `prepare-planar`は`spec`と同じ`SpecUpdateRequest`形式の要求を受け取り、平面・直方体治具・`AsPlaced`配置の範囲でメッシュ生成と準備記録の公開を行う。初期上限は600秒、生成1回、四面体100,000要素、250,000節点。`--parent-revision-id`を指定すると、登録済み準備完了親の`global_size`だけを変えた細分化版を作る。ケース全体でメッシュ3回・FEBio4回の予約があり、失敗・中断でも消費は戻らない。`PREPARED`は準備記録の公開であり、解析の実行や合格ではない。
 

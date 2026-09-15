@@ -16,7 +16,6 @@ from febio_cae.adapters.febio import (
     QualityAdapter,
     RunnerAdapter,
     XpltReaderAdapter,
-    xplt_reader,
 )
 from febio_cae.adapters.geometry import (
     BackendBody,
@@ -274,12 +273,6 @@ def run_demo(
     solver_path = Path(executable).absolute()
     if hashlib.sha256(solver_path.read_bytes()).hexdigest() != profile.solver.executable_digest:
         raise ValueError("solver executable differs from registered identity")
-    reader_payload = Path(xplt_reader.__file__).read_bytes()
-    if hashlib.sha256(reader_payload).hexdigest() != profile.reader.executable_digest or (
-        not isinstance(registration, CurrentPreparationRegistration)
-        and reader_payload != source("registered-reader-source")
-    ):
-        raise ValueError("active reader bytes differ from registered identity")
     stores: list[_BundleBytes] = []
 
     def build(

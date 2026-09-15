@@ -11,6 +11,7 @@ import pytest
 import test_comparison as comparison
 import test_preview_storage as previews
 
+from febio_cae.adapters.febio import xplt_reader
 from febio_cae.application import _demo
 from febio_cae.application._preview import preview_summary
 from febio_cae.domain import ExecutionBundle, FileEntry, Quantity, SolverControl
@@ -247,7 +248,7 @@ def _public(
             asset_id="registered-reader-source",
             source_kind="registered_document",
             media_type="text/plain",
-            content=Path(_demo.xplt_reader.__file__).read_bytes(),
+            content=Path(xplt_reader.__file__).read_bytes(),
         )
 
         def record(data: Any) -> Any:

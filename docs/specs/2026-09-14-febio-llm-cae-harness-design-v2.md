@@ -153,7 +153,7 @@ MVPの目標は、新規環境へ通常インストールしたwheelのCLIから
 
 ### 対応表の登録
 
-`case --state-dir STATE provision-planar-profiles CASE_ID [--bundle-path BUNDLE] --json` は新規登録ケースへ対応表を登録する。`--bundle-path` を省略すると製品組み込みの既定対応表（ソルバー・出力・品質のプロファイルとメッシュ品質基準）を登録し、指定すると外部バンドルの内容を検証してから登録する。ソルバー・出力・品質・メッシュ品質の `NumericalProfileRef` を返し、`PROVISIONED` は登録完了を示す。同じID・同じ内容の再登録は成功し、異なる内容は競合として拒否する。限定範囲の内容は実装ノート §3。組み込み既定値への移行はMVPタスクT2であり、現行実装は外部バンドル必須である。
+`case --state-dir STATE provision-planar-profiles CASE_ID [--bundle-path BUNDLE] --json` は新規登録ケースへ対応表を登録する。`--bundle-path` を省略すると製品組み込みの既定対応表（ソルバー・出力・品質のプロファイルとメッシュ品質基準）を登録し、指定すると外部バンドルの内容を検証してから登録する。ソルバー・出力・品質・メッシュ品質の `NumericalProfileRef` を返し、`PROVISIONED` は登録完了を示す。同じID・同じ内容の再登録は成功し、異なる内容は競合として拒否する。限定範囲の内容は実装ノート §3。
 
 ## 5. 入力生成・実行・出力固定
 

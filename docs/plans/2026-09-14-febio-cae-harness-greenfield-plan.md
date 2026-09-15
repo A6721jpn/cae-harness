@@ -30,13 +30,13 @@ MVPの完了は、`tests/e2e/test_installed_synthetic.py` への合格と、上�
 
 ### MVPまでの実装タスク
 
-着手順は T0 → T2 → T1 → T3 → T4 → T5 → T6。T2 を T1 より先にするのは、本ブランチでは読込器ソースの自己ハッシュ不一致により `provision-planar-profiles` が失敗し、手順2から先へ進めないためである（詳細は[引き継ぎ](mvp-handoff.md) §2）。
+着手順は T0 → T1 → T3 → T4 → T5 → T6。T2 は 2026-09-15 に完了済み。
 
 | # | タスク | 内容 |
 |---|---|---|
 | T0 | ゲート基線の修復 | `orca/acceptance-integration` で赤のままの ruff（整形9ファイル・lint 14件）と mypy（88件、主に `_gmsh_runtime.py`）を、動作を変えずに解消する |
 | T1 | 汎用 `run` | `run-demo` の登録済みデモ前提を解消し、`prepare-planar` により `PREPARED` となった任意の版を `case run --revision-id --solver [--preflight]` で実行可能にする。`run-demo` は互換性維持のために残すか、削除する |
-| T2 | 既定対応表の組み込み | 承認バンドルに含まれる設定値（ソルバー・出力・品質の3プロファイルとメッシュ品質基準）を製品コード内の既定値（`src/febio_cae/resources/` のJSON又はPythonモジュール）にする。`provision-planar-profiles` は `--bundle-path` 省略時に既定値を登録し、外部バンドルの検証経路は任意入力として残す。バンドル本体のSHA-256・サイズ固定と、XPLT読込器ソースの自己ハッシュ固定（`_APPROVED_READER_SHA256`）を撤去する。過去の証拠レポート（約550KB）は同梱せず `docs/reviews/archive/` を参照する |
+| T2 | 既定対応表の組み込み（完了 2026-09-15） | 承認バンドルの設定値を `src/febio_cae/resources/planar_default_bundle.json` に組み込み、`provision-planar-profiles` は `--bundle-path` 省略時にこれを登録する。バンドル・XPLT読込器ソースの自己ハッシュ固定は撤去済み |
 | T3 | メッシュ依存性の任意化 | `required_quality` においてメッシュ依存性が `UNVERIFIED` であっても、他の5項目が `PASS` であれば `quality_status` を合格とし、`task_status` を `NEEDS_QUALITY` と判定しないようにする |
 | T4 | `preview` の `LAUNCHED` | `case preview` が対象XPLTを引数として登録済みStudio実行ファイルを起動し、`LAUNCHED` を記録して `NEEDS_PREVIEW` を解消する。既存の観測プロトコル（`--window-id`、stdin応答）は `CONFIRMED` 向けに維持する |
 | T5 | 一貫試験の更新 | `tests/e2e/test_installed_synthetic.py` をT1〜T4の契約に合わせて更新し、8手順を一連のフローとして通す |
@@ -52,7 +52,7 @@ MVPの完了は、`tests/e2e/test_installed_synthetic.py` への合格と、上�
 | P3：解析・結果 | P1、P2 | 入力生成、所有プロセス管理、実FEBio、XPLT読み込み、数値照合、必須品質、Studio読み込み確認を連携 | 部分完了：登録済み平面経路における実FEBio、XPLT、5項目の品質判定、ログ残差は実装済み。汎用 `run`（T1）と `LAUNCHED` プレビュー（T4）が未完了 | `2026-09-08-p3-solver-adapters`、`r2-residual-repair`、コミット `9fb3852`〜`d736982`（2026-09-12〜13） |
 | P4：日本語操作 | P1、P3 | 意図・質問・回答・型付き差分を連携。根拠不足や競合を適切に処理し、実LLM接続により確認 | 部分完了・MVP対象外：`intent/answer/edit` のコードおよび実LLM試験（`tests/native/test_llm.py`）は存在 | `2026-09-09-p4-intent-source`、コミット `6a60b79`〜`6c4c7dd` |
 | P5：変更・比較・復旧 | P2〜P4 | 元版を保存した状態での再解析、比較、キャッシュ無効化、有限回のリトライ、中断・改変・競合への対応を検証 | 部分完了：ヤング率変更、メッシュ再利用、3段階細分化、比較、および限定的な `cancel/resume` は実装済み | `2026-09-09-prepared-material-descendants`、コミット `d0cb891`〜`4039e9d` |
-| P6：配布・合成一貫試験 | P0〜P5 | 新規環境へ通常インストールしたwheelから、合成STEPの全操作と必須ローカル検証を完了 | 未完了：`test_installed_synthetic.py` は存在するが、承認バンドルがローカル環境にしか存在せず、新規環境で再現できない（T2で既定値を組み込む） | `2026-09-12` コミット `02119b0`〜`fa21f71`、`.local/coordination`（Git外） |
+| P6：配布・合成一貫試験 | P0〜P5 | 新規環境へ通常インストールしたwheelから、合成STEPの全操作と必須ローカル検証を完了 | 部分完了：`test_installed_synthetic.py` はあり、対応表の組み込み（T2）で新規環境でも手順2まで再現可能。実FEBioでの通し合格記録は未取得 | `2026-09-12` コミット `02119b0`〜`fa21f71`、`.local/coordination`（Git外） |
 | P7：実モデル受け入れ | P6、使用許可 | 許可された実STEPおよび最終BottomFrameを用い、解析・品質・Studio・変更・再解析・比較に関する新たな証拠を取得 | 未着手 | — |
 
 上記の状態は `docs/reviews/archive/` の記録および `git log` の要約に基づくものであり、本改訂にあたって再実行した検証結果ではない。2026-09-10以降の受け入れ記録は `.local/coordination`（Git管理外）に保管されており、`docs/reviews/` には転記されていない。
@@ -127,7 +127,7 @@ MVPの完了は、`tests/e2e/test_installed_synthetic.py` への合格と、上�
 
 実行回数の上限はメッシュ生成3回・FEBio実行4回とし、失敗した試行もこの上限を消費する。治具の反力には全保存状態の曲線を用い、最大値のみへの縮約は行わない。MVPでは1サイズ＋ヤング率変更（メッシュ生成1回・FEBio実行2回）をもって完了とし、3段階メッシュはメッシュ依存性を必須要件へ戻す際の検証項目とする。
 
-`FEBIO_CAE_E2E_SETTINGS` の `preparation_requests` に要求のパスとコンテンツハッシュを、`limits` に生成・解析回数を、`qualification_bundle` に承認済み資料のパス・SHA-256・サイズをそれぞれ設定する（T2完了後は設定不要とし、組み込み既定値を使う）。必要な出力は、部品および治具それぞれの全体変位、治具全体の反力・絶対位置、ならびに明示固定領域の支持反力である。各出力は個別のIDで保持する。
+`FEBIO_CAE_E2E_SETTINGS` の `preparation_requests` に要求のパスとコンテンツハッシュを、`limits` に生成・解析回数を、`qualification_bundle` は省略可能（省略時は組み込み既定の対応表）。必要な出力は、部品および治具それぞれの全体変位、治具全体の反力・絶対位置、ならびに明示固定領域の支持反力である。各出力は個別のIDで保持する。
 
 ## 6. 必須ローカル検証と配布
 

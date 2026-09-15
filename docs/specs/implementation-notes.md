@@ -10,7 +10,7 @@
 - 元のWindows wheelの識別値は SHA-256 `7b36083bb410fa27c5d0e052929d1a9844a5b09169d66017b72b41aabd49d711` である。この識別記録のみをもって幾何・数値品質を認定することはない。
 - AP214は取り込み前にHEADERの `FILE_SCHEMA`、OCCTは同一所有セッションの `General.BuildInfo` により厳密に照合する。欠落、曖昧さ、不一致がある場合は形状操作の前に拒否し、別途導入されたOCCTで代用することはない。
 - 汎用設定の `expected_occt_version`、`require_step_ap214`、`cpu_workers` は引き続き任意指定とするが、公開経路では上記の組み合わせを要求する。CPU指定は `General.NumThreads` に設定する。
-- 対応表バンドル（`provision-planar-profiles --bundle-path`）の現行承認版は SHA-256 `f5f5ce51367f6f9af6f19fc42da6641fd3b4202711e95681a89333d74a3d22c5`、604,962バイトであり、`src/febio_cae/application/_profile_provisioning.py` に固定されている。現物は `.local/coordination/acceptance-planar-profile-approved-01.json`（Git追跡外）に存在し、内容に作業機のローカルパスを含むためそのままでは同梱できない。同梱にあたっては、ローカルパスを含まない形式での再生成と、コード内ハッシュの更新が必要である（計画書の実装タスク参照）。
+- 既定の対応表は `src/febio_cae/resources/planar_default_bundle.json`（約44 KB）。旧承認バンドル（SHA-256 `f5f5ce51…`、604,962バイト、Git追跡外）から3プロファイルとメッシュ品質基準を抽出し、証拠参照を1件の出所メモ `planar-default-provenance` に付け替えたもの。読込器の `executable_digest` は `sha256("febio-cae-xplt-reader 0.1.0")` の版ベース識別で、ソースのバイト列とは照合しない。外部バンドルを `--bundle-path` で渡す場合は同じ構造検証（4 MiB上限、重複キー拒否、証拠と文書の一致、対象範囲能力）を通す。
 
 ## 2. STEP調査（`case inspect --native`）
 

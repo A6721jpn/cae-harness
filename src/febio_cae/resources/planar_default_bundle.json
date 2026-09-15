@@ -1,0 +1,1206 @@
+{
+ "authority_status": "PM_APPROVED_FOR_SCOPED_PROVISIONING",
+ "kind": "REVIEWED_PLANAR_COMPATIBILITY_BUNDLE",
+ "mesh_quality": {
+  "algorithm_id": "gmsh-step-planar-tet10",
+  "algorithm_version": "4.15.2/OCCT-7.8.1",
+  "evidence_scope": "synthetic",
+  "format_version": 1,
+  "max_boundary_deviation": {
+   "unit": "m",
+   "value": 1e-08
+  },
+  "primitive_kinds": [
+   "box"
+  ],
+  "profile_id": "gmsh4152-planar-box-quality-01",
+  "purpose": "mesh_quality",
+  "qualification_evidence": [
+   {
+    "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+    "reference": "planar-default-provenance",
+    "schema_version": "1",
+    "source_kind": "registered_document",
+    "target_field": "mesh_quality.qualification"
+   }
+  ]
+ },
+ "profiles": {
+  "outputs": {
+   "capabilities": [
+    {
+     "capability_id": "febio.material.isotropic_linear_elastic",
+     "compression": "none",
+     "evidence": [
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.native_basis"
+      },
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.reader_basis"
+      },
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.residual_basis"
+      }
+     ],
+     "ordering_id": "tet10-canonical-v1",
+     "schema_version": "1",
+     "sign_mapping_id": "native-planar-z-signs-v1",
+     "status": "SUPPORTED",
+     "version": "4.12.0/0x35"
+    },
+    {
+     "capability_id": "febio.mesh.tet10",
+     "compression": "none",
+     "evidence": [
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.native_basis"
+      },
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.reader_basis"
+      },
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.residual_basis"
+      }
+     ],
+     "ordering_id": "tet10-canonical-v1",
+     "schema_version": "1",
+     "sign_mapping_id": "native-planar-z-signs-v1",
+     "status": "SUPPORTED",
+     "version": "4.12.0/0x35"
+    },
+    {
+     "capability_id": "febio.contact.sliding_elastic",
+     "compression": "none",
+     "evidence": [
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.native_basis"
+      },
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.reader_basis"
+      },
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.residual_basis"
+      }
+     ],
+     "ordering_id": "tet10-canonical-v1",
+     "schema_version": "1",
+     "sign_mapping_id": "native-planar-z-signs-v1",
+     "status": "SUPPORTED",
+     "version": "4.12.0/0x35"
+    },
+    {
+     "capability_id": "febio.rigid_body",
+     "compression": "none",
+     "evidence": [
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.native_basis"
+      },
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.reader_basis"
+      },
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.residual_basis"
+      }
+     ],
+     "ordering_id": "tet10-canonical-v1",
+     "schema_version": "1",
+     "sign_mapping_id": "native-planar-z-signs-v1",
+     "status": "SUPPORTED",
+     "version": "4.12.0/0x35"
+    },
+    {
+     "capability_id": "febio.support",
+     "compression": "none",
+     "evidence": [
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.native_basis"
+      },
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.reader_basis"
+      },
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.residual_basis"
+      }
+     ],
+     "ordering_id": "tet10-canonical-v1",
+     "schema_version": "1",
+     "sign_mapping_id": "native-planar-z-signs-v1",
+     "status": "SUPPORTED",
+     "version": "4.12.0/0x35"
+    },
+    {
+     "capability_id": "febio.motion",
+     "compression": "none",
+     "evidence": [
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.native_basis"
+      },
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.reader_basis"
+      },
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.residual_basis"
+      }
+     ],
+     "ordering_id": "tet10-canonical-v1",
+     "schema_version": "1",
+     "sign_mapping_id": "native-planar-z-signs-v1",
+     "status": "SUPPORTED",
+     "version": "4.12.0/0x35"
+    },
+    {
+     "capability_id": "febio.output.xplt",
+     "compression": "none",
+     "evidence": [
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.native_basis"
+      },
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.reader_basis"
+      },
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.residual_basis"
+      }
+     ],
+     "ordering_id": "tet10-canonical-v1",
+     "schema_version": "1",
+     "sign_mapping_id": "native-planar-z-signs-v1",
+     "status": "SUPPORTED",
+     "version": "4.12.0/0x35"
+    },
+    {
+     "capability_id": "febio.contact.primary_part_secondary_tool",
+     "compression": "none",
+     "evidence": [
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.native_basis"
+      },
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.reader_basis"
+      },
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.residual_basis"
+      }
+     ],
+     "ordering_id": "tet10-canonical-v1",
+     "schema_version": "1",
+     "sign_mapping_id": "native-planar-z-signs-v1",
+     "status": "SUPPORTED",
+     "version": "4.12.0/0x35"
+    },
+    {
+     "capability_id": "febio.scope.planar_linear_frictionless_fixed_xyz",
+     "compression": "none",
+     "evidence": [
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.native_basis"
+      },
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.reader_basis"
+      },
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.residual_basis"
+      }
+     ],
+     "ordering_id": "tet10-canonical-v1",
+     "schema_version": "1",
+     "sign_mapping_id": "native-planar-z-signs-v1",
+     "status": "SUPPORTED",
+     "version": "4.12.0/0x35"
+    }
+   ],
+   "evidence": [
+    {
+     "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+     "reference": "planar-default-provenance",
+     "schema_version": "1",
+     "source_kind": "registered_document",
+     "target_field": "compatibility.native_basis"
+    },
+    {
+     "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+     "reference": "planar-default-provenance",
+     "schema_version": "1",
+     "source_kind": "registered_document",
+     "target_field": "compatibility.reader_basis"
+    },
+    {
+     "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+     "reference": "planar-default-provenance",
+     "schema_version": "1",
+     "source_kind": "registered_document",
+     "target_field": "compatibility.residual_basis"
+    }
+   ],
+   "output_mappings": [
+    {
+     "canonical_id": "displacement",
+     "canonical_sign": 1,
+     "frame": "World",
+     "location": "node",
+     "measure_id": "value",
+     "native_name": "displacement",
+     "raw_sign": 1,
+     "schema_version": "1",
+     "unit": "m",
+     "value_type": "VEC3F"
+    },
+    {
+     "canonical_id": "reaction",
+     "canonical_sign": 1,
+     "frame": "World",
+     "location": "node",
+     "measure_id": "value",
+     "native_name": "reaction forces",
+     "raw_sign": -1,
+     "schema_version": "1",
+     "unit": "N",
+     "value_type": "VEC3F"
+    },
+    {
+     "canonical_id": "contact_force",
+     "canonical_sign": 1,
+     "frame": "World",
+     "location": "rigid_body",
+     "measure_id": "value",
+     "native_name": "rigid force",
+     "raw_sign": -1,
+     "schema_version": "1",
+     "unit": "N",
+     "value_type": "VEC3F"
+    },
+    {
+     "canonical_id": "rigid_position",
+     "canonical_sign": 1,
+     "frame": "World",
+     "location": "rigid_body",
+     "measure_id": "value",
+     "native_name": "rigid position",
+     "raw_sign": 1,
+     "schema_version": "1",
+     "unit": "m",
+     "value_type": "VEC3F"
+    }
+   ],
+   "profile_id": "febio412-planar-outputs-01",
+   "reader": {
+    "executable_digest": "76f608b9f42626b404f28ea1a85771c61a014fdc4626b03130b2f41aef37ecb6",
+    "schema_version": "1",
+    "tool_id": "febio-cae-xplt-reader",
+    "version": "0.1.0"
+   },
+   "schema_version": "1",
+   "solver": {
+    "executable_digest": "03b9db12c4b3e2ed0cf027be6b8b5d0cef2d4edc9eab26f5a2bd8193efb770c9",
+    "schema_version": "1",
+    "tool_id": "febio",
+    "version": "4.12.0"
+   }
+  },
+  "quality": {
+   "capabilities": [
+    {
+     "capability_id": "febio.material.isotropic_linear_elastic",
+     "compression": "none",
+     "evidence": [
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.native_basis"
+      },
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.reader_basis"
+      },
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.residual_basis"
+      }
+     ],
+     "ordering_id": "tet10-canonical-v1",
+     "schema_version": "1",
+     "sign_mapping_id": "native-planar-z-signs-v1",
+     "status": "SUPPORTED",
+     "version": "4.12.0/0x35"
+    },
+    {
+     "capability_id": "febio.mesh.tet10",
+     "compression": "none",
+     "evidence": [
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.native_basis"
+      },
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.reader_basis"
+      },
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.residual_basis"
+      }
+     ],
+     "ordering_id": "tet10-canonical-v1",
+     "schema_version": "1",
+     "sign_mapping_id": "native-planar-z-signs-v1",
+     "status": "SUPPORTED",
+     "version": "4.12.0/0x35"
+    },
+    {
+     "capability_id": "febio.contact.sliding_elastic",
+     "compression": "none",
+     "evidence": [
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.native_basis"
+      },
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.reader_basis"
+      },
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.residual_basis"
+      }
+     ],
+     "ordering_id": "tet10-canonical-v1",
+     "schema_version": "1",
+     "sign_mapping_id": "native-planar-z-signs-v1",
+     "status": "SUPPORTED",
+     "version": "4.12.0/0x35"
+    },
+    {
+     "capability_id": "febio.rigid_body",
+     "compression": "none",
+     "evidence": [
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.native_basis"
+      },
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.reader_basis"
+      },
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.residual_basis"
+      }
+     ],
+     "ordering_id": "tet10-canonical-v1",
+     "schema_version": "1",
+     "sign_mapping_id": "native-planar-z-signs-v1",
+     "status": "SUPPORTED",
+     "version": "4.12.0/0x35"
+    },
+    {
+     "capability_id": "febio.support",
+     "compression": "none",
+     "evidence": [
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.native_basis"
+      },
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.reader_basis"
+      },
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.residual_basis"
+      }
+     ],
+     "ordering_id": "tet10-canonical-v1",
+     "schema_version": "1",
+     "sign_mapping_id": "native-planar-z-signs-v1",
+     "status": "SUPPORTED",
+     "version": "4.12.0/0x35"
+    },
+    {
+     "capability_id": "febio.motion",
+     "compression": "none",
+     "evidence": [
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.native_basis"
+      },
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.reader_basis"
+      },
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.residual_basis"
+      }
+     ],
+     "ordering_id": "tet10-canonical-v1",
+     "schema_version": "1",
+     "sign_mapping_id": "native-planar-z-signs-v1",
+     "status": "SUPPORTED",
+     "version": "4.12.0/0x35"
+    },
+    {
+     "capability_id": "febio.output.xplt",
+     "compression": "none",
+     "evidence": [
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.native_basis"
+      },
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.reader_basis"
+      },
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.residual_basis"
+      }
+     ],
+     "ordering_id": "tet10-canonical-v1",
+     "schema_version": "1",
+     "sign_mapping_id": "native-planar-z-signs-v1",
+     "status": "SUPPORTED",
+     "version": "4.12.0/0x35"
+    },
+    {
+     "capability_id": "febio.contact.primary_part_secondary_tool",
+     "compression": "none",
+     "evidence": [
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.native_basis"
+      },
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.reader_basis"
+      },
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.residual_basis"
+      }
+     ],
+     "ordering_id": "tet10-canonical-v1",
+     "schema_version": "1",
+     "sign_mapping_id": "native-planar-z-signs-v1",
+     "status": "SUPPORTED",
+     "version": "4.12.0/0x35"
+    },
+    {
+     "capability_id": "febio.scope.planar_linear_frictionless_fixed_xyz",
+     "compression": "none",
+     "evidence": [
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.native_basis"
+      },
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.reader_basis"
+      },
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.residual_basis"
+      }
+     ],
+     "ordering_id": "tet10-canonical-v1",
+     "schema_version": "1",
+     "sign_mapping_id": "native-planar-z-signs-v1",
+     "status": "SUPPORTED",
+     "version": "4.12.0/0x35"
+    }
+   ],
+   "evidence": [
+    {
+     "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+     "reference": "planar-default-provenance",
+     "schema_version": "1",
+     "source_kind": "registered_document",
+     "target_field": "compatibility.native_basis"
+    },
+    {
+     "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+     "reference": "planar-default-provenance",
+     "schema_version": "1",
+     "source_kind": "registered_document",
+     "target_field": "compatibility.reader_basis"
+    },
+    {
+     "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+     "reference": "planar-default-provenance",
+     "schema_version": "1",
+     "source_kind": "registered_document",
+     "target_field": "compatibility.residual_basis"
+    }
+   ],
+   "output_mappings": [
+    {
+     "canonical_id": "displacement",
+     "canonical_sign": 1,
+     "frame": "World",
+     "location": "node",
+     "measure_id": "value",
+     "native_name": "displacement",
+     "raw_sign": 1,
+     "schema_version": "1",
+     "unit": "m",
+     "value_type": "VEC3F"
+    },
+    {
+     "canonical_id": "reaction",
+     "canonical_sign": 1,
+     "frame": "World",
+     "location": "node",
+     "measure_id": "value",
+     "native_name": "reaction forces",
+     "raw_sign": -1,
+     "schema_version": "1",
+     "unit": "N",
+     "value_type": "VEC3F"
+    },
+    {
+     "canonical_id": "contact_force",
+     "canonical_sign": 1,
+     "frame": "World",
+     "location": "rigid_body",
+     "measure_id": "value",
+     "native_name": "rigid force",
+     "raw_sign": -1,
+     "schema_version": "1",
+     "unit": "N",
+     "value_type": "VEC3F"
+    },
+    {
+     "canonical_id": "rigid_position",
+     "canonical_sign": 1,
+     "frame": "World",
+     "location": "rigid_body",
+     "measure_id": "value",
+     "native_name": "rigid position",
+     "raw_sign": 1,
+     "schema_version": "1",
+     "unit": "m",
+     "value_type": "VEC3F"
+    }
+   ],
+   "profile_id": "febio412-planar-quality-01",
+   "reader": {
+    "executable_digest": "76f608b9f42626b404f28ea1a85771c61a014fdc4626b03130b2f41aef37ecb6",
+    "schema_version": "1",
+    "tool_id": "febio-cae-xplt-reader",
+    "version": "0.1.0"
+   },
+   "schema_version": "1",
+   "solver": {
+    "executable_digest": "03b9db12c4b3e2ed0cf027be6b8b5d0cef2d4edc9eab26f5a2bd8193efb770c9",
+    "schema_version": "1",
+    "tool_id": "febio",
+    "version": "4.12.0"
+   }
+  },
+  "solver": {
+   "capabilities": [
+    {
+     "capability_id": "febio.material.isotropic_linear_elastic",
+     "compression": "none",
+     "evidence": [
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.native_basis"
+      },
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.reader_basis"
+      },
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.residual_basis"
+      }
+     ],
+     "ordering_id": "tet10-canonical-v1",
+     "schema_version": "1",
+     "sign_mapping_id": "native-planar-z-signs-v1",
+     "status": "SUPPORTED",
+     "version": "4.12.0/0x35"
+    },
+    {
+     "capability_id": "febio.mesh.tet10",
+     "compression": "none",
+     "evidence": [
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.native_basis"
+      },
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.reader_basis"
+      },
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.residual_basis"
+      }
+     ],
+     "ordering_id": "tet10-canonical-v1",
+     "schema_version": "1",
+     "sign_mapping_id": "native-planar-z-signs-v1",
+     "status": "SUPPORTED",
+     "version": "4.12.0/0x35"
+    },
+    {
+     "capability_id": "febio.contact.sliding_elastic",
+     "compression": "none",
+     "evidence": [
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.native_basis"
+      },
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.reader_basis"
+      },
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.residual_basis"
+      }
+     ],
+     "ordering_id": "tet10-canonical-v1",
+     "schema_version": "1",
+     "sign_mapping_id": "native-planar-z-signs-v1",
+     "status": "SUPPORTED",
+     "version": "4.12.0/0x35"
+    },
+    {
+     "capability_id": "febio.rigid_body",
+     "compression": "none",
+     "evidence": [
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.native_basis"
+      },
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.reader_basis"
+      },
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.residual_basis"
+      }
+     ],
+     "ordering_id": "tet10-canonical-v1",
+     "schema_version": "1",
+     "sign_mapping_id": "native-planar-z-signs-v1",
+     "status": "SUPPORTED",
+     "version": "4.12.0/0x35"
+    },
+    {
+     "capability_id": "febio.support",
+     "compression": "none",
+     "evidence": [
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.native_basis"
+      },
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.reader_basis"
+      },
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.residual_basis"
+      }
+     ],
+     "ordering_id": "tet10-canonical-v1",
+     "schema_version": "1",
+     "sign_mapping_id": "native-planar-z-signs-v1",
+     "status": "SUPPORTED",
+     "version": "4.12.0/0x35"
+    },
+    {
+     "capability_id": "febio.motion",
+     "compression": "none",
+     "evidence": [
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.native_basis"
+      },
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.reader_basis"
+      },
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.residual_basis"
+      }
+     ],
+     "ordering_id": "tet10-canonical-v1",
+     "schema_version": "1",
+     "sign_mapping_id": "native-planar-z-signs-v1",
+     "status": "SUPPORTED",
+     "version": "4.12.0/0x35"
+    },
+    {
+     "capability_id": "febio.output.xplt",
+     "compression": "none",
+     "evidence": [
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.native_basis"
+      },
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.reader_basis"
+      },
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.residual_basis"
+      }
+     ],
+     "ordering_id": "tet10-canonical-v1",
+     "schema_version": "1",
+     "sign_mapping_id": "native-planar-z-signs-v1",
+     "status": "SUPPORTED",
+     "version": "4.12.0/0x35"
+    },
+    {
+     "capability_id": "febio.contact.primary_part_secondary_tool",
+     "compression": "none",
+     "evidence": [
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.native_basis"
+      },
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.reader_basis"
+      },
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.residual_basis"
+      }
+     ],
+     "ordering_id": "tet10-canonical-v1",
+     "schema_version": "1",
+     "sign_mapping_id": "native-planar-z-signs-v1",
+     "status": "SUPPORTED",
+     "version": "4.12.0/0x35"
+    },
+    {
+     "capability_id": "febio.scope.planar_linear_frictionless_fixed_xyz",
+     "compression": "none",
+     "evidence": [
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.native_basis"
+      },
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.reader_basis"
+      },
+      {
+       "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+       "reference": "planar-default-provenance",
+       "schema_version": "1",
+       "source_kind": "registered_document",
+       "target_field": "compatibility.residual_basis"
+      }
+     ],
+     "ordering_id": "tet10-canonical-v1",
+     "schema_version": "1",
+     "sign_mapping_id": "native-planar-z-signs-v1",
+     "status": "SUPPORTED",
+     "version": "4.12.0/0x35"
+    }
+   ],
+   "evidence": [
+    {
+     "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+     "reference": "planar-default-provenance",
+     "schema_version": "1",
+     "source_kind": "registered_document",
+     "target_field": "compatibility.native_basis"
+    },
+    {
+     "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+     "reference": "planar-default-provenance",
+     "schema_version": "1",
+     "source_kind": "registered_document",
+     "target_field": "compatibility.reader_basis"
+    },
+    {
+     "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+     "reference": "planar-default-provenance",
+     "schema_version": "1",
+     "source_kind": "registered_document",
+     "target_field": "compatibility.residual_basis"
+    }
+   ],
+   "output_mappings": [
+    {
+     "canonical_id": "displacement",
+     "canonical_sign": 1,
+     "frame": "World",
+     "location": "node",
+     "measure_id": "value",
+     "native_name": "displacement",
+     "raw_sign": 1,
+     "schema_version": "1",
+     "unit": "m",
+     "value_type": "VEC3F"
+    },
+    {
+     "canonical_id": "reaction",
+     "canonical_sign": 1,
+     "frame": "World",
+     "location": "node",
+     "measure_id": "value",
+     "native_name": "reaction forces",
+     "raw_sign": -1,
+     "schema_version": "1",
+     "unit": "N",
+     "value_type": "VEC3F"
+    },
+    {
+     "canonical_id": "contact_force",
+     "canonical_sign": 1,
+     "frame": "World",
+     "location": "rigid_body",
+     "measure_id": "value",
+     "native_name": "rigid force",
+     "raw_sign": -1,
+     "schema_version": "1",
+     "unit": "N",
+     "value_type": "VEC3F"
+    },
+    {
+     "canonical_id": "rigid_position",
+     "canonical_sign": 1,
+     "frame": "World",
+     "location": "rigid_body",
+     "measure_id": "value",
+     "native_name": "rigid position",
+     "raw_sign": 1,
+     "schema_version": "1",
+     "unit": "m",
+     "value_type": "VEC3F"
+    }
+   ],
+   "profile_id": "febio412-planar-solver-01",
+   "reader": {
+    "executable_digest": "76f608b9f42626b404f28ea1a85771c61a014fdc4626b03130b2f41aef37ecb6",
+    "schema_version": "1",
+    "tool_id": "febio-cae-xplt-reader",
+    "version": "0.1.0"
+   },
+   "schema_version": "1",
+   "solver": {
+    "executable_digest": "03b9db12c4b3e2ed0cf027be6b8b5d0cef2d4edc9eab26f5a2bd8193efb770c9",
+    "schema_version": "1",
+    "tool_id": "febio",
+    "version": "4.12.0"
+   }
+  }
+ },
+ "publication": {
+  "native_operations": 0
+ },
+ "schema_version": "1",
+ "scope": {
+  "compatibility_not_accuracy": "Capability declarations cover the listed interface mechanisms and four-variable decoding layout. They do not assert numerical accuracy for unexecuted cases, new material parameters, general force components, stress fields, or new geometries.",
+  "enforced_scope_capability": "febio.scope.planar_linear_frictionless_fixed_xyz",
+  "enforcement": "Before native preparation and again before compilation, scoped profiles require isotropic linear elastic material, frictionless contact, one box tool with AsPlaced arrangement, World negative-Z motion, World untransformed fully fixed XYZ supports, nonadaptive 0.1s increments over0..1s and zero step retries. Reject absent/out-of-scope conditions; never add constraints or change physics. Actual geometry/contact/motion/numerical accuracy still requires each case assessment. No CAD digest or benchmark-size special case. The existing rigid-tool World DOFs must also be x/y/rx/ry/rz fixed and z prescribed; no transformed tool DOFs.",
+  "mesh_quality": "Synthetic evidence/admission only: box primitive, declared boundary limit1e-8m. Actual generated geometry and per-case mandatory numerical checks remain required.",
+  "native_report_aggregate": "UNVERIFIED; four non-support diagnostics retain their original status.",
+  "not_qualified": [
+   "stress output in the planar profile",
+   "sphere",
+   "cylinder",
+   "finite friction",
+   "neo-Hookean",
+   "Hertz",
+   "mixed fixed/free supports",
+   "general XYZ force interpretation",
+   "full-field convergence",
+   "Studio",
+   "live LLM",
+   "public installed E2E",
+   "real models"
+  ],
+  "purpose": "Explicit trusted provisioning for the bounded synthetic planar installed E2E; compatibility declarations do not grant execution permission or numerical-quality PASS.",
+  "reader": "Only the exact four-variable 0x35 uncompressed layout listed in these profiles. All-node values are retained; nodal reaction physical interpretation is support-Z only. XY sign multiplication is decoding consistency, not independent physical calibration.",
+  "solver": "Exact qualified FEBio4.12.0 package; static fixed-step linear-elastic/frictionless planar rigid-box path; primary part/secondary tool; prescribed-zero XYZ base support and tool Z displacement."
+ },
+ "source_documents": [
+  {
+   "asset_id": "planar-default-provenance",
+   "content_base64": "ewogImRlcml2ZWRfZnJvbV9idW5kbGUiOiB7CiAgInNoYTI1NiI6ICJmNWY1Y2U1MTM2N2Y2ZjlhZjZmMTlmYzQyZGE2NjQxZmQzYjQyMDI3MTFlOTU2ODFhODkzMzNkNzRhM2QyMmM1IiwKICAic2l6ZSI6IDYwNDk2MgogfSwKICJraW5kIjogIlBMQU5BUl9ERUZBVUxUX1BST1ZFTkFOQ0UiLAogIm5vdGUiOiAiUHJvZHVjdCBkZWZhdWx0IHBsYW5hciBwcm9maWxlcy4gVGhlIG9yaWdpbmFsIG5hdGl2ZSBxdWFsaWZpY2F0aW9uIHJlcG9ydHMgYXJlIG5vdCBzaGlwcGVkOyBzZWUgZG9jcy9yZXZpZXdzL2FyY2hpdmUgaW4gdGhlIHJlcG9zaXRvcnkuIFJlYWRlciBpZGVudGl0eSBpcyB2ZXJzaW9uLWJhc2VkOyBzb3VyY2UtaGFzaCBjaGVja3Mgd2VyZSByZW1vdmVkICh0YXNrIFQyLCAyMDI2LTA5LTE1KS4iLAogIm9yaWdpbmFsX3NvdXJjZV9kb2N1bWVudHMiOiBbCiAgewogICAiYXNzZXRfaWQiOiAibmF0aXZlLXBsYW5hci1udW1lcmljYWwiLAogICAiY29udGVudF9kaWdlc3QiOiAiNWNjN2VhOWVlYmIzYTdhODA0YmMxNjA0YjAyZDE3ZDQ1NWU0NmNmY2I5YzNkMzcxYTdkNTYxN2QwMjMwMjU4ZSIKICB9LAogIHsKICAgImFzc2V0X2lkIjogIm5hdGl2ZS1wbGFuYXItcmVhZGVyIiwKICAgImNvbnRlbnRfZGlnZXN0IjogImViMDExZTkxZTBkYWQ5MTIwOTQxYWUyYTkyNThhNmI2MmQwYTM4NDU4YzVlODRiZTJkYjcxNDZjZjM5OTU0MDgiCiAgfSwKICB7CiAgICJhc3NldF9pZCI6ICJuYXRpdmUtcGxhbmFyLXJlc2lkdWFsIiwKICAgImNvbnRlbnRfZGlnZXN0IjogImM5NDQxNGU3ZTJhZTQ4ODUwZDdjZTY2NmJmYjU3YTgyNzMxNmUyMGI2MjU3NTg2ODY5ZjE2MTlmMWY0ODBiYjIiCiAgfSwKICB7CiAgICJhc3NldF9pZCI6ICJuYXRpdmUtcGxhbmFyLXByb3RvY29sIiwKICAgImNvbnRlbnRfZGlnZXN0IjogIjQxNGNiMTA4NjYxZTNlYzg5YWU3MzNmZTNhZTgxNzQ1NjQyMjUwYzU5N2E3ZGMwYTNjMDQzODMzODA2YmQ1M2QiCiAgfQogXSwKICJzY2hlbWFfdmVyc2lvbiI6ICIxIgp9",
+   "content_digest": "5cca571f02ca03fc2681b2fb322d4030b951ef2c73db27b1316e1b1c3735dd67",
+   "media_type": "application/json",
+   "source_kind": "registered_document"
+  }
+ ],
+ "supersedes": "external bundle f5f5ce51…; built into the product as the default planar profiles"
+}

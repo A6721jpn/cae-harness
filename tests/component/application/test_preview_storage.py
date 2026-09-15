@@ -386,13 +386,14 @@ def _demo_log_result(service: Any, storage: Any, revision: Any, tmp_path: Path, 
 
     from test_comparison import _result
 
+    from febio_cae.adapters.febio import xplt_reader
     from febio_cae.application import _demo
 
     storage.ingest_source(
         asset_id="registered-reader-source",
         source_kind="registered_document",
         media_type="text/plain",
-        content=Path(_demo.xplt_reader.__file__).read_bytes(),
+        content=Path(xplt_reader.__file__).read_bytes(),
     )
     original_seal = storage._seal_native_output
     original_read = storage._read_candidate

@@ -52,7 +52,9 @@ def _build_parser() -> argparse.ArgumentParser:
         help="provision the reviewed planar compatibility bundle",
     )
     provision.add_argument("case_id")
-    provision.add_argument("--bundle-path", required=True)
+    provision.add_argument(
+        "--bundle-path", default=None, help="external bundle file; default is the built-in bundle"
+    )
     provision.add_argument("--json", action="store_true")
     inspect = case_commands.add_parser("inspect", help="read registered case metadata")
     inspect.add_argument("case_id")

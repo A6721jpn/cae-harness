@@ -35,15 +35,13 @@ python -m ruff format --check . ; python -m ruff check . ; python -m mypy src te
 | 合成STEP（直方体） | `C:\dev\CAE-HARNESS-V2\.local\v\native-inspection-05\producer\box.step` |
 | 準備要求3件（粗・中・細） | `C:\dev\CAE-HARNESS-V2\.local\v\public-input04\{coarse,refined,fine}.json` |
 | E2E設定の実例 | `C:\dev\CAE-HARNESS-V2\.local\v\public-settings05\settings.json` |
-| 承認バンドル（T2で不要とする） | `C:\dev\CAE-HARNESS-V2\.local\coordination\acceptance-planar-profile-approved-01.json` |
+| 旧承認バンドル（現在は不要。参考のみ） | `C:\dev\CAE-HARNESS-V2\.local\coordination\acceptance-planar-profile-approved-01.json` |
 
 新しい合成STEPが必要な場合は `.local/synthetic/` に生成する。実CAEモデルや `02_CAE` には手を触れない。
 
 ## 2. 現状の最重要事実
 
-**本ブランチでは MVP の手順2（対応表登録）が正常に機能しない状態にある。** `src/febio_cae/application/_profile_provisioning.py` の `_APPROVED_READER_SHA256`（`8bed227c…`）は `xplt_reader.py` ソースコードの自己ハッシュであるが、本ブランチでは同ファイルが改変されており、現在のハッシュ値は `5f058c90…` となっている。したがって `provision-planar-profiles` は「installed reader differs from the qualified reader」となり失敗し、以降の処理へ進むことができない。`run-demo` も対応表内の `profile.reader.executable_digest` を照合するため同様に失敗する。
-
-このため **T2 を最優先で実施する**（計画書上の順序は T1→T2 であるが、T2 を先行させる）。
+MVP の手順2（対応表登録）は 2026-09-15 に修正済み（旧タスクT2）。製品組み込みの既定対応表 `src/febio_cae/resources/planar_default_bundle.json` を `provision-planar-profiles` が `--bundle-path` 省略時に登録し、バンドルおよび XPLT 読込器ソースの自己ハッシュ固定は撤去した。新規 venv にインストールした wheel から `create → provision-planar-profiles` が `PROVISIONED` を返すことを確認済み。**残りは T0 → T1 → T3 → T4 → T5 → T6 の順で進める。**
 
 ### 2026-09-15 時点のゲート基線（`.venv`、`e696fbcc` のコード）
 
@@ -61,19 +59,6 @@ ruff・mypy の赤は本ブランチが 9/14 に「ローカルゲート未実�
 ### T0：ゲート基線の修復（最初に、機械的に）
 
 上表の ruff / mypy を解消し、`python -m pytest` が通る状態で1コミットにする。`_gmsh_runtime.py` の mypy 80件は `ctypes` 周りの型注釈不足が大半で、`cast` と `Callable[..., Any]` の注釈で閉じる。動作を変えない。
-
-### T2：既定対応表の組み込み（最初に着手）
-
-目的：外部バンドルおよび自己ハッシュ固定を廃止し、新規環境において `provision-planar-profiles` を正常に通過させる。
-
-1. `src/febio_cae/resources/planar_default_profiles.json`（新規）を作成する。内容は承認バンドルの `profiles`（solver / outputs / quality の3件、`CompatibilityProfile` の辞書表現）および `mesh_quality`（`MeshQualityRegistration`）をそのまま抽出したものとする。`source_documents`（約550KBの証拠レポート）は含めない。各プロファイル内の `evidence[].reference` は証拠レポートIDを参照しているため、`reference` を `"product-default"` に、`content_digest` を新規JSONファイル自体のSHA-256に付け替える（`EvidenceRef` は `source_kind / reference / target_field / content_digest` を要求するため、`domain/evidence.py` を参照のこと）。
-2. `pyproject.toml` の `[tool.setuptools]` にパッケージデータとしてJSONを含める（`package-data = {"febio_cae" = ["resources/*.json"]}`）。wheel に同梱されることを `python -m build` → `unzip -l` で確認する。
-3. `_profile_provisioning.provision_planar_profiles(service, case_id, *, bundle_path: Path | None)` とし、`None` の場合は組み込みJSONを読み込む。`_APPROVED_BUNDLE_SHA256 / _APPROVED_BUNDLE_SIZE / _APPROVED_READER_SHA256` の照合は削除する。外部バンドルを渡した際の構造検証（`_parse_bundle`）は残して差し支えない。
-4. `src/febio_cae/cli/main.py:50` 付近の `provision.add_argument("--bundle-path", required=True)` を `required=False` に変更し、`cli/case.py:217` 付近の呼び出し側もそれに合わせる。
-5. `run-demo`（`application/_demo.py:278` 付近）における `profile.reader.executable_digest` の照合と `registered-reader-source` の照合を削除する。同様の照合が `adapters/febio/xplt_reader.py:1055` の `_check_profile` にも存在する。リーダーの識別については `ToolIdentity` のバージョン文字列のみを残す。
-6. 試験：`tests/component/febio/test_profile_provisioning.py` の `_synthetic_bundle` を「既定値で登録」する試験に置き換え、外部バンドル経由のルートは1本のみ残す。`tests/e2e/test_installed_synthetic.py:30-31,1052-1060` の `_APPROVED_BUNDLE_*` および `qualification_bundle` の必須指定を解除する。
-
-完了条件：新規の `case create` 作成直後に `provision-planar-profiles CASE --json` が `PROVISIONED` を返し、返却される3つの `NumericalProfileRef` と `mesh_quality` が準備要求3件の参照と一致すること。
 
 ### T1：汎用 `run`
 
@@ -111,7 +96,7 @@ ruff・mypy の赤は本ブランチが 9/14 に「ローカルゲート未実�
 
 `tests/e2e/test_installed_synthetic.py`（2,975行・1関数）を T1〜T4 の変更に合わせて更新する。
 
-- 設定（`FEBIO_CAE_E2E_SETTINGS`）から `qualification_bundle` を除外し、`limits` を `preparation_calls: 1, solver_calls: 2` に変更した MVP 向けの設定を新たに用意する（3段階メッシュの設定は backlog 用に残して差し支えない）。
+- 設定（`FEBIO_CAE_E2E_SETTINGS`）の `qualification_bundle` は省略可能になっている（省略で組み込み既定値）。`limits` を `preparation_calls: 1, solver_calls: 2` に変更した MVP 向けの設定を新たに用意する（3段階メッシュの設定は backlog 用に残して差し支えない）。
 - `run-demo` → `run` とし、fine 以外の mesh_dependence 判定は T3 の方針に従う。
 - 手順7として `preview`（ダミー Studio で可。実 Studio は手動で実施）を追加し、最終的な `task_status=COMPLETE` を確認する。
 - 設定側で `installed_python` と `wheel` の SHA-256 を固定しているため、コードを変更するたびに `python -m build` → 新規 venv へのインストール → 設定内の SHA 更新を行う必要がある。この手順を `docs/cli-usage.md` に記載する。
@@ -128,7 +113,7 @@ ruff・mypy の赤は本ブランチが 9/14 に「ローカルゲート未実�
 
 - 球、円柱、摩擦、Neo-Hookean、ソースローカル細分化、LLM経路には手を加えない（backlog）。
 - `adapters/geometry/_gmsh_runtime.py`（約4,200行の依存関係認証）には手を触れない。動作しているならそのまま利用する。
-- 新たなハッシュ固定、自己ハッシュ、追加の権限レイヤーは導入しない。T2 はこれらを削減するための作業である。
+- 新たなハッシュ固定、自己ハッシュ、追加の権限レイヤーは導入しない。既定対応表の組み込み（済）で撤去したハッシュ固定を復活させない。
 - 試験は変更した契約の分のみ作成する。1機能につき数本で十分である。
 
 ## 5. 報告の形式

@@ -27,8 +27,6 @@ from typing import Any, cast
 import pytest
 
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
-_APPROVED_BUNDLE_SHA256 = "f5f5ce51367f6f9af6f19fc42da6641fd3b4202711e95681a89333d74a3d22c5"
-_APPROVED_BUNDLE_SIZE = 604962
 _EVIDENCE_KEYS = {
     "schema_version",
     "source_kind",
@@ -136,7 +134,7 @@ class _Settings:
     wheel: _FileIdentity
     solver: _FileIdentity
     source_step: _FileIdentity
-    qualification_bundle: _FileIdentity
+    qualification_bundle: _FileIdentity | None
     preparation_requests: tuple[_FileIdentity, ...]
     youngs_modulus_pa: float
     instruction: str
@@ -1042,22 +1040,23 @@ def _load_settings() -> _Settings:
         "comparison",
         "limits",
     }
-    settings = _strict_object(raw, required=allowed, allowed=allowed, field="settings")
+    settings = _strict_object(
+        raw, required=allowed - {"qualification_bundle"}, allowed=allowed, field="settings"
+    )
     if settings["schema_version"] != "1" or settings["scope"] != "synthetic_explicit":
         raise _EnvironmentNotReady(
             "settings must use schema_version '1' and synthetic_explicit scope"
         )
     identities = {
         name: _file_identity(settings[name], f"settings.{name}")
-        for name in ("installed_python", "wheel", "solver", "source_step", "qualification_bundle")
+        for name in ("installed_python", "wheel", "solver", "source_step")
     }
-    if (
-        identities["qualification_bundle"].digest != _APPROVED_BUNDLE_SHA256
-        or identities["qualification_bundle"].size != _APPROVED_BUNDLE_SIZE
-    ):
-        raise _EnvironmentNotReady(
-            "settings.qualification_bundle is not the approved portable bundle identity"
-        )
+    # Optional external bundle; omitted means the product's built-in default bundle.
+    qualification_bundle = (
+        _file_identity(settings["qualification_bundle"], "settings.qualification_bundle")
+        if "qualification_bundle" in settings
+        else None
+    )
     raw_requests = settings["preparation_requests"]
     if not isinstance(raw_requests, list) or len(raw_requests) != 3:
         raise _EnvironmentNotReady(
@@ -1138,7 +1137,7 @@ def _load_settings() -> _Settings:
         wheel=identities["wheel"],
         solver=identities["solver"],
         source_step=identities["source_step"],
-        qualification_bundle=identities["qualification_bundle"],
+        qualification_bundle=qualification_bundle,
         preparation_requests=preparation_requests,
         youngs_modulus_pa=youngs_modulus_pa,
         instruction=instruction,
@@ -2398,16 +2397,10 @@ def test_installed_synthetic_cli_flow(tmp_path: Path) -> None:
         report.data["artifacts"]["case_id"] = case_id
         report.write()
 
-        provision_code, provisioned, _ = cli(
-            "provision-planar-profiles",
-            [
-                "provision-planar-profiles",
-                case_id,
-                "--bundle-path",
-                str(settings.qualification_bundle.path),
-                "--json",
-            ],
-        )
+        provision_args = ["provision-planar-profiles", case_id, "--json"]
+        if settings.qualification_bundle is not None:
+            provision_args[2:2] = ["--bundle-path", str(settings.qualification_bundle.path)]
+        provision_code, provisioned, _ = cli("provision-planar-profiles", provision_args)
         _expect(
             provision_code == 0
             and provisioned.get("status") == "PROVISIONED"
@@ -2415,14 +2408,18 @@ def test_installed_synthetic_cli_flow(tmp_path: Path) -> None:
             and provisioned.get("native_operations") == 0,
             "planar profile provisioning failed or performed native work",
         )
-        approved_bundle = _require_dict(
-            provisioned.get("approved_bundle"), "provisioned.approved_bundle"
-        )
-        _expect(
-            approved_bundle.get("sha256") == settings.qualification_bundle.digest
-            and approved_bundle.get("size") == settings.qualification_bundle.size,
-            "provisioned bundle identity differs from configured evidence",
-        )
+        provisioned_bundle = _require_dict(provisioned.get("bundle"), "provisioned.bundle")
+        if settings.qualification_bundle is None:
+            _expect(
+                provisioned_bundle.get("source") == "builtin",
+                "provisioning did not use the built-in default bundle",
+            )
+        else:
+            _expect(
+                provisioned_bundle.get("sha256") == settings.qualification_bundle.digest
+                and provisioned_bundle.get("size") == settings.qualification_bundle.size,
+                "provisioned bundle identity differs from configured evidence",
+            )
         provision_scope = _require_dict(provisioned.get("scope"), "provisioned.scope")
         _expect(
             provision_scope.get("enforced_scope_capability")

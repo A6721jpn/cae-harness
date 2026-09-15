@@ -8,7 +8,6 @@ from pathlib import Path
 
 import pytest
 
-from febio_cae.adapters.febio import xplt_reader
 from febio_cae.application import _profile_provisioning
 from febio_cae.application.service import RegisteredCaseService
 from febio_cae.domain import EvidenceRef, PortError, PortErrorCategory, Quantity, ToolIdentity
@@ -21,7 +20,7 @@ from .fixtures import make_profile
 def _synthetic_bundle(tmp_path: Path) -> tuple[Path, tuple[str, ...]]:
     note = b"Synthetic caller-authored note; no native qualification exists."
     note_digest = hashlib.sha256(note).hexdigest()
-    reader_digest = hashlib.sha256(Path(xplt_reader.__file__).read_bytes()).hexdigest()
+    reader_digest = hashlib.sha256(b"synthetic reader identity").hexdigest()
     original = make_profile()
     profile = replace(
         original,
@@ -98,45 +97,70 @@ def _synthetic_bundle(tmp_path: Path) -> tuple[Path, tuple[str, ...]]:
     return path, tuple(str(record["profile_id"]) for record in profiles.values())
 
 
-def test_caller_authored_qualification_cannot_provision_profiles(tmp_path: Path) -> None:
-    path, profile_ids = _synthetic_bundle(tmp_path)
+def _new_case(tmp_path: Path) -> tuple[RegisteredCaseService, str]:
     cad = tmp_path / "source.step"
     cad.write_bytes(b"ISO-10303-21; END-ISO-10303-21;")
     service = RegisteredCaseService(state_dir=tmp_path / "state")
     created = service.create_case(case_root=tmp_path / "case", cad_path=cad)
-    before = service.current_draft(created.case_id)
-    with pytest.raises(PortError):
-        service.provision_planar_profiles(created.case_id, bundle_path=path)
-    assert service.current_draft(created.case_id) == before
-    for profile_id in profile_ids:
-        with pytest.raises(PortError):
-            service.compatibility.get_profile(profile_id)
+    return service, created.case_id
 
 
-def test_unqualified_installed_reader_cannot_publish_trusted_records(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    path, profile_ids = _synthetic_bundle(tmp_path)
-    content = path.read_bytes()
-    # Trust only this synthetic release fixture; production trust remains pinned.
-    monkeypatch.setattr(
-        _profile_provisioning, "_APPROVED_BUNDLE_SHA256", hashlib.sha256(content).hexdigest()
+def test_builtin_default_bundle_provisions_planar_profiles(tmp_path: Path) -> None:
+    service, case_id = _new_case(tmp_path)
+    before = service.current_draft(case_id)
+    result = service.provision_planar_profiles(case_id)
+    assert result["status"] == "PROVISIONED"
+    assert result["native_operations"] == 0
+    bundle = result["bundle"]
+    assert isinstance(bundle, dict) and bundle["source"] == "builtin"
+    profiles = result["profiles"]
+    assert isinstance(profiles, dict)
+    assert {purpose: ref["profile_id"] for purpose, ref in profiles.items()} == dict(
+        _profile_provisioning._PROFILE_IDS
     )
-    monkeypatch.setattr(_profile_provisioning, "_APPROVED_BUNDLE_SIZE", len(content))
-    different_reader = tmp_path / "different_reader.py"
-    different_reader.write_bytes(b"unqualified reader bytes")
-    monkeypatch.setattr(xplt_reader, "__file__", str(different_reader))
-    cad = tmp_path / "source.step"
-    cad.write_bytes(b"ISO-10303-21; END-ISO-10303-21;")
-    service = RegisteredCaseService(state_dir=tmp_path / "state")
-    created = service.create_case(case_root=tmp_path / "case", cad_path=cad)
-    before = service.current_draft(created.case_id)
+    for ref in profiles.values():
+        assert service.compatibility.get_profile(ref["profile_id"]).profile_id == ref["profile_id"]
+    mesh = result["mesh_quality"]
+    assert isinstance(mesh, dict) and mesh["profile_id"] == _profile_provisioning._MESH_PROFILE_ID
+    assert service.current_draft(case_id) == before
+    # Same bundle again is idempotent, not a conflict.
+    again = service.provision_planar_profiles(case_id)
+    assert again["profiles"] == profiles
+
+
+def test_external_bundle_path_is_accepted_when_consistent(tmp_path: Path) -> None:
+    path, profile_ids = _synthetic_bundle(tmp_path)
+    service, case_id = _new_case(tmp_path)
+    result = service.provision_planar_profiles(case_id, bundle_path=path)
+    assert result["status"] == "PROVISIONED"
+    bundle = result["bundle"]
+    assert isinstance(bundle, dict) and bundle["source"] == str(path)
+    for profile_id in profile_ids:
+        assert service.compatibility.get_profile(profile_id).profile_id == profile_id
+
+
+def test_external_bundle_with_tampered_evidence_is_rejected(tmp_path: Path) -> None:
+    path, profile_ids = _synthetic_bundle(tmp_path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["source_documents"][0]["content_base64"] = base64.b64encode(b"tampered").decode()
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    service, case_id = _new_case(tmp_path)
+    before = service.current_draft(case_id)
     with pytest.raises(PortError) as rejected:
-        service.provision_planar_profiles(created.case_id, bundle_path=path)
+        service.provision_planar_profiles(case_id, bundle_path=path)
     assert rejected.value.category is PortErrorCategory.INTEGRITY
-    assert service.current_draft(created.case_id) == before
+    assert service.current_draft(case_id) == before
     with pytest.raises(StorageConflictError):
-        service._storage(created.case_id).source_asset("forged-qualification")
+        service._storage(case_id).source_asset("forged-qualification")
     for profile_id in profile_ids:
         with pytest.raises(PortError):
             service.compatibility.get_profile(profile_id)
+
+
+def test_different_bundle_for_same_profile_ids_conflicts(tmp_path: Path) -> None:
+    service, case_id = _new_case(tmp_path)
+    service.provision_planar_profiles(case_id)
+    path, _ = _synthetic_bundle(tmp_path)
+    with pytest.raises(PortError) as rejected:
+        service.provision_planar_profiles(case_id, bundle_path=path)
+    assert rejected.value.category is PortErrorCategory.CONFLICT

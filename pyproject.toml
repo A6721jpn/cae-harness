@@ -19,6 +19,9 @@ febio-cae = "febio_cae.cli:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+febio_cae = ["resources/*.json"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests/unit", "tests/component"]
 pythonpath = ["src"]
