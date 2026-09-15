@@ -47,7 +47,7 @@ MVP の手順2（対応表登録）は 2026-09-15 に修正済み（旧タスク
 
 | ゲート | 結果 |
 |---|---|
-| `python -m pytest`（unit + component、1780 件） | 1780 passed、exit 0、47分42秒（`test_required_numerical_quality.py` の細分化系15件が大半の時間を占める。実装中は `-k` で絞る） |
+| `python -m pytest`（unit + component、1782 件） | 1782 passed、exit 0、46分45秒（`c5df325` で実測）（`test_required_numerical_quality.py` の細分化系15件が大半の時間を占める。実装中は `-k` で絞る） |
 | `ruff format --check .` | 9ファイルが未整形（`ruff --fix` 相当で機械的に直る） |
 | `ruff check .` | 14件（6件は `--fix` 可。残りは `TRY004` 等の小さな修正） |
 | `mypy src tests` | 88件。80件は `adapters/geometry/_gmsh_runtime.py`、残りは `tests/component/geometry/test_gmsh_runtime_identity.py` と `test_required_numerical_quality.py`（pytest 9 の `FixtureFunctionDefinition.__wrapped__`） |
