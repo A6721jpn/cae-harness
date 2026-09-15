@@ -28,10 +28,13 @@ STEP部品と新規剛体治具の接触押し込みを実FEBioで解析し、�
 
 MVPの完了は、`tests/e2e/test_installed_synthetic.py` への合格と、上記8手順を手動で実行した記録（`docs/reviews/`）によって証明する。なお、MVPの達成は、球・円柱・摩擦・非線形材料・日本語入力・実モデルへの対応完了を意味するものではない。
 
-### MVPまでの実装タスク（優先順）
+### MVPまでの実装タスク
+
+着手順は T0 → T2 → T1 → T3 → T4 → T5 → T6。T2 を T1 より先にするのは、本ブランチでは読込器ソースの自己ハッシュ不一致により `provision-planar-profiles` が失敗し、手順2から先へ進めないためである（詳細は[引き継ぎ](mvp-handoff.md) §2）。
 
 | # | タスク | 内容 |
 |---|---|---|
+| T0 | ゲート基線の修復 | `orca/acceptance-integration` で赤のままの ruff（整形9ファイル・lint 14件）と mypy（88件、主に `_gmsh_runtime.py`）を、動作を変えずに解消する |
 | T1 | 汎用 `run` | `run-demo` の登録済みデモ前提を解消し、`prepare-planar` により `PREPARED` となった任意の版を `case run --revision-id --solver [--preflight]` で実行可能にする。`run-demo` は互換性維持のために残すか、削除する |
 | T2 | 既定対応表の組み込み | 承認バンドルに含まれる設定値（ソルバー・出力・品質の3プロファイルとメッシュ品質基準）を製品コード内の既定値（`src/febio_cae/resources/` のJSON又はPythonモジュール）にする。`provision-planar-profiles` は `--bundle-path` 省略時に既定値を登録し、外部バンドルの検証経路は任意入力として残す。バンドル本体のSHA-256・サイズ固定と、XPLT読込器ソースの自己ハッシュ固定（`_APPROVED_READER_SHA256`）を撤去する。過去の証拠レポート（約550KB）は同梱せず `docs/reviews/archive/` を参照する |
 | T3 | メッシュ依存性の任意化 | `required_quality` においてメッシュ依存性が `UNVERIFIED` であっても、他の5項目が `PASS` であれば `quality_status` を合格とし、`task_status` を `NEEDS_QUALITY` と判定しないようにする |
@@ -70,7 +73,7 @@ MVPの完了は、`tests/e2e/test_installed_synthetic.py` への合格と、上�
 
 ### 次に進める順序
 
-1. T1〜T6を実施してMVPを完了させる（P3・P6の未完了項目）。
+1. T0〜T6（[引き継ぎ](mvp-handoff.md)）を実施してMVPを完了させる（P3・P6の未完了項目）。
 2. 実モデルの入力、条件、および使用許可が整い次第、P7（E2E-02、E2E-03）に着手する。
 3. MVP以降の目標範囲（§7 backlog）については、対応表の実測証拠が得られた項目から順次着手する。
 

@@ -12,6 +12,7 @@ V2は、独立した開発履歴を持つPython 3.12のheadless CLIである。�
 |---|---|
 | [設計仕様書](docs/specs/2026-09-14-febio-llm-cae-harness-design-v2.md) | 製品契約。MVPの範囲、20要求、構成、データ契約、状態遷移、品質項目、CLI、比較、拡張点 |
 | [実装・検証計画](docs/plans/2026-09-14-febio-cae-harness-greenfield-plan.md) | MVPの完了条件と実装タスク、P0〜P7の現在地、検証ID、数値参照ケース、配布・実モデル受け入れ、backlog |
+| [MVP実装の引き継ぎ](docs/plans/mvp-handoff.md) | 作業場所・環境・タスクT1〜T6のファイル別作業指示 |
 | [実装ノート](docs/specs/implementation-notes.md) | 現行実装の数値上限、ログ構文規則、LLM接続詳細、試験専用境界 |
 | [開発契約](AGENTS.md) | 作業範囲、データ境界、体制、検証・報告、証拠と主張の規則 |
 | [文書レビュー記録](docs/reviews/archive/2026-09-07-prototype-design-review.md) | 文書検査と未検証項目 |

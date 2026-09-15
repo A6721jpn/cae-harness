@@ -5,6 +5,7 @@
 - 正式仕様は次の2文書のみ。参照が必要なときだけ読むこと。
   - `docs/specs/2026-09-14-febio-llm-cae-harness-design-v2.md`（製品契約。§1にMVPの範囲）
   - `docs/plans/2026-09-14-febio-cae-harness-greenfield-plan.md`（工程・MVP完了条件・現在地・backlog）
+- 実装作業の入口は `docs/plans/mvp-handoff.md`（作業場所、環境、タスクT1〜T6のファイル別指示）。作業ブランチは `orca/acceptance-integration`、作業ツリーは `C:/Users/backo/orca/workspaces/CAE-HARNESS-V2/acceptance-integration`。`V2` は約100コミット古く、MVP完了時に早送りで反映する。
 - `docs/specs/implementation-notes.md` は現行実装の数値上限・構文規則の記録。コード変更に追従して更新し、製品契約を変えない限り仕様書の改訂は不要。
 - 本リポジトリ内でPython 3.12により新規開発する。初期製品はCLIのみ。GUIやCodex Desktop・Orcaへの実行時依存は禁止。
 - 別リポジトリ・旧CAE Harnessの資産は調査・再利用・統合禁止。V2は独立履歴とし、fetch・統合はV2とその開発ブランチのみ。

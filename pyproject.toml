@@ -9,6 +9,10 @@ description = "Headless FEBio CAE harness bootstrap"
 requires-python = ">=3.12,<3.13"
 dependencies = []
 
+[project.optional-dependencies]
+dev = ["pytest", "ruff", "mypy", "build"]
+native = ["gmsh==4.15.2"]
+
 [project.scripts]
 febio-cae = "febio_cae.cli:main"
 
