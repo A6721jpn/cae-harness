@@ -1,93 +1,52 @@
-# FEBio CAE Harness Development Contract
+# FEBio CAE Harness 開発契約
 
-テストは最低限に。初期計画にないテストや機能追加は最小限に。最短で最速で計画通りの開発を遂行せよ。
+## 仕様・範囲
 
-Effective: 2026-09-09. This contract supersedes earlier development role and dispatch instructions.
+- 正式仕様は次の2文書のみ。参照が必要なときだけ読むこと。
+  - `docs/specs/2026-09-14-febio-llm-cae-harness-design-v2.md`（製品契約。§1にMVPの範囲）
+  - `docs/plans/2026-09-14-febio-cae-harness-greenfield-plan.md`（工程・MVP完了条件・現在地・backlog）
+- `docs/specs/implementation-notes.md` は現行実装の数値上限・構文規則の記録。コード変更に追従して更新し、製品契約を変えない限り仕様書の改訂は不要。
+- 本リポジトリ内でPython 3.12により新規開発する。初期製品はCLIのみ。GUIやCodex Desktop・Orcaへの実行時依存は禁止。
+- 別リポジトリ・旧CAE Harnessの資産は調査・再利用・統合禁止。V2は独立履歴とし、fetch・統合はV2とその開発ブランチのみ。
+- remoteは`https://github.com/A6721jpn/cae-harness.git`、統合先は`V2`。`REMOTE_CONFIGURED`として報告し、force pushは禁止。
 
-## Authority and scope
+## 開発・統合
 
-- The only product authorities are:
-  - `docs/specs/2026-08-27-febio-llm-cae-harness-design-v2.md`
-  - `docs/plans/2026-08-27-febio-cae-harness-greenfield-plan.md`
-- Work only inside this repository. Do not inspect, copy, merge, or cherry-pick code,
-  tests, schemas, skills, releases, branches, or worktrees from another repository.
-- This is a greenfield Python 3.12 project. Do not introduce Codex Desktop or Orca as a
-  product runtime dependency. The initial product is a headless CLI; do not add a GUI.
-- The authorized remote is `https://github.com/A6721jpn/cae-harness.git` and the
-  integration branch is `V2`. Report this state as `REMOTE_CONFIGURED`.
-- V2 has an independent history containing only the new V2 design and implementation.
-  Do not reuse or inspect legacy CAE Harness code, tests, schemas, releases, branches,
-  worktrees, or case assets. Limit fetches and integration to V2 and its development branches.
-- The PM also serves as PdM and uses `gpt-6-astra` / `xhigh`. Exactly one implementation
-  task uses `gpt-6-astra` / `low`. A separate, independent code-review task uses
-  `gpt-6-astra` / `medium`. Do not dispatch additional or parallel coding workers.
-- Continue the existing designated tasks through the Codex task tools, explicitly
-  setting the destination role's model and effort on work dispatch. Do not use the
-  Luna Spawn route. Reports preserve destination settings; a PM report must not
-  switch the PM to the sender's effort. Verify effective settings from runtime
-  metadata; a title or requested setting alone is not execution evidence.
-- The PM/PdM decides product priorities, scope, task order, technical tradeoffs,
-  acceptance criteria and finite development/execution budgets within user-authorized
-  requirements. Record consequential decisions and update the two product authorities
-  before implementation when behavior or acceptance changes. Routine engineering
-  decisions do not require another permission request. This authority does not
-  invent physical conditions, authorize unapproved real-data/native operations,
-  waive required real E2E, or describe unverified behavior as accepted.
-- The PM/PdM owns scope and integration. The sole implementer owns assigned product
-  files; the PM owns governance documents and does not concurrently edit those product files. The
-  reviewer inspects exact commits read-only and reports findings to the PM. Only the PM
-  integrates reviewed, clean, passing changes into V2 and pushes V2 without force.
-- Keep task IDs, runtime metadata, launcher prompts, and local coordination state outside
-  Git, under an ignored local coordination directory. These tools are development tools,
-  not product runtime dependencies.
+- あらゆるオーバーエンジニアリングを禁ずる。ユーザーが明示的に製造レベルのコードを要求しない限り、開発しているのはMVPである。そのため **最小限のテストで最速で動くものを作る** べきである。
+- OMPのユーザー役割設定を使い、モデル・推論強度を固定せず、グローバル設定を変更しない。
+- 担当・委譲・並列化はOMPが判断し、過去の固定方針より優先する。共有変更の競合、長時間テスト・solverの重複実行、過剰分割を避ける。
+- PMが範囲・統合を管理する。実装者と独立した担当が指定コミットを読み取り専用でレビューし、小さく、レビュー済み・必須検証合格・未コミット変更なしの変更だけを統合する。
+- 実行情報・起動プロンプト・調整状態はGit追跡外に置く。
 
-## Data and authority boundaries
+## データ・判断
 
-- Never add real CAE models, results, credentials, or desktop state to Git.
-- Treat every `02_CAE` directory as outside the tool repository. Do not modify real
-  `02_CAE` data before the final authorized E2E phase.
-- Never infer material, load, constraint, contact, ROI, or other physical meaning from
-  geometry or convention. Use `ASK_AND_BLOCK` only when authoritative evidence cannot
-  determine a required physical condition.
-- Synthetic tests are synthetic evidence. Never describe them as real FEBio, official
-  FBS, FEBio Studio, Computer Use, or real-model success.
+- 実CAEモデル・結果・認証情報・デスクトップ状態はGitに追加しない。全`02_CAE`は外部扱いとし、最終の許可済みE2E前は変更禁止。
+- 材料・荷重・拘束・接触・ROI等を形状や慣例から推測しない。正式な根拠で必須物理条件を確定できない場合のみ`ASK_AND_BLOCK`。
+- 合成テストやSMOKEテストを実FEBio・公式FBS・FEBio Studio・Computer Use・実モデルの成功証拠にしない。
+- 実検証のための既製caeモデルが必要な場合はFEBioの公式例題リポジトリからダウンロードするか、次善策としてネット上の既存モデルを使うこと。
 
-## Implementation discipline
+## 検証・報告
 
-- Use test-first development: record a failing RED command and exit code, implement the
-  smallest change, then record the GREEN command, count, and exit code.
-- Do not count interrupted runs, collection errors, environment errors, skipped required
-  checks, or unexecuted tests as passing evidence.
-- Keep common contracts single-owner. The sole implementer works sequentially across
-  input/model, solver/FBS, autonomy and build/launch, using explicit file boundaries
-  and reviewed base commits. Logical module boundaries do not authorize more workers.
-- Worker tasks must state the base commit, allowed files, forbidden changes, RED and GREEN
-  commands, completion criteria, unverified items, and required clean commit handoff.
-- Accept only small, reviewed, clean commits. Do not hand off uncommitted changes or large
-  snapshots.
-- Use the smallest meaningful RED/GREEN checks for the planned behavior and observed
-  defects. Do not add speculative features or redundant test matrices. Run required
-  local gates once on the final implementation candidate; repeat only checks justified
-  by a changed candidate, environment, failure or unresolved risk. A documentation-only
-  change needs content/link/diff checks and independent review, not product RED/GREEN,
-  pytest, build or a new installed environment. Retain valid existing tests.
-- Coordinate on completion, failure or a decision request. Do not create acknowledgement
-  loops, repeated unchanged polling, or additional tasks solely to wait.
+- 最小変更。一律のテスト先行や固定した試験件数は求めない。不具合には再現する回帰試験を用意し、通常の変更は影響する契約の試験を通す。実行したコマンド・終了コード・件数を記録し、中断・エラー・省略・未実行は合格に数えない。
+- フェーズごとに未検証事項・次タスクを報告する。必須実E2Eすべてと最終BottomFrame実モデルE2Eの合格証拠がそろうまで最終完成を宣言しない。
 
-## Required local gates
+## 体制
 
-- Tests: `python -m pytest`
-- Format: `python -m ruff format --check .`
-- Lint: `python -m ruff check .`
-- Types: `python -m mypy src tests`
-- CAE boundary: `python scripts/scan_cae_data.py --root .`
-- Build: `python -m build`
-- Installed smoke: create a clean virtual environment, install the built wheel, and run
-  `febio-cae --version` from that environment.
+- PM（範囲・統合・文書整合）、単独の実装担当、独立レビュー担当の3役。実装担当と共通契約の所有者は一人とし、既存の作業ツリー・成果を継続利用する。モデル・推論強度は固定せず、OMPのユーザー役割設定に従う。
+- 依頼には目的、基準コミット、変更範囲、必要な契約、完了条件、予算、未検証事項を記す。モジュール数を理由に担当を増やさない。作業ブランチは `codex/` を使う。
+- 候補は未コミット差分のない状態でレビューする。最終検証と証拠を満たした後、PMだけがV2へ統合し、強制更新なしで反映する。作業・レビュー担当はV2へ直接反映せず、他のブランチ・リモートを変更・削除しない。
+- `docs/reviews/` の報告には、対象工程、基準・候補・統合コミット、変更概要、検証結果、wheel識別、実行入力・結果のハッシュ、許容値と実測、未完了項目と次の到達点を残す。実データ・画面はケース領域、タスクID・会話記録はGit外へ保存する。
 
-## Phase reporting
+## 証拠と主張の規則
 
-At every phase boundary report the commit SHA, changed files, exact test commands, test
-counts, exit codes, unverified items, and next task. Do not declare the project complete
-until every required real E2E and the final BottomFrame real-model E2E have fresh passing
-evidence.
+仕様書・計画書・レビュー・応答で状態を報告するとき、次を守る。仕様書本文にはこれらの注意書きを繰り返さない。
+
+- 状態語の意味を混同しない。`INSPECTED` は観測完了、`PROVISIONED` は登録完了、`PREPARED` は準備記録の公開、`SUCCEEDED` は終端到達と出力完全性、`LAUNCHED` は表示ソフトの起動、`COMPLETE` は品質・表示を含む完了。終了コード0は操作の成功であり、解析の完了ではない。
+- 未実装・証拠不足・範囲外の品質項目は `UNVERIFIED` のまま残す。項目名・不適用理由文・対応表名・単純計算だけで合格にしない。
+- 合成データ・模擬ログ・模擬XPLT・模擬画面・SMOKE試験の合格を、実FEBio・Studio・実LLM・実モデルの成功証拠にしない。限定的な合成経路の合格を、球・円柱・摩擦・非線形材料・一般的な実機互換性へ一般化しない。
+- 版・ハッシュ・ツール識別の記録だけで幾何・数値品質を認定しない。ハッシュ一致は同一性の証拠であり、正しさの証拠ではない。
+- 呼出側の自己申告（`approved`、`ready`、完了フラグ、ツール実体の指定）を権限や証拠にしない。権限・完了状態はサービスが記録から導出する。
+- 未指定の物理条件をゼロ・既定値・慣例で補わない。摩擦なし・回転固定・隙間ゼロも明示値として登録させる。
+- 文書の改訂・整理は実装や実機の合格証拠ではない。過去の「次タスク」や試験件数を現在の判定に使わない。
+- 最終完成は、必須実E2Eすべてと最終BottomFrame実モデルE2Eの合格証拠がそろうまで宣言しない。MVP完了は計画書 §2 の8手順で別に判定する。
+

@@ -1,15 +1,56 @@
-# 検証・レビュー記録の扱い
+# 検証・レビュー記録
 
-- [2026-09-09 公開 planar preparation のsource検証](2026-09-09-public-planar-preparation.md)
+`docs/reviews/` 直下には現行の記録のみを置く。2026-09-15時点では現行の記録はなく、次はMVP（計画書 §2）の手動記録を追加する。
 
-このディレクトリの日付付き文書は、記録対象時点の検証・判断の証拠である。当時のモデル、担当、SHA、件数、コマンド、結果、未検証項目を保持する。過去の「次タスク」や並行分担は現行の作業指示ではない。
+## アーカイブ
 
-2026-09-09以降の開発体制は[開発契約](../../AGENTS.md)と[実装・検証計画](../plans/2026-08-27-febio-cae-harness-greenfield-plan.md)に従う。PM兼PdMはAstra X-high、実装は単独のAstra Low、独立レビューは別タスクのAstra Mediumが担う。旧体制の記載は現在の発注やモデル設定の根拠として使わない。
+`archive/` の日付付き文書（2026-09-07〜09-09）は、記録対象時点における検証および判断の証拠である。当時のモデル、担当、SHA、件数、コマンド、結果、未検証項目をそのまま保持する。過去の「次タスク」や並行分担は現行の作業指示ではなく、限定的な成功を一般的な互換性や実モデルでの成功へと拡張するものではない。一部に削除済みの作業フォルダへの絶対パスリンクが残っているが、当時の記録として変更しない。
 
-記録済みの限定的な成功を一般的なnative互換性や実モデル成功へ拡張しない。現行候補の受け入れでは証拠の対象SHA・適用範囲を確認し、未検証の必須実E2Eと最終BottomFrameを省略しない。
+現行の開発体制と証拠の規則は[開発契約](../../AGENTS.md)に、工程と現在地は[実装・検証計画](../plans/2026-09-14-febio-cae-harness-greenfield-plan.md)にそれぞれ従う。
 
-- [2026-09-09 Prepared material descendants: code stage](2026-09-09-prepared-material-descendants.md)
-
-- [2026-09-09 P4 intent source: CODE_READY](2026-09-09-p4-intent-source.md)
-
-- [2026-09-09 Initial public native inspection: CODE_READY](2026-09-09-public-native-inspection.md)
+- [P0-A bootstrap verification](archive/2026-09-07-p0-a-bootstrap.md)
+- [P0-B 公式互換性調査記録](archive/2026-09-07-p0-b-compatibility-research.md)
+- [P0-B native elastic patch probe記録](archive/2026-09-07-p0-b-elastic-patch.md)
+- [P0-B native free-DOF compressible neo-Hookean observation](archive/2026-09-07-p0-b-free-dof-neo-hookean.md)
+- [P0-B Gmsh to FEBio Tet10 mapping observation](archive/2026-09-07-p0-b-gmsh-febio-mapping.md)
+- [P0-B Gmsh native geometry observation](archive/2026-09-07-p0-b-gmsh-observation.md)
+- [P0-B Gmsh native primitive probe記録](archive/2026-09-07-p0-b-native-primitives.md)
+- [P0-B compressible neo-Hookean native observation](archive/2026-09-07-p0-b-neo-hookean-observation.md)
+- [P0-B FEBio Studio XPLT観察記録](archive/2026-09-07-p0-b-studio-observation.md)
+- [P0-B XPLT reader observation記録](archive/2026-09-07-p0-b-xplt-observation.md)
+- [P1-A domain foundation verification](archive/2026-09-07-p1-a-domain-foundation.md)
+- [P1-B1 spatial and selection contract verification](archive/2026-09-07-p1-b1-spatial-selection.md)
+- [P1-B10 output policy and evaluation intent](archive/2026-09-07-p1-b10-output-policy.md)
+- [P1-B11 quality policy and numerical quality intent](archive/2026-09-07-p1-b11-quality-policy.md)
+- [P1-B12 CaseSpec composition](archive/2026-09-07-p1-b12-case-spec.md)
+- [P1-B13 CaseRevision content contract](archive/2026-09-07-p1-b13-case-revision.md)
+- [P1-B14 PartialCaseSpec and CaseDraft contracts](archive/2026-09-07-p1-b14-case-draft.md)
+- [P1-B2 material and motion contract verification](archive/2026-09-07-p1-b2-material-motion.md)
+- [P1-B3 support and rigid contract verification](archive/2026-09-07-p1-b3-support-rigid.md)
+- [P1-B4 contact intent verification](archive/2026-09-07-p1-b4-contact.md)
+- [P1-B5 rigid kinematics and tool intent verification](archive/2026-09-07-p1-b5-rigid-kinematics.md)
+- [P1-B6 computational budget contract](archive/2026-09-07-p1-b6-budget.md)
+- [P1-B7 STEP geometry intent](archive/2026-09-07-p1-b7-geometry.md)
+- [P1-B8 mesh policy and numerical profile reference](archive/2026-09-07-p1-b8-mesh-policy.md)
+- [P1-B9 solver policy and numerical intent](archive/2026-09-07-p1-b9-solver-policy.md)
+- [プロトタイプ設計文書のレビュー記録](archive/2026-09-07-prototype-design-review.md)
+- [Registered numerical criteria and explicit selection context](archive/2026-09-08-a-c-registered-interface.md)
+- [P1 common interface freeze: R3 bounded repair handoff](archive/2026-09-08-p1-interface-freeze.md)
+- [Registered lifecycle and explicit CLI phase report](archive/2026-09-08-p1-registered-cli.md)
+- [P2 C consolidated adapter-source handoff](archive/2026-09-08-p2-c-source-handoff.md)
+- [P2 connected geometry binding intermediate repair](archive/2026-09-08-p2-connected-binding-intermediate.md)
+- [P2 controlled curved tools and native-session ownership](archive/2026-09-08-p2-curved-support-intermediate.md)
+- [P2 input/model geometry and mesh adapter handoff](archive/2026-09-08-p2-input-model-geometry-mesh.md)
+- [P2 mesh validity intermediate repair](archive/2026-09-08-p2-mesh-validity-intermediate.md)
+- [P2 H7 exact-arithmetic certificate delta](archive/2026-09-08-p2-numeric-certificate-delta.md)
+- [P2 concrete placed-selection bridge](archive/2026-09-08-p2-placed-selection-bridge.md)
+- [P2 C2-M1 session-admission correction](archive/2026-09-08-p2-session-admission-delta.md)
+- [P3 solver adapters: corrected evidence and mixed-test migration](archive/2026-09-08-p3-solver-adapters.md)
+- [R2 residual repair — H2 design decision required](archive/2026-09-08-r2-residual-repair.md)
+- [Generated AP214 schema admission correction](archive/2026-09-09-ap214-generated-schema.md)
+- [Fixed public Gmsh / OCCT candidate correction](archive/2026-09-09-native-occ-pair-correction.md)
+- [P4 intent source: CODE_READY evidence](archive/2026-09-09-p4-intent-source.md)
+- [Prepared material descendants: code stage](archive/2026-09-09-prepared-material-descendants.md)
+- [Initial public native inspection — code stage](archive/2026-09-09-public-native-inspection.md)
+- [Public planar preparation source phase](archive/2026-09-09-public-planar-preparation.md)
+- [STEP preparation admission prerequisites](archive/2026-09-09-step-preparation-admission.md)
