@@ -68,7 +68,9 @@ def test_source_local_metric_routes_its_declared_criterion_to_the_mesh_producer(
             "public arithmetic adapter does not own source-local studies",
         ),
     )
-    required = _passing_required() + (
+    required = tuple(
+        row for row in _passing_required() if row.criterion_id != "mesh_dependence"
+    ) + (
         CriterionAssessment(
             criterion.criterion_id,
             "numeric",
@@ -99,10 +101,28 @@ def test_only_unverified_mesh_is_optional_with_all_five_required_passes() -> Non
 
     rows = _passing_required()
     optional = (*rows[:-1], replace(rows[-1], status=AssessmentStatus.UNVERIFIED))
-    assert _quality_status((), (), optional, "PASS") == "PASS"
+    criterion = replace(
+        make_revision().spec.quality_policy.criteria[0],
+        criterion_id="public_mesh_study",
+        metric_id="mesh_dependence",
+        evidence=evidence("quality_policy.criteria.public_mesh_study", "public"),
+    )
+    arithmetic = (
+        CriterionAssessment(
+            criterion.criterion_id,
+            "numeric",
+            AssessmentStatus.UNVERIFIED,
+            (),
+            "public arithmetic adapter does not own mesh studies",
+        ),
+    )
+    assert _quality_status((criterion,), arithmetic, optional, "PASS") == "PASS"
     assert (
         _quality_status(
-            (), (), (*rows[:-1], replace(rows[-1], status=AssessmentStatus.FAIL)), "PASS"
+            (criterion,),
+            arithmetic,
+            (*rows[:-1], replace(rows[-1], status=AssessmentStatus.FAIL)),
+            "PASS",
         )
         == "FAIL"
     )
