@@ -27,7 +27,7 @@ import sys
 import threading
 from collections.abc import Callable, Mapping
 from contextlib import ExitStack
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import (
     BuiltinFunctionType,
@@ -903,6 +903,8 @@ class _FunctionState:
     code_digest: str | None = None
     source_path: Path | None = None
     source_identity: dict[str, object] | None = None
+    reexport_bindings: tuple[tuple[_SourceImportBinding, ModuleType], ...] = ()
+    defining_bindings: tuple[tuple[ModuleType, str], ...] = ()
 
 
 @dataclass(slots=True)
@@ -970,6 +972,14 @@ def _validate_function_state(
         return
     seen.add(id(state))
     function = state.function
+    for defining_module, definition_name in state.defining_bindings:
+        _validate_dependency_module(defining_module, f"{label} defining module")
+        if vars(defining_module).get(definition_name, _MISSING) is not function:
+            raise _error(f"live Gmsh executable dependency {label} defining binding was replaced")
+    for source_binding, source_module in state.reexport_bindings:
+        resolved, current_module = _load_source_import_binding(source_binding, label)
+        if current_module is not source_module or resolved is not function:
+            raise _error(f"live Gmsh executable dependency {label} source reexport changed")
     if state.code_digest is None:
         if function.__code__ is not state.code:
             raise _error(f"live Gmsh executable function {label} code changed")
@@ -2137,6 +2147,10 @@ def _authenticate_reexported_function(
     bindings, expected, _absent = _source_import_flow(tree, reexport_name=export_name)
     if export_name not in bindings or expected.get(export_name, _MISSING) is not function:
         raise _error(f"Gmsh executable dependency {label} differs from its source reexport")
+    source_binding = bindings[export_name]
+    resolved, source_module = _load_source_import_binding(source_binding, label)
+    if resolved is not function:
+        raise _error(f"Gmsh executable dependency {label} differs from its source reexport")
     defining_name = function.__module__
     if not isinstance(defining_name, str):
         raise _error(f"Gmsh executable dependency {label} has an unexpected source owner")
@@ -2147,13 +2161,18 @@ def _authenticate_reexported_function(
     trusted_ctypes = _ctypes_expected_binding(defining_module, definition_name)
     if trusted_ctypes is not _MISSING and trusted_ctypes is not function:
         raise _error(f"Gmsh executable dependency {label} ctypes binding was replaced")
-    return _authenticate_dependency_function(
+    state = _authenticate_dependency_function(
         function,
         defining_module,
         f"{defining_name}.{definition_name}",
         dependency_depth=dependency_depth,
         dependency_seen=dependency_seen,
         dependency_context=dependency_context,
+    )
+    return replace(
+        state,
+        reexport_bindings=state.reexport_bindings + ((source_binding, source_module),),
+        defining_bindings=state.defining_bindings + ((defining_module, definition_name),),
     )
 
 
