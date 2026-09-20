@@ -1349,7 +1349,26 @@ def _supported_dependency_builtin(value: object, parent: object, name: str) -> b
         return False
     namespace_value = vars(parent).get(name, _MISSING)
     value_name = getattr(value, "__name__", _MISSING)
-    return namespace_value is value and value_name == name
+    if namespace_value is not value:
+        return False
+    if value_name == name:
+        return True
+    # A stdlib re-export can have a different public name (ntpath.isfile).
+    # Authenticate the alias from canonical source, not from mutable metadata.
+    if parent_name not in sys.stdlib_module_names:
+        return False
+    source_path = _canonical_stdlib_source_path(parent_name, parent_name)
+    _validate_dependency_module(parent, parent_name)
+    tree = ast.parse(source_path.read_bytes())
+    binding = _source_import_bindings(tree, frozenset({name})).get(name)
+    if binding is None or binding.path != (value_name,):
+        return False
+    expected_value, owner = _load_source_import_binding(binding, f"{parent_name}.{name}")
+    return (
+        expected_value is value
+        and value.__module__ == binding.module_name
+        and cast(BuiltinFunctionType, value).__self__ is owner
+    )
 
 
 def _supported_dependency_type(value: object, parent: object, name: str) -> bool:

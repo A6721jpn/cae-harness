@@ -791,6 +791,31 @@ def test_verified_load_rejects_dependency_dict_descriptor_without_execution(
     assert not marker.exists()
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows stdlib builtin alias")
+def test_source_dependencies_accept_windows_builtin_alias() -> None:
+    source = b"import os\ndef probe(path):\n    return os.path.isfile(path)\n"
+    states = runtime._capture_source_dependencies(source, compile(source, "probe.py", "exec"))
+    assert any(state.values[-1] is os.path.isfile for state in states)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows stdlib builtin alias")
+def test_windows_builtin_alias_rejects_substitution_and_spoofed_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owner = sys.modules["nt"]
+    original = os.path.isfile
+    replacement = vars(owner)["_path_isdir"]
+    with monkeypatch.context() as scoped:
+        scoped.setattr(os.path, "isfile", replacement)
+        assert not runtime._supported_dependency_builtin(replacement, os.path, "isfile")
+        scoped.setattr(owner, "_path_isfile", replacement)
+        assert not runtime._supported_dependency_builtin(replacement, os.path, "isfile")
+    fake_owner = ModuleType("nt")
+    vars(fake_owner)["_path_isfile"] = original
+    monkeypatch.setitem(sys.modules, "nt", fake_owner)
+    assert not runtime._supported_dependency_builtin(original, os.path, "isfile")
+
+
 def test_verified_load_rejects_same_module_builtin_symbol_substitution(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
