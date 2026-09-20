@@ -133,6 +133,7 @@ class _Settings:
     installed_python: _FileIdentity
     wheel: _FileIdentity
     solver: _FileIdentity
+    studio: _FileIdentity | None
     source_step: _FileIdentity
     qualification_bundle: _FileIdentity | None
     preparation_requests: tuple[_FileIdentity, ...]
@@ -625,17 +626,21 @@ def _validate_request(request: dict[str, Any], source: _FileIdentity) -> tuple[s
 def _validate_refinement_requests(
     requests: Sequence[dict[str, Any]], source: _FileIdentity
 ) -> tuple[str, str, int]:
-    if len(requests) != 3:
-        raise _EnvironmentNotReady("exactly three ordered preparation requests are required")
+    if len(requests) not in {1, 3}:
+        raise _EnvironmentNotReady("one MVP or three ordered study preparations are required")
     identities = [_validate_request(request, source) for request in requests]
     first = requests[0]
     values = _as_object(first["values"], "coarse.values")
     mesh = _as_object(values["mesh_policy"], "coarse.mesh_policy")
     budget = _as_object(values["budget"], "coarse.budget")
+    if type(budget.get("max_attempts")) is not int or budget["max_attempts"] != len(requests) + 1:
+        raise _EnvironmentNotReady(
+            "solver attempts must equal preparation count plus one E-only run"
+        )
+    if len(requests) == 1:
+        return identities[0]
     if type(mesh.get("max_refinements")) is not int or mesh["max_refinements"] < 2:
         raise _EnvironmentNotReady("the study must declare at least two refinements")
-    if type(budget.get("max_attempts")) is not int or budget["max_attempts"] != 4:
-        raise _EnvironmentNotReady("the study must declare four solver attempts")
     policy = _as_object(values["quality_policy"], "coarse.quality_policy")
     criteria = policy.get("criteria")
     if not isinstance(criteria, list):
@@ -1033,6 +1038,7 @@ def _load_settings() -> _Settings:
         "installed_python",
         "wheel",
         "solver",
+        "studio",
         "source_step",
         "qualification_bundle",
         "preparation_requests",
@@ -1041,7 +1047,10 @@ def _load_settings() -> _Settings:
         "limits",
     }
     settings = _strict_object(
-        raw, required=allowed - {"qualification_bundle"}, allowed=allowed, field="settings"
+        raw,
+        required=allowed - {"qualification_bundle", "studio"},
+        allowed=allowed,
+        field="settings",
     )
     if settings["schema_version"] != "1" or settings["scope"] != "synthetic_explicit":
         raise _EnvironmentNotReady(
@@ -1058,10 +1067,13 @@ def _load_settings() -> _Settings:
         else None
     )
     raw_requests = settings["preparation_requests"]
-    if not isinstance(raw_requests, list) or len(raw_requests) != 3:
+    if not isinstance(raw_requests, list) or len(raw_requests) not in {1, 3}:
         raise _EnvironmentNotReady(
-            "settings.preparation_requests must contain three file identities"
+            "settings.preparation_requests must contain one or three file identities"
         )
+    studio = _file_identity(settings["studio"], "settings.studio") if "studio" in settings else None
+    if len(raw_requests) == 1 and studio is None:
+        raise _EnvironmentNotReady("MVP settings require an explicit Studio file identity")
     preparation_requests = tuple(
         _file_identity(item, f"settings.preparation_requests[{index}]")
         for index, item in enumerate(raw_requests)
@@ -1120,11 +1132,15 @@ def _load_settings() -> _Settings:
     if (
         isinstance(preparation_calls, bool)
         or not isinstance(preparation_calls, int)
-        or preparation_calls != 3
+        or preparation_calls != len(preparation_requests)
     ):
-        raise _EnvironmentNotReady("settings.limits.preparation_calls must be exactly 3")
-    if isinstance(solver_calls, bool) or not isinstance(solver_calls, int) or solver_calls != 4:
-        raise _EnvironmentNotReady("settings.limits.solver_calls must be exactly 4")
+        raise _EnvironmentNotReady("settings.limits.preparation_calls must equal request count")
+    if (
+        isinstance(solver_calls, bool)
+        or not isinstance(solver_calls, int)
+        or solver_calls != preparation_calls + 1
+    ):
+        raise _EnvironmentNotReady("settings.limits.solver_calls must equal request count plus one")
     command_timeout = _finite(
         limits["command_timeout_seconds"],
         "settings.limits.command_timeout_seconds",
@@ -1136,6 +1152,7 @@ def _load_settings() -> _Settings:
         installed_python=identities["installed_python"],
         wheel=identities["wheel"],
         solver=identities["solver"],
+        studio=studio,
         source_step=identities["source_step"],
         qualification_bundle=qualification_bundle,
         preparation_requests=preparation_requests,
@@ -1165,7 +1182,7 @@ class _Report:
             "runs": [],
             "artifacts": {},
             "unverified_boundaries": [
-                "Studio/VW-01 is not exercised by this CLI gate",
+                "Studio display contents/CONFIRMED are not observed by this CLI gate",
                 "live LLM/AI-02 is not exercised by this CLI gate",
                 "real-model E2E-02 is not exercised by this synthetic gate",
                 "BottomFrame E2E-03 is not exercised by this synthetic gate",
@@ -1643,11 +1660,16 @@ def _validate_persisted_solver_budget(
     *,
     runs: Sequence[dict[str, Any]],
     preparation_ids: Sequence[str],
+    preparation_calls: int,
+    solver_calls: int,
 ) -> dict[str, Any]:
-    _expect(len(runs) == 4 and len(preparation_ids) == 3, "finite study inventory differs")
+    _expect(
+        len(runs) == solver_calls and len(preparation_ids) == preparation_calls,
+        "finite study inventory differs",
+    )
     expected_attempts = {run["attempt_id"]: run["attempt"] for run in runs}
     _expect(
-        len(expected_attempts) == 4 and len(set(preparation_ids)) == 3,
+        len(expected_attempts) == solver_calls and len(set(preparation_ids)) == preparation_calls,
         "each native study operation must have a distinct registered identity",
     )
     owners = _read_db_payloads(
@@ -1656,7 +1678,9 @@ def _validate_persisted_solver_budget(
         case_id,
         "solver owners",
     )
-    _expect(len(owners) == 4, "persisted solver owner count differs from the finite budget")
+    _expect(
+        len(owners) == solver_calls, "persisted solver owner count differs from the finite budget"
+    )
     owner_attempt_ids = set()
     for owner in owners:
         attempt_id = _require_id(owner.get("attempt_id"), "persisted attempt_id")
@@ -1678,7 +1702,10 @@ def _validate_persisted_solver_budget(
         case_id,
         "solver manifests",
     )
-    _expect(len(manifests) == 4, "persisted solver manifest count differs from the finite budget")
+    _expect(
+        len(manifests) == solver_calls,
+        "persisted solver manifest count differs from the finite budget",
+    )
     expected_manifests = {run["attempt_id"]: run["manifest"] for run in runs}
     manifest_attempt_ids = set()
     manifest_ids = set()
@@ -1690,7 +1717,7 @@ def _validate_persisted_solver_budget(
         _expect(attempt_id in expected_manifests, "persisted manifest is not a returned result")
         _expect(manifest == expected_manifests[attempt_id], "persisted manifest differs")
     _expect(
-        manifest_attempt_ids == set(expected_manifests) and len(manifest_ids) == 4,
+        manifest_attempt_ids == set(expected_manifests) and len(manifest_ids) == solver_calls,
         "persisted manifests are not one distinct result per solver attempt",
     )
     try:
@@ -1705,12 +1732,13 @@ def _validate_persisted_solver_budget(
         *(("febio", attempt_id) for attempt_id in expected_attempts),
     }
     _expect(
-        len(reservations) == 7 and set(reservations) == expected_reservations,
-        "native reservations differ from the exact three-generation/four-solver study",
+        len(reservations) == preparation_calls + solver_calls
+        and set(reservations) == expected_reservations,
+        "native reservations differ from the selected preparation/solver budget",
     )
     return {
-        "solver_budget": 4,
-        "mesh_budget": 3,
+        "solver_budget": solver_calls,
+        "mesh_budget": preparation_calls,
         "native_reservations": sorted(reservations),
         "solver_owner_count": len(owners),
         "solver_manifest_count": len(manifests),
@@ -2181,6 +2209,47 @@ def _comparison_payload(
     }
 
 
+def _initial_spec_request(request: dict[str, Any], inspection: dict[str, Any]) -> dict[str, Any]:
+    """Bind only observed identities; preparation still resolves selections and mesh."""
+    result = copy.deepcopy(request)
+    result.pop("preparation", None)
+    topology = _require_dict(inspection.get("topology"), "inspection.topology")
+    geometry = _require_dict(inspection.get("geometry"), "inspection.geometry")
+    geometry_digest = _require_digest(topology.get("geometry_digest"), "observed geometry digest")
+    inspection_digest = _require_digest(geometry.get("inspection_digest"), "inspection digest")
+    # The public codec emits these semantic sets in ID order; time histories stay ordered.
+    set_keys = {
+        "supports": "support_id",
+        "requests": "request_id",
+        "evaluations": "evaluation_id",
+        "criteria": "criterion_id",
+        "thresholds": "parameter_id",
+        "controls": "name",
+        "local_refinements": "refinement_id",
+    }
+
+    def bind(value: object) -> None:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if isinstance(child, list):
+                    if key in set_keys:
+                        child.sort(key=lambda item: item[set_keys[key]])
+                    elif key == "evaluation_ids":
+                        child.sort()
+                if key == "geometry_digest" and child is None:
+                    value[key] = geometry_digest
+                elif key == "inspection_digest" and child is None:
+                    value[key] = inspection_digest
+                else:
+                    bind(child)
+        elif isinstance(value, list):
+            for child in value:
+                bind(child)
+
+    bind(result["values"])
+    return result
+
+
 def _validate_comparison(
     response: dict[str, Any],
     *,
@@ -2339,7 +2408,9 @@ def test_installed_synthetic_cli_flow(tmp_path: Path) -> None:
         generated_inputs = tmp_path / "generated-inputs"
         generated_inputs.mkdir()
         timeout = settings.command_timeout_seconds
-        dispatch_counts = {"preparation": 0, "solver": 0}
+        mvp = len(settings.preparation_requests) == 1
+        report.data["mode"] = "MVP" if mvp else "THREE_MESH_STUDY"
+        dispatch_counts = {"inspection": 0, "preparation": 0, "solver": 0, "studio": 0}
         report.data["dispatch_counts"] = dict(dispatch_counts)
 
         def cli(
@@ -2351,11 +2422,12 @@ def test_installed_synthetic_cli_flow(tmp_path: Path) -> None:
             if native_kind is not None:
                 dispatch_counts[native_kind] += 1
                 report.data["dispatch_counts"] = dict(dispatch_counts)
-                limit = (
-                    settings.preparation_calls
-                    if native_kind == "preparation"
-                    else settings.solver_calls
-                )
+                limit = {
+                    "inspection": 1,
+                    "preparation": settings.preparation_calls,
+                    "solver": settings.solver_calls,
+                    "studio": 1 if settings.studio is not None else 0,
+                }[native_kind]
                 _expect(
                     dispatch_counts[native_kind] <= limit,
                     f"{native_kind} dispatch budget exceeded before {stage}",
@@ -2395,6 +2467,58 @@ def test_installed_synthetic_cli_flow(tmp_path: Path) -> None:
             "create returned fabricated lifecycle IDs",
         )
         report.data["artifacts"]["case_id"] = case_id
+        report.write()
+
+        inspect_code, inspected, inspection_index = cli(
+            "inspect-native",
+            [
+                "inspect",
+                case_id,
+                "--native",
+                "--wall-seconds",
+                str(min(timeout, 600)),
+                "--cpu-workers",
+                "1",
+                "--json",
+            ],
+            native_kind="inspection",
+        )
+        _expect(
+            inspect_code == 0
+            and inspected.get("status") == "INSPECTED"
+            and inspected.get("case_id") == case_id
+            and inspected.get("generation") == 0,
+            "native inspection failed or changed draft generation",
+        )
+        inspection_limits = _require_dict(inspected.get("limits"), "inspection.limits")
+        _expect(inspection_limits.get("mesh_generations") == 0, "inspection generated a mesh")
+        inspected_geometry = _require_dict(inspected.get("geometry"), "inspection.geometry")
+        inspected_source = _require_dict(
+            inspected_geometry.get("source_asset"), "inspection source"
+        )
+        _expect(
+            inspected_source.get("content_digest") == settings.source_step.digest,
+            "inspection source differs from registered STEP",
+        )
+        _expect(
+            settings.part_body_id
+            in _require_list(inspected_geometry.get("closed_solid_body_ids"), "closed bodies"),
+            "explicit part body is not an inspected closed solid",
+        )
+        facts = _require_list(inspected_geometry.get("body_facts"), "inspection body facts")
+        selected = [
+            fact
+            for fact in facts
+            if isinstance(fact, dict) and fact.get("body_id") == settings.part_body_id
+        ]
+        _expect(
+            len(selected) == 1 and _finite(selected[0].get("volume_si"), "part volume") > 0,
+            "part volume was not observed",
+        )
+        inspection_process = _require_dict(inspected.get("process"), "inspection.process")
+        _expect(inspection_process.get("exit_code") == 0, "inspection child did not succeed")
+        report.observe_native(inspection_index, observed=inspection_process)
+        report.data["inspection"] = inspected
         report.write()
 
         provision_args = ["provision-planar-profiles", case_id, "--json"]
@@ -2455,15 +2579,40 @@ def test_installed_synthetic_cli_flow(tmp_path: Path) -> None:
         report.data["profile_provisioning"] = provisioned
         report.write()
 
+        _expect(
+            inspected_geometry.get("declared_unit")
+            == request_payloads[0]["values"]["geometry"]["step_unit"],
+            "observed STEP unit differs from the explicit condition",
+        )
+        initial_request = _initial_spec_request(request_payloads[0], inspected)
+        initial_path = generated_inputs / "initial-spec.json"
+        initial_path.write_bytes(_json_bytes(initial_request))
+        initial_code, initial, _ = cli(
+            "initial-spec",
+            ["spec", case_id, "--file", str(initial_path), "--expected-generation", "0", "--json"],
+        )
+        _expect(
+            initial_code == 0 and initial.get("status") == "UPDATED", "initial typed spec failed"
+        )
+        initial_draft = _require_dict(initial.get("draft"), "initial.draft")
+        _expect(initial_draft.get("generation") == 1, "initial spec generation differs")
+        _expect(
+            initial_draft.get("values") == initial_request["values"],
+            "initial spec changed explicit conditions",
+        )
+        _expect(initial.get("revision_id") is None, "initial spec prematurely froze a revision")
+
         revisions: list[dict[str, Any]] = []
         studies: list[dict[str, Any]] = []
         preparation_ids: list[str] = []
         immutable_files: dict[Path, str] = {}
-        generation = 0
+        generation = initial_draft["generation"]
         report.data["artifacts"]["revisions"] = []
         report.data["preparation_evidence"] = []
         for stage, request_identity in zip(
-            ("coarse", "refined", "fine"), settings.preparation_requests, strict=True
+            ("coarse",) if mvp else ("coarse", "refined", "fine"),
+            settings.preparation_requests,
+            strict=True,
         ):
             prepare_args = [
                 "prepare-planar",
@@ -2547,8 +2696,17 @@ def test_installed_synthetic_cli_flow(tmp_path: Path) -> None:
             _expect(
                 validated_draft.get("generation") == generation, "validation changed generation"
             )
+            _expect(validated_draft.get("unresolved_fields") == [], "prepared draft is not ready")
+            freeze_code, frozen, _ = cli(f"{stage}-freeze-prepared", ["freeze", case_id, "--json"])
+            _expect(
+                freeze_code == 0
+                and frozen.get("status") == "FROZEN"
+                and frozen.get("revision_id") == revision_id
+                and frozen.get("revision") == revision,
+                "public freeze did not retain the same prepared immutable revision",
+            )
             run_args = [
-                "run-demo",
+                "run",
                 case_id,
                 "--revision-id",
                 revision_id,
@@ -2587,6 +2745,12 @@ def test_installed_synthetic_cli_flow(tmp_path: Path) -> None:
                         f"{stage} required numerical evidence is not qualified: {criterion_id}={status}",
                     )
             studies.append(run)
+            attempt_root = Path(report.data["runs"][-1]["attempt_root"])
+            for path in [
+                attempt_root / "input" / "case.feb",
+                *(attempt_root / entry["logical_path"] for entry in run["manifest"]["files"]),
+            ]:
+                immutable_files[path] = _file_sha256(path)
             _expect(
                 all(
                     path.is_file() and _file_sha256(path) == digest
@@ -2595,9 +2759,95 @@ def test_installed_synthetic_cli_flow(tmp_path: Path) -> None:
                 "refinement or solver execution changed a retained origin",
             )
         parent_revision = revisions[-1]
-        parent_revision_id = _require_id(parent_revision.get("revision_id"), "fine revision ID")
-        parent_spec_digest = _require_digest(parent_revision.get("spec_digest"), "fine spec digest")
+        parent_revision_id = _require_id(parent_revision.get("revision_id"), "baseline revision ID")
+        parent_spec_digest = _require_digest(
+            parent_revision.get("spec_digest"), "baseline spec digest"
+        )
         baseline = studies[-1]
+        baseline_mesh = _read_db_payload(
+            case_root,
+            "SELECT mesh FROM execution_lineage WHERE attempt_id=?",
+            baseline["attempt_id"],
+            "baseline execution mesh",
+        )
+
+        def status(run: dict[str, Any], stage: str, expected_task: str) -> dict[str, Any]:
+            code, payload, _ = _run_cli(
+                settings,
+                report,
+                stage=stage,
+                cwd=cwd,
+                timeout=timeout,
+                args=[
+                    "status",
+                    run["run_id"],
+                    "--case-id",
+                    case_id,
+                    "--state-dir",
+                    str(state_dir),
+                    "--json",
+                ],
+            )
+            _expect(
+                code == 0
+                and payload.get("run_id") == run["run_id"]
+                and payload.get("run_status") == "SUCCEEDED"
+                and payload.get("quality_status") == "PASS"
+                and payload.get("task_status") == expected_task,
+                f"{stage} does not match the retained run/quality/preview state",
+            )
+            return payload
+
+        status(baseline, "baseline-status-before-preview", "NEEDS_PREVIEW")
+        if settings.studio is not None:
+            preview_code, preview, preview_index = cli(
+                "baseline-preview",
+                [
+                    "preview",
+                    case_id,
+                    "--manifest-id",
+                    baseline["manifest_id"],
+                    "--studio",
+                    str(settings.studio.path),
+                    "--json",
+                ],
+                native_kind="studio",
+            )
+            _expect(
+                preview_code == 0
+                and preview.get("preview_status") == "LAUNCHED"
+                and preview.get("task_status") == "COMPLETE"
+                and preview.get("run_id") == baseline["run_id"],
+                "baseline Studio launch did not complete the MVP preview contract",
+            )
+            launch = _require_dict(preview.get("launch"), "preview.launch")
+            studio_identity = _require_dict(launch.get("studio"), "preview.launch.studio")
+            _expect(
+                _same_path(
+                    Path(_text(launch.get("studio_path"), "studio path")), settings.studio.path
+                )
+                and studio_identity.get("executable_digest") == settings.studio.digest
+                and type(launch.get("process_id")) is int
+                and launch["process_id"] > 0,
+                "preview did not launch the configured Studio identity",
+            )
+            report.observe_native(preview_index, observed=launch)
+            report.data["baseline_preview"] = preview
+            preview_id = _require_id(preview.get("preview_id"), "preview ID")
+            preview_status_code, preview_status, _ = cli(
+                "baseline-preview-status",
+                ["preview-status", case_id, "--preview-id", preview_id, "--json"],
+            )
+            _expect(
+                preview_status_code == 0
+                and preview_status.get("preview_status") == "LAUNCHED"
+                and preview_status.get("task_status") == "COMPLETE"
+                and preview_status.get("run_id") == baseline["run_id"],
+                "stored baseline preview did not revalidate",
+            )
+            status(baseline, "baseline-status-after-preview", "COMPLETE")
+        else:
+            report.data["unverified_boundaries"].append("Studio was not configured or launched")
 
         registration_request = {
             "schema_version": "1",
@@ -2790,7 +3040,7 @@ def test_installed_synthetic_cli_flow(tmp_path: Path) -> None:
         candidate_preflight_code, candidate_preflight, _ = cli(
             "candidate-preflight",
             [
-                "run-demo",
+                "run",
                 case_id,
                 "--revision-id",
                 child_revision_id,
@@ -2809,7 +3059,7 @@ def test_installed_synthetic_cli_flow(tmp_path: Path) -> None:
         candidate_code, candidate_response, candidate_native_index = cli(
             "candidate-real-run",
             [
-                "run-demo",
+                "run",
                 case_id,
                 "--revision-id",
                 child_revision_id,
@@ -2833,11 +3083,40 @@ def test_installed_synthetic_cli_flow(tmp_path: Path) -> None:
             native_index=candidate_native_index,
             solver=settings.solver,
         )
+        candidate_status = status(candidate, "candidate-status", "NEEDS_PREVIEW")
+        _expect(
+            candidate_status.get("preview_status") is None, "candidate inherited baseline preview"
+        )
+        candidate_mesh = _read_db_payload(
+            case_root,
+            "SELECT mesh FROM execution_lineage WHERE attempt_id=?",
+            candidate["attempt_id"],
+            "candidate execution mesh",
+        )
+        for field in ("nodes", "elements", "faces"):
+            _expect(
+                _require_list(candidate_mesh.get(field), f"candidate mesh {field}")
+                == _require_list(baseline_mesh.get(field), f"baseline mesh {field}"),
+                f"E-only candidate did not reuse baseline mesh {field}",
+            )
+        _expect(
+            _read_db_payload(
+                case_root,
+                "SELECT mesh FROM execution_lineage WHERE attempt_id=?",
+                baseline["attempt_id"],
+                "retained baseline mesh",
+            )
+            == baseline_mesh,
+            "E-only candidate mutated baseline execution mesh",
+        )
+        report.data["same_mesh_reuse"] = True
         persisted_budget = _validate_persisted_solver_budget(
             case_root,
             case_id,
             runs=(*studies, candidate),
             preparation_ids=preparation_ids,
+            preparation_calls=settings.preparation_calls,
+            solver_calls=settings.solver_calls,
         )
         report.data["persisted_budget"] = persisted_budget
         report.write()
@@ -2940,7 +3219,10 @@ def test_installed_synthetic_cli_flow(tmp_path: Path) -> None:
             f"{label}.{criterion}": status
             for label, statuses in numerical_rows.items()
             for criterion, status in statuses.items()
-            if status not in _ALLOWED_NUMERICAL
+            if status
+            not in (
+                {"UNVERIFIED"} if mvp and criterion == "mesh_dependence" else _ALLOWED_NUMERICAL
+            )
         }
         quality_statuses = {
             label: run["quality_status"]
