@@ -48,6 +48,7 @@ MVPの目標は、新規環境へ通常インストールしたwheelのCLIから
 ### 完了の定義
 
 解析タスクは、要求された終端への到達、結果の完全性、必須数値品質、および指定された表示確認がすべて揃った時点で `COMPLETE` となる。物理的な実物照合の状態は個別に表示する。未完了の場合は到達点・理由・次に取るべき操作を返す。製品全体の完成条件は計画書の定めに従う。
+MVPの製品完了判定では、自動E2Eのログ・receiptを手動8手順の代用にしない。操作者が公開CLIの各コマンド、終了コード、ID、FEBioログ、Studio画面とGit外PNGを記録し、欠測を`UNVERIFIED`として理由付きで保持する。
 
 ## 2. 要求と検証の対応
 
@@ -88,6 +89,8 @@ MVPの目標は、新規環境へ通常インストールしたwheelのCLIから
 | `storage`／`cli` | SQLiteおよび不変ファイルによる永続化／共通サービスを用いた日本語表示およびJSON出力 |
 
 採用技術はGmshのPython API、OpenCASCADE、Pydantic、標準SQLiteとする。外部処理は所有する子プロセス内に隔離して実行する。
+
+Gmshの実行時依存検証は、検証済みソースが持つ任意importとフォールバックの意味を保持する。新規の `native` 環境で、NumPyが未導入でも公式Gmshソースが非NumPy経路を選択できる場合、未導入だけを理由に必須依存不足と判定しない。選択されたimport・定義元・別名の同一性、未導入の事実、および選択を制御する初期フラグと未束縛名を照合する。必須importの欠落、認証失敗、差し替えを任意依存の欠落として扱わない。静的に裏付けられない分岐は実行せず、未対応として拒否する。
 
 ### 永続データ
 
@@ -197,7 +200,7 @@ MVPの目標は、新規環境へ通常インストールしたwheelのCLIから
 
 各項目には、適用範囲が検証された判定処理と、該当する実行に紐付く証拠が必要となる。証拠不足または適用範囲外の場合は `UNVERIFIED` とする。材料・負荷・支持の適用根拠および実物照合の結果は別行に記載する。各判定処理の具体的な内容は実装ノート §5 に従う。
 
-`quality_registration_status` は評価登録の利用可否を示し、`quality_status` は必須項目を含めた数値判定を示す。既知の `FAIL` は他項目の `UNVERIFIED` よりも優先して扱われる。実行自体が成功していても必須品質が不足している場合は `NEEDS_QUALITY`、不合格の場合は `FAILED`、品質基準を満たしつつ必要な表示確認のみが不足している場合は `NEEDS_PREVIEW` とする。なおMVPにおいては、メッシュ依存性が `UNVERIFIED` であっても、他の5項目が `PASS` であれば品質合格と判定する。
+`quality_registration_status` は評価登録の利用可否を示し、`quality_status` は必須項目を含めた数値判定を示す。既知の `FAIL` は他項目の `UNVERIFIED` よりも優先して扱われる。実行自体が成功していても必須品質が不足している場合は `NEEDS_QUALITY`、不合格の場合は `FAILED`、品質基準を満たしつつ必要な表示確認のみが不足している場合は `NEEDS_PREVIEW` とする。なおMVPにおいては、source-local metricが存在しないcanonical global mesh producerの`mesh_dependence`だけは`UNVERIFIED`を許容し、他の5項目が`PASS`であれば品質合格と判定する。明示的に宣言されたsource-local rowはcriterion IDが`mesh_dependence`でもstrictに扱い、ID衝突でoptional扱いへ変換しない。
 
 ## 7. 表示・編集・比較
 

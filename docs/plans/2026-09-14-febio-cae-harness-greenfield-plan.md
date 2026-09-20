@@ -1,15 +1,15 @@
 # FEBio CAEハーネス V2 — 実装・検証計画
 
 文書版：0.5／作成日：2026-09-07／改訂日：2026-09-15。
-ファイル名の日付は識別子である。本書は工程・検証・進捗を、[設計仕様書](../specs/2026-09-14-febio-llm-cae-harness-design-v2.md)は製品の振る舞いを、[実装ノート](../specs/implementation-notes.md)は現行実装の詳細をそれぞれ定める。開発体制および証拠の規則は[開発契約](../../AGENTS.md)に規定されている。
+ファイル名の日付は識別子である。本書は工程・検証・進捗を、[設計仕様書](../specs/2026-09-14-febio-llm-cae-harness-design-v2.md)は製品の振る舞いを、[実装ノート](../specs/implementation-notes.md)は現行実装の詳細をそれぞれ定める。開発体制および証拠に関する規則は[開発契約](../../AGENTS.md)に規定されている。
 
 ## 1. 到達点と開発方針
 
-STEP部品と新規剛体治具の接触押し込みを実FEBioで解析し、その結果を検証してFEBio Studioで表示する。この一連の処理経路に対して、条件入力、部分編集、再解析、および比較の機能を接続する。
+STEP部品と新規剛体治具の接触押し込みを実FEBioで解析し、その結果を検証してFEBio Studioに表示する。この一連の処理経路に対して、条件入力、部分編集、再解析、および比較の各機能を接続する。
 
-目的・制約・完了条件を中心に記述し、詳細な実装手順の判断は担当者に委ねる。初回の実装にとどまらず、許可された範囲内での実行・確認・修正までを完遂する。不具合に対しては再現性のある回帰試験を用意し、通常の変更時には影響を受ける契約を検証する。一律のテスト先行、テストと実装の機械的なコミット分離、および固定的な試験件数の設定は求めない。ただし、最終候補に対する必須検証、独立レビュー、実ツール試験、ならびに実モデル試験は維持する。
+目的・制約・完了条件を中心に記述し、詳細な実装手順の判断は担当者に委ねる。初回の実装にとどまらず、許可された範囲内での実行・確認・修正までを完遂する。不具合に対しては再現性のある回帰試験を用意し、通常の変更時には影響を受ける契約を検証する。一律のテスト先行、テストと実装の機械的なコミット分離、ならびに固定的な試験件数の設定は求めない。ただし、最終候補に対する必須検証、独立レビュー、実ツール試験、および実モデル試験は維持する。
 
-使い捨ての合成データを用いたローカル環境での検証と修正は、継続して行う。実ツールの実行は、登録済みの入力・条件・許可、および有限な予算の範囲内で行う。未確定の必須物理条件への対応、許可外の実データ操作、あるいは予算の拡張が必要な場合に限り、その判断を仰ぐ。通常の技術的判断を都度ユーザーへ差し戻すことはしない。
+使い捨ての合成データを用いたローカル環境での検証と修正は、継続して実施する。実ツールの実行は、登録済みの入力・条件・許可、および有限な予算の範囲内で行う。未確定の必須物理条件への対応、許可外の実データ操作、あるいは予算の拡張が必要な場合に限り、その判断を仰ぐ。通常の技術的判断を都度ユーザーへ差し戻すことはしない。
 
 ## 2. MVP（最初のゴール）の完了条件
 
@@ -18,62 +18,59 @@ STEP部品と新規剛体治具の接触押し込みを実FEBioで解析し、�
 | # | 手順 | 完了条件 |
 |---|---|---|
 | 1 | `case create` → `inspect --native` | 合成STEPを登録し、`INSPECTED` によりボディ・単位・体積を取得する |
-| 2 | `provision-planar-profiles` | 組み込み既定の対応表で `PROVISIONED`（`--bundle-path` 省略） |
+| 2 | `provision-planar-profiles` | 組み込み既定の対応表による `PROVISIONED`（`--bundle-path` は省略） |
 | 3 | `spec` | 明示条件の型付きJSONと根拠を登録する。形状・選択集合・メッシュの準備前に `READY` と判定しない |
-| 4 | `prepare-planar` → `validate` → `freeze` | `PREPARED`、Tet10部品メッシュおよび直方体剛体メッシュを生成する。準備処理で検証・確定した版を公開CLIでも `READY` および同一の不変版として確認する |
-| 5 | `run` | 実FEBio 4.12で `SUCCEEDED` を実行し、結果一覧を公開する |
-| 6 | 品質 | 5項目の `PASS`、メッシュ依存性 `UNVERIFIED`、`quality_status` に合格する |
+| 4 | `prepare-planar` → `validate` → `freeze` | `PREPARED`、Tet10部品メッシュおよび直方体剛体メッシュを生成する。準備処理で検証・確定した版を、公開CLIでも `READY` かつ同一の不変版として確認する |
+| 5 | `run` | 実FEBio 4.12で`run_status=SUCCEEDED`を確認し、結果一覧を取得・公開する |
+| 6 | 品質 | 5項目の`PASS`、メッシュ依存性`UNVERIFIED`、`quality_status=PASS`を確認する |
 | 7 | `preview` | Studioを起動して対象XPLTを開き、`LAUNCHED`、`task_status=COMPLETE` を実施する |
 | 8 | ヤング率変更 → `run` → `compare` | 既存メッシュを再利用した子版の再解析と、反力―移動量曲線および部品変位の比較を行う |
 
-MVPの完了は、`tests/e2e/test_installed_synthetic.py` への合格と、上記8手順を手動で実行した記録（`docs/reviews/`）によって証明する。なお、MVPの達成は、球・円柱・摩擦・非線形材料・日本語入力・実モデルへの対応完了を意味するものではない。
+MVPの完了は、`tests/e2e/test_installed_synthetic.py` への合格と、上記8手順を手動で実行した記録（`docs/reviews/`）によって証明する。なお、MVPの達成は球・円柱・摩擦・非線形材料・日本語入力・実モデルへの対応完了を意味しない。
+### 現行状態（candidate 0e35ba4／source 71c388f／test 56e122b／format 0e35ba4／manual 8未完了）
+
+現行candidateはnative-enabled final flow `case-80e5f42a5043`で、gmsh 4.15.2、22 stage全exit 0、coarse／candidate両run `SUCCEEDED`、必須5 numerical statuses `PASS`、baseline `COMPLETE`、candidate comparison、same-mesh reuseを取得した。最終標準full-suiteは`1798 passed / 0 failed / 3493.86 s`、manual caseはpreparation `FAILED`／`ABORTED/BLOCKED`である。詳細なargv／exit／比較値／native・Studio・累積会計は[canonical review](../reviews/2026-09-20-mvp-planar-e2e.md)を正とする。251/b28、71/c180、過去1797/1は履歴節にのみ保持する。
 
 ### MVPまでの実装タスク
 
-着手順は T0 → T1 → T3 → T4 → T5 → T6。T2 は 2026-09-15 に完了済み。
+着手順は T0 → T1 → T3 → T4 → T5 → T6 とする。T2 は 2026-09-15 に完了済み。
 
-| # | タスク | 内容 |
-|---|---|---|
-| T0 | ゲート基線の修復 | `orca/acceptance-integration` で赤のままの ruff（整形9ファイル・lint 14件）と mypy（88件、主に `_gmsh_runtime.py`）を、動作を変えずに解消する |
-| T1 | 汎用 `run` | `prepare-planar` により `PREPARED` となった版を `case run --revision-id --solver [--preflight]` で実行可能にする。公開コマンドを `run` に統一し、旧 `run-demo` エイリアスと呼出例を移行する。登録済み解析の内部処理は維持する |
-| T2 | 既定対応表の組み込み（完了 2026-09-15） | 承認バンドルの設定値を `src/febio_cae/resources/planar_default_bundle.json` に組み込み、`provision-planar-profiles` は `--bundle-path` 省略時にこれを登録する。バンドル・XPLT読込器ソースの自己ハッシュ固定は撤去済み |
-| T3 | メッシュ依存性の任意化 | `required_quality` においてメッシュ依存性が `UNVERIFIED` であっても、他の5項目が `PASS` であれば `quality_status` を合格とし、`task_status` を `NEEDS_QUALITY` と判定しないようにする |
-| T4 | `preview` の `LAUNCHED` | `case preview` が対象XPLTを引数として登録済みStudio実行ファイルを起動し、実行ファイルのパス・ハッシュ、PID、起動時刻、取得可能な版を記録して `NEEDS_PREVIEW` を解消する。版情報が取得できない場合は理由付き `UNVERIFIED` とし、起動証拠と版認定を区別する。既存の観測プロトコル（`--window-id`、stdin応答）は `CONFIRMED` 向けに維持する |
-| T5 | 一貫試験の更新 | `tests/e2e/test_installed_synthetic.py` をT1〜T4の契約に合わせて更新し、8手順を一連のフローとして通す |
-| T6 | 文書 | `docs/cli-usage.md` に8手順の実行例を記載し、`docs/reviews/` に手動の実行記録を残す |
+| # | タスク | 内容 | 現在状態（2026-09-21） |
+|---|---|---|---|
+| T0 | ゲート基線の修復 | ruff、mypy、scan、build、focused pytestを現行sourceで確認する | 完了。static／build gate clean、focused 18 passed |
+| T1 | 汎用 `run` | `prepare-planar`後の版を`case run --revision-id --solver [--preflight]`で実行する | 完了。現行native final `case-80e5f42a5043`でcoarse／candidate両run `SUCCEEDED`、solver dispatch 2 |
+| T2 | 既定対応表の組み込み | built-in bundleを`provision-planar-profiles`で登録する | 完了（2026-09-15） |
+| T3 | メッシュ依存性の任意化 | mesh dependenceが`UNVERIFIED`でも他5項目で`quality_status`を判定する | 完了。現行native finalで必須5 numerical statuses `PASS`、mesh dependence `UNVERIFIED`を記録 |
+| T4 | `preview` の `LAUNCHED` | 登録済みStudioで対象XPLTを開き、起動receiptと対象を記録する。既存の`--window-id`／stdin `CONFIRMED`経路は実装として保持する | 完了。現行native finalでbaseline `COMPLETE`、Studio `LAUNCHED`、owned PID/creation/exe一致とinitial display PNGを記録 |
+| T5 | 一貫試験の更新 | 8手順を一連の自動flowとして通す | 完了。現行native finalは22 stage全exit 0、baseline `COMPLETE`、candidate comparisonまで取得 |
+| T6 | 文書と記録 | CLI実行例とmanual記録を保持する | manual preparation FAILED／ABORTED/BLOCKED。71c388f postfix標準full-suiteはexit 1非PASS、56e122b最終標準full-suiteは1798/0/0/0 PASS。native-enabled final automated 8-stepはgmsh 4.15.2で22 stage全exit 0、pytest 1 passed／942.46 s、dispatch inspection1／preparation1／solver2／Studio1、両run SUCCEEDED、必須5 numerical statuses PASS、baseline COMPLETE／candidate comparison、raw label `NUMERICAL_GATE_PASSED_NOT_OVERALL`は原因推定なし。manual 8は未完了 |
 
 ## 3. 工程と現在地
 
-| 工程 | 依存 | 成果と終了条件 | 状態（2026-09-15） | 根拠 |
+| 工程 | 依存 | 成果と終了条件 | 状態（2026-09-21） | 根拠 |
 |---|---|---|---|---|
 | P0：骨格・互換性 | 本仕様 | Python 3.12、配布、版表示、環境診断。FEBio・Studio・Gmshの実体、バージョン、ハッシュ、入出力形式、および観測された能力の記録 | 完了（合成・単独調査） | `2026-09-07-p0-a-bootstrap`、`p0-b-*` 10件 |
 | P1：共通契約 | P0 | ケース登録、草案・質問・不変版、単位、状態、世代一致更新、原子的保存を連携させ、共有スキーマ第1版を確定 | 完了 | `2026-09-07-p1-*` 15件、`2026-09-08-p1-interface-freeze`、`p1-registered-cli` |
-| P2：形状・メッシュ | P1 | STEP調査、領域解決、球・円柱・直方体の生成、要素・面順、品質、ならびに再メッシュとキャッシュの検証 | 部分完了：平面、直方体、Tet10、公開調査、平面準備、細分化は実装済み。球・円柱・曲面近似は `UNVERIFIED`。球・円柱のネイティブ生成、ソースローカル細分化、Gmsh実行時識別の認証はコードがあるが合成検証のみ | `2026-09-08-p2-*` 8件、`2026-09-09-public-native-inspection`、`public-planar-preparation`、`step-preparation-admission` |
-| P3：解析・結果 | P1、P2 | 入力生成、所有プロセス管理、実FEBio、XPLT読み込み、数値照合、必須品質、Studio読み込み確認を連携 | 部分完了：登録済み平面経路における実FEBio、XPLT、5項目の品質判定、ログ残差は実装済み。汎用 `run`（T1）と `LAUNCHED` プレビュー（T4）が未完了 | `2026-09-08-p3-solver-adapters`、`r2-residual-repair`、コミット `9fb3852`〜`d736982`（2026-09-12〜13） |
+| P2：形状・メッシュ | P1 | STEP調査、領域解決、球・円柱・直方体の生成、要素・面順、品質、ならびに再メッシュとキャッシュの検証 | 部分完了：平面、直方体、Tet10、公開調査、平面準備、細分化は実装済み。球・円柱・曲面近似は `UNVERIFIED`。球・円柱のネイティブ生成、ソースローカル細分化、Gmsh実行時識別の認証はコードが存在するものの、合成検証にとどまる | `2026-09-08-p2-*` 8件、`2026-09-09-public-native-inspection`、`public-planar-preparation`、`step-preparation-admission` |
+| P3：解析・結果 | P1、P2 | 入力生成、所有プロセス管理、実FEBio、XPLT読み込み、数値照合、必須品質、Studio読み込み確認を連携 | 完了（現行native finalの合成flow）：22 stage全exit 0、両run `SUCCEEDED`／必須5 numerical statuses `PASS`、baseline `COMPLETE`、candidate comparison。Studio画面のinitial captureを取得し、last-state／deformation／full mesh／`CONFIRMED`は別表示境界として記録 | `<COORDINATION>/mvp-20260921-final-auto-native-0e35ba4/final-accounting.json`、[canonical review](../reviews/2026-09-20-mvp-planar-e2e.md) |
 | P4：日本語操作 | P1、P3 | 意図・質問・回答・型付き差分を連携。根拠不足や競合を適切に処理し、実LLM接続により確認 | 部分完了・MVP対象外：`intent/answer/edit` のコードおよび実LLM試験（`tests/native/test_llm.py`）は存在 | `2026-09-09-p4-intent-source`、コミット `6a60b79`〜`6c4c7dd` |
 | P5：変更・比較・復旧 | P2〜P4 | 元版を保存した状態での再解析、比較、キャッシュ無効化、有限回のリトライ、中断・改変・競合への対応を検証 | 部分完了：ヤング率変更、メッシュ再利用、3段階細分化、比較、および限定的な `cancel/resume` は実装済み | `2026-09-09-prepared-material-descendants`、コミット `d0cb891`〜`4039e9d` |
-| P6：配布・合成一貫試験 | P0〜P5 | 新規環境へ通常インストールしたwheelから、合成STEPの全操作と必須ローカル検証を完了 | 部分完了：`test_installed_synthetic.py` はあり、対応表の組み込み（T2）で新規環境でも手順2まで再現可能。実FEBioでの通し合格記録は未取得 | `2026-09-12` コミット `02119b0`〜`fa21f71`、`.local/coordination`（Git外） |
+| P6：配布・合成一貫試験 | P0〜P5 | 新規環境へ通常インストールしたwheelから8手順と必須検証を行う | 完了（自動8手順）。native-enabled finalはgmsh 4.15.2でpytest 1 passed／942.46 s、inspection1／preparation1／solver2／Studio1、baseline `COMPLETE`／candidate comparison。manual 8はpreparation `FAILED`／`ABORTED/BLOCKED`で未完了。default `python -m build`／sdist-wheelと最終scanの証拠はcanonical reviewを参照 | [canonical review](../reviews/2026-09-20-mvp-planar-e2e.md) |
 | P7：実モデル受け入れ | P6、使用許可 | 許可された実STEPおよび最終BottomFrameを用い、解析・品質・Studio・変更・再解析・比較に関する新たな証拠を取得 | 未着手 | — |
 
-上記の状態は `docs/reviews/archive/` の記録および `git log` の要約に基づくものであり、本改訂にあたって再実行した検証結果ではない。2026-09-10以降の受け入れ記録は `.local/coordination`（Git管理外）に保管されており、`docs/reviews/` には転記されていない。
+上記は現行native-enabled automated 8-stepまでを反映し、自動8手順は完了している。MVP全体で残る必須記録はmanual 8であり、candidate preview／Studio `CONFIRMED`は追加MVP要件ではない。raw report labelやmesh `UNVERIFIED`は別境界として記録し、原因を推定しない。詳細は[canonical review](../reviews/2026-09-20-mvp-planar-e2e.md)を正とする。
 
-### コードとの照合（2026-09-15）
+### Manual preparation incident（2026-09-21、read-only reconciliation済み）
 
-| MVP手順 | `orca/acceptance-integration`（`e696fbcc`）での実装状況 |
-|---|---|
-| 1〜4 登録・調査・対応表・条件・準備 | 実装済み。`tests/e2e/test_installed_synthetic.py` が公開CLIで検証済み |
-| 5 実行 | `run-demo` が `prepare-planar` で準備した版をそのまま実行可能（同試験で使用）。T1は名称変更とデモ専用前提の撤去 |
-| 6 品質 | 5項目の判定は実装済み。`_required_quality._quality_status` がメッシュ依存性の `UNVERIFIED` を不合格と判定するため、1メッシュでは `NEEDS_QUALITY` となる。T3は判定条件1箇所の変更 |
-| 7 表示 | Studioを起動する処理はない。既存の `preview` は外部観測の受け入れのみ。T4は新規実装 |
-| 8 編集・比較 | 実装済み（同試験にてヤング率変更と `compare` を確認済み） |
+T6 manual caseはpreparation `FAILED`／`ABORTED/BLOCKED`、duplicate impact `UNKNOWN`、root cause `UNDETERMINED`であり、後続validate／freeze／solver／Studio／compare／retry／new caseは行わない。詳細なevidence、lock／reservation／identity、flow分離は[canonical review](../reviews/2026-09-20-mvp-planar-e2e.md)に集約する。
 
-同試験が実FEBioで最後まで合格した記録は `.local/coordination` に見当たらない（`solver_calls: 0` の合成証明と、`UNVERIFIED`／`FAIL` の実機チェッカー記録が残る）。したがってE2E-01は未合格として扱う。
+2026-09-20の再開基準は`af3a248`とする。dev branch `orca/acceptance-integration`の受理・pushとV2 integrationは別管理であり、V2は現状のまま変更しない。V2への反映はAGENTSに従い明示的なユーザー指示がある場合だけ行い、自動fast-forwardや自動統合は約束しない。
 
-2026-09-20の再開基準は `af3a248`。この時点で `V2`、`orca/acceptance-integration` および両リモートブランチは同じコミットだった。開発は既存のOrca管理ワークツリー `orca/acceptance-integration` で継続する。候補 `8a5b04b` のT0・T1・T3・T4は独立コードレビュー済みだが、全体検証・wheel・実E2Eは未合格である。最終候補の検証・レビュー後に `V2` へ早送りで反映する。
+2026-09-20のinstalled E2Eの過去候補失敗は履歴として保持し、latest ledgerとcanonical reviewを名前付きprovenanceの正とする。full-suite historical attemptは`INTERRUPTED_TIMEOUT`／非PASS、71c388f postfix標準1798-test full-suiteはexit 1非PASS（sole failure=`test_nested_optional_import_source_flow`）、56e122b最終標準full-suiteはexit 0 PASS（1798 passed／0 failed／3493.86 s）。runner setup／missing-Gmsh corrected flowは履歴として停止、native-enabled final 8-stepは22 stage全exit 0、両run `SUCCEEDED`、必須5 numerical statuses `PASS`、baseline `COMPLETE`／candidate comparisonまで取得し、raw label `NUMERICAL_GATE_PASSED_NOT_OVERALL`は原因推定なしで保持する。合格済みsource＋native candidateは受理対象、manual `case-6294a0a9e02c`はretry／reset／代替caseを行わず、manual 8記録が未完了のためMVP全体完了は宣言しない。V2は変更しない。
 
 ### 次に進める順序
 
-1. T0〜T6（[引き継ぎ](mvp-handoff.md)）を実施してMVPを完了させる（P3・P6の未完了項目）。
+1. 56e122b最終標準full-suite PASS（1798 passed／0 failed／3493.86 s）を受け、native-enabled final automated 8-stepを既定budgetで1 flow実施済み。gmsh 4.15.2環境で22 stage全exit 0、inspection1／preparation1／solver2／Studio1、pytest 1 passed／942.46 s、両run `SUCCEEDED`、必須5 numerical statuses `PASS`、baseline `COMPLETE`／candidate comparisonを記録した。今回の追加実行は不要、manual `case-6294a0a9e02c`の次操作はbudget判断待ち、V2 integrationは明示的ユーザー指示待ちとし、manual 8を残件として保持する。[canonical review](../reviews/2026-09-20-mvp-planar-e2e.md)を正とする。
 2. 実モデルの入力、条件、および使用許可が整い次第、P7（E2E-02、E2E-03）に着手する。
 3. MVP以降の目標範囲（§7 backlog）については、対応表の実測証拠が得られた項目から順次着手する。
 
@@ -127,7 +124,7 @@ MVPの完了は、`tests/e2e/test_installed_synthetic.py` への合格と、上�
 
 実行回数の上限はメッシュ生成3回・FEBio実行4回とし、失敗した試行もこの上限を消費する。治具の反力には全保存状態の曲線を用い、最大値のみへの縮約は行わない。MVPでは1サイズ＋ヤング率変更（メッシュ生成1回・FEBio実行2回）をもって完了とし、3段階メッシュはメッシュ依存性を必須要件へ戻す際の検証項目とする。
 
-`FEBIO_CAE_E2E_SETTINGS` の `preparation_requests` に要求のパスとコンテンツハッシュを、`limits` に生成・解析回数を、`qualification_bundle` は省略可能（省略時は組み込み既定の対応表）。必要な出力は、部品および治具それぞれの全体変位、治具全体の反力・絶対位置、ならびに明示固定領域の支持反力である。各出力は個別のIDで保持する。
+`FEBIO_CAE_E2E_SETTINGS` の `preparation_requests` に要求のパスとコンテンツハッシュを、`limits` に生成・解析回数を記録し、`qualification_bundle` は省略可能とする（省略時は組み込み既定の対応表を適用）。必要な出力は、部品および治具それぞれの全体変位、治具全体の反力・絶対位置、ならびに明示固定領域の支持反力である。各出力は個別のIDで保持する。
 
 ## 6. 必須ローカル検証と配布
 
@@ -146,11 +143,11 @@ python -m build
 
 CAE境界スキャナーにより追跡対象ファイルとコミット候補を検査し、実CAEデータ、資格情報、デスクトップ状態、および `02_CAE` の混入を検知・拒否する。
 
-ビルドログから該当するwheelを一意に特定し、ファイル名およびSHA-256を記録する。これをPython 3.12の新規仮想環境へ通常インストールし、ソース外の新しい作業ディレクトリにて `PYTHONPATH` の影響を排除した上で起動する。バージョン表示およびインストール先からのモジュール読み込みを確認し、E2E試験は同一のインストール済みCLIを用いて実行する。
+ビルドログから該当するwheelを一意に特定し、ファイル名およびSHA-256を記録する。これをPython 3.12の新規仮想環境へ通常インストールし、ソース外の新たな作業ディレクトリにて `PYTHONPATH` の影響を排除したうえで起動する。バージョン表示およびインストール先からのモジュール読み込みを確認し、E2E試験は同一のインストール済みCLIを用いて実行する。
 
 ## 7. 実ツール・実モデルの受け入れ
 
-試験名、マーカー、環境設定の存在、および収集対象を確認した上で、以下を実行のエントリポイントとする。
+試験名、マーカー、環境設定の存在、および収集対象を確認したうえで、以下を実行のエントリポイントとする。
 
 ```powershell
 python -m pytest tests/e2e/test_installed_synthetic.py
@@ -173,9 +170,9 @@ E2E-02およびE2E-03は、対象CAD、ケース領域、許可された操作�
 | メッシュ依存性の必須化 | §5の3段階メッシュ。登録済み3結果の連続比較、および変更後の弾性率で正規化した反力の比較 |
 | 球治具・ヘルツ接触 | 摩擦・接着・重力なしの条件における剛体球と線形弾性半空間。`E* = E/(1−ν²)`、`F = (4/3)E*√R δ^(3/2)`（[MIT講義資料 式73](https://ocw.mit.edu/courses/20-310j-molecular-cellular-and-tissue-biomechanics-spring-2015/2910b668e59306bcf9ba5046b51215e5_MIT20_310JS15_Kamm2.2.pdf)）。E＝1 MPa、ν＝0.3、R＝10 mm、δ＝0.01 mm における参照力は約0.00463 N。最終反力の参照誤差5%以内、試験片拡大時の反力差1%以内、接触部を連続2回細分化した際の反力差がそれぞれ2%以内であることを確認する。なお、δは接触開始後の押し込み深さとする |
 | 円柱治具 | 単純変形における解析値との照合 |
-| ソースローカル細分化 | `source_local_mesh_dependence`：`global_size` を固定し、明示した局所球の中で3段階の局所サイズを進める。局所辺数の増加・最大辺長の減少・要素数増加と力履歴差で判定（実装ノート §11） |
-| 符号校正の再試行 | calibration05 は不合格のまま保持。運動スケールで区間を補正した新規プロトコルを凍結し、独立レビュー後に有限回1回だけ実行する（実装ノート §11） |
-| 曲面接触の干渉判定 | Tri6面と球・円柱・直方体の符号付き最小距離の区間包囲。閾値が区間に交差する場合は `UNVERIFIED`（実装ノート §11） |
+| ソースローカル細分化 | `source_local_mesh_dependence`：`global_size` を固定し、明示した局所球の内部で3段階の局所サイズを適用する。局所辺数の増加・最大辺長の減少・要素数の増加、および力履歴の差異によって判定する（実装ノート §11） |
+| 符号校正の再試行 | calibration05 は不合格のまま保持する。運動スケールで区間を補正した新規プロトコルを凍結し、独立レビュー後に1回限り実行する（実装ノート §11） |
+| 曲面接触の干渉判定 | Tri6面と球・円柱・直方体の符号付き最小距離の区間包囲。閾値が区間と交差する場合は `UNVERIFIED` とする（実装ノート §11） |
 | 有限摩擦 | 正の接触圧下における固着・滑り挙動とCoulomb限界の検証 |
 | 圧縮性Neo-Hookean | 単純変形における解析値との照合（P0-Bにおける単独観測結果は `docs/reviews/archive/2026-09-07-p0-b-neo-hookean-observation.md`） |
 | Studio `CONFIRMED` | 実装ノート §7 に定める観測プロトコルを実行する公開ヘルパー |

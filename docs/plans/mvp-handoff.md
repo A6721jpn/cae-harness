@@ -9,19 +9,19 @@
 | 項目 | 値 |
 |---|---|
 | ブランチ | `orca/acceptance-integration`（2026-09-20再開時は `V2` と同じ `af3a248`） |
-| 作業ツリー | `C:\Users\backo\orca\workspaces\CAE-HARNESS-V2\acceptance-integration` |
+| 作業ツリー | `<WORKTREE>`（Orca管理ワークツリー。実パスはGit外の実行記録だけに保存） |
 | 基準コミット | `af3a248`（2026-09-20再開基準。T2の実装 `c5df325` を含む） |
 | Python | 3.12.10。`.venv/`（作成済み、Git管理外）に `pip install -e ".[dev,native]"` 済み |
-| FEBio 4.12.0 | `C:\Program Files\FEBioStudio\bin\febio4.exe`（SHA-256 `03b9db12…770c9`） |
-| FEBio Studio | `C:\Program Files\FEBioStudio\bin\FEBioStudio.exe` |
+| FEBio 4.12.0 | `<FEBIO4_EXE>`（実体・SHA-256はGit外のゲート記録で照合） |
+| FEBio Studio | `<STUDIO_EXE>` |
 | Gmsh 4.15.2 | `.venv` に pip で導入済み（`import gmsh`、`.venv\Scripts\gmsh.bat`） |
 | 環境変数 | `.env.example` を参照。`FEBIO_CAE_FEBIO_PATH` / `FEBIO_CAE_STUDIO_PATH` / `FEBIO_CAE_GMSH_PATH` |
 
 ```powershell
-cd C:\Users\backo\orca\workspaces\CAE-HARNESS-V2\acceptance-integration
-.\.venv\Scripts\Activate.ps1
-$env:FEBIO_CAE_FEBIO_PATH = "C:\Program Files\FEBioStudio\bin\febio4.exe"
-$env:FEBIO_CAE_STUDIO_PATH = "C:\Program Files\FEBioStudio\bin\FEBioStudio.exe"
+Push-Location '<WORKTREE>'
+& '<WORKTREE>\.venv\Scripts\Activate.ps1'
+$env:FEBIO_CAE_FEBIO_PATH = "<FEBIO4_EXE>"
+$env:FEBIO_CAE_STUDIO_PATH = "<STUDIO_EXE>"
 $env:FEBIO_CAE_GMSH_PATH = "$PWD\.venv\Scripts\gmsh.bat"
 febio-cae doctor --json          # 3ツールとも FOUND_UNVERIFIED になること
 python -m pytest -q              # 標準試験（unit + component）
@@ -32,91 +32,71 @@ python -m ruff format --check . ; python -m ruff check . ; python -m mypy src te
 
 | 用途 | パス |
 |---|---|
-| 合成STEP（直方体） | `C:\dev\CAE-HARNESS-V2\.local\v\native-inspection-05\producer\box.step` |
-| 準備要求3件（粗・中・細） | `C:\dev\CAE-HARNESS-V2\.local\v\public-input04\{coarse,refined,fine}.json` |
-| E2E設定の実例 | `C:\dev\CAE-HARNESS-V2\.local\v\public-settings05\settings.json` |
-| 旧承認バンドル（現在は不要。参考のみ） | `C:\dev\CAE-HARNESS-V2\.local\coordination\acceptance-planar-profile-approved-01.json` |
+| 合成STEP（直方体） | `<SYNTHETIC_STEP>` |
+| 準備要求3件（粗・中・細） | `<PREPARATION_REQUESTS_DIR>\{coarse,refined,fine}.json` |
+| E2E設定の実例 | `<SETTINGS_JSON>` |
+| 旧承認バンドル（現在は不要。参考のみ） | `<LEGACY_BUNDLE>` |
 
-新しい合成STEPが必要な場合は `.local/synthetic/` に生成する。実CAEモデルや `02_CAE` には手を触れない。
+新たな合成STEPが必要な場合は `.local/synthetic/` に生成する。実CAEモデルや `02_CAE` には手を触れない。
+### 2026-09-21 現在の受け入れ境界
+
+#### 証拠root
+
+| 記号 | 実体（Git管理外） |
+|---|---|
+| `<COORDINATION>` | 元のチェックアウト/.local/coordination |
+| `<ROOT_PYTEST>` | 元のチェックアウト/.local/pytest-basetemp |
+| `<WORKTREE_PROOFS>` | Orca開発ワークツリー/.local（docs-proofのみ） |
+
+
+#### 状態とartifact map
+
+| 区分 | authoritative artifact / ID | 状態・会計 |
+|---|---|---|
+| 現行candidate／履歴 | current source=`71c388f229dbfabc9fffb48c90c4ca9c1def5ee9`、test-only=`56e122b`、format-only=`0e35ba4d`、native final wheel SHA-256=`f978de60803f70b9a5858a60bae185e0ed467949b0e062eafd2826a5e18b2cdd`／size=`404193`。251/b28、71/c180、過去1797/1は履歴。56e122b最終標準full-suiteはexit 0（1798 passed／0 failed／3493.86 s）、native-enabled finalは22 stage全exit 0、pytest 1 passed／942.46 s、両run `SUCCEEDED`／必須5 numerical statuses `PASS`、baseline `COMPLETE`／candidate comparison |
+| canonical acceptance status | [検証記録](../reviews/2026-09-20-mvp-planar-e2e.md)、`<COORDINATION>/mvp-20260921-final-auto-native-0e35ba4/final-accounting.json` | 合格済みsource＋native candidateは受理対象として記録。manual preparationは`FAILED`／`ABORTED/BLOCKED`でmanual 8が残るため、MVP全体完了は宣言しない。詳細はcanonical reviewを正とする |
+
+#### 全体会計と残件
+既存raw reportとfinal cumulative accountingに基づくcross-flow inspectionは11 requests＝historical 9＋current environment failure 1＋current successful native flow 1、observed success childは7（初期3要求のchild有無`UNKNOWN`）。named-flowはnative inspection成功の観測5件＋環境失敗要求1件の6 requests、observed child 5（missing-Gmshはchildなし）、named-flow solverは8、Studioは4、successful preparationは4＋manual owner failure 1。native総child数や完全ledgerを推論せず、[検証記録](../reviews/2026-09-20-mvp-planar-e2e.md)のcanonical tableを正とする。full-suite歴史的試行は非PASS、71c388f postfix標準full-suiteもexit 1非PASS、56e122b最終標準full-suiteはexit 0 PASS。native-enabled final automated 8-stepは22 stage全exit 0、必須5 numerical statuses PASS、baseline COMPLETE／candidate comparisonである。
 
 ## 2. 現状の最重要事実
 
-MVP の手順2（対応表登録）は 2026-09-15 に修正済み（旧タスクT2）。製品組み込みの既定対応表 `src/febio_cae/resources/planar_default_bundle.json` を `provision-planar-profiles` が `--bundle-path` 省略時に登録し、バンドルおよび XPLT 読込器ソースの自己ハッシュ固定は撤去した。新規 venv にインストールした wheel から `create → provision-planar-profiles` が `PROVISIONED` を返すことを確認済み。**残りは T0 → T1 → T3 → T4 → T5 → T6 の順で進める。**
+MVP の手順2（対応表登録）は 2026-09-15 に修正済みである。251版の自動T5（履歴）は上記flowまで完了、T6 manual記録はpreparation failure／MVP blockとして[検証記録](../reviews/2026-09-20-mvp-planar-e2e.md)に固定した。71c388f postfix標準full-suiteはexit 1非PASS、56e122b最終標準full-suiteはexit 0 PASS、native-enabled final automated 8-stepはgmsh 4.15.2でpytest 1 passed／942.46 s、22 stage全exit 0、両run `SUCCEEDED`／必須5 numerical statuses `PASS`、baseline `COMPLETE`／candidate comparison、raw label `NUMERICAL_GATE_PASSED_NOT_OVERALL`は原因推定なし。251/b28の証拠を現行candidateへ付け替えない。
+### 現行gateと標準診断
 
-### 2026-09-15 時点のゲート基線（`.venv`、`e696fbcc` のコード）
+static／build／focused pytestの実コマンドと終了値、22 stageの実argv、accepted sourceの変更ファイル一覧は[検証記録](../reviews/2026-09-20-mvp-planar-e2e.md)に集約する。歴史的full-suite wrapperは`INTERRUPTED_TIMEOUT`／非PASS、71c388f postfix標準full-suiteはexit 1非PASS、56e122b最終標準full-suiteはexit 0 PASS。runner setup／missing-Gmsh corrected flowは別記録で保持し、native-enabled final automated 8-stepはbaseline `COMPLETE`／Studio `LAUNCHED`／candidate comparisonまで取得、自動gate PASSである。MVPで残る必須記録はmanual 8である。
 
-| ゲート | 結果 |
-|---|---|
-| `python -m pytest`（unit + component、1782 件） | 1782 passed、exit 0、46分45秒（`c5df325` で実測）（`test_required_numerical_quality.py` の細分化系15件が大半の時間を占める。実装中は `-k` で絞る） |
-| `ruff format --check .` | 9ファイルが未整形（`ruff --fix` 相当で機械的に直る） |
-| `ruff check .` | 14件（6件は `--fix` 可。残りは `TRY004` 等の小さな修正） |
-| `mypy src tests` | 88件。80件は `adapters/geometry/_gmsh_runtime.py`、残りは `tests/component/geometry/test_gmsh_runtime_identity.py` と `test_required_numerical_quality.py`（pytest 9 の `FixtureFunctionDefinition.__wrapped__`） |
-
-ruff・mypy の赤は本ブランチが 9/14 に「ローカルゲート未実施」で中断した時点の残りである。**T0 として最初に機械的に直す**（`ruff format .`、`ruff check --fix .`、残りの lint と mypy を最小の型注釈・例外種別の変更で解消。ロジックは変えない）。ツール版は `.venv` に固定した ruff 0.16.4 / mypy 2.3.1 / pytest 9.1.1 を使う。
 
 ## 3. タスク別の作業指示
 
-### T0：ゲート基線の修復（最初に、機械的に）
+### T0：静的・buildゲート
 
-上表の ruff / mypy を解消し、`python -m pytest` が通る状態で1コミットにする。`_gmsh_runtime.py` の mypy 80件は `ctypes` 周りの型注釈不足が大半で、`cast` と `Callable[..., Any]` の注釈で閉じる。動作を変えない。
+実E2E実施版251/b28のruff、mypy、scan、build、focused pytest結果、および修正版71c388fのstatic／focused clean結果はcanonical reviewに固定済み。古い失敗件数やpytest cacheの並びを現行修正版のfull-suite結果と混同しない。
 
-### T1：汎用 `run`
+### T1〜T4：自動flowの現行契約
 
-現状：`run-demo`（`application/_demo.py:run_demo`）は `PlanarDemoRegistration`（旧デモ）と `CurrentPreparationRegistration`（`prepare-planar` の出力）の双方を受け付け、後者において一貫試験が動作している。すなわち、実行処理の本体はすでに完成している。
+汎用`run`、built-in profile、mesh品質の`UNVERIFIED`扱い、Studio `LAUNCHED`／対象XPLT読込は実装済み。画面タイトル3.1.0とreceipt version `UNVERIFIED`を区別し、既存のCONFIRMED経路も実装として保持する。251版の自動E2E（履歴）の証拠を現行修正版SHAへ付け替えない。
 
-1. `cli/main.py`、`cli/case.py` の公開コマンドを `run` に統一し、旧 `run-demo` エイリアスと公開呼出例を移行する。登録済み解析の内部処理は維持する。
-2. `_demo.py` の `PlanarDemoRegistration` 専用ルート（`recorded_geometry`、`_RecordedInspection`、`registered-reader-source`）は MVP では使用しない。削除して差し支えないが、`tests/component/cli/test_demo_cli.py` と `tests/component/application/test_registered_execution.py` が旧デモ登録を利用している場合は、それらを `prepare-planar` ルートの試験に置き換えるか、削除する。判断に迷う場合は残したまま `run` のみを追加する。
-3. 応答の `scope` 文字列（`"registered synthetic planar demonstration; …"`）を `"planar MVP path"` 程度の内容に修正する。
+### T3：標準2F修復
 
-完了条件：`prepare-planar` により `PREPARED` となったバージョンにおいて、`run CASE --revision-id R --solver febio4.exe --json` で実FEBioが動作し、`run_status=SUCCEEDED` となること。なお、`--preflight` は `PREFLIGHT_PASSED` とする。
+source-local consumerではmissing-receiptを`UNVERIFIED`とする。共有exceptがcanonical global IDを返してlocal宣言IDを失う不備は修正版71c388fで修復済み。71c388f postfix標準full-suiteはexit 1非PASS、56e122b最終標準full-suiteはexit 0 PASS。runner setup／missing-Gmsh corrected flowは履歴停止、native-enabled final automated 8-stepは22 stage全exit 0、inspection1／preparation1／solver2／Studio1、必須5 numerical statuses `PASS`、baseline `COMPLETE`／candidate comparisonまで取得済みである。今回の追加実行は不要、manual次操作はbudget判断待ち、V2 integrationは明示的ユーザー指示待ちとする。詳細はcanonical reviewを正とする。
 
-### T3：メッシュ依存性の任意化
+### T5：一貫試験
 
-対象箇所：`src/febio_cae/application/_required_quality.py:74` の `_quality_status`。
-
-- `required` で全行に `PASS` を要求している箇所のうち、`criterion_id` が `mesh_dependence` である行に限っては `UNVERIFIED` も許容する。`FAIL` は従来どおり全体が `FAIL` であることを求める。
-- `_UNVERIFIED_NUMERICAL` の `mesh_dependence` 行はそのまま維持する（未検証理由の記録用）。
-- `application/_run_reconciliation.py:60-80` と `_preview.py:64-87` は `quality_status == "PASS"` を参照しているのみであるため、変更は不要と考えられる。念のため確認する。
-- 試験：`tests/component/febio/test_required_quality_status.py` に「5項目PASS＋mesh_dependence UNVERIFIED → quality_status PASS」を1本追加する。`tests/e2e/test_installed_synthetic.py:2590` 付近の「fine 以外は mesh_dependence が UNVERIFIED であること」を検証する assert は維持し、`_ALLOWED_NUMERICAL`（94行目）の判定対象から `mesh_dependence` を除外する。
-
-完了条件：1メッシュ・1実行で `quality_status=PASS`、`task_status=NEEDS_PREVIEW`（表示前）となること。
-
-### T4：`preview` の `LAUNCHED`
-
-現状：`cli/preview.py` および `application/_preview.py` は「外部観測者が既存の Studio セッションを確認して stdin で応答する」プロトコルのみであり、Studio を起動する処理は存在しない。
-
-1. `application/_preview.py` に `launch_preview(service, case_id, *, manifest_id, studio_path) -> dict` を追加する。処理手順：manifest を解決して `output/results.xplt` の実パスとハッシュを検証 → `subprocess.Popen([studio_path, xplt_path])` を実行（シェル文字列は使用せず、`cwd` はケース領域外とする）→ `PreviewReceipt` を、`status=LAUNCHED`、`studio` のバージョン・パス・ハッシュ、PID、起動時刻とともに `storage/preview.py` の既存ストアへ保存 → 応答を返す。Studio の終了は待機しない。
-2. `task_status` の導出：`_preview.py:64` の `receipt["status"] == "CONFIRMED"` を `in {"LAUNCHED", "CONFIRMED"}` に変更する。`_run_reconciliation.py:76-80` は `preview_summary` の `task_status` を参照しているのみのため、そのまま追従する。`domain/lifecycle.py:47` の `PreviewStatus` には `LAUNCHED` が既に定義されている。
-3. CLI：`cli/main.py:113` の `preview` パーサーを、`--manifest-id`（必須）、`--studio`（必須）、`--window-id` / `--timeout`（任意。指定された場合は従来の観測プロトコルを使用）を受け付けるよう変更する。`cli/case.py` で `--window-id` の指定がない場合は `launch_preview` を呼び出す。
-4. 試験：Studio 実行ファイルの代わりに引数を記録するのみのダミー `.exe`／`.bat` を `tmp_path` に配置し、`LAUNCHED` の記録と `task_status=COMPLETE` を確認する component 試験を1本追加する。実 Studio での起動確認は手動で記録する（T6）。
-
-完了条件：`preview CASE --manifest-id M --studio FEBioStudio.exe --json` で Studio が起動し、`preview_status=LAUNCHED`、`task_status=COMPLETE` となること。
-
-### T5：一貫試験の更新
-
-`tests/e2e/test_installed_synthetic.py`（2,975行・1関数）を T1〜T4 の変更に合わせて更新する。
-
-- 設定（`FEBIO_CAE_E2E_SETTINGS`）の `qualification_bundle` は省略可能になっている（省略で組み込み既定値）。`limits` を `preparation_calls: 1, solver_calls: 2` に変更した MVP 向けの設定を新たに用意する（3段階メッシュの設定は backlog 用に残して差し支えない）。
-- 初回は公開 `inspect --native` と型付き `spec` を実行し、`prepare-planar` が形状・選択・メッシュに結び付けて確定した版を `validate` と `freeze` で確認する。準備前の凍結は行わない（計画書 §2）。
-- `run-demo` → `run` とし、fine 以外の mesh_dependence 判定は T3 の方針に従う。
-- 手順7として `preview`（ダミー Studio で可。実 Studio は手動で実施）を追加し、最終的な `task_status=COMPLETE` を確認する。
-- 設定側で `installed_python` と `wheel` の SHA-256 を固定しているため、コードを変更するたびに `python -m build` → 新規 venv へのインストール → 設定内の SHA 更新を行う必要がある。この手順を `docs/cli-usage.md` に記載する。
-
-完了条件：実FEBioにおいて `python -m pytest tests/e2e/test_installed_synthetic.py` が exit 0 で終了すること。
+現行native-enabled final automated 8-stepはgmsh 4.15.2で22 stage全exit 0、両run `SUCCEEDED`／必須5 numerical statuses `PASS`、baseline `COMPLETE`／candidate comparisonまで取得した。比較値とlatest 22-command ledgerはcanonical reviewに記録済み。manual 8がMVPで残る必須記録であり、manual caseはretry／reset／new caseを行わず保持する。
 
 ### T6：文書と記録
 
-- `docs/cli-usage.md` に MVP の8手順に関する実行例（実際に使用したコマンドと JSON の要点）を記載する。
-- `docs/reviews/2026-MM-DD-mvp-planar-e2e.md` に、対象コミット、wheel の SHA-256、実行コマンド、終了コード、`run_id` / `manifest_id`、FEBio のログ要約、Studio で開いたスクリーンショットの保存先（Git管理外）を記録する。
-- 計画書 §3 の状態列を更新する。
+1. 56e122b最終標準full-suite PASS（1798 passed／0 failed／3493.86 s）を受け、native-enabled final automated 8-stepは既定budgetで1 flow実施済み。gmsh 4.15.2でpytest 1 passed／942.46 s、22 stage全exit 0、inspection1／preparation1／solver2／Studio1、両run `SUCCEEDED`、必須5 numerical statuses `PASS`、baseline `COMPLETE`／candidate comparisonを記録した。今回の追加実行は不要、manual `case-6294a0a9e02c`の次操作はbudget判断待ち、V2 integrationは明示的ユーザー指示待ちとする。manual caseはretry／reset／代替caseなしで保持し、manual 8を残件とする。[canonical review](../reviews/2026-09-20-mvp-planar-e2e.md)を正とする。
+
 
 ## 4. やらないこと
 
 - 球、円柱、摩擦、Neo-Hookean、ソースローカル細分化、LLM経路には手を加えない（backlog）。
-- `adapters/geometry/_gmsh_runtime.py`（約4,200行の依存関係認証）には手を触れない。動作しているならそのまま利用する。
-- 新たなハッシュ固定、自己ハッシュ、追加の権限レイヤーは導入しない。既定対応表の組み込み（済）で撤去したハッシュ固定を復活させない。
+- `adapters/geometry/_gmsh_runtime.py`（約4,200行の依存関係認証）には手を触れない。正常に動作しているならそのまま利用する。
+- 新たなハッシュ固定、自己ハッシュ、追加の権限レイヤーは導入しない。既定対応表の組み込み（対応済み）によって撤去したハッシュ固定は復活させない。
 - 試験は変更した契約の分のみ作成する。1機能につき数本で十分である。
 
 ## 5. 報告の形式
 
-タスクごとに次の項目を報告すること：対象コミットSHA、変更ファイル、実行したコマンドと終了コード（`pytest` の件数）、実FEBio／Studio の起動回数、未検証事項、次回必要な判断事項。中断・省略した試験は合格数に含めない。
+タスクごとに次の項目を報告すること：対象コミットのSHA、変更したファイル、実行したコマンドと終了コード（`pytest` の件数）、実FEBio／Studio の起動回数、未検証事項、次回必要な判断事項。中断・省略した試験は合格数に含めない。

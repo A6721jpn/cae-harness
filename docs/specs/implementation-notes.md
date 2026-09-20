@@ -10,7 +10,11 @@
 - 元のWindows wheelの識別値は SHA-256 `7b36083bb410fa27c5d0e052929d1a9844a5b09169d66017b72b41aabd49d711` である。この識別記録のみをもって幾何・数値品質を認定することはない。
 - AP214は取り込み前にHEADERの `FILE_SCHEMA`、OCCTは同一所有セッションの `General.BuildInfo` により厳密に照合する。欠落、曖昧さ、不一致がある場合は形状操作の前に拒否し、別途導入されたOCCTで代用することはない。
 - 汎用設定の `expected_occt_version`、`require_step_ap214`、`cpu_workers` は引き続き任意指定とするが、公開経路では上記の組み合わせを要求する。CPU指定は `General.NumThreads` に設定する。
-- 既定の対応表は `src/febio_cae/resources/planar_default_bundle.json`（約44 KB）。旧承認バンドル（SHA-256 `f5f5ce51…`、604,962バイト、Git追跡外）から3プロファイルとメッシュ品質基準を抽出し、証拠参照を1件の出所メモ `planar-default-provenance` に付け替えたもの。読込器の `executable_digest` は `sha256("febio-cae-xplt-reader 0.1.0")` の版ベース識別で、ソースのバイト列とは照合しない。外部バンドルを `--bundle-path` で渡す場合は同じ構造検証（4 MiB上限、重複キー拒否、証拠と文書の一致、対象範囲能力）を通す。
+- 実行時依存の取得では、公式ソース中のリテラルbool、bool名の分岐、import、および限定した入れ子のtry/exceptをソース順に解析する。未導入と証明できたimportだけが対応するフォールバックを選択する。パス・コード・モジュール同一性の認証失敗は、任意依存の未導入として無視しない。
+- vendorの`gmsh.py`にはNumPyから`weakref.finalize`へ分岐する任意経路があるが、MVP環境ではNumPy未導入のためruntime／native分岐は`UNVERIFIED`である。NumPy不在やproduction no-weakref pathを主張せず、選択されなかった`backports.weakref`を必須化しない。product guardは変更しない。`try_numpy=True`、`use_numpy=False`、`numpy`／`weakreffinalize`の未束縛状態を、初期live状態と再検証時に照合する。任意の式を実行する評価器ではなく、未対応のimport制御フローは拒否する。このソース分岐の検証だけを、完全な実行時認証や実Gmsh操作の合格証拠にはしない。
+- 標準ライブラリの組み込み関数の別名は、正規ソースのimport元と実際の定義元の同一性を確認する。factoryが返す入れ子関数の公開名は、正規ソース内の宣言・return・引数なしの直接代入との対応を確認し、関数名の末尾一致だけでは許可しない。propertyの各accessorはデコレーター開始行とgetter／setter／deleterの役割を用いて個別のコンパイル済みコードへ照合し、同じqualnameの最初のコードで代用しない。いずれも既存のコード・closure・globals・live状態の検証を維持する。
+- 取り込んだ関数の再公開は、正規ソースのimport対応（別名・wildcardを含む）で取り込み元を解決してから定義元の関数を検証する。取り込み先モジュール自身の定義と誤分類しない。公開名と実体の対応、および `ctypes` の既知の結び付けは同一性で照合し、別の認証済み関数への差し替えも許容しない。
+- 既定の対応表は `src/febio_cae/resources/planar_default_bundle.json`（約44 KB）。旧承認バンドル（SHA-256 `f5f5ce51...`、604,962バイト、Git追跡外）から3プロファイルとメッシュ品質基準を抽出し、証拠参照を1件の出所メモ `planar-default-provenance` に付け替えたもの。読込器の `executable_digest` は `sha256("febio-cae-xplt-reader 0.1.0")` の版ベース識別で、ソースのバイト列とは照合しない。外部バンドルを `--...
 
 ## 2. STEP調査（`case inspect --native`）
 
@@ -88,11 +92,13 @@
 
 XPLTのヘッダ、辞書、メッシュ、状態、変数、圧縮、配置および型を、対応する版ごとに検証する。未対応の形式は拒否し、積分点値、節点値、平滑化値を区別する。治具の移動および力は、検証済みの同一試行における数値履歴から取得し、欠測をゼロで補完することはない。登録読込器が完全な辞書を必要とする場合、コンパイラは表示要求に含まれないものを含むすべての変数を出力する。
 
-## 7. Studio観測プロトコル（`case preview`）
+## 7. Studio起動と観測（`case preview`）
 
-現行の `case preview` は既存の外部Studioプロセスおよびウィンドウを特定し、XPLTハッシュと表示要求に結び付く一回限りの観測要求を発行する。`CONFIRMED` においては、独立した操作者による対象ファイル、Studioの版、最終状態、変数・成分・座標・単位の実際の表示確認が必要となる。既存セッションおよび一回限りの識別子と合致する記録、ならびに要求後に撮影されたPNGを有限の期限内に標準入力PIPE経由で受け取り、現在のXPLTハッシュと照合する。通信仕様は `src/febio_cae/cli/preview.py`、照合は `src/febio_cae/application/_preview.py` に従う。
+`--window-id` を省略したMVP経路は、成功した実行のmanifestから対象XPLTを解決し、既存の読取ハンドルでXPLTとStudio実行ファイルを保持して内容ハッシュを検証する。ケース領域外を作業ディレクトリとする引数配列・`shell=False` の起動後、既存のpreviewストアへ `LAUNCHED`、PID、起動時刻、実行ファイルのパス・ハッシュ・取得可能な版を保存する。版メタデータがない場合は理由付き `UNVERIFIED` とし、Studioの終了を待たない。起動失敗を成功に置き換えず、`preview-status` は現在の結果と必須品質を再検証する。
 
-この観測を行う公開ヘルパーは現行のCLIには存在しない。MVPにおける表示確認は設計仕様書 §7 の `LAUNCHED` 契約に従い、本プロトコルは `CONFIRMED` を将来必要とする場合の実装として保持する。
+`--window-id` を指定した経路は既存の外部Studioプロセスおよびウィンドウを特定し、XPLTハッシュと表示要求に結び付く一回限りの観測要求を発行する。`CONFIRMED` においては、独立した操作者による対象ファイル、Studioの版、最終状態、変数・成分・座標・単位の実際の表示確認が必要となる。既存セッションおよび一回限りの識別子と合致する記録、ならびに要求後に撮影されたPNGを有限の期限内に標準入力PIPE経由で受け取り、現在のXPLTハッシュと照合する。通信仕様は `src/febio_cae/cli/preview.py`、照合は `src/febio_cae/application/_preview.py` に従う。
+
+この観測を行う公開ヘルパーは現行CLIには存在しないが、MVPの表示確認は実装済みの`LAUNCHED`契約に従う。`--window-id`／stdinによる`CONFIRMED`観測経路は既存実装として保持し、追加MVP GUI criterionへは拡張しない。
 
 ## 8. LLM接続（OpenAI Responses）
 
@@ -121,6 +127,18 @@ XPLTのヘッダ、辞書、メッシュ、状態、変数、圧縮、配置お�
 ## 10. 正規化・ハッシュ
 
 正規化は共通実装によって行い、UTF-8、空白なしJSON、キーおよび順不同集合の整列、型別の数値表現を固定する。履歴配列の順序は保持し、NaN、無限大、重複IDは拒否する。仕様ハッシュには根拠とスキーマ版を含め、自己ハッシュおよび作成時刻は除外する。内容の同一性と数値許容差は明確に区別する。
+## 10.1 現在地と状態の区別（2026-09-21）
+
+`INSPECTED`はSTEP観測、`PROVISIONED`は対応表登録、`PREPARED`はメッシュ・治具生成記録、`SUCCEEDED`は実行結果の正常固定、`LAUNCHED`はStudio起動receipt、`COMPLETE`は品質と表示条件を含む終端を示す。前段の状態を後段の証拠へ読み替えず、`native_qualification`・科学的妥当性・実物適用性の`UNVERIFIED`も独立に保持する。
+
+| 項目 | authoritative status |
+|---|---|
+| 実E2E実施版／修正版regression | current source=`71c388f229dbfabc9fffb48c90c4ca9c1def5ee9`、test-only=`56e122b`、format-only=`0e35ba4d`。focused／static／build／scanはcanonical reviewの最終記録でPASS。251/b28、71/c180、過去1797/1は履歴として保持する |
+| acceptance evidence | [canonical review](../reviews/2026-09-20-mvp-planar-e2e.md)。native final wheel SHA-256=`f978de60803f70b9a5858a60bae185e0ed467949b0e062eafd2826a5e18b2cdd`／size=`404193`が現行candidate。default build receipt、format equivalence receipt、native final launch／accountingを同reviewに固定し、current `case-80e5f42a5043`はgmsh 4.15.2、22 stage全exit 0、pytest 1 passed／942.46 s、両run `SUCCEEDED`／必須5 numerical statuses `PASS`、baseline `COMPLETE`／Studio `LAUNCHED`／candidate comparisonまで取得。比較値はforce-z relative differences `[1,1,1,1,1,1]`、displacement-z differences／relative differences `[0,0,0,0,0,0]`。raw label／mesh `UNVERIFIED`は原因推定なしで別境界として保持する |
+| pending | native-enabled final flowの自動gateはPASS済みで、合格済みsource＋native candidateは受理対象として記録する。MVPで残る必須記録はmanual 8、manual `case-6294a0a9e02c`はretry／reset／代替caseなし。今回の追加実行は不要、manual次操作はbudget判断待ち、V2 integrationは明示的ユーザー指示待ち。詳細は[canonical review](../reviews/2026-09-20-mvp-planar-e2e.md) |
+
+source-local criterion ID collision fixは、canonical global mesh producerにsource-local metricがない場合だけoptional `UNVERIFIED` allowanceを適用し、明示されたsource-local row（`criterion_id=mesh_dependence`でも）はstrictに扱う。V2は変更せず、明示的ユーザー指示があるまで統合しない。
+
 
 ## 11. `orca/acceptance-integration` で追加された実装（合成検証のみ、MVP後）
 
