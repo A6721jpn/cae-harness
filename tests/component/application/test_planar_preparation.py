@@ -414,6 +414,30 @@ def test_prepared_material_child(
     monkeypatch.setattr(_demo, "CompilerAdapter", Compiler)
     monkeypatch.setenv("FEBIO_CAE_STATE_DIR", str(tmp_path / "state"))
 
+    assert main(["case", "freeze", created.case_id, "--json"]) == 0
+    frozen = json.loads(capsys.readouterr().out)
+    assert frozen["revision_id"] == parent.revision_id
+    assert service.get_revision(created.case_id, frozen["revision_id"]).to_bytes() == root_bytes
+    assert (
+        main(
+            [
+                "case",
+                "run",
+                created.case_id,
+                "--revision-id",
+                parent.revision_id,
+                "--solver",
+                str(solver),
+                "--preflight",
+                "--json",
+            ]
+        )
+        == 0
+    ), capsys.readouterr().out
+    capsys.readouterr()
+    assert compiled == [parent.revision_id]
+    compiled.clear()
+
     def freeze_patch(revision: Any, edit: Any, evidence: Any) -> Any:
         patch = CasePatch(revision.revision_id, revision.spec_digest, (edit,), (evidence,))
         path = tmp_path / "patch.json"
@@ -506,6 +530,7 @@ def test_prepared_material_child(
             parent.spec.material.youngs_modulus_evidence,
         )
     assert child.parent_revision_id == parent.revision_id
+    assert child.revision_id != parent.revision_id
     args = [
         "case",
         "run",

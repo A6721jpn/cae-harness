@@ -570,6 +570,31 @@ def test_synthetic_validated_freeze_publishes_immutable_revision(tmp_path: Path)
     assert draft.generation == 1
 
 
+def test_repeated_freeze_rejects_generation_changed_after_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from febio_cae.application import ConcurrentUpdateError
+
+    service, created, storage = _created(tmp_path)
+    _populate_complete(service, created)
+    frozen = service.freeze_case(created.case_id)
+    validate = service._validate
+
+    def advance(case_id: str) -> Any:
+        result = validate(case_id)
+        draft = service.current_draft(case_id)
+        storage.set_draft(
+            replace(draft, draft_id="draft-advance", generation=draft.generation + 1),
+            expected_generation=draft.generation,
+        )
+        return result
+
+    monkeypatch.setattr(service, "_validate", advance)
+    with pytest.raises(ConcurrentUpdateError, match="draft changed before freeze"):
+        service.freeze_case(created.case_id)
+    assert storage.current_frozen_revision(created.case_id) == frozen.revision_id
+
+
 @pytest.mark.parametrize(
     "boundary", ["after_prepare", "after_file_write", "after_file_replace", "after_commit"]
 )

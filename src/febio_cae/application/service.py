@@ -1012,8 +1012,19 @@ class RegisteredCaseService:
             spec=draft.values.to_case_spec(),
             evidence=draft.evidence,
         )
+        storage = self._storage(case_id)
+        current_id = storage.current_frozen_revision(case_id)
+        if current_id is not None:
+            current = storage.get_revision(case_id, current_id)
+            if (
+                revision.parent_revision_id == current.parent_revision_id
+                and revision.parent_spec_digest == current.parent_spec_digest
+                and revision.content_bytes() == current.content_bytes()
+            ):
+                # Reuse identity only; publication still verifies generation and evidence.
+                revision = current
         try:
-            stored = self._storage(case_id).register_revision_if_current(
+            stored = storage.register_revision_if_current(
                 revision, expected_generation=draft.generation, mesh_quality_required=True
             )
         except StorageConflictError as error:
