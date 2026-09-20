@@ -250,7 +250,7 @@ def run_demo(
     if not isinstance(registration, (PlanarDemoRegistration, CurrentPreparationRegistration)):
         raise PortError(
             PortErrorCategory.INVALID_INPUT,
-            "run-demo requires a registered preparation admission",
+            "run requires a registered preparation admission",
         )
     mesh = service._planar_execution_mesh(storage, registration, revision)
     service._verify_execution_mesh(storage, registration, revision, mesh)

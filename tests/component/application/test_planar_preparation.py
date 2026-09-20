@@ -343,7 +343,7 @@ def test_stale_prepared_generation_is_rejected_before_compilation(
             "case",
             "--state-dir",
             str(tmp_path / "state"),
-            "run-demo",
+            "run",
             created.case_id,
             "--revision-id",
             prepared_revision_id,
@@ -508,7 +508,7 @@ def test_prepared_material_child(
     assert child.parent_revision_id == parent.revision_id
     args = [
         "case",
-        "run-demo",
+        "run",
         created.case_id,
         "--revision-id",
         child.revision_id,
