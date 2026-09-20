@@ -2466,6 +2466,80 @@ def test_source_defined_factory_export_authentication(
             runtime._validate_function_state(state, "factory_dependency.export")
 
 
+def test_verified_load_authenticates_ctypes_star_reexports(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _isolated(monkeypatch)
+    source = (
+        "from ctypes import *\n"
+        "__version__ = '4.15.2'\n"
+        "def probe():\n"
+        "    return cast(c_void_p(1), c_void_p).value\n"
+        "class Lib:\n"
+        "    _handle = 99\n"
+        "lib = Lib()\n"
+    )
+    module, library, launcher, image, python_library = _files(tmp_path, source)
+    expected = _binding(tmp_path, module=module, library=library)
+    monkeypatch.setattr(
+        runtime,
+        "_current_process_binding",
+        lambda: {
+            "python": _identity(launcher),
+            "python_image": _identity(image),
+            "python_library": _identity(python_library),
+            "pyvenv_cfg": None,
+        },
+    )
+    monkeypatch.setattr(runtime, "_mapped_module_path", lambda handle: library)
+    monkeypatch.syspath_prepend(str(module.parent))
+    sys.modules.pop("gmsh", None)
+
+    loaded, _ = runtime.load_verified_gmsh(expected)
+    assert loaded.cast is ctypes.cast
+    assert loaded.probe() == 1
+    assert runtime.load_verified_gmsh(expected)[0] is loaded
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(loaded, "cast", ctypes.sizeof)
+        with pytest.raises((OSError, ValueError), match="cast|dependency|global"):
+            runtime.load_verified_gmsh(expected)
+
+
+def test_verified_load_rejects_wrong_trusted_ctypes_star_reexport(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _isolated(monkeypatch)
+    source = (
+        "from ctypes import *\n"
+        "cast = sizeof\n"
+        "__version__ = '4.15.2'\n"
+        "def probe():\n"
+        "    return cast(c_void_p(1))\n"
+        "class Lib:\n"
+        "    _handle = 99\n"
+        "lib = Lib()\n"
+    )
+    module, library, launcher, image, python_library = _files(tmp_path, source)
+    expected = _binding(tmp_path, module=module, library=library)
+    monkeypatch.setattr(
+        runtime,
+        "_current_process_binding",
+        lambda: {
+            "python": _identity(launcher),
+            "python_image": _identity(image),
+            "python_library": _identity(python_library),
+            "pyvenv_cfg": None,
+        },
+    )
+    monkeypatch.setattr(runtime, "_mapped_module_path", lambda handle: library)
+    monkeypatch.syspath_prepend(str(module.parent))
+    sys.modules.pop("gmsh", None)
+
+    with pytest.raises((OSError, ValueError), match="cast|dependency|source owner"):
+        runtime.load_verified_gmsh(expected)
+
+
 def test_decorated_property_accessors_match_exact_source(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

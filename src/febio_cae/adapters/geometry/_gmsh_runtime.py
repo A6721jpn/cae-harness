@@ -1194,6 +1194,8 @@ def _source_import_absent(name: str) -> bool:
 
 def _source_import_flow(
     tree: ast.Module,
+    *,
+    reexport_name: str | None = None,
 ) -> tuple[dict[str, _SourceImportBinding], dict[str, object], tuple[str, ...]]:
     """Select only bounded module-level import regions; never execute vendor code."""
     definitions = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
@@ -1229,6 +1231,8 @@ def _source_import_flow(
         ):
             flags.update(target.id for target in node.targets if isinstance(target, ast.Name))
     tracked = import_names | flags
+    if reexport_name is not None:
+        tracked.add(reexport_name)
     bindings: dict[str, _SourceImportBinding] = {}
     expected: dict[str, object] = dict.fromkeys(tracked, _MISSING)
     absent_imports: set[str] = set()
@@ -1261,7 +1265,28 @@ def _source_import_flow(
                         absent_imports.add(module_name)
                         raise _SourceImportAbsent(module_name)
                     if alias.name == "*":
-                        _safe_import_dependency_module(module_name, module_name)
+                        star_module = _safe_import_dependency_module(module_name, module_name)
+                        if reexport_name is not None:
+                            star_namespace = vars(star_module)
+                            exports = star_namespace.get("__all__", _MISSING)
+                            if exports is _MISSING:
+                                exported = (
+                                    reexport_name in star_namespace
+                                    and not reexport_name.startswith("_")
+                                )
+                            elif type(exports) in (tuple, list) and all(
+                                type(item) is str for item in exports
+                            ):
+                                exported = reexport_name in exports
+                            else:
+                                raise _error("Gmsh import flow has an unsupported star export list")
+                            if exported:
+                                binding = _SourceImportBinding(
+                                    module_name, module_name, (reexport_name,)
+                                )
+                                value, _owner = _load_source_import_binding(binding, reexport_name)
+                                bindings[reexport_name] = binding
+                                expected[reexport_name] = value
                         continue
                     root = alias.asname or (
                         alias.name.partition(".")[0] if isinstance(node, ast.Import) else alias.name
@@ -2017,6 +2042,15 @@ def _authenticate_dependency_function(
         source_name = parent_namespace.get("__file__", _MISSING)
         if parent_namespace.get(label.rpartition(".")[2], _MISSING) is not function:
             raise _error(f"Gmsh executable dependency {label} was replaced")
+        if isinstance(module_name, str) and function.__module__ != module_name:
+            return _authenticate_reexported_function(
+                function,
+                parent,
+                label,
+                dependency_depth=dependency_depth,
+                dependency_seen=dependency_seen,
+                dependency_context=dependency_context,
+            )
         expected_qualname = label.rpartition(".")[2]
         if function.__qualname__ != expected_qualname:
             if not isinstance(module_name, str):
@@ -2080,6 +2114,47 @@ def _authenticate_dependency_function(
     if state is None:
         raise _error(f"Gmsh executable dependency {label} is not independently authenticated")
     return state
+
+
+def _authenticate_reexported_function(
+    function: FunctionType,
+    parent: ModuleType,
+    label: str,
+    *,
+    dependency_depth: int,
+    dependency_seen: frozenset[int],
+    dependency_context: _DependencyContext | None,
+) -> _FunctionState:
+    export_name = label.rpartition(".")[2]
+    source_name = vars(parent).get("__file__", _MISSING)
+    if not isinstance(source_name, str):
+        raise _error(f"Gmsh executable dependency {label} has no reexport source")
+    source = _read_file_bounded(Path(source_name), _MAX_SOURCE_BYTES, label)
+    try:
+        tree = ast.parse(source.decode("utf-8"))
+    except (SyntaxError, UnicodeDecodeError, TypeError, ValueError) as exc:
+        raise _error(f"Gmsh executable dependency {label} source cannot be inspected") from exc
+    bindings, expected, _absent = _source_import_flow(tree, reexport_name=export_name)
+    if export_name not in bindings or expected.get(export_name, _MISSING) is not function:
+        raise _error(f"Gmsh executable dependency {label} differs from its source reexport")
+    defining_name = function.__module__
+    if not isinstance(defining_name, str):
+        raise _error(f"Gmsh executable dependency {label} has an unexpected source owner")
+    defining_module = _safe_import_dependency_module(defining_name, label)
+    definition_name = function.__name__
+    if vars(defining_module).get(definition_name, _MISSING) is not function:
+        raise _error(f"Gmsh executable dependency {label} defining binding was replaced")
+    trusted_ctypes = _ctypes_expected_binding(defining_module, definition_name)
+    if trusted_ctypes is not _MISSING and trusted_ctypes is not function:
+        raise _error(f"Gmsh executable dependency {label} ctypes binding was replaced")
+    return _authenticate_dependency_function(
+        function,
+        defining_module,
+        f"{defining_name}.{definition_name}",
+        dependency_depth=dependency_depth,
+        dependency_seen=dependency_seen,
+        dependency_context=dependency_context,
+    )
 
 
 def _source_factory_export_qualname(
