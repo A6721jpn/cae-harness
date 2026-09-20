@@ -1,20 +1,27 @@
-"""One live observation-only adapter; operator evidence is never a success flag."""
+"""Registered Studio launch and independent existing-session observation."""
 
 from __future__ import annotations
 
 import hashlib
 import math
 import os
+import subprocess
 import time
 import uuid
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 from febio_cae.adapters.febio import QualityAdapter
 from febio_cae.adapters.preview import studio as preview_adapter
-from febio_cae.domain import EvidenceRef, PreviewRequest, PreviewStatus, ToolIdentity
+from febio_cae.domain import (
+    EvidenceRef,
+    PreviewReceipt,
+    PreviewRequest,
+    PreviewStatus,
+    ToolIdentity,
+)
 from febio_cae.domain.canonical import canonical_bytes
 from febio_cae.domain.codec import encode_record
 from febio_cae.domain.lifecycle import TaskStatus
@@ -25,6 +32,9 @@ from febio_cae.storage._ownership import pinned_read
 from febio_cae.storage.preview import RegisteredPreviewStore
 
 from ._required_quality import required_quality_summary
+
+if TYPE_CHECKING:
+    from .service import RegisteredCaseService
 
 
 def preview_summary(store: RegisteredPreviewStore, preview_id: str) -> dict[str, object]:
@@ -61,7 +71,7 @@ def preview_summary(store: RegisteredPreviewStore, preview_id: str) -> dict[str,
         final_force = force.values[numeric_state_indices(force, (target.final_time,))[0]]
         connected = all(math.isfinite(v) for v in final_force) and any(v != 0 for v in final_force)
     complete = (
-        receipt["status"] == "CONFIRMED"
+        receipt["status"] in {"LAUNCHED", "CONFIRMED"}
         and quality_status == "PASS"
         and quality_registration_status == "PASS"
         and connected
@@ -86,11 +96,73 @@ def preview_summary(store: RegisteredPreviewStore, preview_id: str) -> dict[str,
         if quality_status == "UNVERIFIED" or quality_registration_status != "PASS"
         else "NEEDS_PREVIEW",
         "receipt": receipt,
+        "launch": record["binding"] if receipt["status"] == "LAUNCHED" else None,
         "quality": quality.to_dict(),
         "finite_nonzero_tool_force": connected,
         "surface_approximation": "UNVERIFIED",
-        "scope": "registered synthetic planar demonstration; not scientific or real-model qualification",
+        "scope": "planar MVP path",
     }
+
+
+def launch_preview(
+    service: RegisteredCaseService, case_id: str, *, manifest_id: str, studio_path: str
+) -> dict[str, object]:
+    """Launch the verified current XPLT; this does not claim GUI observation."""
+    from ._preview_windows import _file_version
+
+    storage = service._storage(case_id)
+    store = RegisteredPreviewStore(storage)
+    executable = Path(studio_path).resolve(strict=True)
+    with storage.transaction():
+        target = store.target(manifest_id)
+        target.read()
+        with pinned_read(target.path) as xplt, pinned_read(executable) as studio:
+            if hashlib.file_digest(cast(Any, xplt), "sha256").hexdigest() != target.entry.digest:
+                raise PortError(PortErrorCategory.INTEGRITY, "current preview XPLT digest changed")
+            digest = hashlib.file_digest(cast(Any, studio), "sha256").hexdigest()
+            version = _file_version(executable)
+            identity = ToolIdentity(
+                "FEBio Studio", "UNVERIFIED" if version is None else version, digest
+            )
+            receipt = PreviewReceipt(
+                "preview-" + uuid.uuid4().hex,
+                manifest_id,
+                target.entry.digest,
+                identity,
+                PreviewStatus.LAUNCHED,
+                (target.final_state_id,),
+                (target.variable,),
+                (),
+                (),
+                (),
+            )
+            launched_ns = time.time_ns()
+            process = subprocess.Popen(
+                [str(executable), str(target.path)],
+                cwd=storage.root.parent,
+                shell=False,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            store.issue(
+                receipt,
+                {
+                    "nonce": uuid.uuid4().hex,
+                    "manifest_id": manifest_id,
+                    "source_path": str(target.path),
+                    "xplt_digest": target.entry.digest,
+                    "studio_path": str(executable),
+                    "studio": identity.to_dict(),
+                    "process_id": process.pid,
+                    "launched_ns": launched_ns,
+                    "version_source": "pe-file-version" if version is not None else "UNVERIFIED",
+                    "version_reason": "native file metadata has no version"
+                    if version is None
+                    else "native file version observed",
+                },
+            )
+    return preview_summary(store, receipt.receipt_id)
 
 
 def observe_preview(

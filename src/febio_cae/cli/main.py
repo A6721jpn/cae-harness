@@ -115,13 +115,13 @@ def _build_parser() -> argparse.ArgumentParser:
     demo.add_argument("--preflight", action="store_true", help="compile only; no native launch")
     demo.add_argument("--json", action="store_true")
     preview = case_commands.add_parser(
-        "preview", help="observe one existing Studio session without launching"
+        "preview", help="launch Studio or observe an existing window"
     )
     preview.add_argument("case_id")
     preview.add_argument("--manifest-id", required=True)
-    preview.add_argument("--window-id", type=int, required=True)
+    preview.add_argument("--window-id", type=int)
     preview.add_argument("--studio", required=True)
-    preview.add_argument("--timeout", type=float, required=True)
+    preview.add_argument("--timeout", type=float, default=30)
     preview.add_argument("--json", action="store_true")
     preview_status = case_commands.add_parser(
         "preview-status", help="revalidate stored preview evidence"

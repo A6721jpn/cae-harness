@@ -127,3 +127,101 @@ def test_preview_issues_before_capture_and_rejects_unbound_evidence(
                 observation_factory=SimpleNamespace,
             )
         assert store.get(observed_ids[0])["receipt"]["status"] == "FAILED"
+
+
+@pytest.mark.parametrize("defect", ["none", "missing-version", "changed-xplt", "launch-error"])
+def test_cli_launch_persists_current_target_and_gates_completion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    defect: str,
+) -> None:
+    import hashlib
+    import json
+    import subprocess
+
+    from test_preview_storage import _quality_preview
+
+    from febio_cae.adapters.febio import QualityAdapter
+    from febio_cae.application import _preview, _preview_windows
+    from febio_cae.application.service import RegisteredCaseService
+    from febio_cae.cli.main import main
+    from febio_cae.domain.codec import encode_record
+    from febio_cae.storage.preview import RegisteredPreviewStore
+
+    store, existing_preview_id, _ = _quality_preview(tmp_path)
+    target = store.target(store.get(existing_preview_id)["receipt"]["manifest_id"])
+    studio = tmp_path / "synthetic Studio.exe"
+    studio.write_bytes(b"synthetic executable identity; Popen is mocked")
+    calls: list[Any] = []
+
+    def launch(argv: Any, **kwargs: Any) -> Any:
+        calls.append((argv, kwargs))
+        assert argv == [str(studio.resolve()), str(target.path)]
+        assert kwargs["shell"] is False
+        assert not Path(kwargs["cwd"]).is_relative_to(store.storage.root)
+        if defect == "launch-error":
+            raise OSError("synthetic launch failure")
+        return SimpleNamespace(pid=4321)
+
+    monkeypatch.setattr(subprocess, "Popen", launch)
+    monkeypatch.setattr(
+        _preview_windows,
+        "_file_version",
+        lambda path: None if defect == "missing-version" else "synthetic-1",
+    )
+    monkeypatch.setattr(RegisteredCaseService, "_storage", lambda self, case_id: store.storage)
+    quality = QualityAdapter().assess(
+        target.manifest, target.revision, target.mesh, target.profile, store.storage
+    )
+    store.storage.ingest_source(
+        asset_id="quality-" + quality.assessment_id[:24],
+        source_kind="registered_document",
+        media_type="application/json",
+        content=encode_record(quality),
+    )
+    monkeypatch.setattr(_preview, "required_quality_summary", lambda *args: ("PASS", {}))
+    if defect == "changed-xplt":
+        target.path.write_bytes(b"changed before launch")
+    code = main(
+        [
+            "case",
+            "--state-dir",
+            str(tmp_path / "state"),
+            "preview",
+            target.attempt.case_id,
+            "--manifest-id",
+            target.manifest.manifest_id,
+            "--studio",
+            str(studio),
+            "--json",
+        ]
+    )
+    result = json.loads(capsys.readouterr().out)
+    if defect in {"changed-xplt", "launch-error"}:
+        assert code != 0
+        assert len(calls) == (0 if defect == "changed-xplt" else 1)
+        assert result.get("preview_status") != "LAUNCHED"
+        return
+    assert code == 0
+    assert result["preview_status"] == "LAUNCHED"
+    assert result["task_status"] == "COMPLETE" and result["run_status"] == "SUCCEEDED"
+    record = RegisteredPreviewStore(store.storage).get(result["preview_id"])
+    assert (
+        record["receipt"]["studio"]["executable_digest"]
+        == hashlib.sha256(studio.read_bytes()).hexdigest()
+    )
+    assert record["receipt"]["studio"]["version"] == (
+        "UNVERIFIED" if defect == "missing-version" else "synthetic-1"
+    )
+    if defect == "missing-version":
+        assert record["binding"]["version_reason"] == "native file metadata has no version"
+    assert record["binding"]["process_id"] == 4321
+    assert record["binding"]["launched_ns"] > 0
+    assert record["binding"]["studio_path"] == str(studio.resolve())
+    assert not record["receipt"]["confirmation_evidence"]
+    for quality_status, task_status in [("UNVERIFIED", "NEEDS_QUALITY"), ("FAIL", "FAILED")]:
+        monkeypatch.setattr(
+            _preview, "required_quality_summary", lambda *args, status=quality_status: (status, {})
+        )
+        assert _preview.preview_summary(store, result["preview_id"])["task_status"] == task_status

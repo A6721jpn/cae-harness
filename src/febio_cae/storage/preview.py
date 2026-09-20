@@ -133,7 +133,7 @@ class RegisteredPreviewStore:
         with self.storage.transaction():
             target = self.target(receipt.manifest_id)
             if (
-                receipt.status is not PreviewStatus.REQUESTED
+                receipt.status not in {PreviewStatus.REQUESTED, PreviewStatus.LAUNCHED}
                 or receipt.xplt_digest != target.entry.digest
                 or tuple(receipt.requested_state_ids) != (target.final_state_id,)
                 or tuple(receipt.requested_variables) != (target.variable,)
@@ -147,6 +147,18 @@ class RegisteredPreviewStore:
                 or not binding["nonce"]
             ):
                 raise StorageConflictError("preview issue differs from registered target")
+            process_id = binding.get("process_id")
+            launched_ns = binding.get("launched_ns")
+            if receipt.status is PreviewStatus.LAUNCHED and (
+                type(process_id) is not int
+                or process_id <= 0
+                or type(launched_ns) is not int
+                or launched_ns <= 0
+                or not isinstance(binding.get("studio_path"), str)
+                or not binding["studio_path"]
+                or binding.get("studio") != receipt.studio.to_dict()
+            ):
+                raise StorageConflictError("preview launch identity is incomplete")
             with connect(self.storage.registry_path) as connection:
                 connection.execute("BEGIN IMMEDIATE")
                 if connection.execute(

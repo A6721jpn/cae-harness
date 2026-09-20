@@ -182,16 +182,26 @@ def run_case(arguments: Namespace) -> int:
             _print(payload) if arguments.json else print(payload["status"])
             return 0
         if arguments.case_action == "preview":
-            from .preview import capture_observation
+            if arguments.window_id is None:
+                from febio_cae.application._preview import launch_preview
 
-            payload = service.observe_preview(
-                arguments.case_id,
-                arguments.manifest_id,
-                studio_executable=arguments.studio,
-                window_id=arguments.window_id,
-                timeout_seconds=arguments.timeout,
-                capture=capture_observation,
-            )
+                payload = launch_preview(
+                    service,
+                    arguments.case_id,
+                    manifest_id=arguments.manifest_id,
+                    studio_path=arguments.studio,
+                )
+            else:
+                from .preview import capture_observation
+
+                payload = service.observe_preview(
+                    arguments.case_id,
+                    arguments.manifest_id,
+                    studio_executable=arguments.studio,
+                    window_id=arguments.window_id,
+                    timeout_seconds=arguments.timeout,
+                    capture=capture_observation,
+                )
             _print(payload) if arguments.json else print(payload["task_status"])
             return 0 if payload["task_status"] == "COMPLETE" else 6
         if arguments.case_action == "preview-status":
