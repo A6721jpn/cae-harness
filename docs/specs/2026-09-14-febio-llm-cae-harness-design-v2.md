@@ -18,12 +18,14 @@ MVPの目標は、新規環境へ通常インストールしたwheelのCLIから
 | 材料 | 等方線形弾性（ヤング率・ポアソン比・適用根拠を明示） |
 | 支持・接触 | XYZ完全固定支持、部品と治具の1組、摩擦なし |
 | 運動 | World座標の−Z方向への単調な変位制御、準静的 |
-| 操作 | `create → inspect --native → provision-planar-profiles → spec → validate → freeze → prepare-planar → run → status` |
+| 操作 | `create → inspect --native → provision-planar-profiles → spec → prepare-planar → validate → freeze → run → status` |
 | 品質 | 必須項目のうち「実行・結果の完全性」「接触品質」「忠実性」「釣り合い」「ソルバー残差」の5項目を判定。「メッシュ依存性」は `UNVERIFIED` の状態にとどめ、`COMPLETE` を許容 |
 | 表示 | CLIがFEBio Studioを起動して対象XPLTを開き、`LAUNCHED` を記録 |
 | 変更・比較 | ヤング率のみを変更した子版を既存メッシュで再解析し、反力―移動量曲線と部品変位を比較 |
 
 条件入力は型付きJSON（`case spec`）で行う。日本語文やLLMによる入力（`case intent / answer / edit`）はMVPに含めず、実装済みの範囲を維持したまま後続工程で扱う。
+
+初回の `prepare-planar` は観測した形状・選択集合・生成メッシュを仕様へ結び付け、検証と不変版の確定も行う。準備前にメッシュ未登録の版を凍結したことにしてはならない。準備後の公開 `validate` と `freeze` で `READY` および同じ準備済み不変版を確認する。
 
 ### 目標範囲（MVP後）
 

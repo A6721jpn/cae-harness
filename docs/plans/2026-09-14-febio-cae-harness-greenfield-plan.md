@@ -19,8 +19,8 @@ STEP部品と新規剛体治具の接触押し込みを実FEBioで解析し、�
 |---|---|---|
 | 1 | `case create` → `inspect --native` | 合成STEPを登録し、`INSPECTED` によりボディ・単位・体積を取得する |
 | 2 | `provision-planar-profiles` | 組み込み既定の対応表で `PROVISIONED`（`--bundle-path` 省略） |
-| 3 | `spec` → `validate` → `freeze` | 明示条件の型付きJSONにより `READY` → 不変版を確定する |
-| 4 | `prepare-planar` | `PREPARED`、Tet10部品メッシュおよび直方体剛体メッシュを生成する |
+| 3 | `spec` | 明示条件の型付きJSONと根拠を登録する。形状・選択集合・メッシュの準備前に `READY` と判定しない |
+| 4 | `prepare-planar` → `validate` → `freeze` | `PREPARED`、Tet10部品メッシュおよび直方体剛体メッシュを生成する。準備処理で検証・確定した版を公開CLIでも `READY` および同一の不変版として確認する |
 | 5 | `run` | 実FEBio 4.12で `SUCCEEDED` を実行し、結果一覧を公開する |
 | 6 | 品質 | 5項目の `PASS`、メッシュ依存性 `UNVERIFIED`、`quality_status` に合格する |
 | 7 | `preview` | Studioを起動して対象XPLTを開き、`LAUNCHED`、`task_status=COMPLETE` を実施する |
@@ -35,7 +35,7 @@ MVPの完了は、`tests/e2e/test_installed_synthetic.py` への合格と、上�
 | # | タスク | 内容 |
 |---|---|---|
 | T0 | ゲート基線の修復 | `orca/acceptance-integration` で赤のままの ruff（整形9ファイル・lint 14件）と mypy（88件、主に `_gmsh_runtime.py`）を、動作を変えずに解消する |
-| T1 | 汎用 `run` | `run-demo` の登録済みデモ前提を解消し、`prepare-planar` により `PREPARED` となった任意の版を `case run --revision-id --solver [--preflight]` で実行可能にする。`run-demo` は互換性維持のために残すか、削除する |
+| T1 | 汎用 `run` | `prepare-planar` により `PREPARED` となった版を `case run --revision-id --solver [--preflight]` で実行可能にする。公開コマンドを `run` に統一し、旧 `run-demo` エイリアスと呼出例を移行する。登録済み解析の内部処理は維持する |
 | T2 | 既定対応表の組み込み（完了 2026-09-15） | 承認バンドルの設定値を `src/febio_cae/resources/planar_default_bundle.json` に組み込み、`provision-planar-profiles` は `--bundle-path` 省略時にこれを登録する。バンドル・XPLT読込器ソースの自己ハッシュ固定は撤去済み |
 | T3 | メッシュ依存性の任意化 | `required_quality` においてメッシュ依存性が `UNVERIFIED` であっても、他の5項目が `PASS` であれば `quality_status` を合格とし、`task_status` を `NEEDS_QUALITY` と判定しないようにする |
 | T4 | `preview` の `LAUNCHED` | `case preview` が対象XPLTを引数として登録済みStudio実行ファイルを起動し、実行ファイルのパス・ハッシュ、PID、起動時刻、取得可能な版を記録して `NEEDS_PREVIEW` を解消する。版情報が取得できない場合は理由付き `UNVERIFIED` とし、起動証拠と版認定を区別する。既存の観測プロトコル（`--window-id`、stdin応答）は `CONFIRMED` 向けに維持する |
@@ -69,7 +69,7 @@ MVPの完了は、`tests/e2e/test_installed_synthetic.py` への合格と、上�
 
 同試験が実FEBioで最後まで合格した記録は `.local/coordination` に見当たらない（`solver_calls: 0` の合成証明と、`UNVERIFIED`／`FAIL` の実機チェッカー記録が残る）。したがってE2E-01は未合格として扱う。
 
-開発の最新版は `orca/acceptance-integration`（`e696fbcc`、2026-09-14）であり、本書もこのブランチで管理する。`V2`（`d736982`）はこれより100コミット・約17,500行分古い。差分はGmsh実行時の依存関係認証（`_gmsh_runtime.py`、約4,200行）、曲面治具（球・円柱）のネイティブ生成、ソースローカル細分化、Windows CPUアフィニティ強制で、いずれも合成検証のみ。MVPの8手順に対する上表の判定は両ブランチで変わらない。MVP完了時に `V2` へ早送りで反映する。
+2026-09-20の再開基準は `af3a248`。この時点で `V2`、`orca/acceptance-integration` および両リモートブランチは同じコミットだった。開発は既存のOrca管理ワークツリー `orca/acceptance-integration` で継続する。候補 `8a5b04b` のT0・T1・T3・T4は独立コードレビュー済みだが、全体検証・wheel・実E2Eは未合格である。最終候補の検証・レビュー後に `V2` へ早送りで反映する。
 
 ### 次に進める順序
 

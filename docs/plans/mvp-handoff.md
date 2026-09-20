@@ -8,9 +8,9 @@
 
 | 項目 | 値 |
 |---|---|
-| ブランチ | `orca/acceptance-integration`（最新。`V2` は約100コミット古い） |
+| ブランチ | `orca/acceptance-integration`（2026-09-20再開時は `V2` と同じ `af3a248`） |
 | 作業ツリー | `C:\Users\backo\orca\workspaces\CAE-HARNESS-V2\acceptance-integration` |
-| 基準コミット | `b5ab5bc`（文書再構成）。その親である `e696fbcc` がコードの最新 |
+| 基準コミット | `af3a248`（2026-09-20再開基準。T2の実装 `c5df325` を含む） |
 | Python | 3.12.10。`.venv/`（作成済み、Git管理外）に `pip install -e ".[dev,native]"` 済み |
 | FEBio 4.12.0 | `C:\Program Files\FEBioStudio\bin\febio4.exe`（SHA-256 `03b9db12…770c9`） |
 | FEBio Studio | `C:\Program Files\FEBioStudio\bin\FEBioStudio.exe` |
@@ -64,7 +64,7 @@ ruff・mypy の赤は本ブランチが 9/14 に「ローカルゲート未実�
 
 現状：`run-demo`（`application/_demo.py:run_demo`）は `PlanarDemoRegistration`（旧デモ）と `CurrentPreparationRegistration`（`prepare-planar` の出力）の双方を受け付け、後者において一貫試験が動作している。すなわち、実行処理の本体はすでに完成している。
 
-1. `cli/main.py:107` の `run-demo` パーサーと同一の引数で `run` サブコマンドを追加し、`cli/case.py:201,298` の分岐に `"run"` を加える。`run-demo` は当面の間、エイリアスとして残す。
+1. `cli/main.py`、`cli/case.py` の公開コマンドを `run` に統一し、旧 `run-demo` エイリアスと公開呼出例を移行する。登録済み解析の内部処理は維持する。
 2. `_demo.py` の `PlanarDemoRegistration` 専用ルート（`recorded_geometry`、`_RecordedInspection`、`registered-reader-source`）は MVP では使用しない。削除して差し支えないが、`tests/component/cli/test_demo_cli.py` と `tests/component/application/test_registered_execution.py` が旧デモ登録を利用している場合は、それらを `prepare-planar` ルートの試験に置き換えるか、削除する。判断に迷う場合は残したまま `run` のみを追加する。
 3. 応答の `scope` 文字列（`"registered synthetic planar demonstration; …"`）を `"planar MVP path"` 程度の内容に修正する。
 
@@ -97,6 +97,7 @@ ruff・mypy の赤は本ブランチが 9/14 に「ローカルゲート未実�
 `tests/e2e/test_installed_synthetic.py`（2,975行・1関数）を T1〜T4 の変更に合わせて更新する。
 
 - 設定（`FEBIO_CAE_E2E_SETTINGS`）の `qualification_bundle` は省略可能になっている（省略で組み込み既定値）。`limits` を `preparation_calls: 1, solver_calls: 2` に変更した MVP 向けの設定を新たに用意する（3段階メッシュの設定は backlog 用に残して差し支えない）。
+- 初回は公開 `inspect --native` と型付き `spec` を実行し、`prepare-planar` が形状・選択・メッシュに結び付けて確定した版を `validate` と `freeze` で確認する。準備前の凍結は行わない（計画書 §2）。
 - `run-demo` → `run` とし、fine 以外の mesh_dependence 判定は T3 の方針に従う。
 - 手順7として `preview`（ダミー Studio で可。実 Studio は手動で実施）を追加し、最終的な `task_status=COMPLETE` を確認する。
 - 設定側で `installed_python` と `wheel` の SHA-256 を固定しているため、コードを変更するたびに `python -m build` → 新規 venv へのインストール → 設定内の SHA 更新を行う必要がある。この手順を `docs/cli-usage.md` に記載する。
