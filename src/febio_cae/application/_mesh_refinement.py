@@ -765,7 +765,17 @@ def assess_mesh_refinement(
     manifest: ResultManifest, revision: CaseRevision, storage: CaseStorage
 ) -> tuple[CriterionAssessment, dict[str, object]]:
     evidence: dict[str, object] = {"scope": "three_declared_global_tet10_sizes"}
+    refinement_id = _MESH_PRODUCER_ID
     try:
+        refinement_id = next(
+            (
+                item.criterion_id
+                for item in revision.spec.quality_policy.criteria
+                if isinstance(item, QualityCriterion)
+                and item.metric_id == "source_local_mesh_dependence"
+            ),
+            _MESH_PRODUCER_ID,
+        )
         declaration = _parse_mesh_dependence_declaration(revision.spec.quality_policy.criteria)
         if declaration.metric_id == "source_local_mesh_dependence":
             return _assess_source_local_mesh_refinement(
@@ -932,7 +942,7 @@ def assess_mesh_refinement(
         ), evidence
     except (StorageIntegrityError, ValueError, TypeError, KeyError, OverflowError) as error:
         return CriterionAssessment(
-            _MESH_PRODUCER_ID,
+            refinement_id,
             "numeric",
             AssessmentStatus.UNVERIFIED,
             (),
