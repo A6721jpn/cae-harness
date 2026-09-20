@@ -2332,14 +2332,14 @@ if try_optional:
     try:
         import _cae_missing_optional_probe as optional
         try:
-            from weakref import finalize as finalizer
+            from dataclasses import FrozenInstanceError as optional_type
         except:
-            from _cae_missing_fallback_probe import finalize as finalizer
+            from _cae_missing_fallback_probe import optional_type
         use_optional = True
     except:
         pass
 def probe():
-    return optional, finalizer, use_optional
+    return optional, optional_type, use_optional
 """
     code = compile(source, "probe.py", "exec")
     states = runtime._capture_source_dependencies(source, code)
@@ -2350,36 +2350,42 @@ def probe():
         ("use_optional", True),
         ("try_optional", False),
         ("optional", object()),
-        ("finalizer", object()),
+        ("optional_type", object()),
     ):
         with monkeypatch.context() as scoped:
             scoped.setattr(module, name, value, raising=False)
-            with pytest.raises((OSError, ValueError), match="dependency|flow"):
+            with pytest.raises(runtime._RuntimeBindingError):
                 runtime._validate_source_dependencies(module, states)
     with monkeypatch.context() as scoped:
         scoped.setitem(
             sys.modules, "_cae_missing_optional_probe", ModuleType("_cae_missing_optional_probe")
         )
-        with pytest.raises((OSError, ValueError), match="dependency|module"):
+        with pytest.raises(runtime._RuntimeBindingError):
             runtime._capture_source_dependencies(source, code)
-        with pytest.raises((OSError, ValueError), match="dependency|module"):
+        with pytest.raises(runtime._RuntimeBindingError):
             runtime._validate_source_dependencies(module, states)
     required = (
         b"import _cae_missing_optional_probe\ndef probe(): return _cae_missing_optional_probe"
     )
-    with pytest.raises((OSError, ValueError), match="dependency|import"):
+    with pytest.raises(runtime._RuntimeBindingError):
         runtime._capture_source_dependencies(required, compile(required, "probe.py", "exec"))
     present = source.replace(b"_cae_missing_optional_probe", b"math")
     import ast
-    from weakref import finalize
-
+    from dataclasses import FrozenInstanceError
     bindings, expected, absent_imports = runtime._source_import_flow(ast.parse(present))
     assert not absent_imports
-    assert bindings["finalizer"].module_name == "weakref"
-    assert expected["finalizer"] is finalize
+    assert bindings["optional_type"].module_name == "dataclasses"
+    assert expected["optional_type"] is FrozenInstanceError
     assert expected["use_optional"] is True
-    states = runtime._capture_source_dependencies(present, compile(present, "probe.py", "exec"))
-    assert any(state.type_state is not None for state in states)
+    present_module = ModuleType("probe_present")
+    present_code = runtime._compile_source_bytes(present, Path("probe.py"))
+    exec(present_code, vars(present_module))  # noqa: S102
+    present_states = runtime._capture_source_dependencies(present, present_code)
+    runtime._validate_source_dependencies(present_module, present_states)
+    with monkeypatch.context() as scoped:
+        scoped.setattr(present_module, "optional_type", object())
+        with pytest.raises(runtime._RuntimeBindingError):
+            runtime._validate_source_dependencies(present_module, present_states)
 
     partial = b"""try:
     import math as retained
@@ -2391,7 +2397,7 @@ except ImportError:
     assert bindings["retained"].module_name == "math"
     assert expected["absent"] is runtime._MISSING
     assert absent_imports == ("_cae_missing_optional_probe",)
-    with pytest.raises((OSError, ValueError), match="unsupported condition"):
+    with pytest.raises(runtime._RuntimeBindingError):
         runtime._source_import_flow(
             ast.parse(source.replace(b"if try_optional:", b"if unknown():"))
         )
