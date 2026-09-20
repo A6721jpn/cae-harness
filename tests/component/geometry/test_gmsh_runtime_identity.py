@@ -2378,6 +2378,8 @@ def probe():
     assert bindings["finalizer"].module_name == "weakref"
     assert expected["finalizer"] is finalize
     assert expected["use_optional"] is True
+    states = runtime._capture_source_dependencies(present, compile(present, "probe.py", "exec"))
+    assert any(state.type_state is not None for state in states)
 
     partial = b"""try:
     import math as retained
@@ -2393,3 +2395,115 @@ except ImportError:
         runtime._source_import_flow(
             ast.parse(source.replace(b"if try_optional:", b"if unknown():"))
         )
+
+
+def test_source_defined_factory_export_authentication(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    for name in ("fsencode", "fsdecode"):
+        runtime._authenticate_dependency_function(
+            getattr(os, name),
+            os,
+            f"os.{name}",
+            dependency_depth=0,
+            dependency_seen=frozenset(),
+        )
+    path = tmp_path / "factory_dependency.py"
+    path.write_text(
+        "def factory():\n"
+        "    marker = 3\n"
+        "    def export():\n"
+        "        return marker\n"
+        "    return export\n"
+        "export = factory()\n"
+        "def unrelated():\n"
+        "    def export():\n"
+        "        return 4\n"
+        "    return export\n"
+        "other = unrelated()\n"
+        "del factory, unrelated\n",
+        encoding="utf-8",
+    )
+    module = ModuleType("factory_dependency")
+    module.__file__ = str(path)
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    exec(runtime._compile_source_bytes(path.read_bytes(), path), vars(module))  # noqa: S102
+    function = module.export
+    state = runtime._authenticate_dependency_function(
+        function,
+        module,
+        "factory_dependency.export",
+        dependency_depth=0,
+        dependency_seen=frozenset(),
+    )
+    runtime._validate_function_state(state, "factory_dependency.export")
+    with monkeypatch.context() as scoped:
+        scoped.setattr(module, "export", module.other)
+        with pytest.raises((OSError, ValueError), match="replaced"):
+            runtime._authenticate_dependency_function(
+                function,
+                module,
+                "factory_dependency.export",
+                dependency_depth=0,
+                dependency_seen=frozenset(),
+            )
+        with pytest.raises((OSError, ValueError), match="source factory binding"):
+            runtime._authenticate_dependency_function(
+                module.other,
+                module,
+                "factory_dependency.export",
+                dependency_depth=0,
+                dependency_seen=frozenset(),
+            )
+    with monkeypatch.context() as scoped:
+        scoped.setattr(function, "__code__", function.__code__.replace(co_name="changed"))
+        with pytest.raises((OSError, ValueError), match="code changed|source"):
+            runtime._validate_function_state(state, "factory_dependency.export")
+    assert function.__closure__ is not None
+    with monkeypatch.context() as scoped:
+        scoped.setattr(function.__closure__[0], "cell_contents", 8)
+        with pytest.raises((OSError, ValueError), match="closure changed"):
+            runtime._validate_function_state(state, "factory_dependency.export")
+
+
+def test_decorated_property_accessors_match_exact_source(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    path = tmp_path / "property_dependency.py"
+    path.write_text(
+        "class Holder:\n"
+        "    @property\n"
+        "    def value(self):\n"
+        "        return 1\n"
+        "    @value.setter\n"
+        "    def value(self, new):\n"
+        "        self._value = new\n",
+        encoding="utf-8",
+    )
+    module = ModuleType("property_dependency")
+    module.__file__ = str(path)
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    exec(runtime._compile_source_bytes(path.read_bytes(), path), vars(module))  # noqa: S102
+    state = runtime._authenticate_dependency_type(
+        module.Holder, module, "property_dependency.Holder"
+    )
+    assert state is not None
+    runtime._validate_dependency_type_state(state, module.Holder, "property_dependency.Holder")
+    for accessor in (module.Holder.value.fget, module.Holder.value.fset):
+        assert accessor is not None
+        with monkeypatch.context() as scoped:
+            scoped.setattr(accessor, "__code__", accessor.__code__.replace(co_name="changed"))
+            with pytest.raises((OSError, ValueError), match="changed|source"):
+                runtime._validate_dependency_type_state(
+                    state, module.Holder, "property_dependency.Holder"
+                )
+            with pytest.raises((OSError, ValueError), match="changed|source"):
+                runtime._authenticate_dependency_type(
+                    module.Holder, module, "property_dependency.Holder"
+                )
+    with monkeypatch.context() as scoped:
+        scoped.setattr(module.Holder, "value", property(lambda self: 2))
+        with pytest.raises((OSError, ValueError), match="changed"):
+            runtime._validate_dependency_type_state(
+                state, module.Holder, "property_dependency.Holder"
+            )

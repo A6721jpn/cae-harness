@@ -1622,6 +1622,66 @@ def _dependency_class_member_nodes(node: ast.ClassDef) -> dict[str, ast.AST]:
     return result
 
 
+def _dependency_member_code(
+    compiled: CodeType, qualname: str, node: ast.FunctionDef | ast.AsyncFunctionDef
+) -> CodeType | None:
+    first_line = node.decorator_list[0].lineno if node.decorator_list else node.lineno
+    return _code_object(compiled, qualname, first_line)
+
+
+def _authenticate_property_accessors(
+    class_node: ast.ClassDef,
+    member_name: str,
+    descriptor: property,
+    compiled: CodeType,
+    qualname: str,
+    module_name: str,
+    label: str,
+) -> None:
+    source_accessors: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {}
+    for node in class_node.body:
+        if (
+            not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            or node.name != member_name
+        ):
+            continue
+        if len(node.decorator_list) != 1:
+            raise _error(f"Gmsh executable dependency {label} has an unsupported property source")
+        decorator = node.decorator_list[0]
+        if isinstance(decorator, ast.Name) and decorator.id == "property":
+            role = "getter"
+        elif (
+            isinstance(decorator, ast.Attribute)
+            and isinstance(decorator.value, ast.Name)
+            and decorator.value.id == member_name
+            and decorator.attr in {"setter", "deleter"}
+        ):
+            role = decorator.attr
+        else:
+            raise _error(f"Gmsh executable dependency {label} has an unsupported property source")
+        if role in source_accessors:
+            raise _error(f"Gmsh executable dependency {label} has an ambiguous property source")
+        source_accessors[role] = node
+    actual = {"getter": descriptor.fget, "setter": descriptor.fset, "deleter": descriptor.fdel}
+    if not source_accessors or "getter" not in source_accessors:
+        raise _error(f"Gmsh executable dependency {label} property source is unavailable")
+    for role, function in actual.items():
+        accessor_node = source_accessors.get(role)
+        if accessor_node is None:
+            if function is not None:
+                raise _error(f"Gmsh executable dependency {label} property implementation changed")
+            continue
+        expected_code = _dependency_member_code(compiled, qualname, accessor_node)
+        if (
+            type(function) is not FunctionType
+            or function.__module__ != module_name
+            or function.__qualname__ != qualname
+            or expected_code is None
+            or _code_digest(function.__code__) != _code_digest(expected_code)
+        ):
+            raise _error(f"Gmsh executable dependency {label} property implementation changed")
+
+
 def _authenticate_dependency_type(
     value: object,
     parent: object,
@@ -1729,16 +1789,21 @@ def _authenticate_dependency_type(
             raise _error(f"Gmsh executable dependency {label}.{namespace_name} is unavailable")
         expected_code: CodeType | None = None
         if isinstance(member_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            expected_code = _code_object(
-                compiled,
-                f"{value_qualname}.{member_name}",
-                member_node.lineno,
-            )
-            if expected_code is None:
-                expected_code = _code_object_by_qualname(
-                    compiled, f"{value_qualname}.{member_name}"
+            if type(descriptor) is property:
+                _authenticate_property_accessors(
+                    cast(ast.ClassDef, class_node),
+                    member_name,
+                    descriptor,
+                    compiled,
+                    f"{value_qualname}.{member_name}",
+                    source_module_name,
+                    f"{label}.{member_name}",
                 )
-            if expected_code is None:
+            else:
+                expected_code = _dependency_member_code(
+                    compiled, f"{value_qualname}.{member_name}", member_node
+                )
+            if expected_code is None and type(descriptor) is not property:
                 raise _error(
                     f"Gmsh executable dependency {label}.{member_name} source implementation is unavailable"
                 )
@@ -1953,6 +2018,12 @@ def _authenticate_dependency_function(
         if parent_namespace.get(label.rpartition(".")[2], _MISSING) is not function:
             raise _error(f"Gmsh executable dependency {label} was replaced")
         expected_qualname = label.rpartition(".")[2]
+        if function.__qualname__ != expected_qualname:
+            if not isinstance(module_name, str):
+                raise _error(f"Gmsh executable dependency {label} has an unexpected source owner")
+            expected_qualname = _source_factory_export_qualname(
+                function, module_name, expected_qualname, label
+            )
     elif _is_class_object(parent) and type(type(parent)) is type:
         class_namespace = _raw_class_namespace(parent)
         if class_namespace is None:
@@ -2009,6 +2080,71 @@ def _authenticate_dependency_function(
     if state is None:
         raise _error(f"Gmsh executable dependency {label} is not independently authenticated")
     return state
+
+
+def _source_factory_export_qualname(
+    function: FunctionType, module_name: str, export_name: str, label: str
+) -> str:
+    qualname = function.__qualname__
+    parts = qualname.split(".<locals>.")
+    if len(parts) != 2 or parts[1] != export_name or "." in parts[0]:
+        raise _error(f"Gmsh executable dependency {label} has an unexpected source owner")
+    factory_name = parts[0]
+    source_path = _dependency_source_path(function.__code__, label, module_name)
+    source = _read_file_bounded(source_path, _MAX_SOURCE_BYTES, label)
+    try:
+        tree = ast.parse(source.decode("utf-8"))
+    except (SyntaxError, UnicodeDecodeError, TypeError, ValueError) as exc:
+        raise _error(f"Gmsh executable dependency {label} source cannot be inspected") from exc
+    factories = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == factory_name
+    ]
+    if len(factories) != 1 or factories[0].decorator_list:
+        raise _error(f"Gmsh executable dependency {label} has no source factory")
+    factory = factories[0]
+    declarations = [
+        node
+        for node in factory.body
+        if isinstance(node, ast.FunctionDef) and node.name == export_name
+    ]
+    returns = [node for node in factory.body if isinstance(node, ast.Return)]
+    if len(declarations) != 1 or len(returns) != 1:
+        raise _error(f"Gmsh executable dependency {label} has no source factory return")
+    bindings: list[tuple[str, str]] = []
+    for node in tree.body:
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target = node.targets[0]
+        if (
+            not isinstance(node.value, ast.Call)
+            or not isinstance(node.value.func, ast.Name)
+            or node.value.func.id != factory_name
+            or node.value.args
+            or node.value.keywords
+        ):
+            continue
+        result = returns[0].value
+        if isinstance(target, ast.Name) and isinstance(result, ast.Name):
+            bindings.append((target.id, result.id))
+        elif isinstance(target, ast.Tuple) and isinstance(result, ast.Tuple):
+            if len(target.elts) != len(result.elts):
+                continue
+            bindings.extend(
+                (bound.id, returned.id)
+                for bound, returned in zip(target.elts, result.elts)
+                if isinstance(bound, ast.Name) and isinstance(returned, ast.Name)
+            )
+    if bindings.count((export_name, export_name)) != 1:
+        raise _error(f"Gmsh executable dependency {label} has no source factory binding")
+    compiled = _compile_source_bytes(source, source_path)
+    expected = _code_object(compiled, qualname, declarations[0].lineno)
+    if expected is not None and function.__code__.co_filename.startswith("<frozen "):
+        expected = expected.replace(co_filename=function.__code__.co_filename)
+    if expected is None or _code_digest(function.__code__) != _code_digest(expected):
+        raise _error(f"Gmsh executable dependency {label} source factory implementation changed")
+    return qualname
 
 
 def _capture_source_dependencies(
