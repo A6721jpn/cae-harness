@@ -812,11 +812,7 @@ def _signed_read_input(
         )
 
     tolerance_ratio = _signed_positive_ratio(tolerance_si, "tolerance_si")
-    denominators = [
-        denominator
-        for point in coordinate_ratios
-        for _, denominator in point
-    ]
+    denominators = [denominator for point in coordinate_ratios for _, denominator in point]
     if radius_ratio is not None:
         denominators.append(radius_ratio[1])
     if height_ratio is not None:
@@ -841,15 +837,10 @@ def _signed_read_input(
 
     radius = exact_ratio(radius_ratio) if radius_ratio is not None else None
     half_height = (
-        _q_mul(exact_ratio(height_ratio), _q_rational_half())
-        if height_ratio is not None
-        else None
+        _q_mul(exact_ratio(height_ratio), _q_rational_half()) if height_ratio is not None else None
     )
     half_dimensions = (
-        tuple(
-            _q_mul(exact_ratio(ratio), _q_rational_half())
-            for ratio in dimension_ratios
-        )
+        tuple(_q_mul(exact_ratio(ratio), _q_rational_half()) for ratio in dimension_ratios)
         if dimension_ratios is not None
         else None
     )
@@ -945,9 +936,7 @@ def _signed_abs(value: _Rational) -> _Rational:
     return value if value.numerator >= 0 else _q_neg(value)
 
 
-def _signed_abs_interval(
-    minimum: _Rational, maximum: _Rational
-) -> tuple[_Rational, _Rational]:
+def _signed_abs_interval(minimum: _Rational, maximum: _Rational) -> tuple[_Rational, _Rational]:
     if _q_less(maximum, _q_zero()):
         return _q_neg(maximum), _q_neg(minimum)
     if _q_less(_q_zero(), minimum):
@@ -955,9 +944,7 @@ def _signed_abs_interval(
     return _q_zero(), _q_max(_signed_abs(minimum), _signed_abs(maximum))
 
 
-def _signed_feature_sdf_bound(
-    values: tuple[_Rational, ...], *, upward: bool
-) -> _Rational:
+def _signed_feature_sdf_bound(values: tuple[_Rational, ...], *, upward: bool) -> _Rational:
     positives = tuple(_nonnegative(value) for value in values)
     squared = _q_zero()
     for value in positives:
@@ -1058,7 +1045,7 @@ def _signed_point_upper(
 
 
 def _signed_child_positions(
-    position: tuple[_Bernstein, _Bernstein, _Bernstein]
+    position: tuple[_Bernstein, _Bernstein, _Bernstein],
 ) -> tuple[tuple[_Bernstein, _Bernstein, _Bernstein], ...]:
     children = tuple(_subdivide(axis) for axis in position)
     return tuple(
@@ -1120,9 +1107,7 @@ def primitive_face_minimum_signed_distance_interval(
             break
         if work >= spec.work_limit:
             break
-        splittable = [
-            index for index, cell in enumerate(leaves) if cell.depth < _SIGNED_MAX_DEPTH
-        ]
+        splittable = [index for index, cell in enumerate(leaves) if cell.depth < _SIGNED_MAX_DEPTH]
         if not splittable:
             break
         selected = splittable[0]

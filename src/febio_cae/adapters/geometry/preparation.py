@@ -598,7 +598,7 @@ def _verify_preparation_output(result: object, runtime_binding: object) -> dict[
         raise ValueError("preparation response consumed backend differs from current backend")
     backend = result.get("backend")
     if not isinstance(backend, dict):
-        raise ValueError("preparation response backend is missing")
+        raise ValueError("preparation response backend is missing")  # noqa: TRY004 - validation contract
     verify_runtime_identity(runtime_binding, backend.get("runtime_identity"))
     return result
 

@@ -198,8 +198,10 @@ class CurrentPreparationRegistration(PlanarDemoRegistration):
             self.original_mesh_digest,
             self.original_recipe_digest,
         ):
-            if not isinstance(value, str) or len(value) != 64 or any(
-                c not in "0123456789abcdef" for c in value
+            if (
+                not isinstance(value, str)
+                or len(value) != 64
+                or any(c not in "0123456789abcdef" for c in value)
             ):
                 raise ValueError("preparation admission requires pinned SHA256 identities")
         if not isinstance(self.generation_profile, NumericalProfileRef) or (

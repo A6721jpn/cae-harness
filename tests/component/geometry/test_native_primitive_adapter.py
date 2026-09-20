@@ -830,9 +830,9 @@ def test_local_refinements_are_partitioned_by_owner_and_change_recipe(
         RefinementRecordingCurvedBackend(), source_content, _criteria(base, limit=RADIUS)
     ).mesh(base)
     backend = RefinementRecordingCurvedBackend()
-    refined = _adapter(
-        backend, source_content, _criteria(refined_revision, limit=RADIUS)
-    ).mesh(refined_revision)
+    refined = _adapter(backend, source_content, _criteria(refined_revision, limit=RADIUS)).mesh(
+        refined_revision
+    )
 
     assert len(backend.step_refinements) == 1
     assert backend.step_refinements[0].body_id == PART_BODY.value

@@ -88,8 +88,6 @@ def _admission_policy(
 ) -> Any:
     from dataclasses import replace
 
-    from .fixtures import make_revision
-
     from febio_cae.domain import (
         LocalRefinement,
         MeshPolicy,
@@ -97,6 +95,8 @@ def _admission_policy(
         Quantity,
         SourceLocalRefinementBall,
     )
+
+    from .fixtures import make_revision
 
     spec = make_revision().spec
     if not local:

@@ -116,9 +116,7 @@ def adopt(
             )
         if source.resolution is not None and (
             selection.resolution is None
-            or canonical_bytes(
-                source.resolution.to_dict(), unordered_paths=(("faces",),)
-            )
+            or canonical_bytes(source.resolution.to_dict(), unordered_paths=(("faces",),))
             != canonical_bytes(selection.resolution.to_dict(), unordered_paths=(("faces",),))
         ):
             raise ValueError("adoption changes an existing resolved selection snapshot")

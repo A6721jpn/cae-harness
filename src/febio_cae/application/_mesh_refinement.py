@@ -13,6 +13,8 @@ from febio_cae.adapters.febio.planar_quality import assess_planar_requirements
 from febio_cae.adapters.febio.reported_norms import assess_reported_norms, assess_reported_residual
 from febio_cae.adapters.geometry.adapter import _point_values, _transform_point
 from febio_cae.domain import (
+    TET10_CORNER_NODE_POSITIONS,
+    TET10_EDGE_NODE_POSITIONS,
     AssessmentStatus,
     CaseRevision,
     CriterionAssessment,
@@ -23,13 +25,11 @@ from febio_cae.domain import (
     MeshArtifact,
     MeshPolicy,
     NumericalProfileRef,
-    Quantity,
     QualityCriterion,
+    Quantity,
     ResultManifest,
     RigidTransform,
     SourceLocalRefinementBall,
-    TET10_CORNER_NODE_POSITIONS,
-    TET10_EDGE_NODE_POSITIONS,
 )
 from febio_cae.domain.canonical import canonical_bytes
 from febio_cae.domain.results import numeric_state_indices
@@ -43,7 +43,6 @@ from febio_cae.storage.preparation import PreparationStore
 from febio_cae.storage.registry import CaseStorage, StorageIntegrityError
 
 from ._comparison import _curve
-
 
 _MESH_METRICS = frozenset({"mesh_dependence", "source_local_mesh_dependence"})
 _MESH_THRESHOLD_NAMES = frozenset(
@@ -93,11 +92,11 @@ def _parse_mesh_dependence_declaration(
     """Parse either mesh metric through one shared declaration contract."""
 
     if isinstance(criteria, (str, bytes)):
-        raise ValueError("mesh study criteria are invalid")
+        raise ValueError("mesh study criteria are invalid")  # noqa: TRY004 - validation contract
     try:
         criterion_items = tuple(criteria)
-    except TypeError as error:
-        raise ValueError("mesh study criteria are invalid") from error
+    except TypeError:
+        raise ValueError("mesh study criteria are invalid")
     if any(not isinstance(item, QualityCriterion) for item in criterion_items):
         raise ValueError("mesh study criteria are invalid")
     matching = tuple(item for item in criterion_items if item.metric_id in _MESH_METRICS)
@@ -205,7 +204,7 @@ def _local_stage_size(policy: MeshPolicy, declaration: _MeshDependenceDeclaratio
         if not isinstance(item, LocalRefinement) or not isinstance(
             item.region, SourceLocalRefinementBall
         ):
-            raise ValueError("source-local refinement requires explicit balls for every entry")
+            raise ValueError("source-local refinement requires explicit balls for every entry")  # noqa: TRY004 - validation contract
         try:
             size = float(item.size.to_si().value)
         except (AttributeError, TypeError, ValueError, OverflowError) as error:
@@ -277,13 +276,13 @@ def _authenticated_prepared_revision(
 
     registration = storage.resolve_revision_mesh_quality(revision)
     if not isinstance(registration, CurrentPreparationRegistration):
-        raise ValueError("refinement requires a current preparation admission")
+        raise ValueError("refinement requires a current preparation admission")  # noqa: TRY004 - validation contract
     if registration.reference != revision.spec.mesh_policy.quality_profile:
         raise ValueError("revision mesh quality admission reference is not registered")
     registration.check_spec(revision.spec)
     generation = storage.resolve_mesh_quality(registration.generation_profile)
     if not isinstance(generation, MeshQualityRegistration):
-        raise ValueError("preparation admission does not preserve a generation profile")
+        raise ValueError("preparation admission does not preserve a generation profile")  # noqa: TRY004 - validation contract
     if revision.spec.rigid_tool.primitive.kind not in generation.primitive_kinds:
         raise ValueError("preparation generation profile does not cover the declared primitive")
     expected = PreparationStore(storage).mesh(registration, revision)
@@ -318,7 +317,7 @@ def _global_comparison_revision(
             common_generation_profile=common_generation_profile,
         )
     if not isinstance(registration, (MeshQualityRegistration, PlanarDemoRegistration)):
-        raise ValueError("global refinement requires a registered mesh-quality admission")
+        raise ValueError("global refinement requires a registered mesh-quality admission")  # noqa: TRY004 - validation contract
     if registration.reference != revision.spec.mesh_policy.quality_profile:
         raise ValueError("revision mesh quality admission reference is not registered")
     if isinstance(registration, PlanarDemoRegistration):
@@ -365,7 +364,7 @@ def validate_next_refinement(
     """Admit exactly one adjacent declared global or source-local refinement step."""
 
     if not isinstance(parent, MeshPolicy) or not isinstance(requested, MeshPolicy):
-        raise ValueError("refinement policies are invalid")
+        raise ValueError("refinement policies are invalid")  # noqa: TRY004 - validation contract
     declaration = _parse_mesh_dependence_declaration(criteria)
     if declaration.metric_id == "mesh_dependence":
         previous = _global_stage_size(parent, declaration)
@@ -541,7 +540,7 @@ def _local_ball_measurement(
 ) -> _LocalBallMeasurement:
     region = refinement.region
     if not isinstance(region, SourceLocalRefinementBall):
-        raise ValueError("source-local refinement evidence requires an explicit ball")
+        raise ValueError("source-local refinement evidence requires an explicit ball")  # noqa: TRY004 - validation contract
     body_id = refinement.selection.body_id.value
     transform = _local_transform(revision, body_id)
     if index.frame != transform.target_frame or region.center.frame != transform.source_frame:

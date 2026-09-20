@@ -319,7 +319,7 @@ def test_measured_backend_allows_verified_load_per_producer_operation(
 
 def test_measured_backend_keeps_planar_guard_for_imported_step_faces() -> None:
     module = _NativePrimitiveGmsh()
-    setattr(module.model, "getType", lambda dimension, tag: "BSpline surface")
+    module.model.getType = lambda dimension, tag: "BSpline surface"  # type: ignore[method-assign]
     backend = _MeasuredGmsh(1)
     with pytest.raises(ValueError, match="planar STEP faces"):
         backend._inspect_faces(module, "body-1", 1, 1.0)

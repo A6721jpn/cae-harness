@@ -13,7 +13,7 @@ import signal
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -302,7 +302,7 @@ def test_load_verified_gmsh_refuses_stale_cache_and_unverified_preload(
     monkeypatch.syspath_prepend(str(module.parent))
     preloaded = ModuleType("gmsh")
     preloaded.__file__ = str(module)
-    preloaded.__version__ = "4.15.2"
+    cast(Any, preloaded).__version__ = "4.15.2"
     sys.modules["gmsh"] = preloaded
     with pytest.raises((OSError, ValueError), match="preloaded"):
         runtime.load_verified_gmsh(expected)
@@ -520,7 +520,7 @@ def _synthetic_native_callable() -> Any:
     """Create a harmless CFuncPtr for the synthetic native-symbol tests."""
 
     native = ctypes.CFUNCTYPE(ctypes.c_int)(lambda: 0)
-    native.argtypes = None
+    cast(Any, native).argtypes = None
     return native
 
 
@@ -633,12 +633,12 @@ def test_verified_load_rejects_cast_errcheck_before_pointer_use(
         return result
 
     try:
-        ctypes._cast.errcheck = errcheck
+        cast(Any, ctypes)._cast.errcheck = errcheck
         with pytest.raises((OSError, ValueError)):
             runtime.load_verified_gmsh(expected)
         assert not marker.exists()
     finally:
-        del ctypes._cast.errcheck
+        del cast(Any, ctypes)._cast.errcheck
 
 
 def test_verified_load_rejects_cast_restype_callback_before_pointer_use(
@@ -654,14 +654,14 @@ def test_verified_load_rejects_cast_restype_callback_before_pointer_use(
         marker.write_text("called", encoding="ascii")
         return None
 
-    original = ctypes._cast.restype
+    original = cast(Any, ctypes)._cast.restype
     try:
-        ctypes._cast.restype = restype
+        cast(Any, ctypes)._cast.restype = restype
         with pytest.raises((OSError, ValueError)):
             runtime.load_verified_gmsh(expected)
         assert not marker.exists()
     finally:
-        ctypes._cast.restype = original
+        cast(Any, ctypes)._cast.restype = original
 
 
 @pytest.mark.parametrize("replacement_kind", ["instance", "class"])
@@ -767,14 +767,14 @@ def test_verified_load_rejects_dependency_dict_descriptor_without_execution(
 
     class DescriptorNamespace:
         @property
-        def __dict__(self) -> dict[str, object]:
+        def __dict__(self) -> dict[str, object]:  # type: ignore[override]  # adversarial descriptor
             marker.write_text("called", encoding="ascii")
             return {}
 
     numpy = ModuleType("numpy")
-    numpy.ctypeslib = DescriptorNamespace()
+    cast(Any, numpy).ctypeslib = DescriptorNamespace()
     monkeypatch.setitem(sys.modules, "numpy", numpy)
-    monkeypatch.setitem(sys.modules, "numpy.ctypeslib", numpy.ctypeslib)
+    monkeypatch.setitem(sys.modules, "numpy.ctypeslib", cast(Any, numpy).ctypeslib)
     expected, _library = _synthetic_cdll_setup(monkeypatch, tmp_path)
     module = expected["module"]
     assert isinstance(module, dict)
@@ -827,7 +827,7 @@ def test_verified_load_rejects_exact_module_dependency_substitution(
     )
     signal_globals = signal.signal.__globals__
     fake_signal = ModuleType("_signal")
-    fake_signal.signal = signal_globals["_signal"].getsignal
+    cast(Any, fake_signal).signal = signal_globals["_signal"].getsignal
     monkeypatch.setitem(signal_globals, "_signal", fake_signal)
     expected, _library = _synthetic_cdll_setup(monkeypatch, tmp_path)
     _rewrite_synthetic_source(expected, source)
@@ -892,7 +892,7 @@ def test_verified_load_rejects_cached_dependency_namespace_without_attribute_exe
     else:
 
         class MaliciousNamespace:
-            @property
+            @property  # type: ignore[misc]  # adversarial descriptor
             def __class__(self) -> Any:
                 marker.write_text("called", encoding="ascii")
                 return ModuleType
@@ -911,11 +911,11 @@ def test_ctypes_bootstrap_rejects_reassigned_cast_conversion_descriptor(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     _isolated(monkeypatch)
-    original_argtypes = ctypes._cast.argtypes
+    original_argtypes = cast(Any, ctypes)._cast.argtypes
     assert isinstance(original_argtypes, tuple)
     with monkeypatch.context() as context:
         context.setattr(ctypes.c_void_p, "from_param", lambda value: value)
-        context.setattr(ctypes._cast, "argtypes", tuple(original_argtypes))
+        context.setattr(cast(Any, ctypes)._cast, "argtypes", tuple(original_argtypes))
         with pytest.raises((OSError, ValueError), match="ctypes|conversion|descriptor|cast"):
             runtime._build_ctypes_trust()
     runtime._build_ctypes_trust()
@@ -1136,7 +1136,7 @@ def test_ctypes_bootstrap_rejects_preexisting_cast_restype_callback(
         return None
 
     with monkeypatch.context() as context:
-        context.setattr(ctypes._cast, "restype", poisoned)
+        context.setattr(cast(Any, ctypes)._cast, "restype", poisoned)
         with pytest.raises((OSError, ValueError), match="ctypes|cast|metadata|restype"):
             runtime._build_ctypes_trust()
     runtime._build_ctypes_trust()
@@ -1206,11 +1206,11 @@ def test_verified_load_rejects_tampered_import_attribute_before_gmsh_import(
     elif dependency == "platform":
         source = "import platform\nplatform.system()\n"
 
-        def poisoned() -> str:
+        def poisoned_platform() -> str:
             marker.write_text("called", encoding="ascii")
             return "Windows"
 
-        monkeypatch.setattr(platform, "system", poisoned)
+        monkeypatch.setattr(platform, "system", poisoned_platform)
     else:
         source = "import numpy\nnumpy.ctypeslib.as_array(())\n"
         numpy = ModuleType("numpy")
@@ -1221,8 +1221,8 @@ def test_verified_load_rejects_tampered_import_attribute_before_gmsh_import(
             marker.write_text("called", encoding="ascii")
             return ()
 
-        ctypeslib.as_array = poisoned
-        numpy.ctypeslib = ctypeslib
+        cast(Any, ctypeslib).as_array = poisoned
+        cast(Any, numpy).ctypeslib = ctypeslib
         monkeypatch.setitem(sys.modules, "numpy", numpy)
         monkeypatch.setitem(sys.modules, "numpy.ctypeslib", ctypeslib)
 

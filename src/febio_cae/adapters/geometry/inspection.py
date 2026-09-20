@@ -87,9 +87,7 @@ def _identity(value: Any, expected_runtime: object | None = None) -> dict[str, A
         not isinstance(value, dict)
         or set(value) != expected_fields
         or any(
-            not isinstance(value[field], str)
-            or not value[field]
-            or "\x00" in value[field]
+            not isinstance(value[field], str) or not value[field] or "\x00" in value[field]
             for field in fields
         )
     ):

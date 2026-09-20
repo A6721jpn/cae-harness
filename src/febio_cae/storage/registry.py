@@ -1200,7 +1200,8 @@ class CaseStorage:
     def register_mesh_quality(self, record: MeshQualityRecord) -> NumericalProfileRef:
         """Trusted case-local registration; never exposed as a public JSON import."""
         if not isinstance(
-            record, (MeshQualityRegistration, PlanarDemoRegistration, CurrentPreparationRegistration)
+            record,
+            (MeshQualityRegistration, PlanarDemoRegistration, CurrentPreparationRegistration),
         ):
             raise PortError(
                 PortErrorCategory.INVALID_INPUT, "explicit mesh quality record required"

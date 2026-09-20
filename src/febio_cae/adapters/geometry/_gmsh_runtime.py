@@ -25,6 +25,7 @@ import os
 import stat
 import sys
 import threading
+from collections.abc import Callable, Mapping
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
@@ -40,7 +41,7 @@ from types import (
     ModuleType,
     WrapperDescriptorType,
 )
-from typing import Any, BinaryIO, Protocol, cast
+from typing import Any, BinaryIO, Protocol, TypeGuard, cast
 
 _SCHEMA_VERSION = "gmsh-runtime-identity-v1"
 _GMSH_DISTRIBUTION = "gmsh"
@@ -265,7 +266,7 @@ def _coerce_module_handle(handle: object) -> ctypes.wintypes.HMODULE | None:
     c_void_p = _CTYPES_BINDINGS.get("c_void_p", _MISSING)
     if sizeof is _MISSING or c_void_p is _MISSING:
         raise _error("ctypes module-handle bindings are unavailable")
-    bits = sizeof(c_void_p) * 8
+    bits = cast(Callable[..., Any], sizeof)(c_void_p) * 8
     if handle >= 1 << bits:
         raise _error("native module handle is outside the process address width")
     return ctypes.wintypes.HMODULE(handle)
@@ -285,11 +286,11 @@ def _mapped_module_path(handle: object) -> Path:
         create_unicode_buffer = _CTYPES_BINDINGS.get("create_unicode_buffer", _MISSING)
         if windll is _MISSING or create_unicode_buffer is _MISSING:
             raise _error("ctypes Windows bindings are unavailable")
-        api = windll("kernel32", use_last_error=True)
+        api = cast(Callable[..., Any], windll)("kernel32", use_last_error=True)
         function = api.GetModuleFileNameW
         function.argtypes = [ctypes.wintypes.HMODULE, ctypes.wintypes.LPWSTR, ctypes.wintypes.DWORD]
         function.restype = ctypes.wintypes.DWORD
-        buffer = create_unicode_buffer(_MAX_WINDOWS_PATH)
+        buffer = cast(Callable[..., Any], create_unicode_buffer)(_MAX_WINDOWS_PATH)
         length = int(function(module_handle, buffer, _MAX_WINDOWS_PATH))
     except (AttributeError, OSError, TypeError, ValueError) as exc:
         raise _error("Windows module-handle lookup is unavailable") from exc
@@ -647,7 +648,7 @@ def _code_digest(code: CodeType) -> str:
         code.co_cellvars,
     )
     try:
-        content = marshal.dumps(payload)
+        content = marshal.dumps(cast(Any, payload))
     except (TypeError, ValueError) as exc:
         raise _error("Gmsh module code cannot be attested") from exc
     return hashlib.sha256(content).hexdigest()
@@ -656,7 +657,7 @@ def _code_digest(code: CodeType) -> str:
 _MISSING = object()
 
 
-def _is_class_object(value: object) -> bool:
+def _is_class_object(value: object) -> TypeGuard[type]:
     try:
         mro = type.__getattribute__(value, "__mro__")
     except (AttributeError, TypeError):
@@ -664,7 +665,7 @@ def _is_class_object(value: object) -> bool:
     return type(mro) is tuple
 
 
-def _raw_class_namespace(value: object) -> MappingProxyType | None:
+def _raw_class_namespace(value: object) -> MappingProxyType[str, Any] | None:
     if not _is_class_object(value):
         return None
     try:
@@ -810,31 +811,31 @@ def _value_signature(value: object, *, depth: int = 0, budget: int = _MAX_VALUE_
         return (value_type.__name__, value)
     if type(value) is complex:
         return (value_type.__name__, value)
-    if value_type is float:
+    if type(value) is float:
         return (value_type.__name__, repr(value))
-    if value_type is str:
+    if type(value) is str:
         if len(value) <= 256:
             return (value_type.__name__, value)
         return (value_type.__name__, len(value), hashlib.sha256(value.encode()).hexdigest())
-    if value_type is bytes:
+    if type(value) is bytes:
         if len(value) <= 256:
             return (value_type.__name__, value)
         return (value_type.__name__, len(value), hashlib.sha256(value).hexdigest())
     if depth >= _MAX_VALUE_DEPTH or budget <= 0:
         return ("object", value_type, id(value))
-    if value_type is tuple:
+    if type(value) is tuple:
         items = tuple(
             _value_signature(item, depth=depth + 1, budget=budget - index - 1)
             for index, item in enumerate(value[:budget])
         )
         return ("tuple", len(value), items)
-    if value_type is list:
+    if type(value) is list:
         items = tuple(
             _value_signature(item, depth=depth + 1, budget=budget - index - 1)
             for index, item in enumerate(value[:budget])
         )
         return ("list", len(value), items)
-    if value_type is dict:
+    if type(value) is dict:
         dict_items: list[object] = []
         for index, (key, item) in enumerate(value.items()):
             if index >= budget:
@@ -847,7 +848,7 @@ def _value_signature(value: object, *, depth: int = 0, budget: int = _MAX_VALUE_
             )
         items = tuple(dict_items)
         return ("dict", len(value), items)
-    if value_type is frozenset:
+    if type(value) is frozenset:
         set_items: list[object] = []
         for index, item in enumerate(value):
             if index >= budget:
@@ -927,8 +928,8 @@ def _function_state(
         function=function,
         code=selected_code,
         globals_dict=function.__globals__,
-        builtins_value=function.__builtins__,
-        builtins_signature=_value_signature(function.__builtins__),
+        builtins_value=cast(Any, function).__builtins__,
+        builtins_signature=_value_signature(cast(Any, function).__builtins__),
         defaults=function.__defaults__,
         defaults_signature=_value_signature(function.__defaults__),
         kwdefaults=function.__kwdefaults__,
@@ -977,8 +978,8 @@ def _validate_function_state(
     if function.__globals__ is not state.globals_dict:
         raise _error(f"live Gmsh executable function {label} globals changed")
     if (
-        function.__builtins__ is not state.builtins_value
-        or _value_signature(function.__builtins__) != state.builtins_signature
+        cast(Any, function).__builtins__ is not state.builtins_value
+        or _value_signature(cast(Any, function).__builtins__) != state.builtins_signature
     ):
         raise _error(f"live Gmsh executable function {label} builtins changed")
     if (
@@ -1164,7 +1165,7 @@ def _raw_dependency_attribute(value: object, name: str) -> object:
         except TypeError:
             return _MISSING
     if _is_class_object(value) or _CTYPES_TRUSTED_TYPES.get(id(value)) is value:
-        return _raw_type_descriptor(value, name)[1]
+        return _raw_type_descriptor(cast(type, value), name)[1]
     if type(value) in _SAFE_ATTRIBUTE_NAMESPACE_TYPES:
         return _raw_type_descriptor(type(value), name)[1]
     if _DEPENDENCY_TRUSTED_OBJECTS.get(id(value)) is value:
@@ -1454,6 +1455,7 @@ def _authenticate_dependency_type(
         return None
     member_name = label.rpartition(".")[2]
     expected_qualname: str
+    parent_namespace: Mapping[str, Any] | None
     if type(parent) is ModuleType:
         parent_namespace = vars(parent)
         parent_name = parent_namespace.get("__name__", _MISSING)
@@ -1570,7 +1572,7 @@ def _authenticate_dependency_type(
         elif isinstance(member_node, (ast.Assign, ast.AnnAssign)):
             value_node = member_node.value
             try:
-                literal = ast.literal_eval(value_node)
+                literal = ast.literal_eval(cast(ast.AST, value_node))
             except (ValueError, TypeError, MemoryError):
                 literal = _MISSING
             if (
@@ -1613,7 +1615,7 @@ def _authenticate_dependency_type(
                 )
         if (
             expected_base_name is not None
-            and base_signature[1].rpartition(".")[2] != expected_base_name
+            and cast(tuple[str, str], base_signature)[1].rpartition(".")[2] != expected_base_name
         ):
             raise _error(f"Gmsh executable dependency {label} base implementation changed")
     state = _DependencyTypeState(
@@ -1758,6 +1760,7 @@ def _authenticate_dependency_function(
     module_name: object
     source_name: object
     expected_qualname: str
+    parent_namespace: Mapping[str, Any] | None
     if type(parent) is ModuleType:
         parent_namespace = vars(parent)
         module_name = parent_namespace.get("__name__", _MISSING)
@@ -1997,14 +2000,14 @@ def _factory_descriptor_state(value_type: type, name: str) -> _DispatchDescripto
         raise _error(f"ctypes {name} descriptor is not statically authenticated")
     if owner is not value_type or type(descriptor) is not FunctionType:
         raise _error(f"ctypes {name} descriptor is not statically authenticated")
-    function_state = _function_dependency_state(
+    captured_function_state = _function_dependency_state(
         descriptor,
         dependency_depth=0,
         dependency_seen=frozenset(),
     )
-    if function_state is None:
+    if captured_function_state is None:
         raise _error(f"ctypes {name} descriptor is not statically authenticated")
-    return _DispatchDescriptorState(owner, descriptor, (function_state,))
+    return _DispatchDescriptorState(owner, descriptor, (captured_function_state,))
 
 
 @dataclass(slots=True)
@@ -2194,7 +2197,7 @@ def _builtin_binding_from_globals(globals_dict: dict[str, object], name: str) ->
 
 
 def _builtin_binding_from_function(function: FunctionType, name: str) -> object:
-    builtins_value = function.__builtins__
+    builtins_value = cast(Any, function).__builtins__
     if isinstance(builtins_value, dict):
         return builtins_value.get(name, _MISSING)
     if type(builtins_value) is ModuleType:
@@ -2347,7 +2350,7 @@ def _capture_function_globals(
 ) -> dict[str, _GlobalState]:
     context = dependency_context or _DependencyContext({})
     globals_dict = function.__globals__
-    builtins_value = function.__builtins__
+    builtins_value = cast(Any, function).__builtins__
     global_builtins = globals_dict.get("__builtins__", _MISSING)
     if global_builtins is not _MISSING and global_builtins is not builtins_value:
         raise _error("Gmsh executable function builtins mapping differs from its globals")
@@ -2730,7 +2733,7 @@ def _validate_ctypes_native_anchors() -> ModuleType:
         type(type(simple_data)) is not type
         or type(c_void_p) is not type(simple_data)
         or simple_data not in c_void_p_mro
-        or (_raw_class_namespace(c_void_p) or {}).get("_type_", _MISSING) != "P"
+        or (_raw_class_namespace(c_void_p) or dict[str, Any]()).get("_type_", _MISSING) != "P"
         or namespace.get("c_voidp", _MISSING) is not c_void_p
     ):
         raise _error("ctypes c_void_p native conversion anchor is not authentic")
@@ -2744,7 +2747,7 @@ def _validate_ctypes_native_anchors() -> ModuleType:
             raise _error("ctypes c_int native conversion anchor is not authentic")
     elif (
         not _is_class_object(c_int)
-        or (_raw_class_namespace(c_int) or {}).get("_type_", _MISSING) != "i"
+        or (_raw_class_namespace(c_int) or dict[str, Any]()).get("_type_", _MISSING) != "i"
     ):
         raise _error("ctypes c_int native conversion anchor is not authentic")
     wintypes = sys.modules.get("ctypes.wintypes", _MISSING)
@@ -2773,7 +2776,7 @@ def _validate_ctypes_native_anchors() -> ModuleType:
     if (
         type(py_object) is not type(simple_data)
         or simple_data not in py_object_mro
-        or (_raw_class_namespace(py_object) or {}).get("_type_", _MISSING) != "O"
+        or (_raw_class_namespace(py_object) or dict[str, Any]()).get("_type_", _MISSING) != "O"
     ):
         raise _error("ctypes py_object native conversion anchor is not authentic")
     return native
@@ -2829,15 +2832,15 @@ def _establish_ctypes_baseline() -> None:
             continue
         if type(value) is not type and type(type(value)) is not type:
             raise _error(f"ctypes {key} type is unavailable")
-        _CTYPES_EXPECTED_TYPE_STATES[id(value)] = _capture_ctypes_type_state(value, key)
+        _CTYPES_EXPECTED_TYPE_STATES[id(value)] = _capture_ctypes_type_state(cast(type, value), key)
     cdll = _CTYPES_EXPECTED_BINDINGS["ctypes.CDLL"]
-    known_types = [object, type, cdll]
+    known_types = [object, type, cast(type, cdll)]
     cfunc_ptr = _CTYPES_EXPECTED_BINDINGS.get("ctypes._CFuncPtr", _MISSING)
     if cfunc_ptr is not _MISSING:
-        known_types.append(cfunc_ptr)
+        known_types.append(cast(type, cfunc_ptr))
     win_dll = _CTYPES_EXPECTED_BINDINGS.get("ctypes.WinDLL", _MISSING)
     if win_dll is not _MISSING:
-        known_types.append(win_dll)
+        known_types.append(cast(type, win_dll))
     for known_type in known_types:
         if type(type(known_type)) is not type:
             raise _error("ctypes dispatch baseline uses an unsupported type")
@@ -2911,10 +2914,12 @@ def _ctypes_bootstrap_dispatch_expectations(
         if owner is not cdll or current is not descriptor:
             raise _error(f"ctypes CDLL {name} dispatch baseline changed")
         expectations[(cdll, name)] = (cdll, descriptor)
-    for name, expected in expectations.copy().items():
-        owner, descriptor = _raw_type_descriptor(name[0], name[1])
+    for dispatch_key, expected in expectations.copy().items():
+        owner, descriptor = _raw_type_descriptor(dispatch_key[0], dispatch_key[1])
         if owner is not expected[0] or descriptor is not expected[1]:
-            raise _error(f"ctypes {name[0].__name__} {name[1]} dispatch baseline changed")
+            raise _error(
+                f"ctypes {dispatch_key[0].__name__} {dispatch_key[1]} dispatch baseline changed"
+            )
 
     if win_dll is not _MISSING:
         if not _is_class_object(win_dll):
@@ -2994,16 +2999,14 @@ def _build_ctypes_trust() -> None:
         expected = _code_object(
             compiled,
             qualname,
-            getattr(function, "__code__", _MISSING).co_firstlineno
-            if type(function) is FunctionType
-            else -1,
+            function.__code__.co_firstlineno if type(function) is FunctionType else -1,
         )
         if type(function) is not FunctionType or expected is None:
             raise _error(f"ctypes {public_name} implementation is unavailable")
         definitions[public_name] = (function, expected)
     descriptor_specs: dict[str, tuple[object, FunctionType, CodeType]] = {}
     for method_name in ("__getattr__", "__getitem__", "__init__"):
-        owner, descriptor = _raw_type_descriptor(cdll, method_name)
+        owner, descriptor = _raw_type_descriptor(cast(type, cdll), method_name)
         if owner is not cdll or type(descriptor) is not FunctionType:
             raise _error(f"ctypes CDLL {method_name} implementation is unavailable")
         function = descriptor
@@ -3032,8 +3035,11 @@ def _build_ctypes_trust() -> None:
     _CTYPES_DISPATCH_EXPECTATIONS.update(dispatch_expectations)
     _CTYPES_INTERNAL_DISPATCH = internal_dispatch
     _CTYPES_INTERNAL_SIGNATURE = internal_signature
-    for state in (*_CTYPES_EXPECTED_TYPE_STATES.values(), *_CTYPES_DYNAMIC_TYPE_STATES.values()):
-        _CTYPES_TRUSTED_TYPES[id(state.value)] = state.value
+    for type_state in (
+        *_CTYPES_EXPECTED_TYPE_STATES.values(),
+        *_CTYPES_DYNAMIC_TYPE_STATES.values(),
+    ):
+        _CTYPES_TRUSTED_TYPES[id(type_state.value)] = type_state.value
     for name, (function, expected) in definitions.items():
         state = _function_state(
             function,
@@ -3120,6 +3126,7 @@ def _validate_ctypes_function(name: str) -> None:
     state = _CTYPES_TRUSTED_FUNCTIONS_BY_NAME.get(name)
     if state is None or _CTYPES_NAMESPACE is None:
         raise _error(f"ctypes {name} trust state is unavailable")
+    function: object
     if name.startswith("CDLL."):
         method_name = name.partition(".")[2]
         cdll = _CTYPES_NAMESPACE.get("CDLL", _MISSING)
@@ -3455,7 +3462,7 @@ def _native_export_address(library: object, name: str) -> int | None:
         windll = _CTYPES_BINDINGS.get("WinDLL", _MISSING)
         if windll is _MISSING:
             raise _error("ctypes Windows bindings are unavailable")
-        api = windll("kernel32", use_last_error=True)
+        api = cast(Callable[..., Any], windll)("kernel32", use_last_error=True)
         function = api.GetProcAddress
         function.argtypes = [ctypes.wintypes.HMODULE, ctypes.wintypes.LPCSTR]
         function.restype = ctypes.c_void_p
@@ -3978,8 +3985,11 @@ def _validate_loaded_module(
         raise _error("executing Gmsh module code identity changed")
     if (
         getattr(loaded_spec, "loader", None) is not loader
-        or loader._verified_code_digest != expected_code_digest
-        or (expected_code is not None and loader._verified_code is not expected_code)
+        or cast(_SourceOnlyLoader, loader)._verified_code_digest != expected_code_digest
+        or (
+            expected_code is not None
+            and cast(_SourceOnlyLoader, loader)._verified_code is not expected_code
+        )
     ):
         raise _error("executing Gmsh module code identity changed")
     if sys.modules.get("gmsh") is not module:

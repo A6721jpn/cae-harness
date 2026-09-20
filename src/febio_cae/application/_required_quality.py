@@ -238,9 +238,7 @@ def _execution_result_completeness(
     )
 
 
-def _unverified_mesh_refinement(
-    revision: CaseRevision, error: Exception
-) -> CriterionAssessment:
+def _unverified_mesh_refinement(revision: CaseRevision, error: Exception) -> CriterionAssessment:
     criterion_id = next(
         (
             item.criterion_id

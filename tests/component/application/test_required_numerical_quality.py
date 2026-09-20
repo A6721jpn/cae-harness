@@ -14,8 +14,8 @@ import test_comparison as comparison
 from test_comparison import _configure, _result
 from test_persistence_authority import _created, _populate_complete, _profile
 from test_planar_edit_validation import prepared
-from test_registered_execution import _build
 from test_planar_preparation import _isolate, _mesh_study_request, prepared_input
+from test_registered_execution import _build
 from test_reported_solver_norms import _input as _reported_input
 from test_reported_solver_norms import _log as _reported_log
 
@@ -25,17 +25,17 @@ from febio_cae.domain import (
     ExecutionSetting,
     FileEntry,
     NumericResultData,
+    OutputMapping,
     OutputObservation,
     PollResult,
     ProcessIdentity,
-    OutputMapping,
+    Quantity,
     ReadResult,
     ReadStatus,
     ResultDataRef,
     ResultManifest,
     RunState,
     SolverControl,
-    Quantity,
 )
 from febio_cae.domain.ports import PortError
 
@@ -495,10 +495,10 @@ def _source_local_mesh_backend(fixtures: Any) -> Any:
 
 
 def _mesh_study_payload(service: Any, request: dict[str, Any]) -> dict[str, Any]:
+    import copy
+
     from febio_cae.application._preparation_request import normalize_request
     from febio_cae.domain import PartialCaseSpec, QualityThreshold
-
-    import copy
 
     base = normalize_request(request).values.to_case_spec()
     configured = comparison._configure(service, base)
@@ -1119,7 +1119,7 @@ def _registered_mesh_study_summary(
     import copy
     import importlib
 
-    service, created, request, _, _ = prepared_input.__wrapped__(tmp_path, monkeypatch)
+    service, created, request, _, _ = cast(Any, prepared_input).__wrapped__(tmp_path, monkeypatch)
     fixtures = importlib.import_module("geometry.conftest")
     backend = _scaled_mesh_backend(fixtures)
     _isolate(monkeypatch, backend)
@@ -1165,7 +1165,7 @@ def _far_field_maximum(mesh: Any, body_id: str) -> float:
     import math
 
     coordinates = {node.node_id: node.coordinates_si for node in mesh.nodes}
-    lengths = []
+    lengths: list[float] = []
     for element in mesh.elements:
         if element.body_id != body_id:
             continue
@@ -1195,9 +1195,8 @@ def _registered_source_local_study_summary(
 
     from febio_cae.application import _mesh_refinement, _required_quality
     from febio_cae.application._mesh_refinement import _local_mesh_measurements
-    from febio_cae.storage.preparation import PreparationStore
 
-    service, created, request, _, _ = prepared_input.__wrapped__(tmp_path, monkeypatch)
+    service, created, request, _, _ = cast(Any, prepared_input).__wrapped__(tmp_path, monkeypatch)
     fixtures = importlib.import_module("geometry.conftest")
     backend = _source_local_mesh_backend(fixtures)
     _isolate(monkeypatch, backend)

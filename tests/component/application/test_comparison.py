@@ -61,9 +61,7 @@ FIXED = (
 )
 
 
-def _configure(
-    service: Any, spec: Any, *, source_digest: str | None = None
-) -> Any:
+def _configure(service: Any, spec: Any, *, source_digest: str | None = None) -> Any:
     def bind_profile_evidence(profile: Any) -> Any:
         if source_digest is None:
             return profile
@@ -71,8 +69,7 @@ def _configure(
             replace(
                 capability,
                 evidence=tuple(
-                    replace(item, content_digest=source_digest)
-                    for item in capability.evidence
+                    replace(item, content_digest=source_digest) for item in capability.evidence
                 ),
             )
             for capability in profile.capabilities
@@ -478,7 +475,8 @@ def test_comparison_refuses_incompatible_or_ineligible_results(tmp_path: Path, d
 
 
 def test_current_prepared_box_is_an_explicit_comparison_origin(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     from test_planar_preparation import _build_prepared_input, _isolate, _response_text
 
@@ -521,9 +519,7 @@ def test_current_prepared_box_is_an_explicit_comparison_origin(
     bind_evidence(request["values"])
 
     prepared = service.prepare_planar(created.case_id, request, expected_generation=0)
-    parent = service.get_revision(
-        created.case_id, _response_text(prepared, "revision_id")
-    )
+    parent = service.get_revision(created.case_id, _response_text(prepared, "revision_id"))
     registration = storage.resolve_revision_mesh_quality(parent)
     assert isinstance(registration, PlanarPreparationRegistration)
     origin_store = PreparationStore(storage)
@@ -531,9 +527,10 @@ def test_current_prepared_box_is_an_explicit_comparison_origin(
     stored_output = origin_store.origin_output(registration, parent)
     assert origin == parent
     assert stored_output["adoption"]["operation"] == "explicit-planar-metadata-adoption"
-    assert service._planar_execution_mesh(storage, registration, parent).to_dict() == stored_output[
-        "mesh"
-    ]
+    assert (
+        service._planar_execution_mesh(storage, registration, parent).to_dict()
+        == stored_output["mesh"]
+    )
 
     baseline = _result(service, storage, parent, "baseline", (0, 0.5, 1), 1)
     material = replace(parent.spec.material, youngs_modulus=Quantity(2e6, "Pa"))

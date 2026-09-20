@@ -23,9 +23,7 @@ class PreparedInput(NamedTuple):
     step: bytes
 
 
-def _build_prepared_input(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> PreparedInput:
+def _build_prepared_input(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> PreparedInput:
     from test_persistence_authority import _profile
 
     from febio_cae.domain import EvidenceRef, Quantity
@@ -181,8 +179,7 @@ def test_malformed_prepared_geometry_is_a_structured_integrity_diagnostic(
     monkeypatch.setattr(PreparationStore, "origin_output", malformed_output)
     result = service.validate_case(created.case_id)
     assert any(
-        diagnostic.code is ServiceErrorCategory.INTEGRITY
-        and diagnostic.field == "geometry"
+        diagnostic.code is ServiceErrorCategory.INTEGRITY and diagnostic.field == "geometry"
         for diagnostic in result.diagnostics
     )
 
@@ -399,9 +396,7 @@ def test_prepared_material_child(
     if route == "natural":
         payload["values"]["budget"].update(max_llm_calls=2, max_llm_tokens=2200)
     prepared = service.prepare_planar(created.case_id, payload, expected_generation=0)
-    parent = service.get_revision(
-        created.case_id, _response_text(prepared, "revision_id")
-    )
+    parent = service.get_revision(created.case_id, _response_text(prepared, "revision_id"))
     storage = service._storage(created.case_id)
     originals = {p: p.read_bytes() for p in (storage.root / "preparation").rglob("*.json")}
     root_bytes = parent.to_bytes()
@@ -586,9 +581,7 @@ def test_explicit_refinement_preserves_parent_mesh_and_publishes_new_origins(
     payload = _mesh_study_request(request)
     prepared = service.prepare_planar(created.case_id, payload, expected_generation=0)
     storage = service._storage(created.case_id)
-    parent = service.get_revision(
-        created.case_id, _response_text(prepared, "revision_id")
-    )
+    parent = service.get_revision(created.case_id, _response_text(prepared, "revision_id"))
     parent_registration = storage.resolve_revision_mesh_quality(parent)
     assert isinstance(parent_registration, CurrentPreparationRegistration)
     parent_mesh = service._planar_execution_mesh(storage, parent_registration, parent)
@@ -607,9 +600,7 @@ def test_explicit_refinement_preserves_parent_mesh_and_publishes_new_origins(
             expected_generation=_response_int(prepared, "generation"),
             parent_revision_id=parent.revision_id,
         )
-        child = service.get_revision(
-            created.case_id, _response_text(prepared, "revision_id")
-        )
+        child = service.get_revision(created.case_id, _response_text(prepared, "revision_id"))
         assert child.parent_revision_id == parent.revision_id
         assert child.parent_spec_digest == parent.spec_digest
         child_registration = storage.resolve_revision_mesh_quality(child)
@@ -640,9 +631,7 @@ def test_prepared_case_reservations_are_finite_and_not_reset_by_reopening(
         created.case_id, _mesh_study_request(request), expected_generation=0
     )
     storage = service._storage(created.case_id)
-    revision = service.get_revision(
-        created.case_id, _response_text(prepared, "revision_id")
-    )
+    revision = service.get_revision(created.case_id, _response_text(prepared, "revision_id"))
     for number in range(4):
         assert reserve_prepared_solver_attempt(
             CaseStorage(storage.root), revision, f"solver-{number}"
@@ -699,9 +688,7 @@ def test_failed_refinement_cannot_restart_as_changed_initial_preparation(
     payload["values"]["budget"]["max_attempts"] = 2
     prepared = service.prepare_planar(created.case_id, payload, expected_generation=0)
     storage = service._storage(created.case_id)
-    parent = storage.get_revision(
-        created.case_id, _response_text(prepared, "revision_id")
-    )
+    parent = storage.get_revision(created.case_id, _response_text(prepared, "revision_id"))
     payload["values"]["mesh_policy"]["global_size"] = {"value": 1.0, "unit": "mm"}
 
     def fail_publication(*args: Any, **kwargs: Any) -> None:
@@ -733,7 +720,8 @@ def test_failed_refinement_cannot_restart_as_changed_initial_preparation(
 
 
 def test_native_preparation_replays_nonidentity_placement_without_regeneration(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     import copy
     from dataclasses import replace
@@ -818,12 +806,8 @@ def test_native_preparation_replays_nonidentity_placement_without_regeneration(
     native_inspections: list[BackendInspection] = []
     native_meshes: list[BackendMesh] = []
 
-    def inspect_native(
-        self: Any, current: Any, *, geometry_digest: str
-    ) -> BackendInspection:
-        native_backend = importlib.import_module(
-            "febio_cae.adapters.geometry.native_backend"
-        )
+    def inspect_native(self: Any, current: Any, *, geometry_digest: str) -> BackendInspection:
+        native_backend = importlib.import_module("febio_cae.adapters.geometry.native_backend")
         face = BackendFace(
             "tool-body:face-1",
             current.body_id.value,
@@ -920,9 +904,7 @@ def test_native_preparation_replays_nonidentity_placement_without_regeneration(
     assert resolved is not None
     centroid = resolved.faces[0].centroid
     centroid_values = tuple(value.to_si().value for value in (centroid.x, centroid.y, centroid.z))
-    assert centroid_values == pytest.approx(
-        (0.008, 0.021, 0.033)
-    )
+    assert centroid_values == pytest.approx((0.008, 0.021, 0.033))
 
     replay_output = json.loads(
         importlib.import_module("febio_cae.domain.canonical").canonical_bytes(output)
@@ -984,9 +966,7 @@ def test_native_preparation_replays_nonidentity_placement_without_regeneration(
         )
     assert (len(native_inspections), len(native_meshes)) == before
 
-    def inspect_stale(
-        self: Any, current: Any, *, geometry_digest: str
-    ) -> BackendInspection:
+    def inspect_stale(self: Any, current: Any, *, geometry_digest: str) -> BackendInspection:
         return replace(
             inspect_native(self, current, geometry_digest=geometry_digest),
             source_digest="0" * 64,
@@ -1074,10 +1054,13 @@ def test_box_preparation_preserves_core_record_and_producer_contract(
         expected_primitive=carrier.spec.rigid_tool.primitive,
         expected_tool_geometry_digest=carrier.spec.rigid_tool.contact_surface.geometry_digest,
     )
-    assert replay.inspect(
-        GeometryInspectionRequest(source.source_asset, (carrier.spec.geometry.body_id.value,)),
-        source,
-    ).source_asset.content_digest == source.source_asset.content_digest
+    assert (
+        replay.inspect(
+            GeometryInspectionRequest(source.source_asset, (carrier.spec.geometry.body_id.value,)),
+            source,
+        ).source_asset.content_digest
+        == source.source_asset.content_digest
+    )
     registration = PlanarPreparationRegistration(
         "box-current",
         source.source_asset.content_digest,
@@ -1098,9 +1081,7 @@ def test_box_preparation_preserves_core_record_and_producer_contract(
             mesh_policy=replace(carrier.spec.mesh_policy, quality_profile=registration.reference),
         ),
     )
-    _, receipt = RegisteredCaseService._adopt_planar_mesh(
-        registration, original, carrier, revision
-    )
+    _, receipt = RegisteredCaseService._adopt_planar_mesh(registration, original, carrier, revision)
     assert receipt["operation"] == "explicit-planar-metadata-adoption"
 
     selection = revision.spec.rigid_tool.contact_surface
