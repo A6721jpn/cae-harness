@@ -84,10 +84,31 @@ def _quality_status(
         return "FAIL"
     produced = {item.criterion_id for item in criteria if item.metric_id in _PRODUCED_METRICS}
     remaining = tuple(row for row in arithmetic if row.criterion_id not in produced)
+    refinement_id = next(
+        (
+            item.criterion_id
+            for item in criteria
+            if item.metric_id in {"mesh_dependence", "source_local_mesh_dependence"}
+        ),
+        "mesh_dependence",
+    )
+    expected_ids = {
+        "execution_result_completeness",
+        *(
+            identifier
+            for identifier, _, _ in _UNVERIFIED_NUMERICAL
+            if identifier != "mesh_dependence"
+        ),
+        refinement_id,
+    }
     if (
         reported_status == "PASS"
-        and required
-        and all(row.status is AssessmentStatus.PASS for row in required)
+        and expected_ids <= {row.criterion_id for row in required}
+        and all(
+            row.status is AssessmentStatus.PASS
+            or (row.criterion_id == "mesh_dependence" and row.status is AssessmentStatus.UNVERIFIED)
+            for row in required
+        )
         and all(
             row.status in {AssessmentStatus.PASS, AssessmentStatus.NOT_APPLICABLE}
             for row in remaining

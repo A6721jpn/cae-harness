@@ -20,7 +20,7 @@ def test_required_producer_replaces_only_its_arithmetic_stub_and_failure_wins() 
             "unsupported by arithmetic adapter",
         ),
     )
-    required = (
+    required = _passing_required() + (
         CriterionAssessment(
             "contact_quality", "numeric", AssessmentStatus.PASS, (), "producer evidence"
         ),
@@ -44,7 +44,7 @@ def test_required_looking_criterion_label_cannot_hide_an_unknown_method() -> Non
             "contact_quality", "numeric", AssessmentStatus.UNVERIFIED, (), "unimplemented"
         ),
     )
-    required = (
+    required = _passing_required() + (
         CriterionAssessment(
             "contact_quality", "numeric", AssessmentStatus.PASS, (), "producer evidence"
         ),
@@ -68,7 +68,7 @@ def test_source_local_metric_routes_its_declared_criterion_to_the_mesh_producer(
             "public arithmetic adapter does not own source-local studies",
         ),
     )
-    required = (
+    required = _passing_required() + (
         CriterionAssessment(
             criterion.criterion_id,
             "numeric",
@@ -78,3 +78,41 @@ def test_source_local_metric_routes_its_declared_criterion_to_the_mesh_producer(
         ),
     )
     assert _quality_status((criterion,), arithmetic, required, "PASS") == "PASS"
+
+
+def _passing_required() -> tuple[CriterionAssessment, ...]:
+    return tuple(
+        CriterionAssessment(name, "numeric", AssessmentStatus.PASS, (), "producer evidence")
+        for name in (
+            "execution_result_completeness",
+            "contact_quality",
+            "motion_support_contact_fidelity",
+            "quasistatic_equilibrium",
+            "solver_residual",
+            "mesh_dependence",
+        )
+    )
+
+
+def test_only_unverified_mesh_is_optional_with_all_five_required_passes() -> None:
+    from febio_cae.application._required_quality import _quality_status
+
+    rows = _passing_required()
+    optional = (*rows[:-1], replace(rows[-1], status=AssessmentStatus.UNVERIFIED))
+    assert _quality_status((), (), optional, "PASS") == "PASS"
+    assert (
+        _quality_status(
+            (), (), (*rows[:-1], replace(rows[-1], status=AssessmentStatus.FAIL)), "PASS"
+        )
+        == "FAIL"
+    )
+    for index in range(len(rows)):
+        assert (
+            _quality_status((), (), optional[:index] + optional[index + 1 :], "PASS")
+            == "UNVERIFIED"
+        )
+    for index in range(5):
+        changed = list(optional)
+        changed[index] = replace(changed[index], status=AssessmentStatus.UNVERIFIED)
+        assert _quality_status((), (), changed, "PASS") == "UNVERIFIED"
+    assert _quality_status((), (), (), "PASS") == "UNVERIFIED"
