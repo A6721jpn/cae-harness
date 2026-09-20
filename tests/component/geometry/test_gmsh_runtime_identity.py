@@ -808,8 +808,10 @@ def test_windows_builtin_alias_rejects_substitution_and_spoofed_owner(
     with monkeypatch.context() as scoped:
         scoped.setattr(os.path, "isfile", replacement)
         assert not runtime._supported_dependency_builtin(replacement, os.path, "isfile")
+    with monkeypatch.context() as scoped:
         scoped.setattr(owner, "_path_isfile", replacement)
-        assert not runtime._supported_dependency_builtin(replacement, os.path, "isfile")
+        assert os.path.isfile is original
+        assert not runtime._supported_dependency_builtin(original, os.path, "isfile")
     fake_owner = ModuleType("nt")
     vars(fake_owner)["_path_isfile"] = original
     monkeypatch.setitem(sys.modules, "nt", fake_owner)
@@ -2321,3 +2323,73 @@ def test_cached_session_resolves_current_import_precedence_independently(
     monkeypatch.syspath_prepend(str(earlier.parent))
     with pytest.raises((OSError, ValueError), match="different module|import"):
         runtime.load_verified_gmsh(expected)
+
+
+def test_nested_optional_import_source_flow(monkeypatch: pytest.MonkeyPatch) -> None:
+    source = b"""try_optional = True
+use_optional = False
+if try_optional:
+    try:
+        import _cae_missing_optional_probe as optional
+        try:
+            from weakref import finalize as finalizer
+        except:
+            from _cae_missing_fallback_probe import finalize as finalizer
+        use_optional = True
+    except:
+        pass
+def probe():
+    return optional, finalizer, use_optional
+"""
+    code = compile(source, "probe.py", "exec")
+    states = runtime._capture_source_dependencies(source, code)
+    module = ModuleType("probe")
+    vars(module).update(try_optional=True, use_optional=False)
+    runtime._validate_source_dependencies(module, states)
+    for name, value in (
+        ("use_optional", True),
+        ("try_optional", False),
+        ("optional", object()),
+        ("finalizer", object()),
+    ):
+        with monkeypatch.context() as scoped:
+            scoped.setattr(module, name, value, raising=False)
+            with pytest.raises((OSError, ValueError), match="dependency|flow"):
+                runtime._validate_source_dependencies(module, states)
+    with monkeypatch.context() as scoped:
+        scoped.setitem(
+            sys.modules, "_cae_missing_optional_probe", ModuleType("_cae_missing_optional_probe")
+        )
+        with pytest.raises((OSError, ValueError), match="dependency|module"):
+            runtime._capture_source_dependencies(source, code)
+        with pytest.raises((OSError, ValueError), match="dependency|module"):
+            runtime._validate_source_dependencies(module, states)
+    required = (
+        b"import _cae_missing_optional_probe\ndef probe(): return _cae_missing_optional_probe"
+    )
+    with pytest.raises((OSError, ValueError), match="dependency|import"):
+        runtime._capture_source_dependencies(required, compile(required, "probe.py", "exec"))
+    present = source.replace(b"_cae_missing_optional_probe", b"math")
+    import ast
+    from weakref import finalize
+
+    bindings, expected, absent_imports = runtime._source_import_flow(ast.parse(present))
+    assert not absent_imports
+    assert bindings["finalizer"].module_name == "weakref"
+    assert expected["finalizer"] is finalize
+    assert expected["use_optional"] is True
+
+    partial = b"""try:
+    import math as retained
+    import _cae_missing_optional_probe as absent
+except ImportError:
+    pass
+"""
+    bindings, expected, absent_imports = runtime._source_import_flow(ast.parse(partial))
+    assert bindings["retained"].module_name == "math"
+    assert expected["absent"] is runtime._MISSING
+    assert absent_imports == ("_cae_missing_optional_probe",)
+    with pytest.raises((OSError, ValueError), match="unsupported condition"):
+        runtime._source_import_flow(
+            ast.parse(source.replace(b"if try_optional:", b"if unknown():"))
+        )

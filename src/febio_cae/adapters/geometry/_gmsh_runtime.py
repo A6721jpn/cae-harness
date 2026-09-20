@@ -1105,6 +1105,7 @@ class _ExecutableAttributeState:
     values: tuple[object, ...]
     function_state: _FunctionState | None = None
     type_state: _DependencyTypeState | None = None
+    absent_imports: tuple[str, ...] = ()
 
 
 @dataclass(slots=True)
@@ -1156,6 +1157,171 @@ def _source_import_bindings(
                     path,
                 )
     return result
+
+
+class _SourceImportAbsent(Exception):
+    """Only nonexecuting resolution may select an import-error handler."""
+
+
+def _source_import_absent(name: str) -> bool:
+    if name in sys.modules:
+        _validate_dependency_module(sys.modules[name], name)
+        return False
+    if name in sys.builtin_module_names or name.partition(".")[0] in sys.stdlib_module_names:
+        _preflight_dependency_import(name, name)
+        return False
+    search = list(sys.path)
+    parts = name.split(".")
+    for index in range(len(parts)):
+        qualified = ".".join(parts[: index + 1])
+        if qualified in sys.modules:
+            _validate_dependency_module(sys.modules[qualified], qualified)
+        try:
+            spec = importlib.machinery.PathFinder.find_spec(qualified, search)
+        except (ImportError, OSError, RuntimeError, TypeError, ValueError) as exc:
+            raise _error(f"Gmsh dependency {name} resolution failed") from exc
+        if spec is None:
+            if qualified in sys.modules:
+                raise _error(f"Gmsh dependency {qualified} has an injected module")
+            return True
+        if index < len(parts) - 1:
+            locations = spec.submodule_search_locations
+            if locations is None:
+                raise _error(f"Gmsh dependency {qualified} is not a package")
+            search = list(locations)
+    return False
+
+
+def _source_import_flow(
+    tree: ast.Module,
+) -> tuple[dict[str, _SourceImportBinding], dict[str, object], tuple[str, ...]]:
+    """Select only bounded module-level import regions; never execute vendor code."""
+    definitions = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+
+    def region_nodes(node: ast.AST) -> list[ast.AST]:
+        pending = [node]
+        result: list[ast.AST] = []
+        while pending:
+            current = pending.pop()
+            if isinstance(current, definitions):
+                continue
+            result.append(current)
+            if len(result) > _MAX_LIVE_MEMBERS:
+                raise _error("Gmsh import flow exceeds the finite verification limit")
+            pending.extend(ast.iter_child_nodes(current))
+        return result
+
+    nodes = region_nodes(tree)
+    import_names: set[str] = set()
+    flags: set[str] = set()
+    for node in nodes:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            import_names.update(
+                alias.asname
+                or (alias.name.partition(".")[0] if isinstance(node, ast.Import) else alias.name)
+                for alias in node.names
+                if alias.name != "*"
+            )
+        if (
+            isinstance(node, ast.Assign)
+            and isinstance(node.value, ast.Constant)
+            and type(node.value.value) is bool
+        ):
+            flags.update(target.id for target in node.targets if isinstance(target, ast.Name))
+    tracked = import_names | flags
+    bindings: dict[str, _SourceImportBinding] = {}
+    expected: dict[str, object] = dict.fromkeys(tracked, _MISSING)
+    absent_imports: set[str] = set()
+
+    def relevant(node: ast.AST) -> bool:
+        return any(
+            isinstance(child, (ast.Import, ast.ImportFrom))
+            or isinstance(child, ast.Name)
+            and isinstance(child.ctx, (ast.Store, ast.Del))
+            and child.id in tracked
+            for child in region_nodes(node)
+        )
+
+    def visit(statements: list[ast.stmt], *, strict: bool = False) -> None:
+        for node in statements:
+            if isinstance(node, ast.Pass):
+                continue
+            if not relevant(node):
+                if strict:
+                    raise _error("Gmsh import flow contains an unsupported statement")
+                continue
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                if isinstance(node, ast.ImportFrom) and (node.level or not node.module):
+                    raise _error("Gmsh import flow contains a relative import")
+                for alias in node.names:
+                    module_name = (
+                        alias.name if isinstance(node, ast.Import) else cast(str, node.module)
+                    )
+                    if _source_import_absent(module_name):
+                        absent_imports.add(module_name)
+                        raise _SourceImportAbsent(module_name)
+                    if alias.name == "*":
+                        _safe_import_dependency_module(module_name, module_name)
+                        continue
+                    root = alias.asname or (
+                        alias.name.partition(".")[0] if isinstance(node, ast.Import) else alias.name
+                    )
+                    binding = _SourceImportBinding(
+                        module_name
+                        if isinstance(node, ast.ImportFrom) or alias.asname
+                        else alias.name.partition(".")[0],
+                        module_name,
+                        () if isinstance(node, ast.Import) else tuple(alias.name.split(".")),
+                    )
+                    value, _owner = _load_source_import_binding(binding, root)
+                    bindings[root] = binding
+                    expected[root] = value
+            elif (
+                isinstance(node, ast.Assign)
+                and isinstance(node.value, ast.Constant)
+                and type(node.value.value) is bool
+                and all(isinstance(target, ast.Name) for target in node.targets)
+            ):
+                for target in node.targets:
+                    name = cast(ast.Name, target).id
+                    bindings.pop(name, None)
+                    expected[name] = node.value.value
+            elif isinstance(node, ast.If):
+                condition = node.test
+                value = (
+                    expected.get(condition.id, _MISSING)
+                    if isinstance(condition, ast.Name)
+                    else condition.value
+                    if isinstance(condition, ast.Constant)
+                    else _MISSING
+                )
+                if type(value) is not bool:
+                    raise _error("Gmsh import flow has an unsupported condition")
+                visit(node.body if value else node.orelse, strict=True)
+            elif isinstance(node, ast.Try):
+                if node.orelse or node.finalbody or len(node.handlers) != 1:
+                    raise _error("Gmsh import flow has unsupported exception control")
+                handler = node.handlers[0]
+                if handler.name or not (
+                    handler.type is None
+                    or isinstance(handler.type, ast.Name)
+                    and handler.type.id in {"ImportError", "ModuleNotFoundError"}
+                ):
+                    raise _error("Gmsh import flow has an unsupported exception handler")
+                try:
+                    visit(node.body, strict=True)
+                except _SourceImportAbsent:
+                    visit(handler.body, strict=True)
+            else:
+                raise _error("Gmsh import flow contains an unsupported binding statement")
+
+    try:
+        visit(tree.body)
+    except _SourceImportAbsent as exc:
+        raise _error(f"Gmsh required dependency import {exc} is absent") from exc
+    if absent_imports and not expected:
+        raise _error("Gmsh optional wildcard import flow is unsupported")
+    return bindings, expected, tuple(sorted(absent_imports))
 
 
 def _raw_dependency_attribute(value: object, name: str) -> object:
@@ -1853,7 +2019,7 @@ def _capture_source_dependencies(
     except (SyntaxError, UnicodeDecodeError, TypeError, ValueError) as exc:
         raise _error("Gmsh executable dependencies cannot be inspected") from exc
     used_names = _code_global_names(code)
-    bindings = _source_import_bindings(tree, used_names)
+    bindings, expected, absent_imports = _source_import_flow(tree)
     chains: set[tuple[str, tuple[str, ...]]] = set()
     for node in ast.walk(tree):
         chain = _attribute_chain(node)
@@ -1865,7 +2031,11 @@ def _capture_source_dependencies(
     if len(chains) > _MAX_LIVE_MEMBERS:
         raise _error("Gmsh executable dependencies exceed the finite verification limit")
 
-    result: list[_ExecutableAttributeState] = []
+    result: list[_ExecutableAttributeState] = [
+        _ExecutableAttributeState(name, (), (value,)) for name, value in sorted(expected.items())
+    ]
+    if result:
+        result[0].absent_imports = absent_imports
     dependency_context = _DependencyContext({})
     for root_name, path in sorted(chains):
         root, module = _load_source_import_binding(bindings[root_name], root_name)
@@ -1881,7 +2051,12 @@ def _capture_source_dependencies(
         if not callable(current):
             continue
         parent = values[-2] if len(values) > 1 else module
-        dependency_label = root_name if not path else f"{root_name}.{'.'.join(path)}"
+        binding_path = bindings[root_name].path
+        dependency_label = (
+            (binding_path[-1] if binding_path else root_name)
+            if not path
+            else f"{root_name}.{'.'.join(path)}"
+        )
         dependency_state = _dependency_callable_state(
             current,
             parent,
@@ -1902,8 +2077,11 @@ def _validate_source_dependencies(
 ) -> None:
     namespace = vars(module)
     for state in states:
+        for name in state.absent_imports:
+            if not _source_import_absent(name):
+                raise _error(f"Gmsh dependency import {name} is no longer absent")
         current = namespace.get(state.root_name, _MISSING)
-        if current is _MISSING or current is not state.values[0]:
+        if current is not state.values[0]:
             raise _error(f"live Gmsh executable dependency {state.root_name} was replaced")
         for index, name in enumerate(state.path, start=1):
             current = _raw_dependency_attribute(current, name)
