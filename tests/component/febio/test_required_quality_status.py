@@ -82,6 +82,31 @@ def test_source_local_metric_routes_its_declared_criterion_to_the_mesh_producer(
     assert _quality_status((criterion,), arithmetic, required, "PASS") == "PASS"
 
 
+def test_source_local_unverified_cannot_use_reserved_mesh_producer_id() -> None:
+    from febio_cae.application._required_quality import _quality_status
+
+    criterion = replace(
+        make_revision().spec.quality_policy.criteria[0],
+        criterion_id="mesh_dependence",
+        metric_id="source_local_mesh_dependence",
+        evidence=evidence("quality_policy.criteria.mesh_dependence", "source-local"),
+    )
+    arithmetic = (
+        CriterionAssessment(
+            "mesh_dependence",
+            "numeric",
+            AssessmentStatus.UNVERIFIED,
+            (),
+            "source-local refinement is unavailable",
+        ),
+    )
+    required = (
+        *_passing_required()[:-1],
+        replace(_passing_required()[-1], status=AssessmentStatus.UNVERIFIED),
+    )
+    assert _quality_status((criterion,), arithmetic, required, "PASS") == "UNVERIFIED"
+
+
 def _passing_required() -> tuple[CriterionAssessment, ...]:
     return tuple(
         CriterionAssessment(name, "numeric", AssessmentStatus.PASS, (), "producer evidence")
