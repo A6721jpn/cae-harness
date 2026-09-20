@@ -12,6 +12,13 @@ from febio_cae.cli.main import main
 from febio_cae.domain.ports import PortError, PortErrorCategory
 
 
+def test_removed_run_demo_alias_is_rejected(capsys: Any) -> None:
+    with pytest.raises(SystemExit) as error:
+        main(["case", "run-demo"])
+    assert error.value.code == 2
+    assert "invalid choice: 'run-demo'" in capsys.readouterr().err
+
+
 @pytest.mark.parametrize("fail", [False, True])
 def test_demo_cli_routes_registered_ids_and_reports_cleanup(
     tmp_path: Any, monkeypatch: Any, capsys: Any, fail: bool

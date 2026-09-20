@@ -106,9 +106,7 @@ def _build_parser() -> argparse.ArgumentParser:
     freeze = case_commands.add_parser("freeze", help="create an immutable validated revision")
     freeze.add_argument("case_id")
     freeze.add_argument("--json", action="store_true")
-    demo = case_commands.add_parser(
-        "run", aliases=["run-demo"], help="execute a prepared planar revision"
-    )
+    demo = case_commands.add_parser("run", help="execute a prepared planar revision")
     demo.add_argument("case_id")
     demo.add_argument("--revision-id", required=True)
     demo.add_argument("--solver", required=True)

@@ -208,7 +208,7 @@ def run_case(arguments: Namespace) -> int:
             payload = service.preview_status(arguments.case_id, arguments.preview_id)
             _print(payload) if arguments.json else print(payload["task_status"])
             return 0
-        if arguments.case_action in {"run", "run-demo"}:
+        if arguments.case_action == "run":
             payload = service.run_demo(
                 arguments.case_id,
                 arguments.revision_id,
@@ -306,7 +306,7 @@ def run_case(arguments: Namespace) -> int:
                     "retryable": False,
                 }
             ]
-        if arguments.case_action in {"run", "run-demo"} and service is not None:
+        if arguments.case_action == "run" and service is not None:
             pending = 1
             for _ in range(3):
                 try:
