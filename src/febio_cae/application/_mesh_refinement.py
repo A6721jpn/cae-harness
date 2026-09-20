@@ -95,8 +95,8 @@ def _parse_mesh_dependence_declaration(
         raise ValueError("mesh study criteria are invalid")  # noqa: TRY004 - validation contract
     try:
         criterion_items = tuple(criteria)
-    except TypeError:
-        raise ValueError("mesh study criteria are invalid")
+    except TypeError as error:
+        raise ValueError("mesh study criteria are invalid") from error
     if any(not isinstance(item, QualityCriterion) for item in criterion_items):
         raise ValueError("mesh study criteria are invalid")
     matching = tuple(item for item in criterion_items if item.metric_id in _MESH_METRICS)
