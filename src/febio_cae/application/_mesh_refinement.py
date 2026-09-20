@@ -45,6 +45,7 @@ from febio_cae.storage.registry import CaseStorage, StorageIntegrityError
 from ._comparison import _curve
 
 _MESH_METRICS = frozenset({"mesh_dependence", "source_local_mesh_dependence"})
+_MESH_PRODUCER_ID = "mesh_dependence"
 _MESH_THRESHOLD_NAMES = frozenset(
     {"coarse_size", "refined_size", "fine_size", "relative_max", "absolute_floor"}
 )
@@ -764,11 +765,9 @@ def assess_mesh_refinement(
     manifest: ResultManifest, revision: CaseRevision, storage: CaseStorage
 ) -> tuple[CriterionAssessment, dict[str, object]]:
     evidence: dict[str, object] = {"scope": "three_declared_global_tet10_sizes"}
-    criterion_id = "mesh_dependence"
     try:
         declaration = _parse_mesh_dependence_declaration(revision.spec.quality_policy.criteria)
         if declaration.metric_id == "source_local_mesh_dependence":
-            criterion_id = declaration.criterion.criterion_id
             return _assess_source_local_mesh_refinement(
                 manifest, revision, storage, declaration, evidence
             )
@@ -925,7 +924,7 @@ def assess_mesh_refinement(
             passed = passed and transfer_error <= values[_MATERIAL_SCALING_THRESHOLD]
         status = AssessmentStatus.PASS if passed else AssessmentStatus.FAIL
         return CriterionAssessment(
-            "mesh_dependence",
+            _MESH_PRODUCER_ID,
             "numeric",
             status,
             tuple(measured),
@@ -933,7 +932,7 @@ def assess_mesh_refinement(
         ), evidence
     except (StorageIntegrityError, ValueError, TypeError, KeyError, OverflowError) as error:
         return CriterionAssessment(
-            criterion_id,
+            _MESH_PRODUCER_ID,
             "numeric",
             AssessmentStatus.UNVERIFIED,
             (),

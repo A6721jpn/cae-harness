@@ -30,7 +30,7 @@ from febio_cae.domain.ports import PortError, PortErrorCategory
 from febio_cae.domain.results import numeric_state_indices
 from febio_cae.storage import CaseStorage
 
-from ._mesh_refinement import assess_mesh_refinement
+from ._mesh_refinement import _MESH_PRODUCER_ID, assess_mesh_refinement
 
 _PRODUCED_METRICS = frozenset(
     {
@@ -84,14 +84,7 @@ def _quality_status(
         return "FAIL"
     produced = {item.criterion_id for item in criteria if item.metric_id in _PRODUCED_METRICS}
     remaining = tuple(row for row in arithmetic if row.criterion_id not in produced)
-    refinement_id = next(
-        (
-            item.criterion_id
-            for item in criteria
-            if item.metric_id in {"mesh_dependence", "source_local_mesh_dependence"}
-        ),
-        "mesh_dependence",
-    )
+    refinement_id = _MESH_PRODUCER_ID
     expected_ids = {
         "execution_result_completeness",
         *(
