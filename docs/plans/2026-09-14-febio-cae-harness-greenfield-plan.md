@@ -38,7 +38,7 @@ MVPの完了は、`tests/e2e/test_installed_synthetic.py` への合格と、上�
 | T1 | 汎用 `run` | `run-demo` の登録済みデモ前提を解消し、`prepare-planar` により `PREPARED` となった任意の版を `case run --revision-id --solver [--preflight]` で実行可能にする。`run-demo` は互換性維持のために残すか、削除する |
 | T2 | 既定対応表の組み込み（完了 2026-09-15） | 承認バンドルの設定値を `src/febio_cae/resources/planar_default_bundle.json` に組み込み、`provision-planar-profiles` は `--bundle-path` 省略時にこれを登録する。バンドル・XPLT読込器ソースの自己ハッシュ固定は撤去済み |
 | T3 | メッシュ依存性の任意化 | `required_quality` においてメッシュ依存性が `UNVERIFIED` であっても、他の5項目が `PASS` であれば `quality_status` を合格とし、`task_status` を `NEEDS_QUALITY` と判定しないようにする |
-| T4 | `preview` の `LAUNCHED` | `case preview` が対象XPLTを引数として登録済みStudio実行ファイルを起動し、`LAUNCHED` を記録して `NEEDS_PREVIEW` を解消する。既存の観測プロトコル（`--window-id`、stdin応答）は `CONFIRMED` 向けに維持する |
+| T4 | `preview` の `LAUNCHED` | `case preview` が対象XPLTを引数として登録済みStudio実行ファイルを起動し、実行ファイルのパス・ハッシュ、PID、起動時刻、取得可能な版を記録して `NEEDS_PREVIEW` を解消する。版情報が取得できない場合は理由付き `UNVERIFIED` とし、起動証拠と版認定を区別する。既存の観測プロトコル（`--window-id`、stdin応答）は `CONFIRMED` 向けに維持する |
 | T5 | 一貫試験の更新 | `tests/e2e/test_installed_synthetic.py` をT1〜T4の契約に合わせて更新し、8手順を一連のフローとして通す |
 | T6 | 文書 | `docs/cli-usage.md` に8手順の実行例を記載し、`docs/reviews/` に手動の実行記録を残す |
 
