@@ -2372,6 +2372,7 @@ def probe():
     present = source.replace(b"_cae_missing_optional_probe", b"math")
     import ast
     from dataclasses import FrozenInstanceError
+
     bindings, expected, absent_imports = runtime._source_import_flow(ast.parse(present))
     assert not absent_imports
     assert bindings["optional_type"].module_name == "dataclasses"
