@@ -84,7 +84,14 @@ def _quality_status(
         return "FAIL"
     produced = {item.criterion_id for item in criteria if item.metric_id in _PRODUCED_METRICS}
     remaining = tuple(row for row in arithmetic if row.criterion_id not in produced)
-    refinement_id = _MESH_PRODUCER_ID
+    refinement_id = next(
+        (
+            item.criterion_id
+            for item in criteria
+            if item.metric_id == "source_local_mesh_dependence"
+        ),
+        _MESH_PRODUCER_ID,
+    )
     expected_ids = {
         "execution_result_completeness",
         *(
