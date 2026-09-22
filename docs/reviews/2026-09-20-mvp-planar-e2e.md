@@ -1,10 +1,12 @@
-# MVP planar E2E 実行記録（native-enabled automated PASS・手動8未完了）
+# MVP planar E2E 実行記録（native-enabled automated PASS・旧manual incidentの記録）
 
-- 記録更新日（workstation local date）：2026-09-21
+- 記録更新日（workstation local date）：2026-09-22
 - 対象：許可済みsynthetic STEPによるMVP候補。実モデル、`02_CAE`、資格情報は対象外
-- 記録状態：`NATIVE_AUTOMATED_PASS_MANUAL_8_PENDING`。native-enabled automated synthetic flowはPASS、manual 8手順記録は未完了。MVP全体完了は宣言しない。合格済みsource＋native candidateは受理対象として記録し、project doneは宣言しない
+- 記録状態：`NATIVE_AUTOMATED_PASS`。native-enabled automated synthetic flowはPASS。本書は**automated flowと旧manual incident**の正本である。MVPで残件だったmanual 8手順は2026-09-22に別の新flowで完遂し、その正本は[manual 8実行記録](2026-09-22-mvp-manual-final.md)とする。本書に記載の旧manual `case-6294a0a9e02c`は`FAILED`／`ABORTED/BLOCKED`のまま保持し、新flowの成功へ読み替えない。最終project完成は宣言しない
 - 証拠ルート：`<COORDINATION>`=元のチェックアウト/.local/coordination、`<ROOT_PYTEST>`=元のチェックアウト/.local/pytest-basetemp、`<WORKTREE_PROOFS>`=Orca開発ワークツリー/.local。`<TEST_PYTHON>`=Orca開発ワークツリー/.venv/Scripts/python.exe（pytest runner、installed CLI用Pythonとは別）。いずれもGit管理外であり、実パスは記録しない
-## 現行受け入れ状況（current candidate 0e35ba4／f978de・native-enabled automated PASS・manual 8未完了）
+## 現行受け入れ状況（current candidate 0e35ba4／f978de・native-enabled automated PASS）
+
+> 2026-09-22追記：以下の「manual 8は未完了」という記述は、本書が扱う旧manual `case-6294a0a9e02c`についての事実であり、現在も変更していない。MVPの必須記録であったmanual 8手順そのものは、同じsource／wheel／環境・同一の物理条件と時間上限のもとで、新規case `case-bb9e975f3fb3`による別flowとして2026-09-22に完遂した（[manual 8実行記録](2026-09-22-mvp-manual-final.md)）。両flowの証拠は付け替えない。
 
 現行candidateはsource=`71c388f229dbfabc9fffb48c90c4ca9c1def5ee9`、test-only=`56e122b7d1e2c4a0c30aac477db06d812cb62b69`、format-only=`0e35ba4d5b497f6d55d790e9b4b650b7b6dc9de6`、wheel=`<COORDINATION>/mvp-20260921-final-build-0e35ba4/febio_cae-0.1.0-py3-none-any.whl`、SHA-256=`f978de60803f70b9a5858a60bae185e0ed467949b0e062eafd2826a5e18b2cdd`、size=`404193`である。最終標準full-suite（56e122b）は`1798 passed / 0 failed / 3493.86 s`、exit 0。native-enabled final flowはgmsh 4.15.2でpytest 1 passed／942.46 s／exit 0、22 stage全exit 0、inspection1／preparation1／solver2／Studio1、coarse／candidate両run `SUCCEEDED`、必須5 numerical statuses `PASS`、baseline `COMPLETE`／Studio `LAUNCHED`／candidate comparison、same_mesh_reuse=trueを取得した。比較はYoung's modulus `1e6→2e6 Pa`、force axis 6点のrelative differences `[1,1,1,1,1,1]`、displacement axis 6点のdifference／relative differences `[0,0,0,0,0,0]`である。raw report labelとmesh `UNVERIFIED`は原因を推定せず別境界として記録する。
 

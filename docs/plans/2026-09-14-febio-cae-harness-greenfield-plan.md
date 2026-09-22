@@ -27,7 +27,7 @@ STEP部品と新規剛体治具の接触押し込みを実FEBioで解析し、�
 | 8 | ヤング率変更 → `run` → `compare` | 既存メッシュを再利用した子版の再解析と、反力―移動量曲線および部品変位の比較を行う |
 
 MVPの完了は、`tests/e2e/test_installed_synthetic.py` への合格と、上記8手順を手動で実行した記録（`docs/reviews/`）によって証明する。なお、MVPの達成は球・円柱・摩擦・非線形材料・日本語入力・実モデルへの対応完了を意味しない。
-### 現行状態（candidate 0e35ba4／source 71c388f／test 56e122b／format 0e35ba4／manual 8未完了）
+### 現行状態（candidate 0e35ba4／source 71c388f／test 56e122b／format 0e35ba4／manual 8完了）
 
 現行candidateはnative-enabled final flow `case-80e5f42a5043`で、gmsh 4.15.2、22 stage全exit 0、coarse／candidate両run `SUCCEEDED`、必須5 numerical statuses `PASS`、baseline `COMPLETE`、candidate comparison、same-mesh reuseを取得した。最終標準full-suiteは`1798 passed / 0 failed / 3493.86 s`、manual caseはpreparation `FAILED`／`ABORTED/BLOCKED`である。詳細なargv／exit／比較値／native・Studio・累積会計は[canonical review](../reviews/2026-09-20-mvp-planar-e2e.md)を正とする。251/b28、71/c180、過去1797/1は履歴節にのみ保持する。
 
@@ -43,7 +43,7 @@ MVPの完了は、`tests/e2e/test_installed_synthetic.py` への合格と、上�
 | T3 | メッシュ依存性の任意化 | mesh dependenceが`UNVERIFIED`でも他5項目で`quality_status`を判定する | 完了。現行native finalで必須5 numerical statuses `PASS`、mesh dependence `UNVERIFIED`を記録 |
 | T4 | `preview` の `LAUNCHED` | 登録済みStudioで対象XPLTを開き、起動receiptと対象を記録する。既存の`--window-id`／stdin `CONFIRMED`経路は実装として保持する | 完了。現行native finalでbaseline `COMPLETE`、Studio `LAUNCHED`、owned PID/creation/exe一致とinitial display PNGを記録 |
 | T5 | 一貫試験の更新 | 8手順を一連の自動flowとして通す | 完了。現行native finalは22 stage全exit 0、baseline `COMPLETE`、candidate comparisonまで取得 |
-| T6 | 文書と記録 | CLI実行例とmanual記録を保持する | manual preparation FAILED／ABORTED/BLOCKED。71c388f postfix標準full-suiteはexit 1非PASS、56e122b最終標準full-suiteは1798/0/0/0 PASS。native-enabled final automated 8-stepはgmsh 4.15.2で22 stage全exit 0、pytest 1 passed／942.46 s、dispatch inspection1／preparation1／solver2／Studio1、両run SUCCEEDED、必須5 numerical statuses PASS、baseline COMPLETE／candidate comparison、raw label `NUMERICAL_GATE_PASSED_NOT_OVERALL`は原因推定なし。manual 8は未完了 |
+| T6 | 文書と記録 | CLI実行例とmanual記録を保持する | **完了。** 2026-09-22のmanual final flow（新規case、公開CLI 22コマンド全exit 0、inspection1／preparation1／solver2／Studio1）で8手順を完遂し、[manual 8実行記録](../reviews/2026-09-22-mvp-manual-final.md)に記録した。旧manual preparationはFAILED／ABORTED/BLOCKEDのまま保持する。71c388f postfix標準full-suiteはexit 1非PASS、56e122b最終標準full-suiteは1798/0/0/0 PASS。native-enabled final automated 8-stepはgmsh 4.15.2で22 stage全exit 0、pytest 1 passed／942.46 s、dispatch inspection1／preparation1／solver2／Studio1、両run SUCCEEDED、必須5 numerical statuses PASS、baseline COMPLETE／candidate comparison、raw label `NUMERICAL_GATE_PASSED_NOT_OVERALL`は原因推定なし。manual 8は未完了 |
 
 ## 3. 工程と現在地
 
@@ -70,7 +70,7 @@ T6 manual caseはpreparation `FAILED`／`ABORTED/BLOCKED`、duplicate impact `UN
 
 ### 次に進める順序
 
-1. 56e122b最終標準full-suite PASS（1798 passed／0 failed／3493.86 s）を受け、native-enabled final automated 8-stepを既定budgetで1 flow実施済み。gmsh 4.15.2環境で22 stage全exit 0、inspection1／preparation1／solver2／Studio1、pytest 1 passed／942.46 s、両run `SUCCEEDED`、必須5 numerical statuses `PASS`、baseline `COMPLETE`／candidate comparisonを記録した。今回の追加実行は不要、manual `case-6294a0a9e02c`の次操作はbudget判断待ち、V2 integrationは明示的ユーザー指示待ちとし、manual 8を残件として保持する。[canonical review](../reviews/2026-09-20-mvp-planar-e2e.md)を正とする。
+1. 56e122b最終標準full-suite PASS（1798 passed／0 failed／3493.86 s）を受け、native-enabled final automated 8-stepを既定budgetで1 flow実施済み。gmsh 4.15.2環境で22 stage全exit 0、inspection1／preparation1／solver2／Studio1、pytest 1 passed／942.46 s、両run `SUCCEEDED`、必須5 numerical statuses `PASS`、baseline `COMPLETE`／candidate comparisonを記録した。今回の追加実行は不要、manual `case-6294a0a9e02c`の次操作はbudget判断待ち、V2 integrationは明示的ユーザー指示待ちとし、manual 8はその後2026-09-22の別flowで完遂し、[manual 8実行記録](../reviews/2026-09-22-mvp-manual-final.md)を正とする。automated flowと旧manual incidentは[canonical review](../reviews/2026-09-20-mvp-planar-e2e.md)を正とする。
 2. 実モデルの入力、条件、および使用許可が整い次第、P7（E2E-02、E2E-03）に着手する。
 3. MVP以降の目標範囲（§7 backlog）については、対応表の実測証拠が得られた項目から順次着手する。
 

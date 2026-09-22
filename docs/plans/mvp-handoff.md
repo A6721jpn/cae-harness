@@ -54,17 +54,17 @@ python -m ruff format --check . ; python -m ruff check . ; python -m mypy src te
 | 区分 | authoritative artifact / ID | 状態・会計 |
 |---|---|---|
 | 現行candidate／履歴 | current source=`71c388f229dbfabc9fffb48c90c4ca9c1def5ee9`、test-only=`56e122b`、format-only=`0e35ba4d`、native final wheel SHA-256=`f978de60803f70b9a5858a60bae185e0ed467949b0e062eafd2826a5e18b2cdd`／size=`404193`。251/b28、71/c180、過去1797/1は履歴。56e122b最終標準full-suiteはexit 0（1798 passed／0 failed／3493.86 s）、native-enabled finalは22 stage全exit 0、pytest 1 passed／942.46 s、両run `SUCCEEDED`／必須5 numerical statuses `PASS`、baseline `COMPLETE`／candidate comparison |
-| canonical acceptance status | [検証記録](../reviews/2026-09-20-mvp-planar-e2e.md)、`<COORDINATION>/mvp-20260921-final-auto-native-0e35ba4/final-accounting.json` | 合格済みsource＋native candidateは受理対象として記録。manual preparationは`FAILED`／`ABORTED/BLOCKED`でmanual 8が残るため、MVP全体完了は宣言しない。詳細はcanonical reviewを正とする |
+| canonical acceptance status | [検証記録](../reviews/2026-09-20-mvp-planar-e2e.md)、`<COORDINATION>/mvp-20260921-final-auto-native-0e35ba4/final-accounting.json` | 合格済みsource＋native candidateは受理対象として記録。旧manual preparationは`FAILED`／`ABORTED/BLOCKED`のまま保持するが、MVP必須のmanual 8は2026-09-22の別flowで完遂した（[manual 8実行記録](../reviews/2026-09-22-mvp-manual-final.md)）。最終project完成は宣言しない。詳細は各canonical recordを正とする |
 
 #### 全体会計と残件
 既存raw reportとfinal cumulative accountingに基づくcross-flow inspectionは11 requests＝historical 9＋current environment failure 1＋current successful native flow 1、observed success childは7（初期3要求のchild有無`UNKNOWN`）。named-flowはnative inspection成功の観測5件＋環境失敗要求1件の6 requests、observed child 5（missing-Gmshはchildなし）、named-flow solverは8、Studioは4、successful preparationは4＋manual owner failure 1。native総child数や完全ledgerを推論せず、[検証記録](../reviews/2026-09-20-mvp-planar-e2e.md)のcanonical tableを正とする。full-suite歴史的試行は非PASS、71c388f postfix標準full-suiteもexit 1非PASS、56e122b最終標準full-suiteはexit 0 PASS。native-enabled final automated 8-stepは22 stage全exit 0、必須5 numerical statuses PASS、baseline COMPLETE／candidate comparisonである。
 
 ## 2. 現状の最重要事実
 
-MVP の手順2（対応表登録）は 2026-09-15 に修正済みである。251版の自動T5（履歴）は上記flowまで完了、T6 manual記録はpreparation failure／MVP blockとして[検証記録](../reviews/2026-09-20-mvp-planar-e2e.md)に固定した。71c388f postfix標準full-suiteはexit 1非PASS、56e122b最終標準full-suiteはexit 0 PASS、native-enabled final automated 8-stepはgmsh 4.15.2でpytest 1 passed／942.46 s、22 stage全exit 0、両run `SUCCEEDED`／必須5 numerical statuses `PASS`、baseline `COMPLETE`／candidate comparison、raw label `NUMERICAL_GATE_PASSED_NOT_OVERALL`は原因推定なし。251/b28の証拠を現行candidateへ付け替えない。
+MVP の手順2（対応表登録）は 2026-09-15 に修正済みである。251版の自動T5（履歴）は上記flowまで完了、T6 manual記録は、旧manual caseのpreparation failureを[検証記録](../reviews/2026-09-20-mvp-planar-e2e.md)に固定したうえで、2026-09-22のmanual final flowで8手順を完遂し[manual 8実行記録](../reviews/2026-09-22-mvp-manual-final.md)に固定した。71c388f postfix標準full-suiteはexit 1非PASS、56e122b最終標準full-suiteはexit 0 PASS、native-enabled final automated 8-stepはgmsh 4.15.2でpytest 1 passed／942.46 s、22 stage全exit 0、両run `SUCCEEDED`／必須5 numerical statuses `PASS`、baseline `COMPLETE`／candidate comparison、raw label `NUMERICAL_GATE_PASSED_NOT_OVERALL`は原因推定なし。251/b28の証拠を現行candidateへ付け替えない。
 ### 現行gateと標準診断
 
-static／build／focused pytestの実コマンドと終了値、22 stageの実argv、accepted sourceの変更ファイル一覧は[検証記録](../reviews/2026-09-20-mvp-planar-e2e.md)に集約する。歴史的full-suite wrapperは`INTERRUPTED_TIMEOUT`／非PASS、71c388f postfix標準full-suiteはexit 1非PASS、56e122b最終標準full-suiteはexit 0 PASS。runner setup／missing-Gmsh corrected flowは別記録で保持し、native-enabled final automated 8-stepはbaseline `COMPLETE`／Studio `LAUNCHED`／candidate comparisonまで取得、自動gate PASSである。MVPで残る必須記録はmanual 8である。
+static／build／focused pytestの実コマンドと終了値、22 stageの実argv、accepted sourceの変更ファイル一覧は[検証記録](../reviews/2026-09-20-mvp-planar-e2e.md)に集約する。歴史的full-suite wrapperは`INTERRUPTED_TIMEOUT`／非PASS、71c388f postfix標準full-suiteはexit 1非PASS、56e122b最終標準full-suiteはexit 0 PASS。runner setup／missing-Gmsh corrected flowは別記録で保持し、native-enabled final automated 8-stepはbaseline `COMPLETE`／Studio `LAUNCHED`／candidate comparisonまで取得、自動gate PASSである。MVPで残る必須記録だったmanual 8は2026-09-22に完遂し、[manual 8実行記録](../reviews/2026-09-22-mvp-manual-final.md)を正とする。
 
 
 ## 3. タスク別の作業指示
@@ -83,11 +83,11 @@ source-local consumerではmissing-receiptを`UNVERIFIED`とする。共有excep
 
 ### T5：一貫試験
 
-現行native-enabled final automated 8-stepはgmsh 4.15.2で22 stage全exit 0、両run `SUCCEEDED`／必須5 numerical statuses `PASS`、baseline `COMPLETE`／candidate comparisonまで取得した。比較値とlatest 22-command ledgerはcanonical reviewに記録済み。manual 8がMVPで残る必須記録であり、manual caseはretry／reset／new caseを行わず保持する。
+現行native-enabled final automated 8-stepはgmsh 4.15.2で22 stage全exit 0、両run `SUCCEEDED`／必須5 numerical statuses `PASS`、baseline `COMPLETE`／candidate comparisonまで取得した。比較値とlatest 22-command ledgerはcanonical reviewに記録済み。manual 8は2026-09-22の別flow（新規case、公開CLI手動22コマンド全exit 0）で完遂し、[manual 8実行記録](../reviews/2026-09-22-mvp-manual-final.md)を正とする。旧manual caseはretry／reset／new caseを行わず保持する。
 
 ### T6：文書と記録
 
-1. 56e122b最終標準full-suite PASS（1798 passed／0 failed／3493.86 s）を受け、native-enabled final automated 8-stepは既定budgetで1 flow実施済み。gmsh 4.15.2でpytest 1 passed／942.46 s、22 stage全exit 0、inspection1／preparation1／solver2／Studio1、両run `SUCCEEDED`、必須5 numerical statuses `PASS`、baseline `COMPLETE`／candidate comparisonを記録した。今回の追加実行は不要、manual `case-6294a0a9e02c`の次操作はbudget判断待ち、V2 integrationは明示的ユーザー指示待ちとする。manual caseはretry／reset／代替caseなしで保持し、manual 8を残件とする。[canonical review](../reviews/2026-09-20-mvp-planar-e2e.md)を正とする。
+1. 56e122b最終標準full-suite PASS（1798 passed／0 failed／3493.86 s）を受け、native-enabled final automated 8-stepは既定budgetで1 flow実施済み。gmsh 4.15.2でpytest 1 passed／942.46 s、22 stage全exit 0、inspection1／preparation1／solver2／Studio1、両run `SUCCEEDED`、必須5 numerical statuses `PASS`、baseline `COMPLETE`／candidate comparisonを記録した。今回の追加実行は不要、manual `case-6294a0a9e02c`の次操作はbudget判断待ち、V2 integrationは明示的ユーザー指示待ちとする。旧manual caseはretry／reset／代替caseなしで保持する。manual 8はその後2026-09-22の別flowで完遂し、[manual 8実行記録](../reviews/2026-09-22-mvp-manual-final.md)を正とする。automated flowと旧manual incidentは[canonical review](../reviews/2026-09-20-mvp-planar-e2e.md)を正とする。
 
 
 ## 4. やらないこと
