@@ -1,9 +1,9 @@
 # 製品版M1 readiness記録（範囲調査・文書化のみ／合意は未完了）
 
 - 記録作成日（workstation local date）：2026-09-23
-- 記録状態：`M1_PREPARATION_COMPLETE_AGREEMENT_PENDING`。M1の**準備**は完了したが、**製品範囲の合意は完了していない**。[製品版ロードマップ](../plans/2026-09-23-product-roadmap.md) §8.1 の3件は2026-09-23のPM回答で確定した一方、§8.3（Q3〜Q5・Q8＝実モデルの対象・使用許可・物理条件・精度基準・新規実行予算）は開発部長へ照会中で未回答であるため、合意完了を宣言しない
+- 記録状態：`M1_PREPARATION_COMPLETE_AGREEMENT_PENDING`。M1の**準備**は完了したが、**製品範囲の合意は完了していない**。[製品版ロードマップ](../plans/2026-09-23-product-roadmap.md) §8.1 の既存契約の扱いは2026-09-23のPM回答で確定した一方、§8.3（Q3〜Q5・Q8＝実モデルの対象・使用許可・物理条件・評価基準・新規実行予算）は開発部長へ照会中で未回答であるため、合意完了を宣言しない
 - 対象：`docs` のみ。`src`／`tests` の変更0、新機能0
-- 実施者：単独worker 1名（Claude Opus 5／`claude-opus-5`）。サブエージェント0、他workerの起動0
+- 実施者：初稿調査はClaude Opus 5、前任者の終了後にPMが編集所有権を移管し、本改訂はCodex workerが仕上げた。同時docs編集者1名、本workerによる他worker起動0。運用監視機構は別担当
 - 実FEBio起動0、実FEBio Studio起動0、実Gmsh起動0、実LLM呼出0、実CAEモデル（`02_CAE`）への読み書き0
 
 ## 1. 対象SHA
@@ -11,7 +11,8 @@
 | 対象 | 値 |
 |---|---|
 | ブランチ | `orca/acceptance-integration` |
-| 開始時HEAD | `67cb7fe`（`docs: make the current-state lines consistent`） |
+| 初稿調査開始時HEAD | `67cb7fe`（`docs: make the current-state lines consistent`） |
+| 本改訂開始時HEAD | `a31a87b83a4dec7c4e20893d11782e9fb1304e6d`（M1初稿）。前任者のroadmap未コミット改訂を保持して引継ぎ |
 | 参照している製品source | `71c388f229dbfabc9fffb48c90c4ca9c1def5ee9` |
 | 参照しているtest-only／format-only | `56e122b` ／ `0e35ba4d` |
 | 参照しているnative final wheel | SHA-256 `f978de60803f70b9a5858a60bae185e0ed467949b0e062eafd2826a5e18b2cdd`／size `404193` |
@@ -20,19 +21,16 @@
 
 ## 2. 変更ファイル
 
-新規2件と索引の更新1件のみ。削除0、`src`／`tests` の変更0。
+初稿 `a31a87b` は成果物2件の新規作成と `docs/reviews/README.md` の索引更新を含む。本仕上げは次の既存2件のみを更新し、索引と過去の受入記録は変更しない。削除0、`src`／`tests` の変更0。
 
 ```text
-docs/plans/2026-09-23-product-roadmap.md        （新規）
-docs/reviews/2026-09-23-product-m1-readiness.md （新規・本書）
-docs/reviews/README.md                          （現行記録の索引を3件へ更新）
+docs/plans/2026-09-23-product-roadmap.md
+docs/reviews/2026-09-23-product-m1-readiness.md
 ```
-
-`docs/reviews/README.md` は「2026-09-15時点では現行の記録はなし」という古い記述だけを、現行3件の索引へ置き換えた。他の記録内容は変更していない。
 
 ## 3. 実行したコマンドと終了コード
 
-許容された確認のみを実行した。full `pytest`、`python -m build`、native実行、実 `02_CAE` の読み書き、Studio起動、既存caseの操作はいずれも0回である。
+許容された確認のみを実行した。full `pytest`、`python -m build`、native実行、実 `02_CAE` の読み書き、Studio起動、既存caseの操作はいずれも0回である。以下の表は**初稿から引き継いだ実績**であり、仕上げworkerの再実行結果ではない。
 
 | # | 実コマンド | 終了コード | 件数・結果 |
 |---:|---|---:|---|
@@ -43,7 +41,7 @@ docs/reviews/README.md                          （現行記録の索引を3件�
 | 5 | `git add -A` → `git diff --check` | 0 | 指摘0件（CRLF変換の警告のみ） |
 | 6 | `python scripts/scan_cae_data.py --root .`（新規docs追加後・commit直前） | 0 | `status=PASS`、`checked_files=280`、`tracked_files=280`、`index_content_checked=280`、`diagnostics=0`、`issues=0` |
 
-上記のほかに、read-onlyの参照（`cat`／`sed -n`／`grep`／`find`／`wc` によるファイル読取と件数計数）を行った。これらは製品状態を変更せず、終了コードを受入証拠として扱わない。
+初稿は上記以外にread-only参照と件数計数を記録していた。その実行ログを本仕上げで再検証しておらず、初稿の記録として保持する。
 
 ### 3.1 read-onlyで得た静的計数（2026-09-23）
 
@@ -55,7 +53,18 @@ docs/reviews/README.md                          （現行記録の索引を3件�
 | 試験関数の定義数 | unit 455／component 493／e2e 1／native 3 |
 | `tests/native` のマーカー内訳 | `native` 2件、`llm` 1件、**`febio` 0件** |
 
-関数定義数は、parametrize展開後の実行件数（最終full-suiteの `1798`）とは別物であり、合格件数として扱わない。本taskではpytestを一度も実行していない。
+上表は初稿の静的計数の引用であり、本仕上げで再計数していない。関数定義数はparametrize展開後の実行件数（最終full-suiteの `1798`）とは別物であり、合格件数として扱わない。本M1でpytestは実行していない。
+
+### 3.2 本仕上げで実行した確認
+
+| 実コマンド | 終了コード | 件数・結果 |
+|---|---:|---|
+| `git status --short --branch`、`git rev-parse HEAD` | 0 | `a31a87b`。roadmap既存改訂1件を確認し、PMから所有移管を受領 |
+| `git diff -- docs/plans/2026-09-23-product-roadmap.md`、`git log -4 --oneline` | 0 | 既存改訂148追加／120削除。初稿commitと未コミット成果を保存して仕上げ |
+| `git diff --check` | 0 | 指摘0件。LF→CRLFの警告のみ |
+| `python scripts/scan_cae_data.py --root .` | 0 | `PASS`、checked 280／tracked 280／index 280、diagnostics 0／issues 0 |
+
+上記scannerはroadmap改訂後の実行。本記録の更新後にも同じ2検査を最終候補に実行し、最終結果は§9に記録する。ソース・試験のread／glob／grepは静的参照のみで、pytest収集・実行や製品の起動はしていない。Orcaのguide／check／ask／heartbeat等は作業連絡であって製品受入コマンドではない。
 
 ## 4. 実FEBio・Studio・その他ネイティブの起動回数
 
@@ -75,24 +84,26 @@ docs/reviews/README.md                          （現行記録の索引を3件�
 
 | 項目 | 位置 | 観測した事実 |
 |---|---|---|
-| 物理適用性 | `src/febio_cae/application/_required_quality.py:327` | `physical_applicability_validation` は判定処理を持たず、理由付き `UNVERIFIED` を生成するだけである |
-| surface approximation | `src/febio_cae/application/_preparation.py:453`、`src/febio_cae/adapters/geometry/adapter.py:1068` | `surface_approximation` は固定 `UNVERIFIED`。メッシュ品質レコード側も「双方向のCAD↔メッシュ境界は未確立」を理由に常に `UNVERIFIED`。片方向の `tool-boundary-deviation-upper-bound` だけがnative生成時に `PASS` で記録される |
-| native qualification | `src/febio_cae/application/_inspection.py:84` | 調査応答の `native_qualification` は常に `UNVERIFIED`。FEBio側の `has_qualified_runtime`（`adapters/febio/_native_qualification.py:177`）に相当する束縛検査が調査経路には無い |
-| メッシュ依存性 | `src/febio_cae/application/_mesh_refinement.py` | 3段階判定は実装済み。不足しているのは実行証拠（粗・中・細の実FEBio結果）だけである |
+| 物理適用性 | `src/febio_cae/application/_required_quality.py:326-332` | 理由付き `UNVERIFIED` を数値品質とは別行に公開する。既存契約に沿った状態表示であり、実物照合未実施を新たな必須品質失敗にしない |
+| surface approximation | `src/febio_cae/application/_preparation.py:445-456`、`src/febio_cae/adapters/geometry/adapter.py:1067-1078` | `UNVERIFIED`。片方向のprimitive境界証拠は双方向CAD↔mesh近似証拠ではない。適用範囲を既存契約と数値証拠から整理し、一律必須化しない |
+| native qualification | `src/febio_cae/application/_inspection.py:84`、`_preparation.py:455` | 応答は `UNVERIFIED`。Gmshの実行時identity認証と幾何能力のqualificationを区別する。`adapters/febio/_native_qualification.py` のFEBio runtime束縛をGmsh能力証拠へ流用しない。新たなハッシュ固定・権限層は提案しない |
+| メッシュ依存性と製品判定 | `src/febio_cae/application/_mesh_refinement.py`、`_required_quality.py:75-124`、`_preview.py:73-103` | 3段階算定は実装済みだが、MVP判定はglobal mesh `UNVERIFIED` とStudio `LAUNCHED` を許容する。実証取得と製品判定への切替は別作業であり、「不足は証拠だけ」「無変更で合格」とは保証しない |
 | Studio `CONFIRMED` | `src/febio_cae/cli/preview.py`、実装ノート §7 | `--window-id` ＋ stdin PIPEの観測経路は実装済みだが、観測応答を作る公開ヘルパーがCLIに無い |
 | 実モデルE2E | `tests/e2e/` | 計画書 §7 が挙げる `test_authorized_real_case.py` と `test_bottomframe_final.py` が**存在しない** |
 | E2E設定scope | `tests/e2e/test_installed_synthetic.py:1055` | 設定は `scope="synthetic_explicit"` のみ受理する。実モデル用のscopeが無い |
 | 実ツール試験の入口 | `pyproject.toml`、`tests/native` | 計画書 §7 の `pytest tests/native -m "febio"` に該当する試験が0件である |
-| 復旧 | `src/febio_cae/cli/main.py`（`resume` のヘルプ） | `resume` は「中断した同期公開を再開せずに診断する」であり、実行を再開する機能ではない |
-| 結果の自然言語報告 | — | 実装も設計仕様書の契約行も存在しない |
+| 復旧 | `src/febio_cae/cli/run.py`、`application/service.py:1128-1131`、`application/_run_reconciliation.py` | 公開経路は限定的な中断照合を行う。ソルバーの途中計算再開の実証ではない。実ツールでの復旧受入証拠は現行2記録に無い |
+| 部分変更 | `src/febio_cae/domain/case_patch.py:27-39`、`application/service.py:478-526` | 材料以外の型付きトップレベル差分も受理する。現行native受入証拠がE-onlyに限られることと、型の実装範囲を混同しない |
+| AI-02 | `tests/native/test_llm.py:273-518` | 合成fixtureに対する材料3操作と明示freezeの試験。実LLM6呼出を期待するが、CAD新規入力・native解析・結果報告は含まない。本M1では未実行 |
+| 結果の自然言語報告 | ロードマップ §3 M4 | 現行の該当実装を確認できていないが、ユーザー目的と合意済み順序に含まれ、要否の再承認は不要。M4で出力契約を具体化する |
 
 ## 6. 未検証事項（本taskで `UNVERIFIED` のまま残したもの）
 
 - 本記録が引用する既存の受入値（full-suite `1798 passed`、22 stage全exit 0、wheel SHA-256、比較値など）は**再検証していない**。各canonical recordを正とする。
 - `mesh_dependence`、`physical_applicability_validation`、`surface_approximation`、`native_qualification`、Studio表示内容は、MVP時点と同じく `UNVERIFIED` のままである。本taskはこれらを変更していない。
-- 実モデルE2E（E2E-02）、最終BottomFrame E2E（E2E-03）、実LLM AI-02は未着手である。
-- 静的計数（§3.1）はファイル読取に基づく数であり、試験の合格を意味しない。
-- ロードマップ §3〜§6 の「提案」は、いずれもユーザー承認前の案であって製品契約ではない。
+- 実モデルE2E（E2E-02）、最終BottomFrame E2E（E2E-03）、実LLM AI-02の合格証拠は、参照した現行受入記録に無い。全過去実行の不存在を主張しない。
+- 静的計数（§3.1）は初稿の引用であり、試験の合格を意味しない。
+- ロードマップの「提案」は承認前の順序・実施方法・予備見積である。既存仕様の製品範囲、Studio `CONFIRMED`、自然言語報告の要否まで未確定扱いに戻さない。M3の収束・子版表示、M4の解析接続等の予算は別途精査が必要で、予備合計を全体の確定総額としない。
 
 ## 7. 質問への回答状況と、次に必要な判断
 
@@ -118,7 +129,7 @@ M2着手時に確定する観測主体（Q2b）、M4着手前に確定するLLM�
 ### 7.3 次に必要な判断
 
 1. **Q3〜Q5・Q8の回答**。これが無い限りM3（実モデルE2E）は着手できず、M1の合意完了も宣言できない。
-2. **M2の着手対象**：(a) Studio `CONFIRMED`、(b) 3段階mesh依存、(c) 適用性・近似・認定のどれを、どの順で行うか。**おすすめは (b) から**（コード変更0、実モデルの使用許可が不要、予算はメッシュ3／実FEBio 4）。
+2. **M2の着手対象**：(a) Studio `CONFIRMED`、(b) 3段階mesh依存、(c) 適用性・近似・認定の順序を確定する。**おすすめは (b) から**（既存算定経路から着手でき、実モデル操作は不要。予算案はinspection 1／preparation 3／実FEBio 4、Studio確認は別途1）。実測前にコード無変更・PASSは保証しない。
 3. **統合**：`git push` とV2への統合はPMが担当する。本taskでは実施しない。
 
 ## 8. 境界の保持
@@ -127,3 +138,11 @@ M2着手時に確定する観測主体（Q2b）、M4着手前に確定するLLM�
 - 保護ブランチ `native-curved-primitives`／`acceptance-gate-repairs` およびsoft-holdの作業ツリーは削除・変更していない。
 - 公開文書にローカルパス・資格情報・実CAEデータを記載していない（§3 の `scan_cae_data.py` はPASS）。
 - 合成データの結果と実モデルの証拠を混同していない。未取得の項目は `UNVERIFIED` のまま保持している。
+- Q3〜Q5・Q8はPMが既に照会中であることを引継ぎ時に確認し、重複質問していない。Q6後半・Q7を理由にM1文書準備を止めない。
+- Codex週間usedが60%以上なら新規継続停止、Opus／Geminiは継続可、reset後の重複なし再開とstop/resume inbox報告はPM担当。本workerはその運用機構を変更していない。仕上げ中の承認済みquota参照では `2026-09-22T16:14:27.483Z`、10080分window、used 44%を確認した（取得元のローカルパスは公開しない）。
+
+## 9. 仕上げの検証結果と候補の識別
+
+本文整合後に `git diff --check && python scripts/scan_cae_data.py --root .` を実行し、終了コード0。diff指摘0、scanner `PASS`、checked／tracked／indexは各280、diagnostics／issuesは各0。改行のLF→CRLF警告のみで、製品コード・試験・実データへの変更は無い。
+
+本節はその実測結果の追記である。commit対象は§2の2件だけとし、記録追記後のindexにも同じ検査を適用する。対象sourceと初稿SHAは§1に固定し、仕上げcommitの実SHA・最終index検査結果・commit後の差分有無はRunの完了通知で報告する（自己参照SHAを本文へ推測記入しない）。M1-Aの準備候補を提出するが、Q3〜Q5・Q8の未回答を埋めたことにはしない。V2統合・pushはPM担当であり、本workerは実施しない。
