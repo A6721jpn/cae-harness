@@ -1,6 +1,10 @@
 # 検証・レビュー記録
 
-`docs/reviews/` 直下には現行の記録のみを置く。2026-09-15時点では現行の記録はなく、次はMVP（計画書 §2）の手動記録を追加する。
+`docs/reviews/` 直下には現行の記録のみを置く。2026-09-23時点の現行記録は次の3件である。
+
+- [MVP planar E2E 実行記録（native-enabled automated PASS・旧manual incident）](2026-09-20-mvp-planar-e2e.md)
+- [MVP manual 8手順 実行記録（公開CLI手動flow・PASS）](2026-09-22-mvp-manual-final.md)
+- [製品版M1 readiness記録（範囲調査・文書化のみ／合意は未完了）](2026-09-23-product-m1-readiness.md)
 
 ## アーカイブ
 
