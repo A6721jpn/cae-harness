@@ -79,7 +79,7 @@ static／build／focused pytestの実コマンドと終了値、22 stageの実ar
 
 ### T3：標準2F修復
 
-source-local consumerではmissing-receiptを`UNVERIFIED`とする。共有exceptがcanonical global IDを返してlocal宣言IDを失う不備は修正版71c388fで修復済み。71c388f postfix標準full-suiteはexit 1非PASS、56e122b最終標準full-suiteはexit 0 PASS。runner setup／missing-Gmsh corrected flowは履歴停止、native-enabled final automated 8-stepは22 stage全exit 0、inspection1／preparation1／solver2／Studio1、必須5 numerical statuses `PASS`、baseline `COMPLETE`／candidate comparisonまで取得済みである。今回の追加実行は不要、manual次操作はbudget判断待ち、V2 integrationは明示的ユーザー指示待ちとする。詳細はcanonical reviewを正とする。
+source-local consumerではmissing-receiptを`UNVERIFIED`とする。共有exceptがcanonical global IDを返してlocal宣言IDを失う不備は修正版71c388fで修復済み。71c388f postfix標準full-suiteはexit 1非PASS、56e122b最終標準full-suiteはexit 0 PASS。runner setup／missing-Gmsh corrected flowは履歴停止、native-enabled final automated 8-stepは22 stage全exit 0、inspection1／preparation1／solver2／Studio1、必須5 numerical statuses `PASS`、baseline `COMPLETE`／candidate comparisonまで取得済みである。MVP必須のmanual 8は2026-09-22に完遂し（[manual 8実行記録](../reviews/2026-09-22-mvp-manual-final.md)）、同日ユーザー承認済みのV2 docs統合をff-onlyで実施した（pushは未実施）。2026-09-21の旧manual caseは履歴として保持する。詳細は各canonical recordを正とする。
 
 ### T5：一貫試験
 
@@ -87,7 +87,7 @@ source-local consumerではmissing-receiptを`UNVERIFIED`とする。共有excep
 
 ### T6：文書と記録
 
-1. 56e122b最終標準full-suite PASS（1798 passed／0 failed／3493.86 s）を受け、native-enabled final automated 8-stepは既定budgetで1 flow実施済み。gmsh 4.15.2でpytest 1 passed／942.46 s、22 stage全exit 0、inspection1／preparation1／solver2／Studio1、両run `SUCCEEDED`、必須5 numerical statuses `PASS`、baseline `COMPLETE`／candidate comparisonを記録した。今回の追加実行は不要、manual `case-6294a0a9e02c`の次操作はbudget判断待ち、V2 integrationは明示的ユーザー指示待ちとする。旧manual caseはretry／reset／代替caseなしで保持する。manual 8はその後2026-09-22の別flowで完遂し、[manual 8実行記録](../reviews/2026-09-22-mvp-manual-final.md)を正とする。automated flowと旧manual incidentは[canonical review](../reviews/2026-09-20-mvp-planar-e2e.md)を正とする。
+1. 56e122b最終標準full-suite PASS（1798 passed／0 failed／3493.86 s）を受け、native-enabled final automated 8-stepは既定budgetで1 flow実施済み。gmsh 4.15.2でpytest 1 passed／942.46 s、22 stage全exit 0、inspection1／preparation1／solver2／Studio1、両run `SUCCEEDED`、必須5 numerical statuses `PASS`、baseline `COMPLETE`／candidate comparisonを記録した。manual 8はその後2026-09-22のmanual final flowで完遂し、[manual 8実行記録](../reviews/2026-09-22-mvp-manual-final.md)を正とする。同日、ユーザー承認済みのV2 docs統合をff-onlyで実施済み（pushは未実施、PM判断）。2026-09-21の旧manual `case-6294a0a9e02c`はretry／reset／代替caseなしで履歴として保持する。automated flowと旧manual incidentは[canonical review](../reviews/2026-09-20-mvp-planar-e2e.md)を正とする。
 
 
 ## 4. やらないこと
