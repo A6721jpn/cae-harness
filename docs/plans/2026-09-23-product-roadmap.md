@@ -1,6 +1,7 @@
 # FEBio CAEハーネス — 製品版ロードマップ M1〜M5（合意用草案）
 
 作成日：2026-09-23／現在地：**M1-B＝M2予算合意済み・M3条件待ち**。承認 `msg_757df3e48e7a` によりM2は着手可能（inspection 1／preparation 3／実FEBio 4、別枠Studio起動1、失敗停止・再試行0）。§8.3 の実モデル対象・使用許可・物理条件・評価基準は未回答のためM3は `ASK_AND_BLOCK`。製品全体またはM1全体の合意完了は宣言しない。
+実測更新：**M2(b)合格・M2(c)調査済み、M2(a)は起動前競合拒否後の続行判断待ち**。実FEBio4回成功、fine／E-only子の数値6項目PASS。Studio実起動0・予約1保持。[M2実測記録](../reviews/2026-09-23-product-m2-evidence.md)を正とし、M2全体の完了は宣言しない。
 ファイル名の日付は識別子である。参照順序は[開発契約](../../AGENTS.md) → [計画書](2026-09-14-febio-cae-harness-greenfield-plan.md) → [設計仕様書](../specs/2026-09-14-febio-llm-cae-harness-design-v2.md) → [実装ノート](../specs/implementation-notes.md) → [canonical review](../reviews/2026-09-20-mvp-planar-e2e.md)・[manual 8実行記録](../reviews/2026-09-22-mvp-manual-final.md)。本書とこれらが食い違う場合は既存文書を正とする。
 
 初回調査の対象コミットは `67cb7fe`（ブランチ `orca/acceptance-integration`）。初稿commit `a31a87b83a4dec7c4e20893d11782e9fb1304e6d` と前任者の未コミット改訂を保持してM1文書を整合した。M1調査・仕上げでは `src`／`tests` の変更と実ツール・実モデル操作は0だった（[M1 readiness記録](../reviews/2026-09-23-product-m1-readiness.md)）。今回のM2ブリッジ準備・試験は[別記録](../reviews/2026-09-23-product-m2-preview-preparation.md)に分離し、過去の実績を変更しない。
@@ -64,7 +65,7 @@ Git外の証拠rootは記号で参照する（`<COORDINATION>`＝元のチェッ
 | 4 | 対応表（組み込み既定バンドル） | `resources/planar_default_bundle.json`、`application/_profile_provisioning.py` | `tests/component/febio/test_profile_*.py` | `PROVISIONED`（合成、自動1・手動1） | 実装済 | 現行の能力範囲は `febio.scope.planar_linear_frictionless_fixed_xyz` のみ。既存契約にある球・円柱・摩擦・Neo-Hookeanの対応表は未整備 |
 | 5 | 入力生成・所有プロセス実行・出力固定 | `adapters/febio/compiler.py`、`runner.py`、`_windows_job.py` | `tests/component/febio` | 実FEBio 4.12.0で `SUCCEEDED`（合成、自動2・手動2） | 実装済 | 実モデルでの実行は現行受入証拠 未取得 |
 | 6 | 必須数値品質5項目 | `adapters/febio/quality.py`、`planar_quality.py`、`reported_norms.py`、`application/_required_quality.py` | `tests/component/febio/test_required_quality_status.py` ほか | 必須5項目 `PASS`（合成、自動1・手動1） | 実装済 | 実モデルでの判定は現行受入証拠 未取得。参照解は計画書 §5 の弾性パッチのみ |
-| 7 | メッシュ依存性 `mesh_dependence`（既存契約の6項目目） | `application/_mesh_refinement.py`（3段階判定・局所球版を実装） | `tests/component/febio/test_mesh_refinement.py`、`tests/component/geometry/test_native_local_refinement.py` | **未取得**（粗・中・細3版の実FEBio結果が現行受入記録に無い） | 実装済・証拠未取得 | 3段階の実行証拠。E2E設定は `preparation_requests` 3件を既に受け付ける |
+| 7 | メッシュ依存性 `mesh_dependence`（既存契約の6項目目） | `application/_mesh_refinement.py`（3段階判定・局所球版を実装） | `tests/component/febio/test_mesh_refinement.py`、`tests/component/geometry/test_native_local_refinement.py` | 新M2合成flowで3段階実FEBio＋E-only継承、fine／child PASS（[M2実測記録](../reviews/2026-09-23-product-m2-evidence.md)） | 実装済・平面合成で実証 | 実モデル・他形状への証拠は未取得 |
 | 8 | 物理適用性 `physical_applicability_validation` | `application/_required_quality.py:327` が理由付き `UNVERIFIED` を生成し、数値集計とは**別行**で公開する（既存契約どおり） | `tests/component/application/test_required_numerical_quality.py:151` | なし（別行表示のため数値品質の合否には影響しない） | 既存契約どおり | 実物照合の証拠が無い限り `UNVERIFIED` のまま。解消するには実測との照合が要る |
 | 9 | Studio表示 `LAUNCHED` | `adapters/preview/studio.py`、`application/_preview.py` | `tests/component/febio/test_preview_binding.py` ほか | 実Studioで `LAUNCHED`／`task COMPLETE`（合成、自動1・手動1） | 実装済 | 表示内容は `UNVERIFIED`。receiptの `version` も `UNVERIFIED` |
 | 10 | Studio表示 `CONFIRMED`（既存契約） | `cli/preview.py`（`--window-id` ＋ stdin PIPE）、`scripts/observe_preview.py`、`domain/preview.py:166`、`application/_preview.py` | `tests/component/febio/test_preview_existing_session.py`、`tests/component/cli/test_preview_bridge.py` | 実UI証拠は未取得 | 経路・公開ブリッジ実装済 | PMが独立観測者として実UIを確認し、要求後のPNGと応答を期限内に渡す（実装ノート §7）。準備検証は実Studioの成功証拠ではない |
@@ -124,12 +125,12 @@ Git外の証拠rootは記号で参照する（`<COORDINATION>`＝元のチェッ
 - 現状（確定）：`--window-id` ＋ stdin PIPEの観測経路と `PreviewReceipt` の `CONFIRMED` 検証は実装済み。公開ブリッジ `scripts/observe_preview.py` がinstalled CLIの実要求を外部交換ディレクトリへ公開し、独立操作者の応答1件をそのままPIPEへ渡す（実装ノート §7）。
 - 準備実装：表示値の自動転記・PNG生成・`CONFIRMED` の上書きは行わず、既存検証に委ねる。既存の `LAUNCHED` 契約は変更しない。準備の検証記録は[M2 preview preparation](../reviews/2026-09-23-product-m2-preview-preparation.md)を参照。
 - exit criteria（提案）：実Studio 1回の起動に対して `preview_status=CONFIRMED` となり、記録に観測主体・一回限りの識別子・PNGハッシュ・表示変数と最終状態が残る。PNG自体はGit外に保持する。
-- **観測主体（確定）**：PMが実desktop UIを独立観測する。実施手順・120秒以内の期限は実装ノート §7。実UI観測の証拠は未取得であり、M2完了は宣言しない。
+- **観測主体（確定）**：PM。比較完了前の公開preview要求が所有ロックbusyでexit 8となり、Studio起動前に停止した。比較はその後COMPARED／exit 0で完了・所有権解放済み。Studio実起動0・予約1を保持し、同一予約での続行判断待ち。実UI／PNG／CONFIRMEDは未取得。手順は実装ノート §7、事実と原因は[M2実測記録](../reviews/2026-09-23-product-m2-evidence.md)を参照。
 
 **(b) メッシュ依存性の3段階**
 
-- 現状（確定）：`application/_mesh_refinement.py` に3段階判定が実装済み。E2E設定は `preparation_requests` を1件または3件受け付ける。3段階の実行証拠は現行受入記録に無い。
-- 実施方法（提案）：既存の `prepare-planar --parent-revision-id` で粗→中→細を作り、実FEBioで各版を解析する。**現時点の読取では製品コードの変更なしで実施できる見込みだが、実測するまで合格も無変更も保証しない。**不足が判明した場合は、その時点で最小の変更を提案する。
+- 現状（確定）：新M2 flowの3段階とE-only子で実証済み。3版PREPARED・4run SUCCEEDED、fine／childの数値6項目PASS。要素数325→889→1966、最大相対力差0.0007783796064404918、材料正規化差0。[M2実測記録](../reviews/2026-09-23-product-m2-evidence.md)に全コマンド・失敗修正・有限予算を記録した。
+- 実施方法（実施済み）：既存の `prepare-planar --parent-revision-id` で粗→中→細を作り、実FEBioで各版を解析した。受理済みinstalled wheelを変更せず、公開CLIから合成平面・直方体の証拠を取得した。他形状・実モデルへはこの合格を一般化しない。
 - exit criteria（提案）：同一ケースで粗・中・細の3版が `PREPARED`、3版とも実FEBioで `SUCCEEDED`、部品要素数の増加と実測最大辺長の減少が記録され、双方の全保存状態の力履歴差が事前宣言した相対力差限界と力下限を満たし `mesh_dependence=PASS` となる。4回目はヤング率のみを変更し、同一最細メッシュと弾性率正規化比較による継承も `PASS` とする（計画書 §5）。`FAIL`／`UNVERIFIED` は調査結果として保持するが、この受入条件の合格とはしない。許容値を後から緩めない。
 
 **(c) 形状品質と対応資格（`surface_approximation`／`native_qualification`）**
@@ -139,6 +140,7 @@ Git外の証拠rootは記号で参照する（`<COORDINATION>`＝元のチェッ
 - `native_qualification`（提案）：**既存契約を維持する。**恒久的な `UNVERIFIED` 化も、新しいハッシュ束縛や権限レイヤーの追加も、本taskおよびM2では採用しない。M2では「対応資格を満たすために何の証拠が不足しているか」と「その解消手順」を調査して記録することまでを行う。
 - `physical_applicability_validation`（既存契約）：別行表示のまま維持する。**新しい必須品質項目は追加しない。**解消には実測との照合が要るため、M2では証拠不足の内容を記録するにとどめる。
 - exit criteria（提案）：3項目それぞれについて、成立する主張・成立しない理由・解消に必要な証拠が記録され、`PASS` にできない項目は理由付きで `UNVERIFIED` として公開される。
+- 調査結果：既存算定だけでは双方向CAD↔meshの被覆・距離境界が未成立。資格・形状近似・実物適用性の不足証拠を[M2実測記録](../reviews/2026-09-23-product-m2-evidence.md)に記録し、3項目のUNVERIFIEDを維持した。調査に伴うnative起動・製品コード変更は0。
 - 必要形状の補完（提案）：M3の確定入力を既存対応表へ照合し、未対応の治具・配置・接触・材料だけをM2で補完し、その組み合わせの参照解・実ツール証拠を取得する。対象未確定の間に球・円柱等の全組み合わせを作らない。既存製品契約の残件は削除せず、未認定の組み合わせではM3を開始しない。
 
 ### M3：実モデルE2E（E2E-02 → E2E-03）
@@ -218,7 +220,7 @@ M1(M2予算合意済み・M3条件待ち) ──► M2(平面での証拠取得)
 運用条件（M2は承認済み、後続milestoneは提案）：
 
 - **M2(b)の承認上限は inspection 1／preparation 3／実FEBio 4、失敗時は停止し再試行0とする。** 失敗・中断も消費として数え、復元しない（実装ノート §3 の既存運用）。
-- 時間上限は既存設定を根拠に明記する。`inspect --native` は既定600秒（`cli/main.py` の `--wall-seconds` 既定、実装ノート §2 の上限）、`prepare-planar` は既定600秒・生成1回・四面体100,000要素・節点250,000（実装ノート §3）。**実FEBio実行の wall 上限は本書時点で未確定**であり、着手時に対応表・solver policyから確定させる（未確定のまま実行しない）。
+- 時間上限は既存設定を根拠に明記する。`inspect --native` は既定600秒（`cli/main.py` の `--wall-seconds` 既定、実装ノート §2 の上限）、`prepare-planar` は既定600秒・生成1回・四面体100,000要素・節点250,000（実装ノート §3）。M2実行前のprelaunchで、実FEBioは固定した `values.budget.max_elapsed` に基づく各3600秒・CPU 1、preparationは各570秒と確定した（M2実測記録）。後続milestoneの上限は別途確定する。
 - `--preflight` はネイティブソルバーを起動しないため消費しない（manual 8記録 §5）。
 - M2(a)は新M2 flowのmanifestを使う案を優先する。保護対象の既存case操作を暗黙に許可した予算ではない。M3でモデル固有の3段階mesh＋E-onlyを要する場合、各モデル最低 `inspect 1／prep 3／FEBio 4` に再見積し、必要な親子表示の起動回数も追加する。M4の新規CAD→解析→変更→再解析には別途native予算を積む。上表の合計だけを全milestoneの実行許可として扱わない。
 
@@ -233,7 +235,7 @@ M1(M2予算合意済み・M3条件待ち) ──► M2(平面での証拠取得)
 | 3 | M4 | AI-02を1 flow（合成ケースで可）＋結果の日本語報告 | LLM 最大8 | 複数モデル・複数providerの比較 |
 | 4 | M5 | 別環境1台での8手順再現＋復旧・予算・記録保護の各1件 | inspect 1／prep 1／FEBio 3／Studio 1 | 3台目以降の環境、長期運用試験 |
 
-**現在の実施判断**：順1（M2最小構成）の予算は承認済み。(b) native証拠取得と(a)ブリッジ準備を進め、実Studio観測はPMが別枠1回で行う。M3はQ3〜Q5待ちであり、M2完了と条件確定前には進まない。
+**現在の実施判断**：M2(b)は合格、(c)調査済み、(a)は起動前競合拒否後の続行判断待ち（[M2実測記録](../reviews/2026-09-23-product-m2-evidence.md)）。native inspect1／prep3／FEBio4を消費し、Studioは実起動0・予約1保持。M3はQ3〜Q5と固有予算待ちであり、M2完了と条件確定前には進まない。
 
 ## 7. 各milestoneで触らないもの（確定）
 
