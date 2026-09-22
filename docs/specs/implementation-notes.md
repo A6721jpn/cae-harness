@@ -98,7 +98,37 @@ XPLTのヘッダ、辞書、メッシュ、状態、変数、圧縮、配置お�
 
 `--window-id` を指定した経路は既存の外部Studioプロセスおよびウィンドウを特定し、XPLTハッシュと表示要求に結び付く一回限りの観測要求を発行する。`CONFIRMED` においては、独立した操作者による対象ファイル、Studioの版、最終状態、変数・成分・座標・単位の実際の表示確認が必要となる。既存セッションおよび一回限りの識別子と合致する記録、ならびに要求後に撮影されたPNGを有限の期限内に標準入力PIPE経由で受け取り、現在のXPLTハッシュと照合する。通信仕様は `src/febio_cae/cli/preview.py`、照合は `src/febio_cae/application/_preview.py` に従う。
 
-この観測を行う公開ヘルパーは現行CLIには存在しないが、MVPの表示確認は実装済みの`LAUNCHED`契約に従う。`--window-id`／stdinによる`CONFIRMED`観測経路は既存実装として保持し、追加MVP GUI criterionへは拡張しない。
+公開ブリッジは `scripts/observe_preview.py`（標準ライブラリのみ、Windows用）である。installed `febio-cae` のpublic commandをstdin/stdout PIPE付きで1回起動し、実際の `PREVIEW_REQUESTED` 行をそのまま `request.json` に原子的に公開する。`response.json` を1回だけ読み、内容を改変せず末尾改行を補ってstdinへ渡す。`stdout.jsonl` と端末には子の実出力を保存・表示し、通常は子の終了コードを返す。既存ディレクトリの再利用と要求前の応答を拒否し、helperエラーは7。子プロセスのみを有限時間で回収し、Studioは起動・終了しない。JSON・nonce・対象・表示値・PNGの照合はinstalled CLIの既存検証に委ねる。
+
+### 独立操作者（M2ではPM）の手順
+
+1. 承認済みの新M2 flowに対し、公開 `case preview`（`--window-id` 無し）等で予算内のStudio **1回**を起動する。対象XPLTと表示変数・成分・World座標・単位・最終状態を実desktop UIで設定し、Studioの版と実ウィンドウの **HWND（PIDではない）** を観測する。ここは要求発行前に済ませる。旧caseは操作しない。
+2. 別の端末／監督プロセスで下記を起動する。`<EXCHANGE>` はOS一時領域等の**未作成ディレクトリ**で、case／製品state／Git管理対象の外に置く。helperはソースpackageをimportせず、指定したinstalled executableを使う（wheel再build不要）。
+
+   ```text
+   python scripts/observe_preview.py --cli "<INSTALLED_FEBIO_CAE_EXE>" --exchange-dir "<EXCHANGE>" --state-dir "<STATE_DIR>" --case-id "<CASE_ID>" --manifest-id "<MANIFEST_ID>" --studio "<STUDIO_EXE>" --window-id <HWND> --timeout 120
+   ```
+
+3. `<EXCHANGE>/request.json` 出現後に内容を読む。これは `{"status":"PREVIEW_REQUESTED","request":{...},"remaining_seconds":...}` という実CLI出力で、`request` 内に `receipt`、`binding`、`issued_ns` がある。**期限は観測処理開始から最大120秒**（CLI既定30秒、helper既定120秒）、残り時間は実出力の `remaining_seconds`。準備・ハッシュ読込にも時間を使うため出現後120秒ではない。helperの子起動／終了用30秒余裕は観測期限を延長しない。
+4. PMは要求後に実画面を再確認して新しいPNGを作成する（既存画像のコピー不可、20 MiB以下）。PNGはGit外の新しいファイルに置き、必要な表示値と出所を確認する。応答は**UTF-8・BOM無し・JSON object 1行・改行込み64 KiB以内**で以下の全項目を含める。要求値を観測値として自動転記せず、不明・不一致なら送信せず停止する。
+
+   | 応答キー | 根拠・型 |
+   |---|---|
+   | `preview_id` | 今回の `request.receipt.receipt_id`（文字列） |
+   | `request_nonce` | 今回の `request.binding.nonce`（文字列、一回限りの相関ID） |
+   | `manifest_id` | 今回の対象manifest ID（文字列） |
+   | `loaded_file`, `xplt_sha256` | 実際に開いたXPLTの絶対パスとSHA-256。要求の `binding.source_path`／`xplt_digest` と一致が必要 |
+   | `studio` | 実際のStudioの `tool_id`, `version`, `executable_digest` を含むobject。要求のidentityと一致が必要だが版を未観測のままコピーしない |
+   | `session` | 実プロセスの `process_id`（整数）、`process_start_marker`（文字列）、`window_id`（整数）のobject。要求のsessionを実窓・プロセスと照合して返す |
+   | `observed_state_id`, `observed_time_s` | 実際に表示した最終状態番号（整数）と時刻（数値） |
+   | `observed_variable`, `observed_component`, `observed_frame`, `observed_unit` | 独立観測した表示変数・成分・座標・単位（文字列）。`required_*` は確認対象であって観測の証拠ではない |
+   | `observer` | 独立操作者の識別・帰属（空でない文字列） |
+   | `capture_path` | 要求後に撮影した新PNGの絶対パス（文字列） |
+
+5. 書きかけを読ませないため、同じ交換ディレクトリの `response.tmp` へ完全な1行を保存し、**同一ディレクトリ内renameで `response.json` として公開**する。ファイルを直接追記・上書きしない。helperは応答1件を送信して閉じ、子CLIが既存ストアへ検証済み証拠を登録する。helperがcaseへ直接書き込むことはない。
+6. 端末終了コードと `stdout.jsonl` の最終応答を記録する。`preview_status=CONFIRMED` と必要な品質状態を確認し、必要なら公開 `case preview-status` で再検証する。タイムアウト・不一致・子エラーは成功ではなく、M2の失敗停止／再試行0に従う。交換ファイル・PNG・実パスはGitに入れず、実行証拠として外部に保持する。
+
+制約：helperは画面操作、スクリーンショット撮影、表示値の推定、バージョンの補完、`CONFIRMED`生成を一切行わない。実UI観測は別途必要であり、fixture試験はその代わりにならない。MVPの表示確認は従来の `LAUNCHED` 契約を保持し、追加MVP GUI criterionへは拡張しない。
 
 ## 8. LLM接続（OpenAI Responses）
 
