@@ -125,6 +125,8 @@ def _prepared(
         raise PortError(
             PortErrorCategory.INTEGRITY, "static preparation lineage or source snapshot changed"
         )
+    if not isinstance(record["curves"], dict):
+        raise TypeError("static prepared curves must be an object")
     curves = {
         int(tag): tuple(tuple(line) for line in lines) for tag, lines in record["curves"].items()
     }
@@ -244,11 +246,13 @@ def _summary(
             math.sqrt(sum(v * v for v in row)) for row in displacement.values()
         ),
         "maximum_von_mises_pa": max(von_mises),
+        "stress_basis": "element_average_cauchy",
         "checks": checks,
         "quality_status": "FAIL" if "FAIL" in checks.values() else "UNVERIFIED",
         "unverified": [
             "arbitrary-CAD approximation",
             "mesh dependence",
+            "peak stress recovery",
             "solver residual qualification",
             "material yield/safety",
         ],
@@ -259,7 +263,12 @@ def run(root: Path, solver: Path) -> dict[str, Any]:
     store = StaticLoadStore(root)
     with store.operation() as owned:
         if not owned:
-            raise ValueError("static root is owned by another operation")
+            raise PortError(PortErrorCategory.CONFLICT, "static root is owned by another operation")
+        if (store.root / "run.json").exists():
+            raise PortError(
+                PortErrorCategory.CONFLICT,
+                "static root has already reserved its single solver attempt",
+            )
         request, mesh, curves = _prepared(store)
         profile = _profile()
         store.write_bytes("profile.json", profile.to_bytes(), immutable=True)
@@ -369,7 +378,25 @@ def run(root: Path, solver: Path) -> dict[str, Any]:
 
 
 def status(root: Path) -> dict[str, Any]:
-    store = StaticLoadStore(root)
+    try:
+        store = StaticLoadStore(root, create=False)
+    except FileNotFoundError as error:
+        raise PortError(
+            PortErrorCategory.INVALID_INPUT, f"static status root does not exist: {root}"
+        ) from error
+    try:
+        return _status(store)
+    except FileNotFoundError as error:
+        raise PortError(
+            PortErrorCategory.INTEGRITY, f"required stored static evidence is missing: {error}"
+        ) from error
+    except (ValueError, TypeError, LookupError, OverflowError) as error:
+        raise PortError(
+            PortErrorCategory.INTEGRITY, f"stored static record cannot be validated: {error}"
+        ) from error
+
+
+def _status(store: StaticLoadStore) -> dict[str, Any]:
     with store.operation() as owned:
         result = store.read_record("preparation-status.json")
         if owned and result["status"] == "PREPARING":

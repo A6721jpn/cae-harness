@@ -4,11 +4,20 @@ from __future__ import annotations
 
 import hashlib
 import json
+import stat
 import sys
 from pathlib import Path
 from typing import Any, cast
 
-from febio_cae.domain import FrameId, Quantity, RigidTransform, Translation3
+from febio_cae.adapters.febio._windows_job import LaunchCleanupPending
+from febio_cae.domain import (
+    FrameId,
+    PortError,
+    PortErrorCategory,
+    Quantity,
+    RigidTransform,
+    Translation3,
+)
 from febio_cae.domain.artifacts import (
     TET10_FACE_ORDER_ID,
     TET10_NODE_ORDER_ID,
@@ -27,7 +36,7 @@ from ._gmsh_runtime import (
     verify_runtime_identity,
 )
 from .adapter import StepGeometryMeshAdapter
-from .backend import BackendLocalRefinement, GeometryMeshBackend
+from .backend import BackendError, BackendErrorCategory, BackendLocalRefinement, GeometryMeshBackend
 from .gmsh_occ import GmshOCCBackend, GmshOCCConfig
 from .preparation import _run_owned, resource_snapshot
 
@@ -97,7 +106,9 @@ class StaticGmshBackend(GmshOCCBackend):
             len(mesh.nodes) > self.request.max_nodes
             or len(mesh.elements) > self.request.max_elements
         ):
-            raise ValueError("static mesh exceeds declared node/element caps")
+            raise PortError(
+                PortErrorCategory.INVALID_INPUT, "static mesh exceeds declared node/element caps"
+            )
         surfaces = gmsh.model.getBoundary([(3, context.volume_tag)], False, False)
         owned_curves = {
             abs(tag) for dim, tag in gmsh.model.getBoundary(surfaces, False, False) if dim == 1
@@ -105,7 +116,10 @@ class StaticGmshBackend(GmshOCCBackend):
         node_ids = {node.node_id for node in mesh.nodes}
         for load in self.request.loads:
             if load.curve_id not in owned_curves:
-                raise ValueError(f"selected CAD curve {load.curve_id} is not on the source solid")
+                raise PortError(
+                    PortErrorCategory.INVALID_INPUT,
+                    f"selected CAD curve {load.curve_id} is not on the source solid",
+                )
             types, tags, connectivity = gmsh.model.mesh.getElements(1, load.curve_id)
             lines: list[tuple[int, int, int]] = []
             for kind, ids, nodes in zip(types, tags, connectivity, strict=True):
@@ -116,30 +130,44 @@ class StaticGmshBackend(GmshOCCBackend):
                     3,
                     2,
                 ):
-                    raise ValueError(
-                        "selected curve must contain complete quadratic line3 elements"
+                    raise PortError(
+                        PortErrorCategory.INTEGRITY,
+                        "selected curve must contain complete quadratic line3 elements",
                     )
                 if len(nodes) != 3 * len(ids):
-                    raise ValueError("truncated line3 connectivity")
+                    raise PortError(PortErrorCategory.INTEGRITY, "truncated line3 connectivity")
                 for offset in range(0, len(nodes), 3):
                     line = (int(nodes[offset]), int(nodes[offset + 1]), int(nodes[offset + 2]))
                     if len(set(line)) != 3 or not set(line) <= node_ids:
-                        raise ValueError("curve line3 nodes are not source-body mesh nodes")
+                        raise PortError(
+                            PortErrorCategory.INTEGRITY,
+                            "curve line3 nodes are not source-body mesh nodes",
+                        )
                     lines.append(line)
             if not lines:
-                raise ValueError("selected CAD curve has no line3 mesh")
+                raise PortError(
+                    PortErrorCategory.INVALID_INPUT, "selected CAD curve has no line3 mesh"
+                )
             self.curves[load.curve_id] = tuple(lines)
         return mesh
 
 
 def produce(content: bytes, request: StaticLoadRequest, binding: dict[str, Any]) -> dict[str, Any]:
     if hashlib.sha256(content).hexdigest() != request.source_sha256:
-        raise ValueError("source bytes differ from typed request SHA-256")
+        raise PortError(
+            PortErrorCategory.INVALID_INPUT, "source bytes differ from typed request SHA-256"
+        )
     backend = StaticGmshBackend(request, binding)
     inspection = backend.inspect(content, ())
     if len(inspection.bodies) != 1 or not inspection.bodies[0].closed_solid:
-        raise ValueError("static preparation requires exactly one closed solid")
+        raise PortError(
+            PortErrorCategory.INVALID_INPUT, "static preparation requires exactly one closed solid"
+        )
     body = inspection.bodies[0].body_id
+    source_faces = {face.face_id for face in inspection.bodies[0].faces}
+    for tag in request.fixed_face_ids:
+        if f"{body}:face-{tag}" not in source_faces:
+            raise PortError(PortErrorCategory.INVALID_INPUT, f"fixed CAD face {tag} is absent")
     refinements = tuple(
         BackendLocalRefinement(
             body,
@@ -155,7 +183,7 @@ def produce(content: bytes, request: StaticLoadRequest, binding: dict[str, Any])
         native.source_digest != request.source_sha256
         or native.geometry_digest != inspection.geometry_digest
     ):
-        raise ValueError("inspection/mesh source binding mismatch")
+        raise PortError(PortErrorCategory.INTEGRITY, "inspection/mesh source binding mismatch")
     frame = FrameId("World")
     transform = RigidTransform(
         frame,
@@ -195,13 +223,18 @@ def produce(content: bytes, request: StaticLoadRequest, binding: dict[str, Any])
         for lines in curves.values()
         for line in lines
     ):
-        raise ValueError("CAD line3 does not match complete quadratic exterior mesh edges")
+        raise PortError(
+            PortErrorCategory.INTEGRITY,
+            "CAD line3 does not match complete quadratic exterior mesh edges",
+        )
     sets: list[MeshSet] = []
     fixed: set[int] = set()
     for tag in request.fixed_face_ids:
         faces = [face for face in native.faces if face.source_face_id == f"{body}:face-{tag}"]
         if not faces:
-            raise ValueError(f"fixed CAD face {tag} is absent")
+            raise PortError(
+                PortErrorCategory.INTEGRITY, f"fixed CAD face {tag} has no source-body mesh faces"
+            )
         members = sorted({n for face in faces for n in mapped_faces[face.face_id].node_ids})
         fixed.update(members)
         sets.append(
@@ -251,14 +284,6 @@ def produce(content: bytes, request: StaticLoadRequest, binding: dict[str, Any])
             "PASS",
             "Integrated represented quadratic Jacobian",
         ),
-        MeshQualityRecord(
-            "cad_approximation",
-            0.0,
-            "m",
-            None,
-            "UNVERIFIED",
-            "No certified arbitrary-CAD approximation bound",
-        ),
     )
     selected_faces = tuple(
         face.to_dict()
@@ -277,7 +302,10 @@ def produce(content: bytes, request: StaticLoadRequest, binding: dict[str, Any])
         tuple(sets),
         quality,
     )
-    forces = integrate_edge_totals(request, mesh, curves, fixed)
+    try:
+        forces = integrate_edge_totals(request, mesh, curves, fixed)
+    except ValueError as error:
+        raise PortError(PortErrorCategory.INVALID_INPUT, str(error)) from error
     return {
         "mesh": mesh.to_dict(),
         "source_sha256": request.source_sha256,
@@ -288,7 +316,52 @@ def produce(content: bytes, request: StaticLoadRequest, binding: dict[str, Any])
         "curves": {str(tag): [list(line) for line in lines] for tag, lines in curves.items()},
         "nodal_forces_n": {str(node): list(force) for node, force in sorted(forces.items())},
         "runtime_identity": backend.runtime_identity,
+        "cad_approximation_status": "UNVERIFIED",
+        "cad_approximation_reason": "No certified arbitrary-CAD approximation bound",
     }
+
+
+def _read_response(path: Path, cap: int) -> Any:
+    info = path.lstat()
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+    ):
+        raise ValueError("native static response is not a private regular file")
+    if info.st_size > cap:
+        raise ValueError("native static response exceeds bounded memory")
+    with path.open("rb") as stream:
+        content = stream.read(cap + 1)
+    if len(content) > cap:
+        raise ValueError("native static response grew beyond bounded memory")
+    return json.loads(content)
+
+
+def _child_failure(directory: Path, cap: int, original: OSError) -> PortError:
+    # A timeout or failed launch is never reinterpreted using a child response.
+    if not isinstance(original, (TimeoutError, LaunchCleanupPending)):
+        try:
+            record = _read_response(directory / "error.json", min(cap, 65536))
+            if (
+                not isinstance(record, dict)
+                or set(record) != {"schema_version", "category", "message"}
+                or record["schema_version"] != "1"
+                or not isinstance(record["message"], str)
+                or not record["message"].strip()
+            ):
+                raise ValueError("invalid native static error response")
+            category = PortErrorCategory(record["category"])
+            if category not in {
+                PortErrorCategory.INVALID_INPUT,
+                PortErrorCategory.ENVIRONMENT,
+                PortErrorCategory.INTEGRITY,
+                PortErrorCategory.CONFLICT,
+            }:
+                raise ValueError("invalid native static error category")
+            return PortError(category, f"{record['message']}; {original}")
+        except (OSError, ValueError, TypeError, KeyError, RecursionError, OverflowError):
+            pass
+    return PortError(PortErrorCategory.ENVIRONMENT, str(original))
 
 
 def prepare_native(content: bytes, request: StaticLoadRequest, directory: Path) -> dict[str, Any]:
@@ -307,35 +380,97 @@ def prepare_native(content: bytes, request: StaticLoadRequest, directory: Path) 
     )
     package_root = Path(__file__).resolve().parents[3]
     bootstrap = f"import sys; sys.path.insert(0, {str(package_root)!r}); from febio_cae.adapters.geometry.static_load import _main; _main()"
-    process = _run_owned(
-        (sys.executable, "-I", "-c", bootstrap),
-        directory,
-        cpu_workers=request.cpu_workers,
-        timeout_seconds=request.mesh_wall_seconds,
-        memory_bytes=request.memory_bytes,
-    )
-    output = directory / "output.json"
-    if output.stat().st_size > request.memory_bytes // 2:
-        raise ValueError("native static response exceeds bounded memory")
-    result = json.loads(output.read_bytes())
-    verify_runtime_identity(binding, result["runtime_identity"])
-    mesh = decode_record(canonical_bytes(result["mesh"]), MeshArtifact)
-    if (
-        result["source_sha256"] != request.source_sha256
-        or result["request_digest"] != request.digest
-        or mesh.provenance.mesh_recipe_digest != request.digest
-    ):
-        raise ValueError("native response source/recipe binding mismatch")
+    cap = request.memory_bytes // 2
+    try:
+        process = _run_owned(
+            (sys.executable, "-I", "-c", bootstrap),
+            directory,
+            cpu_workers=request.cpu_workers,
+            timeout_seconds=request.mesh_wall_seconds,
+            memory_bytes=request.memory_bytes,
+        )
+    except OSError as error:
+        raise _child_failure(directory, cap, error) from error
+    try:
+        result = _read_response(directory / "output.json", cap)
+        required = {
+            "mesh",
+            "source_sha256",
+            "request_digest",
+            "inspection_geometry_digest",
+            "native_coordinate_unit",
+            "fixed_cad_face_geometry",
+            "curves",
+            "nodal_forces_n",
+            "runtime_identity",
+            "cad_approximation_status",
+            "cad_approximation_reason",
+        }
+        if not isinstance(result, dict) or set(result) != required:
+            raise ValueError("native static response is missing or has unexpected fields")
+        verify_runtime_identity(binding, result["runtime_identity"])
+        mesh = decode_record(canonical_bytes(result["mesh"]), MeshArtifact)
+        if (
+            result["source_sha256"] != request.source_sha256
+            or result["request_digest"] != request.digest
+            or mesh.provenance.mesh_recipe_digest != request.digest
+            or result["inspection_geometry_digest"] != mesh.provenance.source_geometry_digest
+            or result["native_coordinate_unit"] != request.native_coordinate_unit
+        ):
+            raise ValueError("native response source/recipe binding mismatch")
+        if (
+            not isinstance(result["fixed_cad_face_geometry"], list)
+            or not isinstance(result["curves"], dict)
+            or not isinstance(result["nodal_forces_n"], dict)
+            or result["cad_approximation_status"] != "UNVERIFIED"
+            or not isinstance(result["cad_approximation_reason"], str)
+            or not result["cad_approximation_reason"].strip()
+        ):
+            raise ValueError("native static response selection/qualification fields are malformed")
+    except (OSError, ValueError, TypeError, KeyError, RecursionError, OverflowError) as error:
+        raise PortError(
+            PortErrorCategory.INTEGRITY, f"invalid native static response: {error}"
+        ) from error
     result["process"] = process
     result["runtime_binding"] = binding
     return result
 
 
 def _main() -> None:
-    payload = json.loads(Path("input.json").read_bytes())
-    result = produce(
-        bytes.fromhex(payload.pop("content_hex")),
-        StaticLoadRequest.from_dict(payload.pop("request")),
-        payload["runtime_binding"],
-    )
-    Path("output.json").write_bytes(canonical_bytes(result))
+    try:
+        try:
+            payload = json.loads(Path("input.json").read_bytes())
+            if not isinstance(payload, dict) or set(payload) != {
+                "content_hex",
+                "request",
+                "runtime_binding",
+            }:
+                raise ValueError("invalid private static preparation input")
+            content = bytes.fromhex(payload["content_hex"])
+            request = StaticLoadRequest.from_dict(payload["request"])
+            binding = payload["runtime_binding"]
+            if not isinstance(binding, dict):
+                raise TypeError("static preparation runtime binding is missing")
+        except (ValueError, TypeError, KeyError) as error:
+            raise PortError(PortErrorCategory.INTEGRITY, str(error)) from error
+        result = produce(content, request, binding)
+        Path("output.json").write_bytes(canonical_bytes(result))
+    except Exception as error:
+        category = PortErrorCategory.ENVIRONMENT
+        if isinstance(error, PortError):
+            category = error.category
+        elif isinstance(error, BackendError):
+            if error.category == BackendErrorCategory.INVALID_INPUT:
+                category = PortErrorCategory.INVALID_INPUT
+            elif error.category == BackendErrorCategory.INTEGRITY:
+                category = PortErrorCategory.INTEGRITY
+        print(f"{type(error).__name__}: {error}", file=sys.stderr)
+        try:
+            Path("error.json").write_bytes(
+                canonical_bytes(
+                    {"schema_version": "1", "category": category.value, "message": str(error)}
+                )
+            )
+        except OSError as response_error:
+            print(f"native error response could not be written: {response_error}", file=sys.stderr)
+        raise

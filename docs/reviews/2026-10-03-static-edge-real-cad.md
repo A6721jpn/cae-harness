@@ -17,9 +17,10 @@
 - `src/febio_cae/application/static_load.py`：公開prepare/run/status、実RunnerAdapterとXPLT読取、完全性・数値照合、封印出力と再計算されたstatus。
 - `src/febio_cae/cli/static_load.py`、`src/febio_cae/cli/main.py`：公開CLIと既存終了コード規則。既存接触CLIは維持する。
 - `tests/unit/contracts/test_static_load.py`：合計力/共有節点/符号、角・中間節点の支持重複、密度/意味不正、巨大JSON整数、ソース/選択束縛、局所球、中断状態の8試験。実モデルのIDを用いない。
+- `tests/component/geometry/test_static_native_errors.py`、`tests/component/cli/test_static_load_errors.py`：入力/環境/完全性の分類、元の理由、live leaseと再利用の非破壊競合、存在しないroot、壊れた公開記録、平均応力の意味と未検証品質を合成データで確認する。
 - 設計仕様書の独立操作契約、実装ノート§12、計画書の個別承認現在地、レビュー索引と本記録。
 
-## ネイティブ実行と失敗の保存
+## 追加レビュー前のネイティブ実行と失敗の保存
 
 実CADの準備要求は17回開始・17回終了し、16/17回目が `PREPARED`。それ以前の失敗、時間切れ、ネイティブaccess violation、診断補助の失敗、PLC交差、メッシュ封印時のメモリー不足をGit外に保持する。成功2回のrequest/mesh digestは同一だった。原STEPの終了時SHA-256は開始時と一致し、全ソースCAD面、選択固定面、両荷重曲線の対応と全Tet10の正値・外表面完全被覆を確認した。
 
@@ -33,7 +34,7 @@
 
 ## コマンドと検証
 
-nativeのsource呼出しは `<NATIVE_PYTHON> -I -B -c "import sys;sys.path.insert(0,'<WORKTREE>/src');from febio_cae.cli.main import main;raise SystemExit(main())"` を用いた。実パスを記号化した実argvと結果は次のとおり。
+nativeのsource呼出しは `<NATIVE_PYTHON> -I -B -c "import sys;sys.path.insert(0,'<WORKTREE>/src');from febio_cae.cli.main import main;raise SystemExit(main())"` を用いた。以下は追加Opusレビュー前の候補 `518317c` の履歴であり、追加修正後の合格とは区別する。実パスを記号化した実argvと結果は次のとおり。
 
 | コマンド | 結果 |
 |---|---|
@@ -65,14 +66,47 @@ nativeのsource呼出しは `<NATIVE_PYTHON> -I -B -c "import sys;sys.path.inser
 
 初期ruffの7指摘とmypyの10型エラーは修正後の検査合格へ更新した。調査用native logger/export補助処理は製品経路から削除した。失敗履歴を後の合格で置き換えない。
 
+## 追加レビュー後の検証履歴
+
+5点の修正を統合し、次の検証を追加した。合成データ・保存済み実記録の読み取り・新たな実native求解を別の証拠として管理する。
+
+| コマンド／確認 | 結果 |
+|---|---|
+| `python -m pytest tests/component/geometry/test_static_native_errors.py tests/component/cli/test_static_load_errors.py tests/unit/contracts/test_static_load.py` | 修正後exit 0、36 passed、7.09秒 |
+| `python -m ruff check .`／`python -m mypy src tests` | exit 0、指摘0、226 source/test files |
+| `python -m ruff format --check src tests scripts` | exit 0、228 files already formatted |
+| 旧wheel／新版sourceの不在CAD面 `static-load prepare --json`、同一合成STEPと明示600秒要求、別root | 旧版exit 4／106.95秒、子ログは不在面を示すが公開JSONは元理由なし。新版exit 2／92.88秒、不在面の理由を公開JSONで保持 |
+| 新版sourceの支持と荷重曲線の重複 `static-load prepare --json`、合成STEP | exit 2／98.61秒、中間節点を含む重複の理由を公開JSONで保持 |
+| 不在rootの `static-load status --json`、旧wheel／新版source | 旧版exit 4でrootを作成。新版exit 2でroot不作成を実測 |
+| 所有Windows Jobからnative Pythonだけを起動する使い捨て診断 | exit 0／0.44秒、子の実行と終了・drainを確認。Gmsh/FEBio起動0 |
+| `python -m build --outdir .local/build-static-edge-reviewed` | exit 0／10.26秒、sdistと通常wheel |
+| `python -m venv .local/wheel-static-reviewed-env` と `<REVIEWED_PYTHON> -m pip install --no-deps <REVIEWED_WHEEL>` | exit 0／8.59秒、同じPCの新規環境へ通常導入 |
+| `<REVIEWED_PYTHON> -I -B -m febio_cae --version`／`static-load --help` | exit 0／0.58秒、ソース外cwdで公開CLIを確認 |
+| installed wheelによる過去case-03の `static-load status --json` と前後の封印ファイルhash比較 | 公開statusはbasis欠落の完全性exit 6。確認scriptはexit 0／45.40秒、summary/manifest/XPLT/logのhash不変、solver起動0 |
+| 修正後の `static-load prepare --root <PRIVATE>/case-04 --cad <ORIGINAL_STEP> --request <REQUEST> --json` | exit 0／160.51秒／PREPARED。実CAD準備は18回開始・18回終了、原STEPは不変、要求とnodes/elements/faces/setsは先の実成功と同一 |
+| 修正後の `static-load run --root <PRIVATE>/case-04 --solver <FEBIO> --json` | exit 0／250.52秒／SUCCEEDED、4数値照合PASS、要素平均Cauchy応力のbasisを保存、局所最大応力の復元を含む全体品質UNVERIFIED。実FEBio起動計3回、Studio0回 |
+| 修正後sourceの `static-load status --root <PRIVATE>/case-04 --json` | exit 0／47.91秒、owner/profile/lineage/封印hash/数値再計算を受理、solver再起動0 |
+| 修正後installed wheelの `static-load status --root <PRIVATE>/case-04 --json` | exit 0／48.04秒、ソース外cwd・隔離モードで新しい実封印結果の系譜と数値再計算を受理、solver起動0 |
+| 新規環境の `febio-cae --version` | exit 0／0.37秒、ソース外cwdで通常console entrypointを起動 |
+| `python scripts/scan_cae_data.py --root .`（追加修正9ファイルのstage後） | exit 0／16.96秒、checked/tracked/index各294、diagnostics/issues各0 |
+| `python -m pytest`（追加レビュー修正後、無絞込み・人工的なコマンド期限なし） | exit 0、1837 passed／0 failed、3424.37秒（wall 3425.00秒）。先の1809件の合格とは別に保持 |
+
+最初の関連試験は35 passed／1 failed。合成fixtureがfloat型の時間上限を整数で直接組み立て、JSON読込後のrequest digestと一致しなかった。fixtureを正しいfloat値にそろえ、数値配列の型注釈とlint2件を修正して上記36件・静的ゲートを通した。製品のlineage照合を弱めていない。
+
+不在面診断の先行120秒要求は旧版／新版で各1回のowned-process deadline（exit 4）となり保持する。これは入力不正分類の再現成功ではない。別の明示合成要求を既存の600秒上限内で実行して、同じ入力の失敗前・修正後を確認した。実CADの物理条件・上限は変えていない。旧wheelのZIP直接importはnative起動前に失敗したため、展開した同じwheelの未変更コードで比較した。
+
+修正後wheelは427435 bytes、SHA-256=`78344f56e45beed6f20e0b913259e806bbdf3c9980ff453e6a25517acaf9de20`。通常導入したapplication/CLIがsite-packagesから読まれることを `-I -B` で実測した。新しいsummary契約は平均応力のbasisを必須とし、過去の封印summaryへ値を後付けしない。最初の使い捨てwheel確認は不要なエラー文言assertで停止したため、そのassertを削除して上記ファイル不変確認を完遂した。
+
 ## 助言と内部表示
 
-Claude Code CLIは `--model claude-opus-5-5 --effort xhigh --permission-mode plan` と読取ツールで文書・コードを相談した。成功2件では独立型付き静荷重経路、既存CaseSpec維持、実native mesh/RunnerAdapter/XPLT再利用、座標単位・局所球の有界実験を助言として取得した。要求モデルは応答で確認したが、backendのeffortは独立には報告されていない。最新条件を前提にした追加相談はAPI 429で未取得、代替モデルは使っていない。旧荷重助言は最新ユーザーASSUMPTIONへ明示的に従属させた。
+Claude Code CLIは `--model claude-opus-5-5 --effort xhigh --permission-mode plan` と読取ツールで文書・コードを相談した。初期の成功2件では独立型付き静荷重経路、既存CaseSpec維持、実native mesh/RunnerAdapter/XPLT再利用、座標単位・局所球の有界実験を助言として取得した。追加相談のAPI 429を保持し、枠復旧後は同じ指定モデルで3件目の相談を取得した（exit 0／490.43秒／応答モデル `claude-opus-5-5`）。backendのeffortは独立には報告されていない。実CAD・結果・私有ログを相談先へ渡さず、今回のコード・一般試験・公開仕様だけを読ませた。
+
+3件目のsource reviewは物理計算の具体的欠陥を示さず、native入力不正の終了分類、run競合の優先順位、平均応力の表示根拠、未測定CAD近似の偽の数値0、statusのroot作成/破損JSON境界の5点を指摘した。コードを修正し、未測定CAD近似と局所最大応力の復元は `UNVERIFIED` として記録する。source reviewを実求解・任意CADの認定・安全性の合格証拠にはしない。代替モデルは使わず、旧荷重助言は最新ユーザーASSUMPTIONへ明示的に従属させた。
 
 内部ダッシュボードは状態/実行回数/未検証項目のみを更新した。実Chromiumで表示とスクリーンショットを観測し、リンク0、実パス/実CAD/数値結果なしを確認した。外部公開・新規公開URLは0。
 
 ## 未検証と次の判断
 
-今回の単一ソリッド静解析は求解・封印・4数値照合まで実証した。ただしCAD近似、メッシュ依存性、solver残差の適用scope、材料降伏/安全性は `UNVERIFIED`。結果の大小だけで設計安全性を合格としない。Studio確認、実物照合、M3の全条件、P7の必須全E2E、最終BottomFrame、他PC再現は今回の成功に含めない。製品の `COMPLETE` または最終完成を宣言しない。
+今回の単一ソリッド静解析は求解・封印・4数値照合まで実証した。ただしCAD近似、メッシュ依存性、局所最大応力の復元、solver残差の適用scope、材料降伏/安全性は `UNVERIFIED`。von Misesの報告値は要素平均Cauchy応力テンソルから算出した値の最大であり、局所ピークの最大応力とは主張しない。結果の大小だけで設計安全性を合格としない。Studio確認、実物照合、M3の全条件、P7の必須全E2E、最終BottomFrame、他PC再現は今回の成功に含めない。製品の `COMPLETE` または最終完成を宣言しない。
 
 次に結果を設計判定へ用いる場合は、独立したメッシュ細分化/CAD近似の受入根拠と材料許容値・評価領域が必要。今回の採用済み物理条件について追加質問はない。別PC確認はユーザー指定どおり対象外。V2統合/pushは別途明示指示が必要である。

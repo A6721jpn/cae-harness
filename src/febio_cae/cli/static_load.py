@@ -28,7 +28,7 @@ def run_static_load(arguments: argparse.Namespace) -> int:
             )
         )
         return 0
-    except (OSError, ValueError, TypeError, RuntimeError) as error:
+    except (OSError, ValueError, TypeError, LookupError, RuntimeError) as error:
         code = (
             {
                 PortErrorCategory.INVALID_INPUT: 2,
@@ -43,7 +43,7 @@ def run_static_load(arguments: argparse.Namespace) -> int:
             }[error.category]
             if isinstance(error, PortError)
             else (2 if arguments.static_action == "prepare" else 6)
-            if isinstance(error, (ValueError, TypeError))
+            if isinstance(error, (ValueError, TypeError, LookupError))
             else 4
         )
         print(

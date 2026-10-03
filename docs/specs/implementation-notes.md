@@ -193,6 +193,10 @@ febio-cae static-load status --root "<STATIC_ROOT>"
 
 `--json` を受理し、指定の有無によらず `schema_version=1` のJSONを返す。終了コードは共通契約に従い、入力不正2、環境/未対応4、solver実行失敗5、出力完全性/数値品質不合格6、中断/取消7、競合/一回限り予約の再利用8。状態読込の終了0は解析成功を意味しない。`budget.memory_bytes` はネイティブ準備のJob Objectと入力・出力サイズに適用する上限であり、既存RunnerAdapterのsolverヒープ上限を新設するものではない。
 
+native子プロセスは、専用の有界な通常ファイルへ失敗分類と元の理由を記録する。選択CAD面/曲線の不在、荷重と支持の重複、ソース不一致などの入力不正は2、実行環境・native失敗・期限超過は4、成功応答の欠落/破損は6とする。失敗記録を信用できない場合は元の環境失敗を保持する。使用中leaseまたは既存run予約は、準備読込・profile保存・bundle stagingより先に8を返す。
+
+`status` は保存rootを新規作成しない。不在rootは入力不正2、既存の公開記録の破損・必須キー欠落・sealed出力欠落は完全性6としてJSONを返す。
+
 
 要求schema（SHAは実ソースの値に置換する。下記アルゴリズム設定は構文例であり、任意CADの成功を保証しない）：
 
@@ -251,9 +255,9 @@ line3の形状関数と曲線Jacobianを3点Gauss積分し、**各曲線ごと**
 
 静荷重専用の永続owner/run記録、既存Windows filesystem pin/publication lease、LocalBundleStore、RunnerAdapterを使用する。実行入力・mesh・profile・scope・owner generationを照合し、ローカルrunner発行snapshotだけを受理する。root exitだけでは公開しない。所有子孫のdrain、ログの唯一の `N O R M A L   T E R M I N A T I O N`、エラー終端不在、実XPLTの0..1秒の11要求状態、正確な最終時刻1秒と全有限fieldを要求する。クラッシュ後はstatusに中断診断を出し、PID採用や暗黙再起動を行わない。
 
-出力対応表は認定済みnative XPLT reader identity/capabilityのみを再利用し、平面接触の物理的な認定を流用しない。dictionaryは `displacement`、`reaction forces`、`stress` のみ。既存の反力符号対応（raw -1、canonical +1）を適用した支持反力を、実際の外力との釣り合いで検査する。最終状態の力・変形後位置でのmoment・固定変位・有限displacement/stressをsummaryに記録する。力許容差は `max(1e-6 N, TOTAL力ノルム和×0.005)`、momentは `max(1e-9 Nm, TOTAL力ノルム和×CAD mesh bounding diameter×0.005)`、固定変位は `1e-12 m`。stress summaryは最大von Misesであり、降伏/安全性の合格ではない。
+出力対応表は認定済みnative XPLT reader identity/capabilityのみを再利用し、平面接触の物理的な認定を流用しない。dictionaryは `displacement`、`reaction forces`、`stress` のみ。既存の反力符号対応（raw -1、canonical +1）を適用した支持反力を、実際の外力との釣り合いで検査する。最終状態の力・変形後位置でのmoment・固定変位・有限displacement/stressをsummaryに記録する。力許容差は `max(1e-6 N, TOTAL力ノルム和×0.005)`、momentは `max(1e-9 Nm, TOTAL力ノルム和×CAD mesh bounding diameter×0.005)`、固定変位は `1e-12 m`。`maximum_von_mises_pa` は**要素平均Cauchy応力テンソルから算出したvon Mises値の最大**であり、`stress_basis=element_average_cauchy` を必須とする。積分点/局所の最大応力や降伏/安全性の合格ではない。
 
-`sealed-results.xplt`、3つの `numeric-*.json`、`manifest.json`、`summary.json` とnative/solver実ログを保存する。statusは公開されたsealed出力・数値content digest・lineage・summary再計算を検証する。実行成功 `SUCCEEDED` と全体品質を分離し、CAD近似誤差・メッシュ依存性・solver残差のscope認定・材料安全性は不足したまま `UNVERIFIED` とし、偽の総合PASSを生成しない。GUIはこの経路では起動しない。
+`sealed-results.xplt`、3つの `numeric-*.json`、`manifest.json`、`summary.json` とnative/solver実ログを保存する。statusは公開されたsealed出力・数値content digest・lineage・summary再計算を検証する。実行成功 `SUCCEEDED` と全体品質を分離し、CAD近似誤差・メッシュ依存性・局所最大応力の復元（`peak stress recovery`）・solver残差のscope認定・材料安全性は不足したまま `UNVERIFIED` とし、偽の総合PASSを生成しない。未測定のCAD近似を数値0のMeshQualityRecordとして記録せず、準備記録の `cad_approximation_status=UNVERIFIED` と未認定の理由で明示する。古い封印summaryへbasisを後付けせず、新しい要求を満たさない記録は完全性不合格のまま保持する。GUIはこの経路では起動しない。
 
 構文の版固定一次資料：
 [FEBio v4.12 FENodalForce](https://github.com/febiosoftware/FEBio/blob/v4.12/FEBioMech/FENodalForce.cpp)、

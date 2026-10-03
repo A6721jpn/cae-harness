@@ -70,7 +70,7 @@ T6 manual caseはpreparation `FAILED`／`ABORTED/BLOCKED`、duplicate impact `UN
 
 ### 2026-10-03 個別承認の独立した静的辺荷重
 
-ユーザー指定の実STEPと明示ASSUMPTION 1〜4に対し、接触 `CaseSpec` とMVPを変更しない `static-load prepare/run/status` を追加した。原STEP・全CAD面・固定面・両荷重曲線を保持した単一ソリッドTet10で実FEBioを2回起動し、初回の支持反力照合FAILを保存、既存のゼロ指定変位方式へそろえた2回目は `SUCCEEDED`／有限場・固定変位・力とモーメントの4照合 `PASS`。CAD近似、メッシュ依存性、残差scope、材料安全性は `UNVERIFIED`、Studio起動0、別PC確認は明示対象外である。[個別実行・変更記録](../reviews/2026-10-03-static-edge-real-cad.md) を証拠の正とし、P7全受入・BottomFrame・製品全体の完了へ拡張しない。V2統合/pushは未実施。
+ユーザー指定の実STEPと明示ASSUMPTION 1〜4に対し、接触 `CaseSpec` とMVPを変更しない `static-load prepare/run/status` を追加した。原STEP・全CAD面・固定面・両荷重曲線を保持した単一ソリッドTet10で実FEBioを3回起動し、初回の支持反力照合FAILを保存、既存のゼロ指定変位方式へそろえた2回目と追加Opusレビュー後の3回目は `SUCCEEDED`／有限場・固定変位・力とモーメントの4照合 `PASS`。追加レビューの終了コード・JSON・未測定CAD近似・平均応力表示の5点を修正し、物理条件と既存上限は維持した。応力は要素平均Cauchy応力から算出した値であり、CAD近似、メッシュ依存性、局所最大応力の復元、残差scope、材料安全性は `UNVERIFIED`。Studio起動0、別PC確認は明示対象外である。[個別実行・変更記録](../reviews/2026-10-03-static-edge-real-cad.md) を証拠の正とし、P7全受入・BottomFrame・製品全体の完了へ拡張しない。V2統合/pushは未実施。
 
 
 ### 次に進める順序

@@ -32,9 +32,9 @@ class StaticLoadStore:
     permitted. The static lineage does not impersonate a contact CaseRevision.
     """
 
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, *, create: bool = True) -> None:
         self.root = root.absolute()
-        with pin_directories(self.root, create=True):
+        with pin_directories(self.root, create=create):
             pass
         self._issued: AttemptRecord | None = None
         self._runner: Any = None
@@ -73,10 +73,27 @@ class StaticLoadStore:
     def read_record(self, name: str) -> dict[str, Any]:
         if Path(name).name != name:
             raise ValueError("static record name must be a filename")
-        with pinned_read(self.root / name) as stream:
-            value = json.loads(stream.read())
-        if not isinstance(value, dict):
-            raise TypeError("static stored record is not an object")
+
+        def pairs(items: list[tuple[str, Any]]) -> dict[str, Any]:
+            result: dict[str, Any] = {}
+            for key, value in items:
+                if key in result:
+                    raise ValueError(f"duplicate JSON key: {key}")
+                result[key] = value
+            return result
+
+        def constant(value: str) -> Any:
+            raise ValueError(f"nonfinite JSON constant: {value}")
+
+        try:
+            with pinned_read(self.root / name) as stream:
+                value = json.loads(stream.read(), object_pairs_hook=pairs, parse_constant=constant)
+            if not isinstance(value, dict) or value.get("schema_version") != "1":
+                raise ValueError("static stored record must be a schema-1 object")
+        except (ValueError, TypeError) as error:
+            raise PortError(
+                PortErrorCategory.INTEGRITY, f"malformed static record {name}: {error}"
+            ) from error
         return value
 
     def issue(self, bundle: ExecutionBundle) -> TrustedOwnerContext:
