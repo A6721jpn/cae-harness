@@ -179,3 +179,85 @@ source-local criterion ID collision fixは、canonical global mesh producerにso
 - **運動スケール符号校正**：低ペナルティ平面符号プローブの終端重なり区間 `[1e-6, 1.1e-5] m` を、中間状態では宣言した接近変位÷最終値で両端をスケールする。凍結した運動スケジュールだけを使い、実測値・フィット値は使わない。calibration05 は最初の接近が約 `1e-6 m` で下限に余裕がないため不合格のまま。
 - **符号付き干渉区間**：正準Tri6パッチと球・有限円柱・中心直方体の最小符号付きユークリッド距離を、既存の二進・Bernstein算術で外向き区間として包囲する。内側は負。要求精度で細分し、作業上限で広い区間を返すことがある。閾値が区間に交差する場合は消費側で `UNVERIFIED`。
 
+## 12. 独立した単一ソリッド静荷重（`static-load`）
+
+既存の接触 `CaseSpec` と `case run` は変更しない。次の公開経路は、STEPの単一閉ソリッド、CAD面のWorld XYZ固定、CAD曲線ごとの**合計力**、等方線形弾性だけを扱う。重力、接触、剛体治具、密度荷重を追加しない。実モデルと保存rootはGit外に置く。
+
+```text
+febio-cae static-load prepare --root "<STATIC_ROOT>" --cad "<ORIGINAL_STEP>" --request "<STATIC_REQUEST_JSON>"
+febio-cae static-load run --root "<STATIC_ROOT>" --solver "<FEBIO4_EXE>"
+febio-cae static-load status --root "<STATIC_ROOT>"
+```
+
+全コマンドはJSONを返す。`prepare` と `run` は別の明示操作であり、1 rootにつき準備1回・solver試行1回だけ予約する。失敗や中断後に同じrootを再試行しない。元STEPは読み取りのみ、SHA-256を開始前と準備後で照合し、rootには検証済みsnapshotを保存する。
+
+`--json` を受理し、指定の有無によらず `schema_version=1` のJSONを返す。終了コードは共通契約に従い、入力不正2、環境/未対応4、solver実行失敗5、出力完全性/数値品質不合格6、中断/取消7、競合/一回限り予約の再利用8。状態読込の終了0は解析成功を意味しない。`budget.memory_bytes` はネイティブ準備のJob Objectと入力・出力サイズに適用する上限であり、既存RunnerAdapterのsolverヒープ上限を新設するものではない。
+
+
+要求schema（SHAは実ソースの値に置換する。下記アルゴリズム設定は構文例であり、任意CADの成功を保証しない）：
+
+```json
+{
+  "schema_version": "1",
+  "source_sha256": "<LOWERCASE_SOURCE_SHA256>",
+  "fixed": {"face_ids": [1], "components": ["x", "y", "z"], "frame": "World"},
+  "loads": [
+    {"curve_id": 12, "semantics": "TOTAL", "unit": "N", "frame": "World", "vector": [0, 0, -10]},
+    {"curve_id": 14, "semantics": "TOTAL", "unit": "N", "frame": "World", "vector": [0, 0, -10]}
+  ],
+  "material": {
+    "model": "isotropic_linear_elastic",
+    "youngs_modulus": {"value": 68000000000, "unit": "Pa"},
+    "poisson_ratio": {"value": 0.33, "unit": "1"}
+  },
+  "mesh": {
+    "global_size": {"value": 2, "unit": "mm"},
+    "native_coordinate_unit": "MM",
+    "algorithm_2d": 5,
+    "algorithm_3d": 1,
+    "curvature_points": 0,
+    "max_nodes": 1000000,
+    "max_elements": 1000000
+  },
+  "budget": {
+    "cpu_workers": 1,
+    "mesh_wall_seconds": 600,
+    "solver_wall_seconds": 600,
+    "memory_bytes": 1073741824
+  }
+}
+```
+
+面・曲線IDは認証済みGmsh/OCC import後のelementary entity tagであり、STEPレコード番号ではない。固定集合は選択したTri6面の全角節点・中間節点。選択曲線は同一所有native session内のline3を保存し、全外表面の二次辺と一致することを確認する。荷重と固定の節点共有は角・中間のいずれも拒否する。
+
+固定XYZは既存compilerと同じ `bc type="prescribed displacement"` を各軸に出力し、`dof`、`<value lc="1">0</value>`、`<relative>0</relative>` を指定する。同じゼロDirichlet条件のまま、FEBioの反力記録対象となる自由度を確保する。単なる `zero displacement` で反力fieldがゼロとなった実行を釣り合い合格と扱わず、支持反力を実出力で検査する。
+
+line3の形状関数と曲線Jacobianを3点Gauss積分し、**各曲線ごと**に積分長で正規化して要求TOTAL力にする。直線1要素なら端点各1/6・中間2/3。共有節点の寄与と符号を合算する。`N/mm`等の線密度や曖昧な意味指定を受理しない。FEBioにはsingleton NodeSetと `nodal_load type="nodal_force"` の3成分 `value lc="1"` を出力する。
+
+`M` は従来native metre挙動、`MM` はこの静荷重backendだけの明示native millimetre政策。アルゴリズムと曲率設定を含む要求全体をrecipe digestに結び付ける。最終MeshArtifactは常にSIで、既存のTet10置換 `(0,1,2,3,4,5,6,7,9,8)`、全二次写像の正値証明、外表面完全被覆を再利用する。自動fallback、治癒、面削除は行わない。支持CAD面の実測geometryとnative runtime identityも準備記録に保持する。
+
+`mesh.second_order_linear` は任意の真偽値（省略時false）。trueは標準 `Mesh.SecondOrderLinear=1` を明示して中間節点を直線補間し、**変位は二次Tet10・幾何はアフィン**とする。CADデータの修復/削除ではなく、CAD曲面への正確な投影を主張しない。falseは従来の曲面投影。いずれも全要素の正値証明、全外面被覆、CAD面/荷重曲線対応を省略せず、幾何政策をrecipe digestへ固定する。CAD近似とメッシュ依存性は独立に `UNVERIFIED` とする。構文の根拠：[Gmsh 4.15.2 mesh options](https://gmsh.info/doc/texinfo/)。
+
+ネイティブ準備のstdout/stderrとGmsh出力を保存する。大規模メッシュの固定前には不要なbackend投影・照合辞書とSTEP hex payloadを解放し、検査済みエンティティを共有する。調査用の面メッシュexport・logger補助処理は製品経路に残さず、元のnative例外をそのまま伝える。CPU/時間/メモリー上限を自動拡張しない。
+
+
+`mesh.local_refinements` は任意の配列（省略時空、最大64件）。各項目は既存 `SourceLocalRefinementBall` の `region` と単位付き `size` を持つ：
+
+```json
+{"region":{"schema_version":"1","kind":"source_local_ball","center":{"schema_version":"1","frame":"World","x":{"value":0,"unit":"m"},"y":{"value":0,"unit":"m"},"z":{"value":0,"unit":"m"}},"radius":{"value":0.001,"unit":"m"}},"size":{"value":0.0002,"unit":"m"}}
+```
+
+上の中心は一般的な構文例であり実モデルの座標ではない。中心はソースWorld座標、radius/sizeは正の長さ、sizeはglobal_size以下を要求する。既存 `BackendLocalRefinement` とnative背景場を再利用し、重なる球では小さい目標サイズを適用する。球はM/MMに依存せずSIで保存し、全値をrecipe digestへ含める。自動検出・自動細分化・fallbackではない。
+
+静荷重専用の永続owner/run記録、既存Windows filesystem pin/publication lease、LocalBundleStore、RunnerAdapterを使用する。実行入力・mesh・profile・scope・owner generationを照合し、ローカルrunner発行snapshotだけを受理する。root exitだけでは公開しない。所有子孫のdrain、ログの唯一の `N O R M A L   T E R M I N A T I O N`、エラー終端不在、実XPLTの0..1秒の11要求状態、正確な最終時刻1秒と全有限fieldを要求する。クラッシュ後はstatusに中断診断を出し、PID採用や暗黙再起動を行わない。
+
+出力対応表は認定済みnative XPLT reader identity/capabilityのみを再利用し、平面接触の物理的な認定を流用しない。dictionaryは `displacement`、`reaction forces`、`stress` のみ。既存の反力符号対応（raw -1、canonical +1）を適用した支持反力を、実際の外力との釣り合いで検査する。最終状態の力・変形後位置でのmoment・固定変位・有限displacement/stressをsummaryに記録する。力許容差は `max(1e-6 N, TOTAL力ノルム和×0.005)`、momentは `max(1e-9 Nm, TOTAL力ノルム和×CAD mesh bounding diameter×0.005)`、固定変位は `1e-12 m`。stress summaryは最大von Misesであり、降伏/安全性の合格ではない。
+
+`sealed-results.xplt`、3つの `numeric-*.json`、`manifest.json`、`summary.json` とnative/solver実ログを保存する。statusは公開されたsealed出力・数値content digest・lineage・summary再計算を検証する。実行成功 `SUCCEEDED` と全体品質を分離し、CAD近似誤差・メッシュ依存性・solver残差のscope認定・材料安全性は不足したまま `UNVERIFIED` とし、偽の総合PASSを生成しない。GUIはこの経路では起動しない。
+
+構文の版固定一次資料：
+[FEBio v4.12 FENodalForce](https://github.com/febiosoftware/FEBio/blob/v4.12/FEBioMech/FENodalForce.cpp)、
+[ゼロ指定変位](https://github.com/febiosoftware/FEBio/blob/v4.12/FEBioMech/FEPrescribedDisplacement.h)、
+[終端ログ](https://github.com/febiosoftware/FEBio/blob/v4.12/FEBioLib/FEBioModel.cpp#L1865)。
+これらのsource根拠と実native実行証拠は別であり、本節は任意実CADでの成功を主張しない。
+

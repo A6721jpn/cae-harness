@@ -262,8 +262,12 @@ LLMには、必要な形状要約、明示された条件、未解決事項、�
 | `case preview --manifest-id ID --studio EXE` | 対象XPLTをStudioで開き、`LAUNCHED` を記録 |
 | `case preview-status --preview-id ID` | 登録記録、解析結果、および品質内容の再検証 |
 | `compare BASE CAND --case-id ID --spec PATH` | 基準実行・候補実行および型付き比較条件に基づく、数値データ・曲線・報告書の生成 |
+| `static-load prepare`／`run`／`status` | MVP外の独立した単一ソリッド静荷重経路。CAD面の完全固定・指定CAD曲線ごとの合計力・等方線形弾性を専用型付き要求と独立rootへ記録し、既存の接触 `CaseSpec` を変更しない。詳細は実装ノート §12 |
 
 各操作は `--json` を保持し、結果として `schema_version, status, case_id, revision_id, run_id, diagnostics, next_actions` を返す。非該当のID項目はnullとする。また、実行応答時には `run_status, quality_status, preview_status, task_status` も併せて返却する。
+
+`static-load` は上記接触ケースのID/草案契約を流用せず、専用の不変要求、準備状態、実際の所有run/attempt、検証済み出力をJSONとして返す。`--json` を受理し、非指定時も同じJSON契約を用いる。準備とsolverの実行は明示した別操作とし、各rootは準備1回・solver試行1回に限定する。実行成功 `SUCCEEDED` と幾何近似・メッシュ依存性・残差・材料安全性の `UNVERIFIED` を区別し、既存MVPの品質/表示完了条件は変更しない。
+
 
 | 終了コード | 意味 |
 |---|---|

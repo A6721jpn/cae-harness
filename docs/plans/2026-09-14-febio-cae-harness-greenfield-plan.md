@@ -68,6 +68,11 @@ T6 manual caseはpreparation `FAILED`／`ABORTED/BLOCKED`、duplicate impact `UN
 
 2026-09-20のinstalled E2Eの過去候補失敗は履歴として保持し、latest ledgerとcanonical reviewを名前付きprovenanceの正とする。full-suite historical attemptは`INTERRUPTED_TIMEOUT`／非PASS、71c388f postfix標準1798-test full-suiteはexit 1非PASS（sole failure=`test_nested_optional_import_source_flow`）、56e122b最終標準full-suiteはexit 0 PASS（1798 passed／0 failed／3493.86 s）。runner setup／missing-Gmsh corrected flowは履歴として停止、native-enabled final 8-stepは22 stage全exit 0、両run `SUCCEEDED`、必須5 numerical statuses `PASS`、baseline `COMPLETE`／candidate comparisonまで取得し、raw label `NUMERICAL_GATE_PASSED_NOT_OVERALL`は原因推定なしで保持する。合格済みsource＋native candidateは受理対象、manual `case-6294a0a9e02c`はretry／reset／代替caseを行わず、manual 8記録が未完了のためMVP全体完了は宣言しない。V2は変更しない。
 
+### 2026-10-03 個別承認の独立した静的辺荷重
+
+ユーザー指定の実STEPと明示ASSUMPTION 1〜4に対し、接触 `CaseSpec` とMVPを変更しない `static-load prepare/run/status` を追加した。原STEP・全CAD面・固定面・両荷重曲線を保持した単一ソリッドTet10で実FEBioを2回起動し、初回の支持反力照合FAILを保存、既存のゼロ指定変位方式へそろえた2回目は `SUCCEEDED`／有限場・固定変位・力とモーメントの4照合 `PASS`。CAD近似、メッシュ依存性、残差scope、材料安全性は `UNVERIFIED`、Studio起動0、別PC確認は明示対象外である。[個別実行・変更記録](../reviews/2026-10-03-static-edge-real-cad.md) を証拠の正とし、P7全受入・BottomFrame・製品全体の完了へ拡張しない。V2統合/pushは未実施。
+
+
 ### 次に進める順序
 
 1. 56e122b最終標準full-suite PASS（1798 passed／0 failed／3493.86 s）を受け、native-enabled final automated 8-stepを既定budgetで1 flow実施済み。gmsh 4.15.2環境で22 stage全exit 0、inspection1／preparation1／solver2／Studio1、pytest 1 passed／942.46 s、両run `SUCCEEDED`、必須5 numerical statuses `PASS`、baseline `COMPLETE`／candidate comparisonを記録した。manual 8はその後2026-09-22のmanual final flowで完遂し、[manual 8実行記録](../reviews/2026-09-22-mvp-manual-final.md)を正とする。同日、ユーザー承認済みのV2 docs統合をff-onlyで実施済み（pushは未実施、PM判断）。2026-09-21の旧manual `case-6294a0a9e02c`はretry／reset／代替caseを行わず履歴として保持する。automated flowと旧manual incidentは[canonical review](../reviews/2026-09-20-mvp-planar-e2e.md)を正とする。

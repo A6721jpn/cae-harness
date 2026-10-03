@@ -11,6 +11,7 @@ from .case import run_case
 from .compare import COMPARISON_HELP, run_compare
 from .doctor import run_doctor
 from .run import run_lifecycle
+from .static_load import run_static_load
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -33,6 +34,27 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="emit the machine-readable doctor contract",
     )
+    static = commands.add_parser(
+        "static-load", help="prepare and run an independent single-solid edge-TOTAL-force case"
+    )
+    static_commands = static.add_subparsers(dest="static_action", required=True)
+    static_prepare = static_commands.add_parser(
+        "prepare", help="mesh immutable STEP and CAD selections"
+    )
+    static_prepare.add_argument("--root", required=True)
+    static_prepare.add_argument("--cad", required=True)
+    static_prepare.add_argument("--request", required=True)
+    static_run = static_commands.add_parser(
+        "run", help="launch one owned FEBio attempt and read real XPLT"
+    )
+    static_run.add_argument("--root", required=True)
+    static_run.add_argument("--solver", required=True)
+    static_status = static_commands.add_parser(
+        "status", help="read independent static preparation/run records"
+    )
+    static_status.add_argument("--root", required=True)
+    for operation in (static_prepare, static_run, static_status):
+        operation.add_argument("--json", action="store_true", help="emit the static JSON contract")
     case = commands.add_parser(
         "case",
         help="register and explicitly specify a case",
@@ -161,6 +183,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if arguments.command == "doctor":
         return run_doctor(json_output=arguments.json)
+    if arguments.command == "static-load":
+        return run_static_load(arguments)
     if arguments.command == "case":
         return run_case(arguments)
     if arguments.command == "compare":
